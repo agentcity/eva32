@@ -1,5 +1,6 @@
 from PIL import Image, ImageDraw, ImageFont
 import math
+import os
 
 W, H = 1800, 1010
 img = Image.new("RGB", (W, H), "#FFFFFF")
@@ -151,5 +152,5 @@ d.text((130, ly + 29), "асинхронно: события ingest и внут�
 d.text((60, ly + 76), "Go не решает, кому какой документ виден: скоуп приходит из Symfony, RLS в Postgres — второй рубеж.", font=f(14), fill=MUTED)
 d.text((60, ly + 104), "vLLM наружу не смотрит: только приватная сеть/VPN, публичный вход — через Symfony.", font=f(14), fill=MUTED)
 
-img.save("/Users/a/Documents/work/my/eva32/eva/architecture.png")
+img.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), "architecture.png"))
 print("saved", img.size, "boxes:", len(BOXES))

@@ -1,5 +1,6 @@
 from PIL import Image, ImageDraw, ImageFont
 import math
+import os
 
 W, H = 1900, 1260
 img = Image.new("RGB", (W, H), "#FFFFFF")
@@ -170,5 +171,5 @@ for i in range(len(LABELS)):
         if overlap(LABELS[i][:4],LABELS[j][:4]):
             print(f"WARN labels overlap: '{LABELS[i][4]}' / '{LABELS[j][4]}'")
 
-img.save("/Users/a/Documents/work/my/eva32/eva/flows.png")
+img.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), "flows.png"))
 print("saved",img.size,"boxes",len(BOXES))
