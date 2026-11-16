@@ -1,0 +1,8 @@
+# Конфиг генерации EVA32 1.0.0
+temperature: 1.0
+top_p: 1.0
+max_tokens: 1024
+context_window: 65536
+thinking: off          # для чата; on/max — только для сложных задач
+stop: ["<|im_end|>"]
+# usage: stream_options.include_usage = true на стороне клиента

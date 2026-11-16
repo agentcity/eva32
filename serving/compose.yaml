@@ -1,0 +1,47 @@
+services:
+  vllm:
+    # Версию образа закрепить по рецепту recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash
+    # (сейчас latest — только для первого подъёма).
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    command:
+      - --model=deepseek-ai/DeepSeek-V4-Flash
+      - --revision=${MODEL_REVISION:?задайте ревизию весов в .env}
+      - --served-model-name=eva32
+      - --tensor-parallel-size=8
+      - --max-model-len=65536
+      - --gpu-memory-utilization=0.92
+      - --enable-prefix-caching
+      - --kv-cache-dtype=fp8
+      - --api-key=${VLLM_API_KEY:?задайте VLLM_API_KEY в .env}
+      - --host=0.0.0.0
+      - --port=8000
+    environment:
+      VLLM_API_KEY: ${VLLM_API_KEY}
+      HF_HOME: /models/hf
+    volumes:
+      - ${HF_HOME:-~/.cache/huggingface}:/models/hf
+    # Наружу не торчит: только loopback хоста, mTLS/JWT — на входе в orioncode.
+    ports:
+      - "127.0.0.1:8000:8000"
+    ipc: host
+    shm_size: "16gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # curl в образе может отсутствовать — проверяем питоном, он там точно есть.
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c "import os,urllib.request as u;
+          r=u.Request('http://127.0.0.1:8000/v1/models',headers={'Authorization':'Bearer '+os.environ['VLLM_API_KEY']});
+          u.urlopen(r,timeout=4)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 900s
