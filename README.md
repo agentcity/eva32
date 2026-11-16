@@ -7,6 +7,8 @@
 
 - `MODEL_CARD.md` — что за модель, лицензия, ограничения.
 - `docs/contract.md` — контракт с orioncode: промпт, контекст, стриминг, ошибки.
+- `docs/roadmap.md` — что нужно для полноценной Евы: фазы, критерии, зависимости.
+- `docs/gpu-checklist.md` — подъём на GPU: ревизия, стоп-токен, thinking, healthcheck.
 - `prompts/system.ru.md` — персона и правила.
 - `config/generation.yaml` — параметры генерации.
 - `serving/compose.yaml` — vLLM на GPU-сервере.
