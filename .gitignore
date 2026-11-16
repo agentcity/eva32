@@ -221,3 +221,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- EVA32: бандл модели ---
+# Данные и модели
+data/
+local_model/
+*.gguf
+*.safetensors
+# локальный стор Ollama внутри проекта (если OLLAMA_MODELS=./.ollama)
+.ollama/
+models/
+
+# Секреты (шаблон остаётся в репозитории)
+.env.*
+!.env.example
+
+# IDE / OS
+.idea/
+.DS_Store
+**/.DS_Store
