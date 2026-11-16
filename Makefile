@@ -57,7 +57,9 @@ eval-dev:  ## прогон золотого набора на стенде
 	@EVA_BASE=http://127.0.0.1:$(DEV_PORT) $(PY) eval/run_eval.py --model $(DEV_MODEL) --repeat $(REPEAT)
 
 eval:  ## прогон против прод-эндпоинта (vLLM)
-	@EVA_BASE=http://127.0.0.1:$(PROD_PORT) $(PY) eval/run_eval.py --model $${EVA_MODEL:-eva32} --repeat $(REPEAT)
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+	  EVA_BASE=http://127.0.0.1:$(PROD_PORT) $(PY) eval/run_eval.py \
+	    --model $${EVA_MODEL:-eva32} --repeat $(REPEAT)
 
 dev: dev-serve eval-dev  ## стенд + прогон одной командой
 
