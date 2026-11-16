@@ -55,8 +55,11 @@ def sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def ask(base: str, key: str, model: str, system: str, row: dict,
-        cfg: dict, timeout: float) -> str:
+def build_payload(model: str, system: str, row: dict, cfg: dict) -> dict:
+    """Тело запроса ровно в том виде, в каком его обязано слать приложение.
+
+    Источник правды для docs/contract.md: контракт и эта функция не должны расходиться.
+    """
     content = row["question"]
     if row.get("context"):
         content = f"Контекст:\n{row['context']}\n\nВопрос: {content}"
@@ -73,7 +76,12 @@ def ask(base: str, key: str, model: str, system: str, row: dict,
     }
     if cfg.get("stop"):
         payload["stop"] = cfg["stop"]
+    return payload
 
+
+def ask(base: str, key: str, model: str, system: str, row: dict,
+        cfg: dict, timeout: float) -> str:
+    payload = build_payload(model, system, row, cfg)
     req = urllib.request.Request(
         base.rstrip("/") + "/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -109,6 +117,8 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=180.0)
     ap.add_argument("--out", default="")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="не отправлять: напечатать тела запросов (сверка с контрактом)")
     ap.add_argument("--bundle", action="store_true",
                     help="только напечатать хеш бандла (промпт + конфиг) и выйти")
     args = ap.parse_args()
@@ -123,6 +133,12 @@ def main() -> int:
     bundle = sha(system + json.dumps(cfg, sort_keys=True))[:12]
     if args.bundle:
         print(f"bundle {bundle}")
+        return 0
+    if args.dry_run:
+        print(f"# endpoint {args.base}/v1/chat/completions  model {args.model}  bundle {bundle}")
+        for row in rows:
+            print(json.dumps(build_payload(args.model, system, row, cfg),
+                             ensure_ascii=False, indent=2))
         return 0
     if not args.quiet:
         print(f"endpoint {args.base}  model {args.model}  bundle {bundle}")

@@ -6,6 +6,7 @@
 секретов, весов в git.
 
 - `MODEL_CARD.md` — что за модель, лицензия, ограничения.
+- `docs/contract.md` — контракт с orioncode: промпт, контекст, стриминг, ошибки.
 - `prompts/system.ru.md` — персона и правила.
 - `config/generation.yaml` — параметры генерации.
 - `serving/compose.yaml` — vLLM на GPU-сервере.
@@ -25,6 +26,8 @@ make eval-dev REPEAT=3   # каждая строка трижды — видно
 make dev-stop        # выгрузить модель и погасить сервер
 make eval            # прогон против vLLM (:8000)
 make compose-up      # поднять vLLM на GPU-сервере (нужен .env)
+
+python3 eval/run_eval.py --dry-run   # тела запросов без отправки — сверка с docs/contract.md
 ```
 
 Результаты прогонов — `eval/results/eval-*.json`: вердикты по строкам, ответы модели и `bundle`.
