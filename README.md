@@ -9,6 +9,7 @@
 - `docs/contract.md` — контракт с orioncode: промпт, контекст, стриминг, ошибки.
 - `docs/roadmap.md` — что нужно для полноценной Евы: фазы, критерии, зависимости.
 - `docs/plan-russian.md` — план по русскому языку: что измерять и в каком порядке чинить.
+- `docs/quantization.md` — квантование: Q4 сейчас, тернарная гипотеза (4 трита) как исследование.
 - `docs/gpu-checklist.md` — подъём на GPU: ревизия, стоп-токен, thinking, healthcheck.
 - `prompts/system.ru.md` — персона и правила.
 - `config/generation.yaml` — параметры генерации.
