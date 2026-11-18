@@ -362,5 +362,12 @@
     "status": "in_progress",
     "file": "0049-eva-bench.md",
     "assignee": "agent:eva-bench"
+  },
+  {
+    "id": "0056",
+    "title": "Проверка троичности весов",
+    "status": "done",
+    "file": "0056-check-ternary.md",
+    "assignee": "saron"
   }
 ]
