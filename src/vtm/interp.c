@@ -1783,7 +1783,6 @@ void vtm_cache_stats(const vtm_t *m, uint64_t *hits, uint64_t *misses) {
 
 vtm_status vtm_cache_prefix(vtm_t *m, const int32_t *ids, int n) {
     vtm_status st;
-    int i;
 
     if (!m) return VTM_E_ARG;
     if (n < 0 || (n > 0 && !ids)) return VTM_E_ARG;
@@ -1793,19 +1792,19 @@ vtm_status vtm_cache_prefix(vtm_t *m, const int32_t *ids, int n) {
     // префикса здесь побитово равен прогону тех же ids у хоста.
     vtm_reset(m);
     m->cache_valid = 0;
-    for (i = 0; i < n; i++) {
-        vtm_set_token(m, ids[i]);
-        vtm_set_position(m, i);
-        st = vtm_run(m, NULL, NULL);
-        if (st != VTM_OK) return st;
-    }
+    // Прогон префикса пачкой (0112): на скалярном бэкенде это в разы
+    // быстрее, на SIMD vtm_run_batch сам идёт по токену. Состояние после
+    // вызова то же, что у цикла по токену (контракт vtm_run_batch), поэтому
+    // снимок кэша и тесты побитовости не меняются.
+    st = vtm_run_batch(m, ids, n);
+    if (st != VTM_OK) return st;
     cache_store(m, ids, n);
     return VTM_OK;
 }
 
 vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
     vtm_status st = VTM_OK;
-    int i, start, hit;
+    int start, hit;
 
     if (!m) return VTM_E_ARG;
     if (n < 0 || (n > 0 && !ids)) return VTM_E_ARG;
@@ -1825,15 +1824,786 @@ vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
         start = 0;
         m->cache_misses++;
     }
-    for (i = start; i < n; i++) {
-        vtm_set_token(m, ids[i]);
-        vtm_set_position(m, i);
-        st = vtm_run(m, NULL, NULL);
+    // Хвост после префикса (или весь прогон при промахе) — одной пачкой
+    // (0112); на SIMD vtm_run_batch внутри идёт по токену, так что прежняя
+    // побитовость сохраняется.
+    if (start < n) {
+        vtm_set_position(m, start);
+        st = vtm_run_batch(m, ids + start, n - start);
         if (st != VTM_OK) return st;
     }
     // При попадании кэш остаётся префиксом: запросы с тем же префиксом и
     // разными хвостами переиспользуют его повторно.
     if (!hit) cache_store(m, ids, n);
+    return VTM_OK;
+}
+
+// --- батчевый prefill (задача 0112) ----------------------------------------
+//
+// Граф считает один токен за вызов, поэтому промпт из N токенов — это N
+// полных проходов по всем слоям, и каждый проход заново читает и
+// расквантовывает одни и те же веса. vtm_run_batch() прогоняет пачку из C
+// токенов так: инструкция исполняется один раз для всех токенов пачки.
+//
+// Раскладка. Активации (тензоры, в которые пишет программа) перестают быть
+// одним вектором: на время пачки каждому токену даётся своя копия, а
+// инструкции видят её через подмену указателя f32 (batch_bind). Веса и
+// KV-кэш общие: веса не пишутся, а KV-кэш адресуется глобальной позицией
+// (KVW ниже), поэтому копий не требует.
+//
+// Порядок исполнения — по инструкциям, внутри инструкции по токенам. Это
+// допустимо, потому что единственная зависимость между токенами — через
+// KV-кэш: KVW пишет слоты всех токенов пачки до ATTN, а ATTN для строки
+// позиции p читает ключи 0..p (causal) или 0..p (без маски, key_count =
+// q_start+1), т.е. ровно те, что были бы записаны при прогоне по токену.
+// Кольцо KV — исключение: если пачка переходит через границу окна, поздние
+// KVW затрут слот, нужный ранней строке ATTN. Поэтому пачка режется так,
+// чтобы все её позиции были < win (batch_kv_window), а за границей окна
+// токены считаются по одному — результат тот же.
+//
+// Что ускоряется. Только TMV и MM — они и есть 98% времени на форме 1.5B.
+// Их батчевые ядра повторяют арифметику скалярного бэкенда (double,
+// накопитель block_acc на блок масштаба), поэтому равенство с n прогонами
+// vtm_run побитовое. Остальные операции (EMB/ROPE/KVW/ATTN/RMSN/SAMP/...)
+// дешёвые и считаются по токену прежними функциями: это сохраняет их
+// семантику (позиция, окно, эмбеддинг) без дублирования кода.
+//
+// SIMD-бэкенд. Батчевых SIMD-ядер в interp.c нет (они вынесены в задачу
+// 0122 — батчевые NEON/AVX2 TMV/MM), поэтому на нескалярном бэкенде
+// vtm_run_batch идёт прежним путём по токену: побитово то же состояние, без
+// выигрыша. Так же поступает трассировка: записи vtm_set_trace остаются
+// «инструкция на токен».
+
+#define VTM_BATCH_TOKENS        16
+#define VTM_BATCH_SCRATCH_BYTES ((size_t)96u << 20)
+
+// Слова/масштабы в TRT1 лежат со смещением 2 mod 4 (см. backend_scalar.c):
+// читаем через memcpy, иначе разыменование float* по невыровненному адресу — UB.
+static uint32_t batch_load_u32(const uint32_t *words, size_t i) {
+    uint32_t v;
+    memcpy(&v, (const uint8_t *)words + i * sizeof v, sizeof v);
+    return v;
+}
+
+static float batch_load_f32(const float *scales, size_t i) {
+    float v;
+    memcpy(&v, (const uint8_t *)scales + i * sizeof v, sizeof v);
+    return v;
+}
+
+typedef struct {
+    int       C;          // токенов в текущей пачке
+    uint32_t  n_tensors;
+    uint32_t  n_local;    // сколько тензоров-активаций
+    uint8_t  *local;      // [n_tensors] 1 — у токена своя копия
+    uint32_t *idx;        // [n_local] индексы этих тензоров
+    size_t   *off;        // [n_tensors] смещение в слоте токена, float
+    size_t    slot;       // float на токен
+    float    *mem;        // C * slot
+    float   **real;       // [n_tensors] настоящие указатели f32
+    float    *xt;         // [cols * C] транспонированный вход батчевого ядра
+    float    *yt;         // [rows * C] транспонированный выход
+    size_t    xcap, ycap; // ёмкости xt/yt, float
+} batch_scratch;
+
+static void batch_free(batch_scratch *b) {
+    free(b->local);
+    free(b->idx);
+    free(b->off);
+    free(b->mem);
+    free(b->real);
+    free(b->xt);
+    free(b->yt);
+    memset(b, 0, sizeof *b);
+}
+
+// Разметить тензоры: какие получают копию на токена, и сколько float на токен.
+// 1 — размечено (n_local > 0), 0 — батчить нечего/нет памяти.
+static int batch_classify(vtm_t *m, batch_scratch *b) {
+    uint32_t i, n = m->n_tensors;
+
+    memset(b, 0, sizeof *b);
+    b->n_tensors = n;
+    b->local = (uint8_t *)calloc(n ? n : 1u, 1u);
+    b->off = (size_t *)calloc(n ? n : 1u, sizeof *b->off);
+    b->idx = (uint32_t *)calloc(n ? n : 1u, sizeof *b->idx);
+    b->real = (float **)calloc(n ? n : 1u, sizeof *b->real);
+    if (!b->local || !b->off || !b->idx || !b->real) return 0;
+
+    for (i = 0; i < m->n_instr; i++) {
+        const vtm_instr *in = &m->instr[i];
+        // KV-кэш — общий: его строки адресуются глобальной позицией, а не
+        // токеном пачки. KVW пишет в него напрямую (см. op_kvw).
+        if (in->opcode == VTM_OP_KVW) {
+            if (in->dst != VTM_NO_TENSOR && in->dst < n) b->local[in->dst] = 0;
+            if (in->b != VTM_NO_TENSOR && in->b < n) b->local[in->b] = 0;
+            continue;
+        }
+        // У HALT dst — мусор из байткода (как в trace_out_elems): он ничего
+        // не пишет, и «приёмником» его считать нельзя, иначе в активации
+        // попадёт случайный тензор (в demo это emb.w в read-only mmap).
+        if (in->opcode == VTM_OP_HALT) continue;
+        if (in->dst == VTM_NO_TENSOR || in->dst >= n) continue;
+        if (m->tensors[in->dst].kind == VTM_TENSOR_TRIT) continue;
+        if (m->tensors[in->dst].flags & VTM_TENSOR_FLAG_KV_CACHE) continue;
+        b->local[in->dst] = 1;
+    }
+
+    b->n_local = 0;
+    b->slot = 0;
+    for (i = 0; i < n; i++) {
+        size_t sz;
+        if (!b->local[i]) continue;
+        sz = (size_t)m->tensors[i].n_elements;
+        sz = (sz + 7u) & ~(size_t)7u;   // выравнивание под 4-lane
+        if (b->slot > SIZE_MAX - sz) return 0;
+        // Дальше слот умножается на C и sizeof(float) — не даём переполнить.
+        if (b->slot + sz > VTM_BATCH_SCRATCH_BYTES / sizeof(float)) return 0;
+        b->idx[b->n_local++] = i;
+        b->off[i] = b->slot;
+        b->slot += sz;
+    }
+    return b->n_local > 0 && b->slot > 0;
+}
+
+// Выделить память пачки и разложить по копиям текущее состояние активаций
+// (каждый токен начинает проход с того, чем закончил предыдущий).
+static int batch_scratch_alloc(vtm_t *m, batch_scratch *b, int C) {
+    size_t total = (size_t)C * b->slot;
+    uint32_t k;
+
+    b->C = C;
+    b->mem = (float *)calloc(total ? total : 1u, sizeof(float));
+    if (!b->mem) return 0;
+    for (k = 0; k < b->n_local; k++) {
+        uint32_t t = b->idx[k];
+        b->real[t] = m->tensors[t].f32;
+    }
+    return 1;
+}
+
+// Каждый токен пачки начинает проход с состояния, которое оставил
+// предыдущий прогон (так же, как n вызовов vtm_run: активации в машине
+// сохраняются между прогонами). После пачки это состояние — значения
+// последнего токена (batch_store_last), поэтому одного и того же копирования
+// достаточно и на первый, и на все следующие пачки.
+static void batch_reinit(vtm_t *m, const batch_scratch *b) {
+    uint32_t k;
+    int j;
+    for (k = 0; k < b->n_local; k++) {
+        uint32_t t = b->idx[k];
+        const float *src = b->real[t];
+        size_t n_el = (size_t)m->tensors[t].n_elements;
+        if (!src || n_el == 0) continue;
+        for (j = 0; j < b->C; j++)
+            memcpy(b->mem + (size_t)j * b->slot + b->off[t], src,
+                   n_el * sizeof(float));
+    }
+}
+
+// Подменить указатели активаций на копию токена j / вернуть настоящие.
+// Веса и KV-кэш не трогаются: они общие.
+static void batch_bind(vtm_t *m, const batch_scratch *b, int j) {
+    uint32_t k;
+    for (k = 0; k < b->n_local; k++) {
+        uint32_t t = b->idx[k];
+        m->tensors[t].f32 = b->mem + (size_t)j * b->slot + b->off[t];
+    }
+}
+
+static void batch_unbind(vtm_t *m, const batch_scratch *b) {
+    uint32_t k;
+    for (k = 0; k < b->n_local; k++) {
+        uint32_t t = b->idx[k];
+        m->tensors[t].f32 = b->real[t];
+    }
+}
+
+// После пачки активации — это значения последнего токена: ровно то, что
+// оставил бы последний vtm_run (по ним читают логиты тесты и хост).
+static void batch_store_last(vtm_t *m, const batch_scratch *b) {
+    uint32_t k;
+    int last = b->C - 1;
+    for (k = 0; k < b->n_local; k++) {
+        uint32_t t = b->idx[k];
+        float *dst = b->real[t];
+        if (!dst || m->tensors[t].n_elements == 0) continue;
+        memcpy(dst, b->mem + (size_t)last * b->slot + b->off[t],
+               (size_t)m->tensors[t].n_elements * sizeof(float));
+    }
+    (void)m;
+}
+
+// Батчевые ядра дают то же, что скалярные ядра бэкенда, поэтому включаются
+// только на скалярном бэкенде; на SIMD/кастомном vtm_run_batch идёт по токену.
+static int batch_scalar_backend(const vtm_t *m) {
+    const vtm_backend *be = m->backend;
+    if (!be) return 1;
+    if (be == &vtm_backend_scalar_lut || be == &vtm_backend_scalar_direct)
+        return 1;
+    return be->name && strncmp(be->name, "scalar", 6) == 0;
+}
+
+// Наименьшее окно KV-кэша (INT_MAX — 2-D кэшей нет). Пачка не должна
+// перейти через границу окна: слот позиции p занимает p % win, и KVW
+// позднего токена пачки затёр бы ключ, который ещё нужен ранней строке ATTN.
+static int batch_kv_window(vtm_t *m) {
+    int win = INT_MAX;
+    uint32_t i;
+    for (i = 0; i < m->n_instr; i++) {
+        const vtm_instr *in = &m->instr[i];
+        const vtm_tensor *kc;
+        int w;
+        if (in->opcode != VTM_OP_KVW) continue;
+        if (in->dst == VTM_NO_TENSOR || in->dst >= m->n_tensors) continue;
+        kc = &m->tensors[in->dst];
+        if (kc->ndim != 2) continue;
+        w = (int)kv_window(m, kc->dims[0]);
+        if (w > 0 && w < win) win = w;
+    }
+    return win;
+}
+
+// Батчевый TMV: y[r][j] = sum_t W[r,t] * x[j][t]. Порядок сложений для
+// каждого (r,j) — тот же, что у tmv_lut_rows/tmv_direct_rows, поэтому
+// результат побитово равен скалярному ядру, вызванному C раз. Строки делятся
+// между потоками пулом бэкенда: каждая строка считается тем же кодом и в том
+// же порядке, поэтому от числа потоков результат не зависит (побитово).
+typedef struct {
+    const vtm_tensor *w;
+    const float      *xt;
+    int               C;
+    int               rows;
+    int               cols;
+    int               transposed;
+    float            *yt;
+} batch_mm_job;   // общее для TMV (n == C столбцов) и MM
+
+static void batch_tmv_trit_rows(const vtm_tensor *w, const float *xt, int C,
+                                int rows, int cols, float *yt,
+                                int r0, int r1) {
+    const uint32_t *words = w->words;
+    const int sb = (int)w->scale_block;
+    const int block20 = (sb % VTM_TRITS_PER_WORD) == 0;
+    int r, j, g, k;
+
+    lut243_init();   // op_emb зовёт её только для тритовых таблиц; батч — всегда
+    (void)rows;
+
+    for (r = r0; r < r1; r++) {
+        double acc[VTM_BATCH_TOKENS], ba[VTM_BATCH_TOKENS];
+        int64_t base = (int64_t)r * cols;
+        int64_t end = base + cols;
+        int64_t wi = base / VTM_TRITS_PER_WORD;
+        int64_t wi_end = (end + VTM_TRITS_PER_WORD - 1) / VTM_TRITS_PER_WORD;
+        int64_t cur = -1;
+
+        for (j = 0; j < C; j++) { acc[j] = 0.0; ba[j] = 0.0; }
+
+        for (; wi < wi_end; wi++) {
+            uint32_t v = batch_load_u32(words, (size_t)wi);
+            int64_t wbase = wi * VTM_TRITS_PER_WORD;
+
+            for (g = 0; g < 4; g++) {
+                unsigned code = v % 243u;
+                const int8_t *tr = g_lut243[code];
+                int64_t idx0 = wbase + (int64_t)g * 5;
+
+                v /= 243u;
+                for (k = 0; k < 5; k++) {
+                    int64_t idx = idx0 + k;
+                    double tv;
+                    const float *xp;
+
+                    if (idx < base) continue;
+                    if (idx >= end) break;
+                    if (!block20) {
+                        int64_t blk = idx / sb;
+                        if (blk != cur) {
+                            if (cur >= 0) {
+                                double sc = (double)batch_load_f32(
+                                    w->scales, (size_t)cur);
+                                for (j = 0; j < C; j++) {
+                                    acc[j] += ba[j] * sc;
+                                    ba[j] = 0.0;
+                                }
+                            }
+                            cur = blk;
+                        }
+                    }
+                    tv = (double)tr[k];
+                    xp = xt + (size_t)(idx - base) * (size_t)C;
+                    for (j = 0; j < C; j++) ba[j] += tv * (double)xp[j];
+                }
+            }
+            if (block20) {
+                double sc = (double)batch_load_f32(
+                    w->scales, (size_t)(wbase / sb));
+                for (j = 0; j < C; j++) { acc[j] += ba[j] * sc; ba[j] = 0.0; }
+            }
+        }
+        if (!block20 && cur >= 0) {
+            double sc = (double)batch_load_f32(w->scales, (size_t)cur);
+            for (j = 0; j < C; j++) acc[j] += ba[j] * sc;
+        }
+        for (j = 0; j < C; j++) yt[(size_t)r * C + j] = (float)acc[j];
+    }
+}
+
+static void batch_tmv_dense_rows(const vtm_tensor *w, const float *xt, int C,
+                                 int rows, int cols, int transposed,
+                                 float *yt, int r0, int r1) {
+    int r, t, j;
+    for (r = r0; r < r1; r++) {
+        double acc[VTM_BATCH_TOKENS];
+        for (j = 0; j < C; j++) acc[j] = 0.0;
+        for (t = 0; t < cols; t++) {
+            double wv = transposed
+                      ? (double)w->f32[(size_t)t * (size_t)rows + (size_t)r]
+                      : (double)w->f32[(size_t)r * (size_t)cols + (size_t)t];
+            const float *xp = xt + (size_t)t * (size_t)C;
+            for (j = 0; j < C; j++) acc[j] += wv * (double)xp[j];
+        }
+        for (j = 0; j < C; j++) yt[(size_t)r * C + j] = (float)acc[j];
+    }
+}
+
+// Батчевый MM: Y[r][j] = sum_t A[r,t] * B[j][t] (n == 1, как в графе
+// tied lm_head). Порядок сложений — как у скалярного op_mm.
+static void batch_mm_trit_rows(const vtm_tensor *a, const float *bt, int C,
+                               int mm, int kk, float *yt, int r0, int r1) {
+    int r, t, j;
+
+    lut243_init();
+    (void)mm;
+    for (r = r0; r < r1; r++) {
+        double acc[VTM_BATCH_TOKENS];
+        for (j = 0; j < C; j++) acc[j] = 0.0;
+        for (t = 0; t < kk; t++) {
+            float wv;
+            const float *bp;
+            if (trit_weight_at(a, (size_t)r * (size_t)kk + (size_t)t, &wv)
+                != 0)
+                wv = 0.0f;   // недостижимо: границы проверены в ready
+            bp = bt + (size_t)t * (size_t)C;
+            for (j = 0; j < C; j++) acc[j] += (double)wv * (double)bp[j];
+        }
+        for (j = 0; j < C; j++) yt[(size_t)r * C + j] = (float)acc[j];
+    }
+}
+
+static void batch_mm_dense_rows(const vtm_tensor *a, const float *bt, int C,
+                                int mm, int kk, float *yt,
+                                int r0, int r1) {
+    int r, t, j;
+    (void)mm;
+    for (r = r0; r < r1; r++) {
+        double acc[VTM_BATCH_TOKENS];
+        for (j = 0; j < C; j++) acc[j] = 0.0;
+        for (t = 0; t < kk; t++) {
+            double wv = (double)a->f32[(size_t)r * (size_t)kk + (size_t)t];
+            const float *bp = bt + (size_t)t * (size_t)C;
+            for (j = 0; j < C; j++) acc[j] += wv * (double)bp[j];
+        }
+        for (j = 0; j < C; j++) yt[(size_t)r * C + j] = (float)acc[j];
+    }
+}
+
+static void batch_tmv_worker(void *p, int tid, int r0, int r1) {
+    batch_mm_job *j = (batch_mm_job *)p;
+    (void)tid;
+    if (j->w->kind == VTM_TENSOR_TRIT)
+        batch_tmv_trit_rows(j->w, j->xt, j->C, j->rows, j->cols, j->yt,
+                            r0, r1);
+    else
+        batch_tmv_dense_rows(j->w, j->xt, j->C, j->rows, j->cols,
+                             j->transposed, j->yt, r0, r1);
+}
+
+static void batch_mm_worker(void *p, int tid, int r0, int r1) {
+    batch_mm_job *j = (batch_mm_job *)p;
+    (void)tid;
+    if (j->w->kind == VTM_TENSOR_TRIT)
+        batch_mm_trit_rows(j->w, j->xt, j->C, j->rows, j->cols, j->yt,
+                           r0, r1);
+    else
+        batch_mm_dense_rows(j->w, j->xt, j->C, j->rows, j->cols, j->yt,
+                            r0, r1);
+}
+
+static void batch_tmv_kernel(const vtm_tensor *w, const float *xt, int C,
+                             int rows, int cols, int transposed, float *yt) {
+    batch_mm_job job;
+    job.w = w;
+    job.xt = xt;
+    job.C = C;
+    job.rows = rows;
+    job.cols = cols;
+    job.transposed = transposed;
+    job.yt = yt;
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)C,
+                      batch_tmv_worker, &job);
+}
+
+static void batch_mm_kernel(const vtm_tensor *a, const float *bt, int C,
+                            int mm, int kk, float *yt) {
+    batch_mm_job job;
+    job.w = a;
+    job.xt = bt;
+    job.C = C;
+    job.rows = mm;
+    job.cols = kk;
+    job.transposed = 0;
+    job.yt = yt;
+    vtm_parallel_rows(mm, (double)mm * (double)kk * (double)C,
+                      batch_mm_worker, &job);
+}
+
+static int batch_buf(float **p, size_t *cap, size_t need) {
+    float *q;
+    if (*cap >= need) return 1;
+    q = (float *)realloc(*p, (need ? need : 1u) * sizeof(float));
+    if (!q) return 0;
+    *p = q;
+    *cap = need;
+    return 1;
+}
+
+// Указатель на данные тензора для токена j: у активации — своя копия,
+// у общего (вес, KV-кэш) — сам тензор.
+static const float *batch_src(const vtm_t *m, const batch_scratch *b,
+                              uint32_t idx, int j) {
+    if (b->local[idx]) return b->mem + (size_t)j * b->slot + b->off[idx];
+    return m->tensors[idx].f32;
+}
+
+// Готов ли TMV к батчеву ядру. Консервативно: всё нестандартное уходит в
+// путь по токену, где сообщение об ошибке даёт сам op_tmv.
+static int batch_tmv_ready(vtm_t *m, const vtm_instr *in,
+                           const batch_scratch *b, int *rows, int *cols,
+                           int *transposed) {
+    const vtm_tensor *w, *x, *y;
+    int tr = 0;
+
+    if (!batch_scalar_backend(m)) return 0;
+    if (in->a == VTM_NO_TENSOR || in->b == VTM_NO_TENSOR
+        || in->dst == VTM_NO_TENSOR)
+        return 0;
+    if (in->a >= m->n_tensors || in->b >= m->n_tensors
+        || in->dst >= m->n_tensors)
+        return 0;
+    if (in->dst == in->b) return 0;           // op_tmv такое отвергает
+    if (b->local[in->a] || !b->local[in->dst]) return 0;
+    w = &m->tensors[in->a];
+    x = &m->tensors[in->b];
+    y = &m->tensors[in->dst];
+    if (w->ndim != 2) return 0;
+    if (!x->f32 || !y->f32) return 0;
+    if (w->kind == VTM_TENSOR_TRIT) {
+        if (!w->words || !w->scales) return 0;
+        if (w->scale_block != VTM_SCALE_BLOCK_128
+            && w->scale_block != VTM_SCALE_BLOCK_160)
+            return 0;
+        *rows = (int)w->dims[0];
+        *cols = (int)w->dims[1];
+    } else {
+        if (w->kind < VTM_TENSOR_F32 || w->kind > VTM_TENSOR_BF16
+            || !w->f32)
+            return 0;
+        tr = (in->flags & VTM_FLAG_TMV_TRANSPOSED) != 0;
+        *rows = tr ? (int)w->dims[1] : (int)w->dims[0];
+        *cols = tr ? (int)w->dims[0] : (int)w->dims[1];
+    }
+    if (*rows <= 0 || *cols <= 0) return 0;
+    if (x->n_elements != (uint32_t)*cols || y->n_elements != (uint32_t)*rows)
+        return 0;
+    *transposed = tr;
+    return 1;
+}
+
+static vtm_status batch_tmv_apply(vtm_t *m, uint32_t pc,
+                                  const vtm_instr *in,
+                                  batch_scratch *b, int *handled) {
+    const vtm_tensor *w;
+    int rows, cols, tr, j, r, t;
+    size_t xn, yn;
+
+    *handled = 0;
+    if (!batch_tmv_ready(m, in, b, &rows, &cols, &tr)) return VTM_OK;
+    w = &m->tensors[in->a];
+    xn = (size_t)cols * (size_t)b->C;
+    yn = (size_t)rows * (size_t)b->C;
+    if (!batch_buf(&b->xt, &b->xcap, xn) || !batch_buf(&b->yt, &b->ycap, yn))
+        return fail(m, pc, VTM_E_NOMEM, "батчевый TMV: нет памяти");
+
+    for (j = 0; j < b->C; j++) {
+        const float *xs = batch_src(m, b, in->b, j);
+        for (t = 0; t < cols; t++) b->xt[(size_t)t * b->C + j] = xs[t];
+    }
+    batch_tmv_kernel(w, b->xt, b->C, rows, cols, tr, b->yt);
+
+    for (j = 0; j < b->C; j++) {
+        float *ys = b->mem + (size_t)j * b->slot + b->off[in->dst];
+        for (r = 0; r < rows; r++)
+            ys[r] = b->yt[(size_t)r * b->C + j];
+    }
+    *handled = 1;
+    return VTM_OK;
+}
+
+// MM с n == 1 (граф tied lm_head). A общая, B и Y — на токен.
+static int batch_mm_ready(vtm_t *m, const vtm_instr *in,
+                          const batch_scratch *b, int *mm, int *kk) {
+    const vtm_tensor *a, *bv, *y;
+
+    if (!batch_scalar_backend(m)) return 0;
+    if (in->a == VTM_NO_TENSOR || in->b == VTM_NO_TENSOR
+        || in->dst == VTM_NO_TENSOR)
+        return 0;
+    if (in->a >= m->n_tensors || in->b >= m->n_tensors
+        || in->dst >= m->n_tensors)
+        return 0;
+    if (b->local[in->a] || !b->local[in->dst]) return 0;
+    if (in->dst == in->a || in->dst == in->b) return 0;
+    a = &m->tensors[in->a];
+    bv = &m->tensors[in->b];
+    y = &m->tensors[in->dst];
+    if (a->ndim != 2 || bv->ndim != 2 || y->ndim != 2) return 0;
+    if (bv->dims[1] != 1 || y->dims[1] != 1) return 0;
+    *mm = (int)a->dims[0];
+    *kk = (int)a->dims[1];
+    if (*mm <= 0 || *kk <= 0) return 0;
+    if (bv->dims[0] != (uint32_t)*kk || y->dims[0] != (uint32_t)*mm)
+        return 0;
+    if (!bv->f32 || !y->f32) return 0;
+    if (a->kind == VTM_TENSOR_TRIT) {
+        uint64_t n = (uint64_t)*mm * (uint64_t)*kk;
+        if (!a->words || !a->scales) return 0;
+        if (a->scale_block != VTM_SCALE_BLOCK_128
+            && a->scale_block != VTM_SCALE_BLOCK_160)
+            return 0;
+        if (a->n_elements < n) return 0;
+        if ((uint64_t)a->n_scales < (n + a->scale_block - 1u) / a->scale_block)
+            return 0;
+    } else if (a->kind < VTM_TENSOR_F32 || a->kind > VTM_TENSOR_BF16
+               || !a->f32) {
+        return 0;
+    }
+    return 1;
+}
+
+static vtm_status batch_mm_apply(vtm_t *m, uint32_t pc,
+                                 const vtm_instr *in,
+                                 batch_scratch *b, int *handled) {
+    const vtm_tensor *a;
+    int mm, kk, j, r, t;
+    size_t bn, yn;
+
+    *handled = 0;
+    if (!batch_mm_ready(m, in, b, &mm, &kk)) return VTM_OK;
+    a = &m->tensors[in->a];
+    bn = (size_t)kk * (size_t)b->C;
+    yn = (size_t)mm * (size_t)b->C;
+    if (!batch_buf(&b->xt, &b->xcap, bn) || !batch_buf(&b->yt, &b->ycap, yn))
+        return fail(m, pc, VTM_E_NOMEM, "батчевый MM: нет памяти");
+
+    for (j = 0; j < b->C; j++) {
+        const float *bs = batch_src(m, b, in->b, j);
+        for (t = 0; t < kk; t++) b->xt[(size_t)t * b->C + j] = bs[t];
+    }
+    batch_mm_kernel(a, b->xt, b->C, mm, kk, b->yt);
+
+    for (j = 0; j < b->C; j++) {
+        float *ys = b->mem + (size_t)j * b->slot + b->off[in->dst];
+        for (r = 0; r < mm; r++)
+            ys[r] = b->yt[(size_t)r * b->C + j];
+    }
+    *handled = 1;
+    return VTM_OK;
+}
+
+// Одна инструкция прежним путём (кроме TMV/MM — их зовёт batch_token_op).
+static vtm_status batch_op_one(vtm_t *m, uint32_t i, const vtm_instr *in) {
+    switch (in->opcode) {
+    case VTM_OP_RMSN:
+        return op_rmsn(m, i, in);
+    case VTM_OP_ROPE:
+        return op_rope(m, i, in);
+    case VTM_OP_SM:
+        return op_sm(m, i, in);
+    case VTM_OP_SILU:
+        return op_silu(m, i, in);
+    case VTM_OP_MUL:
+        return op_binary(m, i, in, 0);
+    case VTM_OP_ADD:
+        return op_binary(m, i, in, 1);
+    case VTM_OP_EMB:
+        return op_emb(m, i, in);
+    case VTM_OP_KVW:
+        return op_kvw(m, i, in);
+    case VTM_OP_ATTN:
+        return op_attn(m, i, in);
+    case VTM_OP_SAMP: {
+        int stop = 0;
+        return op_samp(m, i, in, NULL, NULL, &stop);
+    }
+    case VTM_OP_CPY:
+        return op_cpy(m, i, in);
+    case VTM_OP_SCAL:
+        return op_scal(m, i, in);
+    default:
+        return fail(m, i, VTM_E_OPCODE, "неизвестный opcode 0x%02x",
+                    (unsigned)in->opcode);
+    }
+}
+
+// Инструкция для всех токенов пачки по одному (позиция и входной токен —
+// как у хоста). Для TMV/MM это запасной путь, если батчевое ядро неприменимо.
+static vtm_status batch_token_op(vtm_t *m, uint32_t pc, const vtm_instr *in,
+                                 batch_scratch *b, const int32_t *ids,
+                                 int pos0) {
+    int j;
+    vtm_status st = VTM_OK;
+
+    for (j = 0; j < b->C; j++) {
+        m->position = pos0 + j;
+        m->input_token = ids[j];
+        batch_bind(m, b, j);
+        if (in->opcode == VTM_OP_TMV)
+            st = op_tmv(m, pc, in);
+        else if (in->opcode == VTM_OP_MM)
+            st = op_mm(m, pc, in);
+        else
+            st = batch_op_one(m, pc, in);
+        batch_unbind(m, b);
+        if (st != VTM_OK) break;
+    }
+    return st;
+}
+
+// Пачка: по инструкциям, внутри инструкции — по токенам.
+static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
+                              int C, int pos0) {
+    uint32_t pc;
+    vtm_status st = VTM_OK;
+    int halted = 0;
+
+    b->C = C;
+    m->halted = 0;
+    m->error[0] = '\0';
+    batch_reinit(m, b);
+
+    for (pc = 0; pc < m->n_instr && !halted; pc++) {
+        const vtm_instr *in = &m->instr[pc];
+        int handled = 0;
+
+        switch (in->opcode) {
+        case VTM_OP_TMV:
+            st = batch_tmv_apply(m, pc, in, b, &handled);
+            if (st == VTM_OK && !handled)
+                st = batch_token_op(m, pc, in, b, ids, pos0);
+            break;
+        case VTM_OP_MM:
+            st = batch_mm_apply(m, pc, in, b, &handled);
+            if (st == VTM_OK && !handled)
+                st = batch_token_op(m, pc, in, b, ids, pos0);
+            break;
+        case VTM_OP_HALT:
+            m->halted = 1;
+            halted = 1;
+            break;
+        default:
+            st = batch_token_op(m, pc, in, b, ids, pos0);
+            break;
+        }
+        if (st != VTM_OK) break;
+    }
+    batch_unbind(m, b);
+    if (st == VTM_OK) batch_store_last(m, b);
+    m->position = pos0 + C - 1;
+    return st;
+}
+
+// Путь по токену: прежняя семантика vtm_run на каждый токен (используется,
+// когда батчевых ядер нет или пачка упирается в кольцо KV).
+static vtm_status batch_sequential(vtm_t *m, const int32_t *ids, int n,
+                                   int pos0) {
+    int i;
+    for (i = 0; i < n; i++) {
+        vtm_status st;
+        vtm_set_position(m, pos0 + i);
+        vtm_set_token(m, ids[i]);
+        st = vtm_run(m, NULL, NULL);
+        if (st != VTM_OK) return st;
+    }
+    return VTM_OK;
+}
+
+vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
+    int64_t start;
+    int off = 0, cmax, win;
+    batch_scratch b;
+
+    if (!m) return VTM_E_ARG;
+    if (n < 0 || (n > 0 && !ids)) return VTM_E_ARG;
+    if (!m->backend) m->backend = &vtm_backend_scalar_lut;
+    if (n == 0) return VTM_OK;              // no-op: позиция не двигается
+    start = (int64_t)m->position;
+    if (start + (int64_t)n - 1 > (int64_t)INT_MAX) return VTM_E_BOUNDS;
+
+    // Трассировка (0082) и нескалярный бэкенд идут прежним путём по токену:
+    // записи трассы остаются прежними, а SIMD-ядер для пачки пока нет.
+    if (m->trace_cb || !batch_scalar_backend(m))
+        return batch_sequential(m, ids, n, (int)start);
+    if (!batch_classify(m, &b)) {
+        batch_free(&b);
+        return batch_sequential(m, ids, n, (int)start);
+    }
+    // Предел пачки — и по памяти (в пачке C копий активаций), и по длине.
+    cmax = VTM_BATCH_TOKENS;
+    {
+        size_t lim = VTM_BATCH_SCRATCH_BYTES / (b.slot * sizeof(float));
+        if (lim < 1u) lim = 1u;
+        if ((size_t)cmax > lim) cmax = (int)lim;
+    }
+    if (cmax > n) cmax = n;
+    if (cmax < 2) {                         // пачка не помещается/не нужна
+        batch_free(&b);
+        return batch_sequential(m, ids, n, (int)start);
+    }
+    if (!batch_scratch_alloc(m, &b, cmax)) {
+        batch_free(&b);
+        return batch_sequential(m, ids, n, (int)start);
+    }
+
+    win = batch_kv_window(m);
+    while (off < n) {
+        int64_t pos0 = start + off;
+        int C = n - off;
+        vtm_status st;
+
+        if (C > cmax) C = cmax;
+        if (win != INT_MAX) {
+            int64_t room = (int64_t)win - pos0;
+            if (room < (int64_t)C) C = (int)room;
+        }
+        if (C > 1) {
+            st = batch_chunk(m, &b, ids + off, C, (int)pos0);
+            off += C;
+        } else {
+            // Позиция у границы окна (или за ней): кольцо переиспользует
+            // слоты, поэтому токен считается отдельно, как раньше.
+            st = batch_sequential(m, ids + off, 1, (int)pos0);
+            off += 1;
+        }
+        if (st != VTM_OK) {
+            batch_free(&b);
+            return st;
+        }
+    }
+    batch_free(&b);
+    m->position = (int)(start + (int64_t)n - 1);
+    m->input_token = ids[n - 1];
     return VTM_OK;
 }
 

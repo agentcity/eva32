@@ -5,6 +5,7 @@
 
 #include "../../src/vtm/vtm.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -4678,6 +4679,376 @@ static void test_cache_prefix_ring(void) {
     if (!g_fail) printf("кэш префикса 0081 (кольцо KV): ok\n");
 }
 
+
+// --- батчевый prefill (задача 0112) ----------------------------------------
+//
+// Проверяется контракт vtm_run_batch(): после пачки состояние машины —
+// логиты последнего токена, K/V, счётчик сгенерированных, сэмплер, halted,
+// input_token и позиция — обязано быть побитово тем же, что после n вызовов
+// vtm_run() по одному токену. Батчевые ядра есть только у скалярного
+// бэкенда (SIMD-ядра — зона 0113), поэтому здесь бэкенд выставляется явно;
+// на прочих бэкендах вызов идёт прежним путём по токену, и проверка
+// побитовости проходит по построению.
+//
+// Конфигурации: GQA + causal, MHA (heads == kv_heads) + causal, и кольцо KV
+// (context_window меньше длины последовательности): пачка, перешедшая
+// границу окна, обязана откатиться на путь по токену и остаться правильной.
+
+typedef struct {
+    int ctx;
+    int hidden;
+    int vocab;
+    int inter;
+    int heads;
+    int head_dim;
+    int kv_heads;
+    int window;   // 0 — context_window в мете не задан (окно = ctx)
+} batch_cfg;
+
+enum {
+    BT_EMB, BT_X, BT_H1, BT_N1, BT_Q, BT_K, BT_V, BT_QW, BT_KW, BT_VW,
+    BT_KC, BT_VC, BT_ATTN, BT_O, BT_OW, BT_H2, BT_N2, BT_GATE, BT_UP,
+    BT_GW, BT_UW, BT_MUL, BT_DOWN, BT_DW, BT_NF, BT_HF, BT_LOGITS,
+    BT_LMW, BT_TOKEN
+};
+
+// Та же программа, что у cache_model(), плюс context_window в мете.
+static vtm_t *batch_model(const batch_cfg *cfg) {
+    model_t md;
+    uint32_t d_emb[2], d_vec[1], d_kv[1], d_q[3], d_k[3], d_c[2], d_g[1];
+    uint32_t d_log[2], d_one[1];
+    int kv_dim = cfg->kv_heads * cfg->head_dim;
+    uint8_t *img;
+    size_t size;
+    char meta[256];
+    vtm_t *m;
+
+    d_emb[0] = (uint32_t)cfg->vocab;
+    d_emb[1] = (uint32_t)cfg->hidden;
+    d_vec[0] = (uint32_t)cfg->hidden;
+    d_kv[0] = (uint32_t)kv_dim;
+    d_q[0] = (uint32_t)cfg->heads;
+    d_q[1] = 1;
+    d_q[2] = (uint32_t)cfg->head_dim;
+    d_k[0] = (uint32_t)cfg->kv_heads;
+    d_k[1] = 1;
+    d_k[2] = (uint32_t)cfg->head_dim;
+    d_c[0] = (uint32_t)cfg->ctx;
+    d_c[1] = (uint32_t)kv_dim;
+    d_g[0] = (uint32_t)cfg->inter;
+    d_log[0] = (uint32_t)cfg->vocab;
+    d_log[1] = 1;
+    d_one[0] = 1;
+
+    model_init(&md);
+    cache_add_f32(&md, "emb.w", 2, d_emb, 0.0f, 0.05f);
+    cache_add_f32(&md, "x", 1, d_vec, 0.0f, 0.0f);
+    cache_add_f32(&md, "h1", 1, d_vec, 0.0f, 0.0f);
+    cache_add_f32(&md, "norm1.w", 1, d_vec, 1.0f, 0.02f);
+    cache_add_f32(&md, "q", 3, d_q, 0.0f, 0.0f);
+    cache_add_f32(&md, "k", 3, d_k, 0.0f, 0.0f);
+    cache_add_f32(&md, "v", 3, d_k, 0.0f, 0.0f);
+    cache_add_trit(&md, "q_proj.w", cfg->hidden, cfg->hidden);
+    cache_add_trit(&md, "k_proj.w", kv_dim, cfg->hidden);
+    cache_add_trit(&md, "v_proj.w", kv_dim, cfg->hidden);
+    cache_add_f32(&md, "kcache", 2, d_c, 0.0f, 0.0f);
+    cache_add_f32(&md, "vcache", 2, d_c, 0.0f, 0.0f);
+    cache_add_f32(&md, "attn", 3, d_q, 0.0f, 0.0f);
+    cache_add_f32(&md, "o", 1, d_vec, 0.0f, 0.0f);
+    cache_add_trit(&md, "o_proj.w", cfg->hidden, cfg->hidden);
+    cache_add_f32(&md, "h2", 1, d_vec, 0.0f, 0.0f);
+    cache_add_f32(&md, "norm2.w", 1, d_vec, 1.0f, 0.02f);
+    cache_add_f32(&md, "gate", 1, d_g, 0.0f, 0.0f);
+    cache_add_f32(&md, "up", 1, d_g, 0.0f, 0.0f);
+    cache_add_trit(&md, "gate_proj.w", cfg->inter, cfg->hidden);
+    cache_add_trit(&md, "up_proj.w", cfg->inter, cfg->hidden);
+    cache_add_f32(&md, "mul", 1, d_g, 0.0f, 0.0f);
+    cache_add_f32(&md, "down", 1, d_vec, 0.0f, 0.0f);
+    cache_add_trit(&md, "down_proj.w", cfg->hidden, cfg->inter);
+    cache_add_f32(&md, "final_norm.w", 1, d_vec, 1.0f, 0.02f);
+    cache_add_f32(&md, "hfinal", 1, d_vec, 0.0f, 0.0f);
+    cache_add_f32(&md, "logits", 2, d_log, 0.0f, 0.0f);
+    cache_add_trit(&md, "lm_head.w", cfg->vocab, cfg->hidden);
+    cache_add_f32(&md, "token", 1, d_one, 0.0f, 0.0f);
+
+    model_inst(&md, VTM_OP_EMB, VTM_FLAG_EMB_INPUT, BT_X, BT_EMB,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_RMSN, 0, BT_H1, BT_X, BT_N1, VTM_NO_TENSOR, 1);
+    model_inst(&md, VTM_OP_TMV, 0, BT_Q, BT_QW, BT_H1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_TMV, 0, BT_K, BT_KW, BT_H1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_TMV, 0, BT_V, BT_VW, BT_H1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_ROPE, 0, BT_Q, BT_Q, (uint16_t)cfg->heads,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_ROPE, 0, BT_K, BT_K, (uint16_t)cfg->kv_heads,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_KVW, 0, BT_KC, BT_K, BT_VC, BT_V, 0);
+    model_inst(&md, VTM_OP_ATTN, VTM_FLAG_CAUSAL, BT_ATTN, BT_Q, BT_KC,
+               BT_VC, 0);
+    model_inst(&md, VTM_OP_TMV, 0, BT_O, BT_OW, BT_ATTN, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_ADD, 0, BT_X, BT_X, BT_O, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_RMSN, 0, BT_H2, BT_X, BT_N2, VTM_NO_TENSOR, 1);
+    model_inst(&md, VTM_OP_TMV, 0, BT_GATE, BT_GW, BT_H2, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_TMV, 0, BT_UP, BT_UW, BT_H2, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_SILU, 0, BT_GATE, BT_GATE, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_MUL, 0, BT_MUL, BT_GATE, BT_UP, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_TMV, 0, BT_DOWN, BT_DW, BT_MUL, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_ADD, 0, BT_X, BT_X, BT_DOWN, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_RMSN, 0, BT_HF, BT_X, BT_NF, VTM_NO_TENSOR, 1);
+    model_inst(&md, VTM_OP_TMV, 0, BT_LOGITS, BT_LMW, BT_HF,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_SAMP, 0, BT_TOKEN, BT_LOGITS, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_SAMP_TEMPERATURE);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+
+    if (cfg->window > 0)
+        snprintf(meta, sizeof meta,
+                 "{\"temperature\": 0.8, \"sample_seed\": 7,"
+                 " \"rms_norm_eps\": 1e-06, \"context_window\": %d}",
+                 cfg->window);
+    else
+        snprintf(meta, sizeof meta,
+                 "{\"temperature\": 0.8, \"sample_seed\": 7,"
+                 " \"rms_norm_eps\": 1e-06}");
+    model_set_meta(&md, meta);
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    free(img);
+    model_free(&md);
+    return m;
+}
+
+
+// Побитовое сравнение всего наблюдаемого состояния двух машин.
+static void batch_check_same(vtm_t *want, vtm_t *got, const char *what) {
+    uint32_t i, n = vtm_tensor_count(want);
+    int bad = 0;
+
+    if (vtm_tensor_count(got) != n) {
+        fprintf(stderr, "FAIL batch %s: разное число тензоров\n", what);
+        g_fail++;
+        return;
+    }
+    if (vtm_position(want) != vtm_position(got)
+        || vtm_input_token(want) != vtm_input_token(got)
+        || vtm_generated(want) != vtm_generated(got)
+        || vtm_halted(want) != vtm_halted(got)) {
+        fprintf(stderr, "FAIL batch %s: позиция %d/%d, вход %d/%d, "
+                "сгенерировано %d/%d, halted %d/%d\n", what,
+                vtm_position(want), vtm_position(got),
+                vtm_input_token(want), vtm_input_token(got),
+                vtm_generated(want), vtm_generated(got),
+                vtm_halted(want), vtm_halted(got));
+        g_fail++;
+    }
+    for (i = 0; i < n; i++) {
+        const vtm_tensor *a = vtm_tensor_by_index(want, i);
+        const vtm_tensor *b = vtm_tensor_by_index(got, i);
+        if (a->n_elements != b->n_elements) {
+            fprintf(stderr, "FAIL batch %s: %s: элементов %u/%u\n", what,
+                    a->name, a->n_elements, b->n_elements);
+            g_fail++;
+            continue;
+        }
+        if (!a->f32 || !b->f32 || a->n_elements == 0) continue;
+        if (memcmp(a->f32, b->f32, (size_t)a->n_elements * 4u) != 0) {
+            fprintf(stderr, "FAIL batch %s: тензор %s (%u эл.) расходится\n",
+                    what, a->name, a->n_elements);
+            g_fail++;
+            if (++bad >= 5) break;
+        }
+    }
+}
+
+// Одна конфигурация: n токенов по одному против одной пачки.
+static void batch_case(const batch_cfg *cfg, int n, const char *what,
+                       int force_scalar) {
+    vtm_t *want, *got;
+    int32_t ids[128];
+    int i;
+
+    CHECK(n <= 128);
+    want = batch_model(cfg);
+    got = batch_model(cfg);
+    CHECK(want != NULL && got != NULL);
+    if (!want || !got) {
+        vtm_free(want);
+        vtm_free(got);
+        return;
+    }
+    if (force_scalar) {
+        vtm_set_backend(want, &vtm_backend_scalar_lut);
+        vtm_set_backend(got, &vtm_backend_scalar_lut);
+    }
+    for (i = 0; i < n; i++) ids[i] = (int32_t)((i * 7 + 3) % cfg->vocab);
+    cache_run_plain(want, ids, n);
+    vtm_set_position(got, 0);
+    CHECK(vtm_run_batch(got, ids, n) == VTM_OK);
+    CHECK(vtm_position(got) == n - 1);
+    CHECK(vtm_input_token(got) == ids[n - 1]);
+    // Батч не создаёт снимок кэша префикса: K/V он кладёт, но «это ровно
+    // прогон ids[0..n)» машина не запоминает.
+    CHECK(vtm_cache_prefix_len(got) == 0);
+    batch_check_same(want, got, what);
+    vtm_free(want);
+    vtm_free(got);
+}
+
+// MM с n == 1 (граф tied lm_head): EMB -> CPY (столбец) -> MM -> SAMP.
+enum { BMM_EMB, BMM_X, BMM_XCOL, BMM_LOGITS, BMM_TOKEN };
+
+static vtm_t *batch_mm_model(void) {
+    model_t md;
+    uint32_t d_emb[2], d_x[1], d_col[2], d_log[2], d_one[1];
+    uint8_t *img;
+    size_t size;
+    vtm_t *m;
+
+    d_emb[0] = 16; d_emb[1] = 8;
+    d_x[0] = 8;
+    d_col[0] = 8; d_col[1] = 1;
+    d_log[0] = 16; d_log[1] = 1;
+    d_one[0] = 1;
+
+    model_init(&md);
+    cache_add_trit(&md, "emb.w", 16, 8);
+    cache_add_f32(&md, "x", 1, d_x, 0.0f, 0.05f);
+    cache_add_f32(&md, "xcol", 2, d_col, 0.0f, 0.0f);
+    cache_add_f32(&md, "logits", 2, d_log, 0.0f, 0.0f);
+    cache_add_f32(&md, "token", 1, d_one, 0.0f, 0.0f);
+
+    model_inst(&md, VTM_OP_EMB, VTM_FLAG_EMB_INPUT, BMM_X, BMM_EMB,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_CPY, 0, BMM_XCOL, BMM_X, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_MM, 0, BMM_LOGITS, BMM_EMB, BMM_XCOL,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_SAMP, 0, BMM_TOKEN, BMM_LOGITS, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_SAMP_ARGMAX);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_set_meta(&md, "{\"temperature\": 0, \"rms_norm_eps\": 1e-06}");
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    free(img);
+    model_free(&md);
+    return m;
+}
+
+static void batch_mm_case(int n, const char *what) {
+    vtm_t *want = batch_mm_model();
+    vtm_t *got = batch_mm_model();
+    int32_t ids[32];
+    int i;
+
+    CHECK(want != NULL && got != NULL);
+    if (!want || !got) {
+        vtm_free(want);
+        vtm_free(got);
+        return;
+    }
+    vtm_set_backend(want, &vtm_backend_scalar_lut);
+    vtm_set_backend(got, &vtm_backend_scalar_lut);
+    for (i = 0; i < n; i++) ids[i] = (int32_t)((i * 7 + 3) % 16);
+    cache_run_plain(want, ids, n);
+    vtm_set_position(got, 0);
+    CHECK(vtm_run_batch(got, ids, n) == VTM_OK);
+    batch_check_same(want, got, what);
+    vtm_free(want);
+    vtm_free(got);
+}
+
+static void test_run_batch(void) {
+    batch_cfg gqa, mha, ring;
+    int32_t ids[16];
+    vtm_t *m;
+    int i;
+
+    printf("  -- батчевый prefill: vtm_run_batch\n");
+    gqa.ctx = 256; gqa.hidden = 32; gqa.vocab = 32; gqa.inter = 64;
+    gqa.heads = 4; gqa.kv_heads = 2; gqa.head_dim = 8; gqa.window = 0;
+    mha = gqa; mha.kv_heads = 4;
+    ring = gqa; ring.window = 32;
+
+    batch_case(&gqa, 8, "GQA/causal 8", 1);
+    batch_case(&gqa, 64, "GQA/causal 64", 1);
+    batch_case(&gqa, 128, "GQA/causal 128", 1);
+    batch_case(&mha, 64, "MHA/causal 64", 1);
+    batch_case(&ring, 64, "кольцо KV 64 (окно 32)", 1);
+    batch_case(&ring, 128, "кольцо KV 128 (окно 32)", 1);
+    // Бэкенд по умолчанию (обычно SIMD): батчевых ядер там нет, вызов идёт
+    // по токену — состояние всё равно обязано совпасть побитово.
+    batch_case(&gqa, 16, "бэкенд по умолчанию 16", 0);
+
+    // MM-путь: tied lm_head (A — тритовая таблица эмбеддингов, B — столбец).
+    batch_mm_case(8, "MM 8");
+    batch_mm_case(32, "MM 32");
+
+    // Две пачки подряд == один последовательный прогон: стык пачек (позиция,
+    // активации последнего токена) не теряется.
+    {
+        vtm_t *want = batch_model(&gqa);
+        vtm_t *got = batch_model(&gqa);
+        CHECK(want != NULL && got != NULL);
+        if (want && got) {
+            vtm_set_backend(want, &vtm_backend_scalar_lut);
+            vtm_set_backend(got, &vtm_backend_scalar_lut);
+            for (i = 0; i < 16; i++) ids[i] = (int32_t)((i * 5 + 1) % 32);
+            cache_run_plain(want, ids, 16);
+            vtm_set_position(got, 0);
+            CHECK(vtm_run_batch(got, ids, 8) == VTM_OK);
+            vtm_set_position(got, 8);
+            CHECK(vtm_run_batch(got, ids + 8, 8) == VTM_OK);
+            batch_check_same(want, got, "две пачки по 8");
+            vtm_free(want);
+            vtm_free(got);
+        }
+    }
+
+    // n == 0 — no-op; аргументы; граница int.
+    m = batch_model(&gqa);
+    CHECK(m != NULL);
+    if (m) {
+        vtm_set_backend(m, &vtm_backend_scalar_lut);
+        for (i = 0; i < 4; i++) ids[i] = (int32_t)i;
+        vtm_set_position(m, 5);
+        vtm_set_token(m, 3);
+        CHECK(vtm_run_batch(m, ids, 0) == VTM_OK);
+        CHECK(vtm_position(m) == 5);
+        CHECK(vtm_input_token(m) == 3);
+        CHECK(vtm_generated(m) == 0);
+        CHECK(vtm_run_batch(NULL, ids, 1) == VTM_E_ARG);
+        CHECK(vtm_run_batch(m, NULL, 1) == VTM_E_ARG);
+        CHECK(vtm_run_batch(m, ids, -1) == VTM_E_ARG);
+        vtm_set_position(m, INT_MAX);
+        CHECK(vtm_run_batch(m, ids, 2) == VTM_E_BOUNDS);
+        vtm_free(m);
+    }
+
+    // n == 1 — ровно один прогон.
+    {
+        vtm_t *want = batch_model(&gqa);
+        vtm_t *got = batch_model(&gqa);
+        CHECK(want != NULL && got != NULL);
+        if (want && got) {
+            vtm_set_backend(want, &vtm_backend_scalar_lut);
+            vtm_set_backend(got, &vtm_backend_scalar_lut);
+            ids[0] = 9;
+            cache_run_plain(want, ids, 1);
+            vtm_set_position(got, 0);
+            CHECK(vtm_run_batch(got, ids, 1) == VTM_OK);
+            batch_check_same(want, got, "n=1");
+            vtm_free(want);
+            vtm_free(got);
+        }
+    }
+
+    if (!g_fail)
+        printf("  -- батчевый prefill: побитово (8/64/128, GQA/MHA/кольцо):"
+               " ok\n");
+}
+
 // --- замер кэша префикса (задача 0081) ------------------------------------
 //
 // Сценарий из задачи: 128-токенный префикс + 16 новых токенов.
@@ -4846,6 +5217,7 @@ int main(void) {
     test_samp_stale_stamps();
     test_cache_prefix();
     test_cache_prefix_ring();
+    test_run_batch();
     bench_cache_prefix();
     test_samp_bench_150k();
 

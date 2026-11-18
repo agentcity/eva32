@@ -737,7 +737,7 @@
   {
     "id": "0112",
     "title": "Батчевый prefill: промпт пачкой, а не по токену",
-    "status": "in_progress",
+    "status": "done",
     "file": "0112-prefill-batch.md",
     "assignee": "agent:prefill-batch"
   },
