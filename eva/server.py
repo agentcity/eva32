@@ -11,6 +11,12 @@
 ``eva`` (маршрут, скилл, цена, латентность): без него нельзя посчитать
 себестоимость запроса.
 
+С ``"stream": true`` сервер отдаёт ``text/event-stream``: чанки
+``data: {...}\\n\\n`` с ``choices[0].delta.content`` и финальный ``data: [DONE]``.
+Если у инжектированного маршрутизатора есть метод ``stream(request)`` — ответ
+уходит по частям по мере генерации; если нет — готовый ответ приходит одним
+чанком (без имитации стриминга). Ошибки до первого чанка — обычный JSON.
+
 Ошибки клиента — 4xx с человеческим текстом, ошибка маршрутизатора — 500 с
 человеческим текстом и идентификатором запроса; трейсбек уходит в лог сервера
 и наружу не попадает.
@@ -33,7 +39,9 @@ __all__ = [
     "EvaHTTPServer",
     "EvaRequestHandler",
     "as_router",
+    "as_stream_router",
     "build_request",
+    "chat_chunk",
     "create_server",
     "default_router",
     "make_handler",
@@ -48,6 +56,9 @@ SERVICE_NAME = "eva-server"
 DEFAULT_MODEL = "eva-hybrid"
 #: Больше мегабайта тело чата не бывает: защита от случайного мусора.
 MAX_BODY_BYTES = 1024 * 1024
+
+#: Сентинел «поток не дал ни одного куска» для ``next(..., _STREAM_END)``.
+_STREAM_END = object()
 
 _VERSION_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "VERSION"
@@ -85,6 +96,8 @@ def build_request(pairs: list[tuple[str, str]], meta: dict[str, Any]) -> Any:
 
 #: Маршрутизатор — функция ``request -> Answer`` (Answer из eva.types).
 Router = Callable[[Any], Any]
+#: Потоковый маршрутизатор — функция ``request -> iterable`` кусков ответа.
+StreamRouter = Callable[[Any], Any]
 
 
 def as_router(router: Any) -> Router:
@@ -105,6 +118,28 @@ def as_router(router: Any) -> Router:
         "router должен быть функцией router(request) -> Answer "
         "или объектом с методом answer(request)"
     )
+
+
+def as_stream_router(router: Any) -> StreamRouter | None:
+    """Достаёт у маршрутизатора необязательный метод ``stream(request)``.
+
+    Маршрутизатор объявляет умение отдавать ответ по частям явно: атрибутом
+    ``stream``, который вызывается как ``stream(request)`` и возвращает
+    итератор кусков. Куском считается строка (текст дельты), объект/словарь с
+    полем ``text`` (тогда текст уходит в ``delta.content``, а ``route``/``usage``
+    запоминаются для финального чанка) или словарь с ``delta``. Нет такого
+    метода — сервер отдаёт готовый ответ одним чанком.
+
+    Отдельная функция, а не поле в :func:`as_router`: объект с ``answer`` и
+    ``stream`` после ``as_router`` превращается в связанный метод и второй
+    атрибут теряет.
+    """
+    if router is None:
+        return None
+    stream = getattr(router, "stream", None)
+    if callable(stream):
+        return stream
+    return None
 
 
 def _load_config() -> Any:
@@ -167,6 +202,11 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     return default
 
 
+def _elapsed_ms(started: float) -> int:
+    """Миллисекунды с момента ``started`` (``time.monotonic()``)."""
+    return int((time.monotonic() - started) * 1000)
+
+
 def _route_summary(route: Any) -> dict[str, Any]:
     if route is None:
         return {"route": "unknown", "reason": "", "confidence": 0.0}
@@ -190,6 +230,70 @@ def _route_summary(route: Any) -> dict[str, Any]:
     }
 
 
+def _usage_summary(answer: Any) -> dict[str, int]:
+    """``usage`` в форме OpenAI из ответа маршрутизатора."""
+    raw_usage = _field(answer, "usage") or {}
+    if not isinstance(raw_usage, Mapping):
+        raw_usage = {}
+    prompt_tokens = max(0, _as_int(raw_usage.get("prompt_tokens")))
+    completion_tokens = max(0, _as_int(raw_usage.get("completion_tokens")))
+    total_tokens = _as_int(raw_usage.get("total_tokens"))
+    if total_tokens <= 0:
+        total_tokens = prompt_tokens + completion_tokens
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _eva_summary(answer: Any, latency_ms: int) -> dict[str, Any]:
+    """Поле ``eva``: маршрут, скилл, цена и латентность ответа."""
+    skill = _field(answer, "skill")
+    if not isinstance(skill, str) or not skill.strip():
+        skill = None
+    cost_rub = max(0.0, _as_float(_field(answer, "cost_rub")))
+
+    eva = _route_summary(_field(answer, "route"))
+    eva["skill"] = skill
+    eva["cost_rub"] = round(cost_rub, 4)
+    measured = max(0, _as_int(latency_ms))
+    eva["latency_ms"] = max(0, _as_int(_field(answer, "latency_ms"), measured))
+    return eva
+
+
+def chat_chunk(
+    *,
+    chunk_id: str,
+    created: int,
+    model: str,
+    delta: Mapping[str, Any],
+    finish_reason: str | None = None,
+    eva: Mapping[str, Any] | None = None,
+    usage: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Один SSE-чанк в формате OpenAI (``chat.completion.chunk``).
+
+    ``delta`` всегда содержит ``content`` (пустая строка, если дельты нет):
+    клиент не должен проверять наличие ключа. ``finish_reason`` не ``None``
+    только в последнем чанке ответа.
+    """
+    payload: dict[str, Any] = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {"index": 0, "delta": dict(delta), "finish_reason": finish_reason}
+        ],
+    }
+    if usage is not None:
+        payload["usage"] = dict(usage)
+    if eva is not None:
+        payload["eva"] = dict(eva)
+    return payload
+
+
 def reply_to_openai(
     answer: Any,
     *,
@@ -201,26 +305,6 @@ def reply_to_openai(
     text = _field(answer, "text")
     if not isinstance(text, str):
         raise TypeError("маршрутизатор вернул ответ без текста")
-
-    raw_usage = _field(answer, "usage") or {}
-    if not isinstance(raw_usage, Mapping):
-        raw_usage = {}
-    prompt_tokens = max(0, _as_int(raw_usage.get("prompt_tokens")))
-    completion_tokens = max(0, _as_int(raw_usage.get("completion_tokens")))
-    total_tokens = _as_int(raw_usage.get("total_tokens"))
-    if total_tokens <= 0:
-        total_tokens = prompt_tokens + completion_tokens
-
-    skill = _field(answer, "skill")
-    if not isinstance(skill, str) or not skill.strip():
-        skill = None
-    cost_rub = max(0.0, _as_float(_field(answer, "cost_rub")))
-
-    eva = _route_summary(_field(answer, "route"))
-    eva["skill"] = skill
-    eva["cost_rub"] = round(cost_rub, 4)
-    measured = max(0, _as_int(latency_ms))
-    eva["latency_ms"] = max(0, _as_int(_field(answer, "latency_ms"), measured))
 
     return {
         "id": "chatcmpl-{}".format(request_id[:24]),
@@ -234,12 +318,8 @@ def reply_to_openai(
                 "finish_reason": "stop",
             }
         ],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-        },
-        "eva": eva,
+        "usage": _usage_summary(answer),
+        "eva": _eva_summary(answer, latency_ms),
     }
 
 
@@ -276,12 +356,53 @@ def _content_to_text(content: Any) -> str | None:
     return None
 
 
+def _coerce_stream_piece(item: Any) -> tuple[str, Any]:
+    """Кусок потока -> ``(текст дельты, Answer-метаданные | None)``.
+
+    Понимает строку, объект/словарь с ``text`` (Answer-подобный: у него есть
+    ``route``, метаданные пойдут в финальный чанк), ``delta`` строкой и
+    ``{"delta": {"content": ...}}``. Всё прочее — ошибка маршрутизатора.
+    """
+    if isinstance(item, str):
+        return item, None
+    if isinstance(item, bytes):
+        try:
+            return item.decode("utf-8"), None
+        except UnicodeDecodeError as exc:
+            raise TypeError("кусок потока не в UTF-8") from exc
+
+    text = _field(item, "text")
+    if isinstance(text, str):
+        meta = item if _field(item, "route") is not None else None
+        return text, meta
+
+    delta = _field(item, "delta")
+    if isinstance(delta, str):
+        return delta, None
+    if isinstance(delta, Mapping):
+        content = delta.get("content")
+        if isinstance(content, str):
+            return content, None
+
+    content = _field(item, "content")
+    if isinstance(content, str):
+        return content, None
+
+    raise TypeError(
+        "кусок потока должен быть строкой или объектом с текстом: {!r}".format(item)
+    )
+
+
 class EvaRequestHandler(BaseHTTPRequestHandler):
     """Один HTTP-запрос. Маршрутизатор задаётся подклассом из :func:`make_handler`."""
 
     server_version = "EVA32/1.0"
     protocol_version = "HTTP/1.1"
     _router: Router = staticmethod(default_router)
+    #: Необязательный ``stream(request)``; ``None`` — стриминга у роутера нет.
+    _stream_router: StreamRouter | None = None
+    #: Тело SSE пишется chunked (HTTP/1.1) или до закрытия соединения (1.0).
+    _sse_chunked = True
 
     # -- маршрутизация методов ------------------------------------------------
 
@@ -361,10 +482,21 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
 
         try:
             payload = self._read_json_body()
-            pairs, meta, model = self._parse_chat(payload)
+            pairs, meta, model, stream, include_usage = self._parse_chat(payload)
         except _ClientError as exc:
             logger.info("запрос %s отклонён (%s): %s", request_id, exc.code, exc)
             self._send_error(exc.status, str(exc), exc.code)
+            return
+
+        if stream:
+            self._handle_chat_stream(
+                pairs,
+                meta,
+                model=model,
+                include_usage=include_usage,
+                request_id=request_id,
+                started=started,
+            )
             return
 
         try:
@@ -374,20 +506,222 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                 answer,
                 model=model,
                 request_id=request_id,
-                latency_ms=int((time.monotonic() - started) * 1000),
+                latency_ms=_elapsed_ms(started),
             )
         except Exception:  # noqa: BLE001 - наружу только текст, трейсбек в лог
             logger.exception("ошибка обработки запроса %s", request_id)
-            self._send_error(
-                500,
-                "Внутренняя ошибка сервера. Повторите запрос позже; "
-                "если не поможет, сообщите код {}.".format(request_id),
-                "internal_error",
-                error_type="server_error",
-            )
+            self._send_internal_error(request_id)
             return
 
         self._send_json(200, body, headers={"X-Request-Id": request_id})
+
+    # -- потоковая выдача -----------------------------------------------------
+
+    def _handle_chat_stream(
+        self,
+        pairs: list[tuple[str, str]],
+        meta: dict[str, Any],
+        *,
+        model: str,
+        include_usage: bool,
+        request_id: str,
+        started: float,
+    ) -> None:
+        """SSE: куски из ``router.stream(request)`` или готовый ответ одним чанком.
+
+        Всё, что может упасть до первого чанка (сборка запроса, первый кусок),
+        отдаётся обычным JSON-ответом 500. Ошибка после первого чанка уже не
+        может стать JSON — уходит событием ``data: {"error": ...}`` и ``[DONE]``.
+        """
+        body: dict[str, Any] | None = None
+        iterator: Any = None
+
+        try:
+            request = build_request(pairs, meta)
+            stream_fn = self._stream_router
+            if stream_fn is None:
+                # Роутер не умеет по частям — отдаём готовый ответ одним чанком
+                # (честно: это не поток, а один кусок уже сгенерированного текста).
+                answer = self._router(request)
+                body = reply_to_openai(
+                    answer,
+                    model=model,
+                    request_id=request_id,
+                    latency_ms=_elapsed_ms(started),
+                )
+                first_text = body["choices"][0]["message"]["content"]
+                first_meta = None
+            else:
+                iterator = iter(stream_fn(request))
+                first = next(iterator, _STREAM_END)
+                if first is _STREAM_END:
+                    first_text, first_meta = "", None
+                else:
+                    first_text, first_meta = _coerce_stream_piece(first)
+        except Exception:  # noqa: BLE001 - до первого чанка ещё можно ответить JSON
+            logger.exception("ошибка обработки запроса %s", request_id)
+            self._send_internal_error(request_id)
+            return
+
+        self._open_sse(request_id)
+        created = int(time.time())
+        chunk_id = "chatcmpl-{}".format(request_id[:24])
+
+        if body is not None:
+            self._send_sse_data(
+                chat_chunk(
+                    chunk_id=chunk_id,
+                    created=created,
+                    model=model,
+                    delta={"role": "assistant", "content": first_text},
+                    finish_reason="stop",
+                    eva=body["eva"],
+                )
+            )
+            if include_usage:
+                self._send_sse_usage(chunk_id, created, model, body["usage"])
+            self._send_sse_done()
+            return
+
+        answer_meta = first_meta
+        sent_any = False
+        try:
+            if first_text:
+                if not self._send_sse_data(
+                    chat_chunk(
+                        chunk_id=chunk_id,
+                        created=created,
+                        model=model,
+                        delta={"role": "assistant", "content": first_text},
+                    )
+                ):
+                    return
+                sent_any = True
+
+            for item in iterator:
+                text, item_meta = _coerce_stream_piece(item)
+                if item_meta is not None:
+                    answer_meta = item_meta
+                if not text:
+                    continue
+                delta: dict[str, Any] = {"content": text}
+                if not sent_any:
+                    delta["role"] = "assistant"
+                if not self._send_sse_data(
+                    chat_chunk(
+                        chunk_id=chunk_id,
+                        created=created,
+                        model=model,
+                        delta=delta,
+                    )
+                ):
+                    return
+                sent_any = True
+
+            eva = (
+                _eva_summary(answer_meta, _elapsed_ms(started))
+                if answer_meta is not None
+                else None
+            )
+            if not self._send_sse_data(
+                chat_chunk(
+                    chunk_id=chunk_id,
+                    created=created,
+                    model=model,
+                    delta={"content": ""},
+                    finish_reason="stop",
+                    eva=eva,
+                )
+            ):
+                return
+            if include_usage and answer_meta is not None:
+                self._send_sse_usage(
+                    chunk_id, created, model, _usage_summary(answer_meta)
+                )
+            self._send_sse_done()
+        except Exception:  # noqa: BLE001 - заголовки уже отправлены, только SSE
+            logger.exception("ошибка потока %s", request_id)
+            if self._send_sse_error(request_id):
+                self._send_sse_done()
+
+    # -- SSE ------------------------------------------------------------------
+
+    def _open_sse(self, request_id: str) -> None:
+        """Заголовки SSE. HTTP/1.1 — chunked (keep-alive), HTTP/1.0 — до закрытия."""
+        self._sse_chunked = self.request_version != "HTTP/1.0"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Request-Id", request_id)
+        # Прокси не должны копить поток в буфере.
+        self.send_header("X-Accel-Buffering", "no")
+        if self._sse_chunked:
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Transfer-Encoding", "chunked")
+        else:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        self.end_headers()
+
+    def _write_sse(self, payload: bytes) -> bool:
+        """Пишет одно событие ``data: ...\\n\\n``; ``False`` — клиент ушёл."""
+        event = b"data: " + payload + b"\n\n"
+        try:
+            if self._sse_chunked:
+                self.wfile.write(b"%x\r\n" % len(event) + event + b"\r\n")
+            else:
+                self.wfile.write(event)
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError):
+            logger.debug("клиент закрыл соединение во время стрима")
+            self.close_connection = True
+            return False
+
+    def _send_sse_data(self, payload: Mapping[str, Any]) -> bool:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return self._write_sse(body.encode("utf-8"))
+
+    def _send_sse_usage(
+        self, chunk_id: str, created: int, model: str, usage: Mapping[str, Any]
+    ) -> bool:
+        """Отдельный чанк с ``usage`` (``stream_options.include_usage``)."""
+        return self._send_sse_data(
+            {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": dict(usage),
+            }
+        )
+
+    def _send_sse_error(self, request_id: str) -> bool:
+        """Ошибка после первого чанка: JSON уже не отправить, шлём событие."""
+        return self._send_sse_data(
+            {
+                "error": {
+                    "message": "Внутренняя ошибка сервера. Повторите запрос позже; "
+                    "если не поможет, сообщите код {}.".format(request_id),
+                    "type": "server_error",
+                    "code": "stream_error",
+                    "param": None,
+                }
+            }
+        )
+
+    def _send_sse_done(self) -> None:
+        """Терминальное событие ``data: [DONE]`` и конец chunked-тела."""
+        if not self._write_sse(b"[DONE]"):
+            return
+        if self._sse_chunked:
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                logger.debug("клиент закрыл соединение до конца стрима")
+                self.close_connection = True
 
     # -- разбор запроса -------------------------------------------------------
 
@@ -444,18 +778,32 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                 code="invalid_json",
             ) from None
 
-    def _parse_chat(self, payload: Any) -> tuple[list[tuple[str, str]], dict, str]:
+    def _parse_chat(
+        self, payload: Any
+    ) -> tuple[list[tuple[str, str]], dict, str, bool, bool]:
+        """Разбор тела чата -> (pairs, meta, model, stream, include_usage)."""
         if not isinstance(payload, Mapping):
             raise _ClientError(
                 "Тело запроса должно быть JSON-объектом.", code="invalid_body"
             )
 
-        if payload.get("stream") not in (None, False):
+        stream_raw = payload.get("stream", False)
+        if not isinstance(stream_raw, bool):
             raise _ClientError(
-                "Потоковая выдача (stream=true) не поддерживается: повторите "
-                "запрос без stream.",
-                code="unsupported_stream",
+                "Поле stream должно быть true или false.",
+                code="invalid_stream",
             )
+        stream = stream_raw
+
+        include_usage = False
+        stream_options = payload.get("stream_options")
+        if stream_options is not None:
+            if not isinstance(stream_options, Mapping):
+                raise _ClientError(
+                    "Поле stream_options должно быть объектом.",
+                    code="invalid_stream_options",
+                )
+            include_usage = stream_options.get("include_usage") is True
 
         messages = payload.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -499,7 +847,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
             if isinstance(requested_model, str) and requested_model.strip()
             else DEFAULT_MODEL
         )
-        return pairs, meta, model
+        return pairs, meta, model, stream, include_usage
 
     # -- ответы ---------------------------------------------------------------
 
@@ -597,6 +945,16 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
             close=True,
         )
 
+    def _send_internal_error(self, request_id: str) -> None:
+        """500 с идентификатором запроса; трейсбек остаётся в логе."""
+        self._send_error(
+            500,
+            "Внутренняя ошибка сервера. Повторите запрос позже; "
+            "если не поможет, сообщите код {}.".format(request_id),
+            "internal_error",
+            error_type="server_error",
+        )
+
     # -- журнал ---------------------------------------------------------------
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
@@ -607,12 +965,21 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
 
 
 def make_handler(router: Any) -> type[EvaRequestHandler]:
-    """Подкласс обработчика с вшитым маршрутизатором (без глобального состояния)."""
+    """Подкласс обработчика с вшитым маршрутизатором (без глобального состояния).
+
+    ``router`` передаётся как есть: из него берётся и ``answer`` (через
+    :func:`as_router`), и необязательный ``stream`` (через
+    :func:`as_stream_router`).
+    """
     router_impl = as_router(router)
+    stream_impl = as_stream_router(router)
 
     class BoundHandler(EvaRequestHandler):
         _router = staticmethod(router_impl)
 
+    BoundHandler._stream_router = (
+        staticmethod(stream_impl) if stream_impl is not None else None
+    )
     BoundHandler.__name__ = "EvaRequestHandler[{}]".format(
         getattr(router_impl, "__name__", type(router_impl).__name__)
     )
@@ -640,13 +1007,13 @@ def create_server(
     """Создаёт (но не запускает) сервер; ``port=0`` — свободный порт.
 
     ``router`` — функция ``router(request) -> Answer`` или объект с методом
-    ``answer(request)``. Без ``router`` используется боевая связка
-    :func:`default_router`, которая собирается лениво.
+    ``answer(request)``. Если у него есть ещё и ``stream(request)``,
+    ``stream=true`` отдаёт ответ по частям. Без ``router`` используется боевая
+    связка :func:`default_router`, которая собирается лениво.
     """
-    router_impl = as_router(router)
     server = EvaHTTPServer(
         (host, port),
-        make_handler(router_impl),
+        make_handler(router),
         router_name="default" if router is None else "injected",
     )
     logger.info(
