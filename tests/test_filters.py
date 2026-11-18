@@ -51,6 +51,33 @@ class TestCheck(unittest.TestCase):
         self.assertIn("invented_price", problems)
 
 
+class TestVendor(unittest.TestCase):
+    def test_claims_openai(self):
+        self.assertTrue(filters.has_other_vendor("Я работаю на языковой модели OpenAI."))
+
+    def test_claims_qwen(self):
+        self.assertTrue(filters.has_other_vendor("Меня создали на Qwen от Alibaba."))
+
+    def test_neutral_mention(self):
+        self.assertFalse(filters.has_other_vendor("Тариф «Старт» стоит 990 ₽ в месяц."))
+
+    def test_check_flags_vendor(self):
+        self.assertIn("other_vendor", filters.check("Кто тебя сделал?", "Меня сделала OpenAI."))
+
+
+class TestTeacherMessage(unittest.TestCase):
+    def test_without_context(self):
+        from distill.teacher import Teacher
+        self.assertEqual(Teacher.build_message("Сколько стоит?"), "Сколько стоит?")
+
+    def test_with_context(self):
+        from distill.teacher import Teacher
+        msg = Teacher.build_message("Сколько стоит?", "[1] 990 ₽")
+        self.assertIn("Контекст:", msg)
+        self.assertIn("[1] 990 ₽", msg)
+        self.assertTrue(msg.rstrip().endswith("Сколько стоит?"))
+
+
 class TestDedupe(unittest.TestCase):
     def test_same_question_different_case(self):
         pairs = [{"question": "Сколько стоит?"}, {"question": "сколько стоит ?"},

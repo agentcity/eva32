@@ -46,15 +46,33 @@ class Teacher:
         self.model = model or os.environ.get("TEACHER_MODEL", "deepseek-v4.1-flash")
         self.mock = mock
         self._i = 0
+        self.last_usage: dict = {}
+        self.last_reasoning: str = ""
 
-    def ask(self, question: str) -> str:
+    @staticmethod
+    def build_message(question: str, context: str | None = None) -> str:
+        """Точно тот же формат, что в контракте: «Контекст: [n] … Вопрос: …».
+
+        Без контекста учитель отвечает общими словами («уточните, о каком сервисе
+        речь») — такому ученицу учить нельзя.
+        """
+        if not context:
+            return question
+        return f"Контекст:\n{context}\n\nВопрос: {question}"
+
+    def ask(self, question: str, context: str | None = None,
+            system: str | None = None) -> str:
         if self.mock:
             answer = MOCK_ANSWERS[self._i % len(MOCK_ANSWERS)]
             self._i += 1
             return answer
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": self.build_message(question, context)})
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": question}],
+            "messages": messages,
             "temperature": 0.7,
             "max_tokens": 800,
         }
@@ -64,5 +82,10 @@ class Teacher:
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {self.key}"},
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.load(resp)["choices"][0]["message"]["content"]
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.load(resp)
+        msg = data["choices"][0]["message"]
+        self.last_usage = data.get("usage") or {}
+        # reasoning-часть не идёт в обучение, но стоит токенов — считаем отдельно
+        self.last_reasoning = msg.get("reasoning_content") or ""
+        return msg["content"]

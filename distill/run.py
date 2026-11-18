@@ -21,18 +21,28 @@ from distill.teacher import Teacher               # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GOLD = os.path.join(ROOT, "eval", "golden.jsonl")
+SYSTEM = os.path.join(ROOT, "prompts", "system.ru.md")
 
 
-def load_questions(path: str | None) -> list[str]:
-    if path:
-        with open(path, encoding="utf-8") as fh:
-            return [line.strip() for line in fh if line.strip() and not line.startswith("#")]
-    out: list[str] = []
-    with open(GOLD, encoding="utf-8") as fh:
+def load_questions(path: str | None) -> list[dict]:
+    """Вопросы с необязательным контекстом.
+
+    .jsonl — строки {"question": ..., "context": ...}; .txt — по вопросу в строке.
+    Золотой набор (eval/golden.jsonl) уже содержит context у части строк.
+    """
+    src = path or GOLD
+    items: list[dict] = []
+    with open(src, encoding="utf-8") as fh:
         for line in fh:
-            if line.strip():
-                out.append(json.loads(line)["question"])
-    return out
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("{"):
+                row = json.loads(line)
+                items.append({"question": row["question"], "context": row.get("context")})
+            else:
+                items.append({"question": line, "context": None})
+    return items
 
 
 def main() -> int:
@@ -41,19 +51,30 @@ def main() -> int:
     ap.add_argument("--out", default=os.path.join(ROOT, "distill", "out", "pairs.jsonl"))
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--mock", action="store_true", help="без сети: учитель-заглушка")
+    ap.add_argument("--no-system", action="store_true",
+                    help="не передавать prompts/system.ru.md (учим свободному стилю, не нашему)")
     args = ap.parse_args()
 
     questions = load_questions(args.questions)
     if args.limit:
         questions = questions[: args.limit]
     teacher = Teacher(mock=args.mock)
+    system = None
+    if not args.no_system:
+        with open(SYSTEM, encoding="utf-8") as fh:
+            system = fh.read().strip()
 
     pairs, rejected = [], []
-    for q in questions:
-        answer = teacher.ask(q)
+    tok_in = tok_out = 0
+    for item in questions:
+        q = item["question"]
+        answer = teacher.ask(q, item.get("context"), system)
+        tok_in += int(teacher.last_usage.get("prompt_tokens") or 0)
+        tok_out += int(teacher.last_usage.get("completion_tokens") or 0)
         problems = filters.check(q, answer)
         row = {
             "question": q,
+            "context": item.get("context"),
             "answer": answer,
             "meta": {
                 "model": teacher.model if not args.mock else "mock",
@@ -78,6 +99,8 @@ def main() -> int:
     print(f"вопросов: {total}")
     print(f"принято:  {len(pairs)}")
     print(f"отброшено: {len(rejected)}  " + (", ".join(f"{k}={v}" for k, v in by_reason.items()) or ""))
+    if tok_in or tok_out:
+        print(f"токены: вход {tok_in}, выход {tok_out}")
     print(f"-> {os.path.relpath(args.out, ROOT)}")
     return 0 if pairs else 1
 
