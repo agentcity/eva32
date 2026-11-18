@@ -238,7 +238,7 @@ models/
 !.env.example
 
 # Выходы конвейера дистилляции
-distill/out/
+# Пары и банки вопросов лежат в git: ответы стоят денег, а не восстанавливаются.
 
 # IDE / OS
 .idea/
@@ -275,4 +275,3 @@ runs/
 # Внешние датасеты и кэш HuggingFace: качаются заново, в репозиторий не идут.
 distill/pulled/
 .hfcache/
-distill/business_*_q.jsonl
