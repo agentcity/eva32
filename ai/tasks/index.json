@@ -527,7 +527,7 @@
   {
     "id": "0081",
     "title": "Кэш промпта: не пересчитывать одинаковый префикс",
-    "status": "in_progress",
+    "status": "done",
     "file": "0081-vtm-prompt-cache.md",
     "assignee": "agent:vtm-prompt-cache"
   },
@@ -564,6 +564,13 @@
     "title": "UBSan: misaligned load в ядрах (memcpy)",
     "status": "pending",
     "file": "0086-unaligned-loads.md",
+    "assignee": ""
+  },
+  {
+    "id": "0087",
+    "title": "Кэш промпта в C-ABI: не сбрасывать между запросами",
+    "status": "pending",
+    "file": "0087-api-cache.md",
     "assignee": ""
   }
 ]

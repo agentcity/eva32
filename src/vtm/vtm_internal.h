@@ -91,6 +91,40 @@ struct vtm {
     uint32_t        samp_stamp_gen;   // поколение меток (0 — метки пусты)
     size_t          samp_buf_bytes;   // сколько байт выделено
     size_t          samp_buf_allocs;  // выделений за жизнь машины (тест-хук)
+
+    // --- кэш префикса (задача 0081) ----------------------------------------
+    //
+    // K/V префикса — это уже содержимое KV-тензоров (KVW), поэтому кэш хранит
+    // не копию K/V, а снимок всего остального состояния: идентификатор
+    // префикса (sha256 от ids), позицию и состояние сэмплера. Попадание
+    // восстанавливает снимок, и прогон продолжается с позиции cache_len так,
+    // как будто префикс только что посчитан.
+    //
+    // Снимок хранится прямо в машине: он маленький (~1,2 КБ) и фиксированный,
+    // а выделять память нельзя — vtm_free() в loader.c (вне зоны задачи) её
+    // не освободит. Поля обнуляются calloc'ом в vtm_load_mem(); cache_len ==
+    // 0 и cache_valid == 0 означают «кэша нет».
+    int             cache_valid;      // 1 — снимок описывает префикс
+    int             cache_len;        // длина префикса в токенах
+    uint8_t         cache_digest[32]; // sha256 от ids[0..cache_len)
+    const vtm_backend *cache_backend; // бэкенд, которым считан префикс
+    int             cache_generated;  // m->generated после префикса
+    int             cache_position;   // m->position после префикса
+    int             cache_input;      // m->input_token после префикса
+    int             cache_samp_ready;
+    uint64_t        cache_samp_rng;
+    uint64_t        cache_samp_seed;
+    double          cache_samp_temperature;
+    double          cache_samp_top_p;
+    double          cache_samp_repetition_penalty;
+    int             cache_samp_top_k;
+    int             cache_samp_repetition_window;
+    int             cache_samp_prev_generated;
+    int             cache_samp_hist_len;
+    int             cache_samp_hist_head;
+    int             cache_samp_hist[VTM_MAX_REPETITION_WINDOW];
+    uint64_t        cache_hits;       // попаданий vtm_run_cached()
+    uint64_t        cache_misses;     // полных прогонов vtm_run_cached()
 };
 
 // Записать ошибку в машину и в глобальный буфер vtm_last_error().

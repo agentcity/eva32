@@ -13,6 +13,7 @@
 //   там означает результат, а не поле инструкции.
 #include "vtm_internal.h"
 #include "vtm_backend.h"
+#include "sha256.h"
 
 #include <limits.h>
 #include <math.h>
@@ -689,6 +690,17 @@ static vtm_status op_kvw(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     if (pos < 0 || pos > (long long)INT_MAX)
         return fail(m, ins, VTM_E_BOUNDS,
                     "KVW: позиция %lld вне диапазона", pos);
+    // Кэш префикса (задача 0081) живёт в этих же тензорах: запись на позицию
+    // меньше длины префикса затирает его K/V, а запись за пределами окна
+    // запускает кольцо, которое начнёт переиспользовать слоты префикса. В
+    // обоих случаях снимок перестаёт описывать KV, и следующий
+    // vtm_run_cached() обязан считать заново. Запись позиции >= len(prefix)
+    // в пределах окна безопасна: она кладёт K/V продолжения, а нужные ATTN
+    // ключи префикса лежат в других слотах (позиция < win не пересекается).
+    if (m->cache_valid
+        && (pos < (long long)m->cache_len
+            || (unsigned long long)pos >= (unsigned long long)win))
+        m->cache_valid = 0;
     slot = (size_t)(pos % (long long)win);
     memmove(kc->f32 + slot * kv_dim, kv->f32,
             (size_t)kv_dim * sizeof(float));
@@ -1655,6 +1667,172 @@ static vtm_status op_samp(vtm_t *m, uint32_t ins, const vtm_instr *in,
     m->generated++;
     m->samp_prev_generated = m->generated;
     if (emit && emit(user, token, m->position) != 0) *stop = 1;
+    return VTM_OK;
+}
+
+// --- кэш префикса (задача 0081) --------------------------------------------
+//
+// Зачем не копия K/V. K/V префикса и так лежат в KV-тензорах машины (их пишет
+// KVW), поэтому копировать их незачем: достаточно знать, что текущее
+// состояние соответствует прогону ids[0..len). Всё остальное, что переживает
+// vtm_run(), — позиция, счётчик сгенерированных и состояние сэмплера —
+// снимается в поля машины и восстанавливается при попадании. Так запрос с тем
+// же префиксом (системный промпт) и другим хвостом не пересчитывает префикс,
+// а результат остаётся побитово тем же, что у полного прогона.
+//
+// Почему хеш, а не копия ids. Копия ids потребовала бы либо фиксированного
+// предела длины префикса, либо malloc, который vtm_free() (loader.c, вне зоны
+// задачи) не освободит. SHA-256 от ids — 32 байта в машине и полная гарантия:
+// совпадение двух разных префиксов по 256-битному хешу это 2^-256, а цена
+// (один проход по n·4 байтам) на фоне прогона модели не видна.
+//
+// Совместимость по состоянию. Попадание восстанавливает снимок, поэтому после
+// vtm_run_cached() машина находится ровно в том же состоянии, что и после
+// полного прогона тех же ids по одному токену: та же позиция, тот же счётчик,
+// та же история и ГПСЧ сэмплера. На это опирается тест (побитовое сравнение).
+static void cache_store(vtm_t *m, const int32_t *ids, int n) {
+    vtm_sha256_ctx ctx;
+
+    if (n <= 0) {
+        m->cache_valid = 0;
+        m->cache_len = 0;
+        return;
+    }
+    vtm_sha256_init(&ctx);
+    vtm_sha256_update(&ctx, ids, (size_t)n * sizeof *ids);
+    vtm_sha256_final(&ctx, m->cache_digest);
+    m->cache_len = n;
+    m->cache_backend = m->backend;
+    m->cache_generated = m->generated;
+    m->cache_position = m->position;
+    m->cache_input = m->input_token;
+    m->cache_samp_ready = m->samp_ready;
+    m->cache_samp_rng = m->samp_rng;
+    m->cache_samp_seed = m->samp_seed;
+    m->cache_samp_temperature = m->samp_temperature;
+    m->cache_samp_top_k = m->samp_top_k;
+    m->cache_samp_top_p = m->samp_top_p;
+    m->cache_samp_repetition_penalty = m->samp_repetition_penalty;
+    m->cache_samp_repetition_window = m->samp_repetition_window;
+    m->cache_samp_prev_generated = m->samp_prev_generated;
+    m->cache_samp_hist_len = m->samp_hist_len;
+    m->cache_samp_hist_head = m->samp_hist_head;
+    memcpy(m->cache_samp_hist, m->samp_hist, sizeof m->samp_hist);
+    m->cache_valid = 1;
+}
+
+static void cache_restore(vtm_t *m) {
+    m->position = m->cache_position;
+    m->input_token = m->cache_input;
+    m->generated = m->cache_generated;
+    m->samp_ready = m->cache_samp_ready;
+    m->samp_rng = m->cache_samp_rng;
+    m->samp_seed = m->cache_samp_seed;
+    m->samp_temperature = m->cache_samp_temperature;
+    m->samp_top_k = m->cache_samp_top_k;
+    m->samp_top_p = m->cache_samp_top_p;
+    m->samp_repetition_penalty = m->cache_samp_repetition_penalty;
+    m->samp_repetition_window = m->cache_samp_repetition_window;
+    m->samp_prev_generated = m->cache_samp_prev_generated;
+    m->samp_hist_len = m->cache_samp_hist_len;
+    m->samp_hist_head = m->cache_samp_hist_head;
+    memcpy(m->samp_hist, m->cache_samp_hist, sizeof m->samp_hist);
+}
+
+// Годен ли снимок для текущего состояния машины.
+static int cache_usable(const vtm_t *m) {
+    if (!m->cache_valid || m->cache_len <= 0) return 0;
+    // Смена бэкенда (vtm_set_backend) — другой численный путь, K/V префикса
+    // посчитаны не им. Модель сменить в одной машине нельзя: загрузка даёт
+    // новую vtm_t, а у неё кэш пуст.
+    if (m->backend != m->cache_backend) return 0;
+    // vtm_reset() ставит input_token = -1; после прогона префикса он всегда
+    // равен последнему токену (>= 0), поэтому -1 — надёжный признак сброса
+    // даже для префикса из одного токена.
+    if (m->input_token < 0 && m->cache_input >= 0) return 0;
+    // Состояние ушло назад (vtm_reset, vtm_set_position): снимок относится к
+    // более поздней точке, и восстанавливать его значило бы проигнорировать
+    // сброс.
+    if (m->generated < m->cache_generated) return 0;
+    if (m->position < m->cache_position) return 0;
+    return 1;
+}
+
+// Начинается ли ids[0..n) с кэшированного префикса.
+static int cache_hit(vtm_t *m, const int32_t *ids, int n) {
+    vtm_sha256_ctx ctx;
+    uint8_t digest[32];
+
+    if (!cache_usable(m)) return 0;
+    if (m->cache_len > n) return 0;
+    vtm_sha256_init(&ctx);
+    vtm_sha256_update(&ctx, ids, (size_t)m->cache_len * sizeof *ids);
+    vtm_sha256_final(&ctx, digest);
+    return memcmp(digest, m->cache_digest, sizeof digest) == 0;
+}
+
+int vtm_cache_prefix_len(const vtm_t *m) {
+    return (m && cache_usable(m)) ? m->cache_len : 0;
+}
+
+void vtm_cache_stats(const vtm_t *m, uint64_t *hits, uint64_t *misses) {
+    if (hits) *hits = m ? m->cache_hits : 0;
+    if (misses) *misses = m ? m->cache_misses : 0;
+}
+
+vtm_status vtm_cache_prefix(vtm_t *m, const int32_t *ids, int n) {
+    vtm_status st;
+    int i;
+
+    if (!m) return VTM_E_ARG;
+    if (n < 0 || (n > 0 && !ids)) return VTM_E_ARG;
+    if (!m->backend) m->backend = &vtm_backend_scalar_lut;
+    // Префикс считается с чистого состояния: vtm_reset() обнуляет позицию,
+    // счётчик и сбрасывает сэмплер (лениво, на первом SAMP), поэтому прогон
+    // префикса здесь побитово равен прогону тех же ids у хоста.
+    vtm_reset(m);
+    m->cache_valid = 0;
+    for (i = 0; i < n; i++) {
+        vtm_set_token(m, ids[i]);
+        vtm_set_position(m, i);
+        st = vtm_run(m, NULL, NULL);
+        if (st != VTM_OK) return st;
+    }
+    cache_store(m, ids, n);
+    return VTM_OK;
+}
+
+vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
+    vtm_status st = VTM_OK;
+    int i, start, hit;
+
+    if (!m) return VTM_E_ARG;
+    if (n < 0 || (n > 0 && !ids)) return VTM_E_ARG;
+    if (!m->backend) m->backend = &vtm_backend_scalar_lut;
+
+    hit = cache_hit(m, ids, n);
+    if (hit) {
+        cache_restore(m);
+        start = m->cache_len;
+        m->cache_hits++;
+    } else {
+        // Несовпадающий префикс — честный полный прогон с чистого состояния;
+        // кэшем становится вся последовательность, чтобы следующий запрос с
+        // тем же промптом (и другим продолжением) уже не считал его заново.
+        vtm_reset(m);
+        m->cache_valid = 0;
+        start = 0;
+        m->cache_misses++;
+    }
+    for (i = start; i < n; i++) {
+        vtm_set_token(m, ids[i]);
+        vtm_set_position(m, i);
+        st = vtm_run(m, NULL, NULL);
+        if (st != VTM_OK) return st;
+    }
+    // При попадании кэш остаётся префиксом: запросы с тем же префиксом и
+    // разными хвостами переиспользуют его повторно.
+    if (!hit) cache_store(m, ids, n);
     return VTM_OK;
 }
 
