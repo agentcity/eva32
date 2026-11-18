@@ -786,7 +786,7 @@
   {
     "id": "0119",
     "title": "Промпт короче: 4,4 КБ — это 1000 токенов prefill",
-    "status": "in_progress",
+    "status": "done",
     "file": "0119-prompt-shorten.md",
     "assignee": "agent:prompt-shorten"
   }
