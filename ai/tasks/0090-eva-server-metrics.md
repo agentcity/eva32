@@ -5,7 +5,7 @@ title: eva: метрики и отмена запросов на сервере
 created_at: 2026-11-18T13:10:00Z
 author: yuri
 assignee: agent:eva-server-metrics
-status: in_progress
+status: done
 scope:
   docs: false
   code: true
@@ -49,4 +49,12 @@ scope:
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: `Metrics` в `telemetry.py` (потокобезопасные счётчики + перцентили R-7 по
+окну 4096 замеров: `requests`, `streams`, `finish{ok,stop,cancel,error}`, `routes`,
+`tokens`, `ttft_ms`, `latency_ms`, `by_route`). В `server.py` — учёт каждого запроса
+ровно один раз, `TTFT` от старта до первого чанка, отмена генерации при обрыве SSE,
+`GET /metrics` (JSON, требует Bearer при `EVA_AUTH_TOKEN`). 25 тестов без сокета.
+
+Риски: отмена ловится только по ошибке записи в сокет (клиент, переставший читать, но
+не закрывший соединение, обнаружится позже); у отменённого потока токены = 0 (usage не
+приходит); TTFT нет для non-stream; метрики в памяти процесса, обнуляются при рестарте.

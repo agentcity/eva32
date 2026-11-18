@@ -21,6 +21,13 @@
 обычный JSON; обрыв потока после первого чанка — событие ``error`` и
 ``[DONE]``, сервер продолжает работать.
 
+Каждый запрос, дошедший до маршрутизатора, учитывается в ``server.metrics``
+(``eva.telemetry.Metrics``): TTFT, полное время, токены, код завершения
+(``ok``/``stop``/``cancel``/``error``) и маршрут. Если клиент оборвал SSE, сервер
+не продолжает генерацию в пустоту: поток роутера закрывается, запрос
+учитывается как ``cancel``. Сводка отдаётся ``GET /metrics`` (JSON, с
+перцентилями p50/p95/p99 по TTFT и полному времени).
+
 Ошибки клиента — 4xx с человеческим текстом, ошибка маршрутизатора — 500 с
 человеческим текстом и идентификатором запроса; трейсбек уходит в лог сервера
 и наружу не попадает.
@@ -41,6 +48,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import ceil
 from typing import Any, Callable
 from urllib.parse import urlsplit
+
+from .telemetry import Metrics
 
 __all__ = [
     "AccessGuard",
@@ -82,6 +91,8 @@ _MAX_RATE_KEYS = 4096
 
 #: Сентинел «поток не дал ни одного куска» для ``next(..., _STREAM_END)``.
 _STREAM_END = object()
+#: Ошибки записи, означающие уход клиента; для SSE это отмена генерации.
+_CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 
 _VERSION_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "VERSION"
@@ -334,9 +345,14 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     return default
 
 
-def _elapsed_ms(started: float) -> int:
-    """Миллисекунды с момента ``started`` (``time.monotonic()``)."""
-    return int((time.monotonic() - started) * 1000)
+def _elapsed_ms(started: float, now: float | None = None) -> int:
+    """Миллисекунды с момента ``started`` (``time.monotonic()``).
+
+    ``now`` подменяет текущий момент: сервер считает время по своим часам
+    (``server.clock``), а тесты — по фейковым, чтобы TTFT был детерминирован.
+    """
+    moment = time.monotonic() if now is None else float(now)
+    return int((moment - started) * 1000)
 
 
 def _route_summary(route: Any) -> dict[str, Any]:
@@ -554,6 +570,8 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
         path = self._path()
         if path == "/health":
             self._send_health()
+        elif path == "/metrics":
+            self._send_metrics()
         elif path == "/v1/models":
             self._send_models()
         elif path == "/v1/chat/completions":
@@ -567,7 +585,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
         path = self._path()
         if path == "/v1/chat/completions":
             self._handle_chat()
-        elif path in ("/health", "/v1/models"):
+        elif path in ("/health", "/v1/models", "/metrics"):
             self._send_method_not_allowed("GET")
         else:
             self._send_not_found(path)
@@ -611,8 +629,9 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
         """Аутентификация и лимит запросов; ``False`` — ответ уже отправлен.
 
         ``GET /health`` открыт намеренно: по нему проверяют живость процесса,
-        и он ничего не стоит. Всё остальное (включая ``/v1/models`` и
-        незнакомые пути) при заданном ``EVA_AUTH_TOKEN`` требует Bearer-токен.
+        и он ничего не стоит. Всё остальное (включая ``/v1/models``,
+        ``/metrics`` и незнакомые пути) при заданном ``EVA_AUTH_TOKEN`` требует
+        Bearer-токен.
         Проверка идёт до чтения тела: без токена байты не читаем и 413 не
         выдаём — сначала 401.
         """
@@ -696,9 +715,45 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _send_metrics(self) -> None:
+        """``GET /metrics``: счётчики и перцентили работающего сервера."""
+        metrics = getattr(self.server, "metrics", None)
+        snapshot = (
+            metrics.snapshot() if metrics is not None else Metrics().snapshot()
+        )
+        started_at = getattr(self.server, "started_at", None)
+        payload: dict[str, Any] = {
+            "service": SERVICE_NAME,
+            "version": version(),
+            "uptime_s": (
+                round(self._clock() - started_at, 3)
+                if started_at is not None
+                else 0.0
+            ),
+        }
+        payload.update(snapshot)
+        self._send_json(200, payload)
+
+    # -- метрики запроса ------------------------------------------------------
+
+    def _clock(self) -> float:
+        """Текущий момент по часам сервера; в тестах — фейковые часы."""
+        clock = getattr(self.server, "clock", None)
+        return time.monotonic() if clock is None else float(clock())
+
+    def _observe(self, **fields: Any) -> None:
+        """Учесть запрос в метриках; сбой учёта не должен ронять ответ."""
+        metrics = getattr(self.server, "metrics", None)
+        if metrics is None:
+            return
+        try:
+            metrics.observe(**fields)
+        except Exception:  # noqa: BLE001 - метрика не важнее ответа клиенту
+            logger.exception("не удалось записать метрику запроса")
+
     def _handle_chat(self) -> None:
         request_id = uuid.uuid4().hex
-        started = time.monotonic()
+        started = self._clock()
 
         try:
             payload = self._read_json_body()
@@ -722,17 +777,36 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
         try:
             request = build_request(pairs, meta)
             answer = self._router(request)
+            latency_ms = _elapsed_ms(started, self._clock())
             body = reply_to_openai(
                 answer,
                 model=model,
                 request_id=request_id,
-                latency_ms=_elapsed_ms(started),
+                latency_ms=latency_ms,
             )
         except Exception:  # noqa: BLE001 - наружу только текст, трейсбек в лог
             logger.exception("ошибка обработки запроса %s", request_id)
+            self._observe(
+                route="unknown",
+                finish="error",
+                latency_ms=_elapsed_ms(started, self._clock()),
+                stream=False,
+            )
             self._send_internal_error(request_id)
             return
 
+        eva = body.get("eva") or {}
+        usage = body.get("usage") or {}
+        self._observe(
+            route=eva.get("route", "unknown"),
+            finish="ok",
+            ttft_ms=None,  # у не потокового ответа нет «первого чанка»
+            latency_ms=latency_ms,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens"),
+            stream=False,
+        )
         self._send_json(200, body, headers={"X-Request-Id": request_id})
 
     # -- потоковая выдача -----------------------------------------------------
@@ -752,122 +826,190 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
         Всё, что может упасть до первого чанка (сборка запроса, первый кусок),
         отдаётся обычным JSON-ответом 500. Ошибка после первого чанка уже не
         может стать JSON — уходит событием ``data: {"error": ...}`` и ``[DONE]``.
+
+        Обрыв SSE клиентом — не ошибка и не повод продолжать генерацию: первая
+        же неудачная запись в сокет помечает запрос ``cancel``, поток роутера
+        закрывается (генератор получает ``GeneratorExit``), лишние куски не
+        запрашиваются. Запрос учитывается в метриках ровно один раз — в
+        ``finally``, чем бы поток ни закончился.
         """
         body: dict[str, Any] | None = None
         iterator: Any = None
+        answer_meta: Any = None
+        route = "unknown"
+        finish = "error"
+        ttft_ms: int | None = None
+
+        def mark_ttft() -> None:
+            """TTFT — от начала запроса до первого успешно отданного чанка."""
+            nonlocal ttft_ms
+            if ttft_ms is None:
+                ttft_ms = _elapsed_ms(started, self._clock())
 
         try:
-            request = build_request(pairs, meta)
-            stream_fn = self._stream_router
-            if stream_fn is None:
-                # Роутер не умеет по частям — отдаём готовый ответ одним чанком
-                # (честно: это не поток, а один кусок уже сгенерированного текста).
-                answer = self._router(request)
-                body = reply_to_openai(
-                    answer,
-                    model=model,
-                    request_id=request_id,
-                    latency_ms=_elapsed_ms(started),
-                )
-                first_text = body["choices"][0]["message"]["content"]
-                first_meta = None
-            else:
-                iterator = iter(stream_fn(request))
-                first = next(iterator, _STREAM_END)
-                if first is _STREAM_END:
-                    first_text, first_meta = "", None
+            try:
+                request = build_request(pairs, meta)
+                stream_fn = self._stream_router
+                if stream_fn is None:
+                    # Роутер не умеет по частям — отдаём готовый ответ одним чанком
+                    # (честно: это не поток, а один кусок уже сгенерированного текста).
+                    answer = self._router(request)
+                    body = reply_to_openai(
+                        answer,
+                        model=model,
+                        request_id=request_id,
+                        latency_ms=_elapsed_ms(started, self._clock()),
+                    )
+                    first_text = body["choices"][0]["message"]["content"]
+                    first_meta = None
+                    route = body["eva"]["route"]
                 else:
-                    first_text, first_meta = _coerce_stream_piece(first)
-        except Exception:  # noqa: BLE001 - до первого чанка ещё можно ответить JSON
-            _close_iterator(iterator)
-            logger.exception("ошибка обработки запроса %s", request_id)
-            self._send_internal_error(request_id)
-            return
+                    iterator = iter(stream_fn(request))
+                    first = next(iterator, _STREAM_END)
+                    if first is _STREAM_END:
+                        first_text, first_meta = "", None
+                    else:
+                        first_text, first_meta = _coerce_stream_piece(first)
+                        if first_meta is not None:
+                            route = _route_summary(
+                                _field(first_meta, "route")
+                            )["route"]
+            except Exception:  # noqa: BLE001 - до первого чанка ещё можно ответить JSON
+                _close_iterator(iterator)
+                logger.exception("ошибка обработки запроса %s", request_id)
+                self._send_internal_error(request_id)
+                return
 
-        self._open_sse(request_id)
-        created = int(time.time())
-        chunk_id = "chatcmpl-{}".format(request_id[:24])
+            try:
+                self._open_sse(request_id)
+            except _CLIENT_GONE:
+                # Клиент ушёл до заголовков: генерацию не начинаем.
+                logger.debug("клиент закрыл соединение до начала стрима")
+                self.close_connection = True
+                finish = "cancel"
+                return
+            created = int(time.time())
+            chunk_id = "chatcmpl-{}".format(request_id[:24])
 
-        if body is not None:
-            self._send_sse_data(
-                chat_chunk(
-                    chunk_id=chunk_id,
-                    created=created,
-                    model=model,
-                    delta={"role": "assistant", "content": first_text},
-                    finish_reason="stop",
-                    eva=body["eva"],
-                )
-            )
-            if include_usage:
-                self._send_sse_usage(chunk_id, created, model, body["usage"])
-            self._send_sse_done()
-            return
-
-        answer_meta = first_meta
-        sent_any = False
-        try:
-            if first_text:
+            if body is not None:
                 if not self._send_sse_data(
                     chat_chunk(
                         chunk_id=chunk_id,
                         created=created,
                         model=model,
                         delta={"role": "assistant", "content": first_text},
+                        finish_reason="stop",
+                        eva=body["eva"],
                     )
                 ):
+                    finish = "cancel"
                     return
-                sent_any = True
+                mark_ttft()
+                if include_usage and not self._send_sse_usage(
+                    chunk_id, created, model, body["usage"]
+                ):
+                    finish = "cancel"
+                    return
+                if not self._send_sse_done():
+                    finish = "cancel"
+                    return
+                finish = "stop"
+                return
 
-            for item in iterator:
-                text, item_meta = _coerce_stream_piece(item)
-                if item_meta is not None:
-                    answer_meta = item_meta
-                if not text:
-                    continue
-                delta: dict[str, Any] = {"content": text}
-                if not sent_any:
-                    delta["role"] = "assistant"
+            answer_meta = first_meta
+            sent_any = False
+            try:
+                if first_text:
+                    if not self._send_sse_data(
+                        chat_chunk(
+                            chunk_id=chunk_id,
+                            created=created,
+                            model=model,
+                            delta={"role": "assistant", "content": first_text},
+                        )
+                    ):
+                        finish = "cancel"
+                        return
+                    sent_any = True
+                    mark_ttft()
+
+                for item in iterator:
+                    text, item_meta = _coerce_stream_piece(item)
+                    if item_meta is not None:
+                        answer_meta = item_meta
+                        route = _route_summary(_field(item_meta, "route"))["route"]
+                    if not text:
+                        continue
+                    delta: dict[str, Any] = {"content": text}
+                    if not sent_any:
+                        delta["role"] = "assistant"
+                    if not self._send_sse_data(
+                        chat_chunk(
+                            chunk_id=chunk_id,
+                            created=created,
+                            model=model,
+                            delta=delta,
+                        )
+                    ):
+                        finish = "cancel"
+                        return
+                    sent_any = True
+                    mark_ttft()
+
+                eva = (
+                    _eva_summary(answer_meta, _elapsed_ms(started, self._clock()))
+                    if answer_meta is not None
+                    else None
+                )
                 if not self._send_sse_data(
                     chat_chunk(
                         chunk_id=chunk_id,
                         created=created,
                         model=model,
-                        delta=delta,
+                        delta={"content": ""},
+                        finish_reason="stop",
+                        eva=eva,
                     )
                 ):
+                    finish = "cancel"
                     return
-                sent_any = True
-
-            eva = (
-                _eva_summary(answer_meta, _elapsed_ms(started))
-                if answer_meta is not None
-                else None
-            )
-            if not self._send_sse_data(
-                chat_chunk(
-                    chunk_id=chunk_id,
-                    created=created,
-                    model=model,
-                    delta={"content": ""},
-                    finish_reason="stop",
-                    eva=eva,
-                )
-            ):
-                return
-            if include_usage and answer_meta is not None:
-                self._send_sse_usage(
-                    chunk_id, created, model, _usage_summary(answer_meta)
-                )
-            self._send_sse_done()
-        except Exception:  # noqa: BLE001 - заголовки уже отправлены, только SSE
-            logger.exception("ошибка потока %s", request_id)
-            if self._send_sse_error(request_id):
-                self._send_sse_done()
+                mark_ttft()
+                if include_usage and answer_meta is not None:
+                    if not self._send_sse_usage(
+                        chunk_id, created, model, _usage_summary(answer_meta)
+                    ):
+                        finish = "cancel"
+                        return
+                if not self._send_sse_done():
+                    finish = "cancel"
+                    return
+                finish = "stop"
+            except Exception:  # noqa: BLE001 - заголовки уже отправлены, только SSE
+                logger.exception("ошибка потока %s", request_id)
+                if self._send_sse_error(request_id):
+                    self._send_sse_done()
+                finish = "error"
+            finally:
+                # Клиент мог уйти или поток оборваться: закрываем генератор
+                # роутера, чтобы клиент провайдера не висел до сборки мусора.
+                _close_iterator(iterator)
         finally:
-            # Клиент мог уйти или поток оборваться: закрываем генератор
-            # роутера, чтобы клиент провайдера не висел до сборки мусора.
-            _close_iterator(iterator)
+            if answer_meta is not None:
+                usage = _usage_summary(answer_meta)
+            elif body is not None:
+                usage = body["usage"]
+            else:
+                usage = {}
+            self._observe(
+                route=route,
+                finish=finish,
+                ttft_ms=ttft_ms,
+                latency_ms=_elapsed_ms(started, self._clock()),
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens"),
+                stream=True,
+            )
 
     # -- SSE ------------------------------------------------------------------
 
@@ -898,7 +1040,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(event)
             self.wfile.flush()
             return True
-        except (BrokenPipeError, ConnectionResetError):
+        except _CLIENT_GONE:
             logger.debug("клиент закрыл соединение во время стрима")
             self.close_connection = True
             return False
@@ -936,17 +1078,22 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
             }
         )
 
-    def _send_sse_done(self) -> None:
-        """Терминальное событие ``data: [DONE]`` и конец chunked-тела."""
+    def _send_sse_done(self) -> bool:
+        """Терминальное событие ``data: [DONE]`` и конец chunked-тела.
+
+        ``False`` — клиент ушёл до ``[DONE]`` (запрос считается отменённым).
+        """
         if not self._write_sse(b"[DONE]"):
-            return
+            return False
         if self._sse_chunked:
             try:
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+            except _CLIENT_GONE:
                 logger.debug("клиент закрыл соединение до конца стрима")
                 self.close_connection = True
+                return False
+        return True
 
     # -- разбор запроса -------------------------------------------------------
 
@@ -1080,7 +1227,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
         return urlsplit(self.path).path or "/"
 
     def _allowed_methods(self, path: str) -> str | None:
-        if path in ("/health", "/v1/models"):
+        if path in ("/health", "/v1/models", "/metrics"):
             return "GET"
         if path == "/v1/chat/completions":
             return "POST"
@@ -1097,8 +1244,8 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
     def _send_not_found(self, path: str) -> None:
         self._send_error(
             404,
-            "Эндпоинт {} не найден. Доступны: GET /health, GET /v1/models, "
-            "POST /v1/chat/completions.".format(path),
+            "Эндпоинт {} не найден. Доступны: GET /health, GET /metrics, "
+            "GET /v1/models, POST /v1/chat/completions.".format(path),
             "not_found",
         )
 
@@ -1218,7 +1365,13 @@ def make_handler(router: Any) -> type[EvaRequestHandler]:
 
 
 class EvaHTTPServer(ThreadingHTTPServer):
-    """ThreadingHTTPServer с отметкой старта для ``/health``."""
+    """ThreadingHTTPServer с отметкой старта для ``/health`` и метриками.
+
+    ``clock`` — источник времени для латентности и TTFT (по умолчанию
+    ``time.monotonic``); ``metrics`` — накопитель ``eva.telemetry.Metrics``
+    (по умолчанию новый). Оба параметра инжектируются в тестах: фейковые часы
+    дают детерминированный TTFT, а свой накопитель — изолированные счётчики.
+    """
 
     daemon_threads = True
     allow_reuse_address = True
@@ -1230,10 +1383,14 @@ class EvaHTTPServer(ThreadingHTTPServer):
         *,
         router_name: str = "injected",
         access_guard: AccessGuard | None = None,
+        metrics: Any = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.router_name = router_name
         self.access_guard = access_guard
-        self.started_at = time.monotonic()
+        self.clock = clock if callable(clock) else time.monotonic
+        self.metrics = metrics if metrics is not None else Metrics()
+        self.started_at = self.clock()
         super().__init__(address, handler)
 
 
@@ -1251,6 +1408,8 @@ def create_server(
     *,
     auth_token: str | None = None,
     rate_limit_per_min: int | None = None,
+    metrics: Any = None,
+    clock: Callable[[], float] | None = None,
 ) -> EvaHTTPServer:
     """Создаёт (но не запускает) сервер; ``port=0`` — свободный порт.
 
@@ -1264,6 +1423,10 @@ def create_server(
     «взять из окружения», пустая строка и ``0`` — явно выключить проверку
     токена и лимит соответственно. Заданный токен включает требование
     ``Authorization: Bearer`` на всех путях, кроме ``GET /health``.
+
+    ``metrics`` — накопитель ``eva.telemetry.Metrics`` (по умолчанию новый);
+    ``clock`` — часы для латентности и TTFT (по умолчанию ``time.monotonic``).
+    Оба нужны тестам: подмена часов делает замеры детерминированными.
     """
     env_token, env_limit = _auth_settings()
     token = env_token if auth_token is None else auth_token.strip()
@@ -1278,6 +1441,8 @@ def create_server(
         make_handler(router),
         router_name="default" if router is None else "injected",
         access_guard=AccessGuard(token=token, rate_limit_per_min=limit),
+        metrics=metrics,
+        clock=clock,
     )
     bound_host, bound_port = server.server_address[:2]
     logger.info("eva-server слушает http://%s:%s", bound_host, bound_port)
