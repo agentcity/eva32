@@ -13,11 +13,16 @@
     result = client.chat([{"role": "user", "content": "привет"}])
     result.text, result.usage["cost_rub"], result.raw
 
+    for chunk in client.stream_chat([{"role": "user", "content": "привет"}]):
+        if chunk.text:
+            print(chunk.text, end="", flush=True)
+
 Устройство:
 
-* единственный сетевой вызов — `urllib.request.urlopen` внутри `_post_json`;
-  тесты подменяют `_post_json` (транспорт) или `_sleep` (пауза) — реальных
-  запросов и реальных задержек в тестах нет;
+* сетевые вызовы — `urllib.request.urlopen` внутри `_post_json` (для
+  `chat()`) и `_open_stream` (для `stream_chat()`); тесты подменяют
+  транспорт, `stream_transport` или `_sleep` — реальных запросов и реальных
+  задержек в тестах нет;
 * повторяются только таймаут, сетевые ошибки, `429` и `5xx`; пауза —
   экспоненциальный backoff (`backoff * 2**n`), для `429` уважается
   `Retry-After`;
@@ -30,6 +35,7 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import logging
 import socket
@@ -46,6 +52,8 @@ __all__ = [
     "ClientResult",
     "HTTPResponse",
     "OpenAIClient",
+    "StreamChunk",
+    "StreamResponse",
     "DEFAULT_BACKOFF",
     "DEFAULT_RETRIES",
     "DEFAULT_TIMEOUT",
@@ -117,6 +125,117 @@ def _post_json(
         return HTTPResponse(status=exc.code, body=payload or b"", headers=response_headers)
 
 
+@dataclass(frozen=True)
+class StreamChunk(Mapping[str, Any]):
+    """Один кусок потока от провайдера.
+
+    Успешный поток — последовательность кусков с непустым ``text``; последний
+    кусок всегда терминальный (``done=True``) и несёт ``usage``, даже если
+    провайдер его не прислал (тогда ``usage == {}``). ``raw`` — разобранный
+    JSON события, он нужен для отладки и телеметрии.
+    """
+
+    text: str = ""
+    usage: dict[str, Any] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
+    finish_reason: str | None = None
+    done: bool = False
+
+    _FIELDS = ("text", "usage", "raw", "finish_reason", "done")
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._FIELDS:
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(self._FIELDS)
+
+    def __len__(self) -> int:
+        return len(self._FIELDS)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "text": self.text,
+            "usage": dict(self.usage),
+            "raw": dict(self.raw),
+            "finish_reason": self.finish_reason,
+            "done": self.done,
+        }
+
+    def __repr__(self) -> str:
+        text = self.text if len(self.text) <= 40 else self.text[:37] + "…"
+        return (
+            f"StreamChunk(text={text!r}, finish_reason={self.finish_reason!r}, "
+            f"done={self.done}, usage={self.usage!r})"
+        )
+
+
+@dataclass
+class StreamResponse:
+    """Ответ транспорта на потоковый запрос.
+
+    ``body`` — файлоподобный объект с ``readline()`` и ``close()`` (у
+    ``urlopen`` это сам HTTP-ответ). ``status`` есть даже у ошибки: тело
+    ошибочного ответа приходит уже прочитанным в ``io.BytesIO``.
+    """
+
+    status: int
+    body: Any = None
+    headers: Mapping[str, str] = field(default_factory=dict)
+
+    def header(self, name: str, default: str | None = None) -> str | None:
+        target = name.lower()
+        for key, value in self.headers.items():
+            if str(key).lower() == target:
+                return value
+        return default
+
+    def close(self) -> None:
+        body = self.body
+        if body is not None:
+            try:
+                body.close()
+            except Exception:  # noqa: BLE001 - закрытие не должно ронять поток
+                pass
+
+
+def _open_stream(
+    url: str,
+    headers: Mapping[str, str],
+    body: bytes,
+    timeout: float,
+) -> StreamResponse:
+    """Транспорт потока: POST и чтение SSE по строкам без буферизации всего тела.
+
+    HTTP-ошибки не бросаются: тело читается ограниченно и отдаётся вместе со
+    статусом, чтобы ``stream_chat`` сам решил, повторять или нет.
+    """
+    request = urllib.request.Request(
+        url, data=body, headers=dict(headers), method="POST"
+    )
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = exc.read(MAX_ERROR_BODY * 8)
+        except Exception:  # noqa: BLE001 - тело ошибки не критично
+            payload = b""
+        response_headers = dict(exc.headers.items()) if exc.headers else {}
+        try:
+            exc.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return StreamResponse(
+            status=exc.code, body=io.BytesIO(payload or b""), headers=response_headers
+        )
+    return StreamResponse(
+        status=getattr(response, "status", 200),
+        body=response,
+        headers=dict(response.headers.items()),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Ошибки и результат
 # --------------------------------------------------------------------------- #
@@ -127,7 +246,7 @@ class ClientError(RuntimeError):
     Поля для вызывающего кода (роутер/политика):
 
     * `kind` — `"timeout"`, `"network"`, `"http"`, `"response"` (200, но
-      разобрать тело не удалось) или `"config"`;
+      разобрать тело не удалось), `"stream"` (поток оборвался) или `"config"`;
     * `status` — HTTP-код, если ошибка пришла от сервера, иначе `None`;
     * `attempts` — сколько попыток реально сделано (1…`retries + 1`);
     * `retryable` — была ли ошибка из класса повторяемых (даже если попытки
@@ -146,6 +265,7 @@ class ClientError(RuntimeError):
         attempts: int = 0,
         retryable: bool = False,
         detail: str | None = None,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -154,6 +274,7 @@ class ClientError(RuntimeError):
         self.attempts = attempts
         self.retryable = retryable
         self.detail = detail
+        self.retry_after = retry_after
 
     def __str__(self) -> str:
         return self.message
@@ -262,6 +383,61 @@ def _error_detail(body: bytes | str) -> str:
     return _collapse(text)
 
 
+def _close_quietly(obj: Any) -> None:
+    """Закрыть ответ/тело, не давая ошибке закрытия испортить поток."""
+    close = getattr(obj, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - закрытие не должно ронять поток
+            pass
+
+
+def _iter_lines(body: Any):
+    """Строки SSE из файлоподобного тела; ``readline`` — точка таймаута."""
+    if body is None:
+        return
+    while True:
+        line = body.readline()
+        if not line:
+            break
+        yield line
+
+
+def _decode_line(raw: Any) -> str:
+    """Байты/строка -> строка без завершающего перевода строки."""
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", "replace")
+    else:
+        text = str(raw)
+    return text.rstrip("\r\n")
+
+
+def _delta_text(choice: Mapping[str, Any]) -> str:
+    """Текст дельты из ``choices[0]`` (``delta.content`` или старый ``text``)."""
+    delta = choice.get("delta")
+    content: Any = None
+    if isinstance(delta, Mapping):
+        content = delta.get("content")
+    elif isinstance(delta, str):
+        content = delta
+    if content is None:
+        message = choice.get("message")
+        if isinstance(message, Mapping):
+            content = message.get("content")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        content = "".join(parts)
+    if isinstance(content, str):
+        return content
+    if isinstance(choice.get("text"), str):
+        return choice["text"]
+    return ""
+
+
 def _build_endpoint(base: str) -> str:
     """Собрать URL `/chat/completions`, не удваивая `/v1`.
 
@@ -350,7 +526,10 @@ class OpenAIClient:
     price_prompt_rub, price_completion_rub — рубли за 1000 токенов, если
     провайдер не отдаёт `cost_rub` своим полем;
     transport, sleep — точки подмены для тестов (по умолчанию `_post_json`
-    и `_sleep` модуля).
+    и `_sleep` модуля);
+    stream_transport — точка подмены для `stream_chat()` (по умолчанию
+    используется `transport`, если он задан, иначе `_open_stream`); нужна
+    потому, что поток читается по строкам, а не целиком.
 
     `repr` не печатает ключ.
     """
@@ -369,6 +548,7 @@ class OpenAIClient:
         price_completion_rub: float = 0.0,
         transport: Any = None,
         sleep: Any = None,
+        stream_transport: Any = None,
     ) -> None:
         if not isinstance(base, str):
             raise TypeError("base: нужна строка")
@@ -416,6 +596,7 @@ class OpenAIClient:
         self.endpoint = _build_endpoint(self.base)
         self._transport = transport
         self._sleep = sleep
+        self._stream_transport = stream_transport
 
     # -- публичное ---------------------------------------------------------- #
 
@@ -519,6 +700,79 @@ class OpenAIClient:
             "исчерпаны попытки", attempts=total_attempts, retryable=True
         )
 
+    def stream_chat(self, messages: Any, max_tokens: int = 512):
+        """Поток кусков ответа через SSE (``stream: true``).
+
+        Возвращает итератор :class:`StreamChunk`: куски с непустым ``text`` по
+        мере генерации, затем терминальный кусок (``done=True``) с ``usage``.
+        Если провайдер не прислал ``usage``, в терминальном куске ``{}`` —
+        вызывающий сам решает, как оценить токены.
+
+        Ошибки аргументов (``max_tokens``, ``messages``) — сразу, как у
+        :meth:`chat`; ошибки потока — исключениями :class:`ClientError` при
+        итерации: таймаут, сеть, HTTP-статус, некорректный JSON события и
+        обрыв потока без ``finish_reason``/``[DONE]``. Повторяется только
+        ошибка до первого куска: повторять поток, который уже отдал текст,
+        нельзя — клиент получил бы дубли. ``finally`` закрывает ответ
+        провайдера, поэтому закрытие итератора (клиент ушёл) не оставляет
+        висящих соединений.
+        """
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+            raise TypeError("max_tokens: нужно целое число")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens: должен быть больше нуля")
+
+        payload = {
+            "model": self.model,
+            "messages": _normalize_messages(messages),
+            "max_tokens": max_tokens,
+            "stream": True,
+            # Просим usage отдельным событием: без него цену в потоке не
+            # посчитать, а у некоторых провайдеров это единственный способ.
+            "stream_options": {"include_usage": True},
+        }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "User-Agent": USER_AGENT,
+        }
+        if self.key:
+            headers["Authorization"] = f"Bearer {self.key}"
+        return self._stream_chat(headers, body)
+
+    def _stream_chat(self, headers: Mapping[str, str], body: bytes):
+        """Итератор потока с повторами и закрытием; ошибки — ``ClientError``."""
+        transport = self._stream_transport or self._transport or _open_stream
+        sleep = self._sleep or _sleep
+        total_attempts = self.retries + 1
+        last_error: ClientError | None = None
+
+        for attempt in range(total_attempts):
+            attempts = attempt + 1
+            state = {"text": 0}
+            try:
+                yield from self._stream_once(transport, headers, body, state, attempts)
+                return
+            except ClientError as exc:
+                # Дубли текста недопустимы: после первого куска не повторяем.
+                if state["text"] or not exc.retryable or attempts >= total_attempts:
+                    raise
+                last_error = exc
+                delay = self._delay(attempt, exc.retry_after)
+                log.warning(
+                    "eva.clients: %s — повтор потока %d/%d через %.2f с",
+                    exc.message,
+                    attempts,
+                    total_attempts - 1,
+                    delay,
+                )
+                sleep(delay)
+
+        if last_error is not None:
+            raise last_error
+        raise self._fail("исчерпаны попытки", attempts=total_attempts, retryable=True)
+
     def __repr__(self) -> str:
         return (
             f"OpenAIClient(model={self.model!r}, base={self.base!r}, "
@@ -536,6 +790,7 @@ class OpenAIClient:
         retryable: bool,
         status: int | None = None,
         detail: str | None = None,
+        retry_after: float | None = None,
     ) -> ClientError:
         """Собрать `ClientError` с единым человеческим форматом."""
         total = self.retries + 1
@@ -551,6 +806,7 @@ class OpenAIClient:
             attempts=attempts,
             retryable=retryable,
             detail=self._redact(detail) if detail else None,
+            retry_after=retry_after,
         )
 
     def _label(self) -> str:
@@ -572,7 +828,10 @@ class OpenAIClient:
     @staticmethod
     def _retry_after(response: HTTPResponse) -> float | None:
         """`Retry-After` числом секунд; HTTP-дату игнорируем — возьмём backoff."""
-        raw = response.header("Retry-After")
+        header = getattr(response, "header", None)
+        if not callable(header):
+            return None
+        raw = header("Retry-After")
         if not raw:
             return None
         try:
@@ -642,6 +901,228 @@ class OpenAIClient:
         if not isinstance(content, str):
             content = ""
         return content.strip()
+
+    def _stream_once(
+        self,
+        transport: Any,
+        headers: Mapping[str, str],
+        body: bytes,
+        state: dict[str, int],
+        attempts: int,
+    ):
+        """Одна попытка потока: открыть, разобрать SSE, закрыть в ``finally``."""
+        try:
+            response = transport(self.endpoint, headers, body, self.timeout)
+        except (TimeoutError, socket.timeout) as exc:
+            raise self._fail(
+                f"таймаут {self.timeout:g} с",
+                kind="timeout",
+                attempts=attempts,
+                retryable=True,
+                detail=_collapse(str(exc)) or None,
+            ) from exc
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, TimeoutError):
+                text, kind = f"таймаут {self.timeout:g} с", "timeout"
+            elif isinstance(reason, socket.gaierror):
+                text, kind = f"DNS не разрешил хост: {reason}", "network"
+            else:
+                text, kind = f"сеть недоступна: {reason}", "network"
+            raise self._fail(
+                text, kind=kind, attempts=attempts, retryable=True
+            ) from exc
+        except OSError as exc:
+            raise self._fail(
+                f"ошибка сокета: {exc}",
+                kind="network",
+                attempts=attempts,
+                retryable=True,
+            ) from exc
+
+        stream_body: Any = None
+        try:
+            status = int(getattr(response, "status", 0) or 0)
+            # Подмена транспорта может вернуть уже прочитанное тело (HTTPResponse
+            # из chat()) — тогда разбираем его как обычный SSE-буфер.
+            stream_body = getattr(response, "body", None)
+            if isinstance(stream_body, (bytes, bytearray)):
+                stream_body = io.BytesIO(bytes(stream_body))
+            elif isinstance(stream_body, str):
+                stream_body = io.StringIO(stream_body)
+            elif stream_body is None and hasattr(response, "readline"):
+                stream_body = response
+            if not (200 <= status < 300):
+                detail = self._stream_error_detail(stream_body)
+                reason = http.client.responses.get(status, "")
+                head = f"HTTP {status}" + (f" {reason}" if reason else "")
+                message = f"{head}: {detail}" if detail else head
+                retryable = status == 429 or 500 <= status < 600
+                raise self._fail(
+                    message,
+                    kind="http",
+                    status=status,
+                    attempts=attempts,
+                    retryable=retryable,
+                    detail=detail or None,
+                    retry_after=self._retry_after(response),
+                )
+
+            usage: dict[str, Any] = {}
+            usage_seen = False
+            finish_reason: str | None = None
+            saw_done = False
+            saw_event = False
+
+            try:
+                for raw_line in _iter_lines(stream_body):
+                    line = _decode_line(raw_line)
+                    if not line:
+                        continue
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith(":"):
+                        continue
+                    field, _, value = stripped.partition(":")
+                    if field != "data":
+                        # id/event/retry SSE не нужны для chat.completions.
+                        continue
+                    value = value[1:] if value.startswith(" ") else value
+                    if value.strip() == "[DONE]":
+                        saw_done = True
+                        break
+                    if not value:
+                        continue
+                    saw_event = True
+                    data = self._parse_stream_event(value, status, attempts)
+                    if "usage" in data or "cost_rub" in data:
+                        usage = self._extract_usage(data)
+                        usage_seen = True
+
+                    choices = data.get("choices")
+                    if not isinstance(choices, list) or not choices:
+                        continue
+                    first = choices[0] if isinstance(choices[0], Mapping) else {}
+                    piece_finish = first.get("finish_reason")
+                    if piece_finish is not None:
+                        finish_reason = str(piece_finish)
+                    piece_text = _delta_text(first)
+                    if piece_text:
+                        state["text"] += 1
+                        yield StreamChunk(
+                            text=piece_text,
+                            raw=data,
+                            finish_reason=piece_finish
+                            if isinstance(piece_finish, str)
+                            else None,
+                        )
+            except (TimeoutError, socket.timeout) as exc:
+                raise self._fail(
+                    f"таймаут {self.timeout:g} с при чтении потока",
+                    kind="timeout",
+                    status=status,
+                    attempts=attempts,
+                    retryable=True,
+                    detail=_collapse(str(exc)) or None,
+                ) from exc
+            except (ConnectionResetError, BrokenPipeError, http.client.IncompleteRead) as exc:
+                raise self._fail(
+                    f"соединение оборвалось во время потока: {exc}",
+                    kind="stream",
+                    status=status,
+                    attempts=attempts,
+                    retryable=True,
+                ) from exc
+            except OSError as exc:
+                raise self._fail(
+                    f"ошибка сокета во время потока: {exc}",
+                    kind="network",
+                    status=status,
+                    attempts=attempts,
+                    retryable=True,
+                ) from exc
+
+            if not saw_done and finish_reason is None:
+                if not saw_event:
+                    raise self._fail(
+                        "поток пуст: провайдер не прислал ни одного события",
+                        kind="stream",
+                        status=status,
+                        attempts=attempts,
+                        retryable=True,
+                    )
+                raise self._fail(
+                    "поток оборвался: соединение закрыто без finish_reason и [DONE]",
+                    kind="stream",
+                    status=status,
+                    attempts=attempts,
+                    retryable=True,
+                )
+
+            yield StreamChunk(
+                text="",
+                usage=usage if usage_seen else {},
+                finish_reason=finish_reason,
+                done=True,
+            )
+        finally:
+            _close_quietly(stream_body)
+            if response is not stream_body:
+                _close_quietly(response)
+
+    def _parse_stream_event(
+        self, value: str, status: int, attempts: int
+    ) -> dict[str, Any]:
+        """JSON одного SSE-события; мусор и ошибка провайдера — ``ClientError``."""
+        try:
+            data = json.loads(value)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise self._fail(
+                f"поток: некорректный JSON события: {exc}",
+                kind="response",
+                status=status,
+                attempts=attempts,
+                retryable=False,
+                detail=_collapse(value),
+            ) from exc
+        if not isinstance(data, dict):
+            raise self._fail(
+                "поток: событие не объект JSON",
+                kind="response",
+                status=status,
+                attempts=attempts,
+                retryable=False,
+                detail=_collapse(value),
+            )
+        if data.get("error") is not None:
+            detail = _error_detail(value)
+            raise self._fail(
+                f"провайдер вернул ошибку в потоке: {detail}" if detail else
+                "провайдер вернул ошибку в потоке",
+                kind="response",
+                status=status,
+                attempts=attempts,
+                retryable=False,
+                detail=detail or None,
+            )
+        return data
+
+    @staticmethod
+    def _stream_error_detail(body: Any) -> str:
+        """Выжимка тела ошибочного потокового ответа (тело уже ограничено)."""
+        if body is None:
+            return ""
+        try:
+            if isinstance(body, (bytes, bytearray)):
+                payload: Any = bytes(body)
+            elif hasattr(body, "read"):
+                payload = body.read(MAX_ERROR_BODY * 8)
+            else:
+                payload = body
+        except Exception:  # noqa: BLE001 - тело ошибки не критично
+            return ""
+        if isinstance(payload, bytes):
+            return _error_detail(payload)
+        return _error_detail(str(payload or ""))
 
     def _extract_usage(self, data: Mapping[str, Any]) -> dict[str, Any]:
         source = data.get("usage")

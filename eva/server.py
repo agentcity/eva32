@@ -15,7 +15,11 @@
 ``data: {...}\\n\\n`` с ``choices[0].delta.content`` и финальный ``data: [DONE]``.
 Если у инжектированного маршрутизатора есть метод ``stream(request)`` — ответ
 уходит по частям по мере генерации; если нет — готовый ответ приходит одним
-чанком (без имитации стриминга). Ошибки до первого чанка — обычный JSON.
+чанком (без имитации стриминга). Боевая связка (``router=None``) стримит через
+``eva.router.stream(req, cfg, deps)``: скилл отдаёт один кусок, модель — поток
+от клиента, финальный кусок несёт маршрут и цену. Ошибки до первого чанка —
+обычный JSON; обрыв потока после первого чанка — событие ``error`` и
+``[DONE]``, сервер продолжает работать.
 
 Ошибки клиента — 4xx с человеческим текстом, ошибка маршрутизатора — 500 с
 человеческим текстом и идентификатором запроса; трейсбек уходит в лог сервера
@@ -50,6 +54,7 @@ __all__ = [
     "chat_chunk",
     "create_server",
     "default_router",
+    "default_stream_router",
     "make_handler",
     "reply_to_openai",
     "version",
@@ -278,6 +283,27 @@ def default_router(request: Any) -> Any:
     return answer(request, _load_config(), None)
 
 
+def default_stream_router(request: Any) -> Any:
+    """Боевая потоковая связка ``eva.router.stream(req, cfg, deps)``.
+
+    Отдельная функция, а не атрибут :func:`default_router`: ``as_router``
+    превращает объект с ``answer``/``stream`` в связанный метод и теряет
+    второй атрибут. Собирается лениво, как и ``default_router``: ``/health``
+    и обычный ответ не должны зависеть от готовности потока.
+    """
+    try:
+        from .router import stream
+    except ImportError as exc:
+        raise RuntimeError(
+            "потоковый маршрутизатор eva.router не собран: запустите сервер с "
+            "router=... или --router МОДУЛЬ:ФАБРИКА"
+        ) from exc
+
+    if not callable(stream):
+        raise RuntimeError("в eva.router нет функции stream(req, cfg, deps)")
+    return stream(request, _load_config(), None)
+
+
 # --------------------------------------------------------------------------- #
 # Перевод Answer в ответ OpenAI
 # --------------------------------------------------------------------------- #
@@ -497,6 +523,16 @@ def _coerce_stream_piece(item: Any) -> tuple[str, Any]:
     raise TypeError(
         "кусок потока должен быть строкой или объектом с текстом: {!r}".format(item)
     )
+
+
+def _close_iterator(iterator: Any) -> None:
+    """Закрыть поток роутера, если он это умеет; ошибки закрытия не важны."""
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - закрытие не должно ронять сервер
+            logger.debug("ошибка закрытия потока", exc_info=True)
 
 
 class EvaRequestHandler(BaseHTTPRequestHandler):
@@ -743,6 +779,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                 else:
                     first_text, first_meta = _coerce_stream_piece(first)
         except Exception:  # noqa: BLE001 - до первого чанка ещё можно ответить JSON
+            _close_iterator(iterator)
             logger.exception("ошибка обработки запроса %s", request_id)
             self._send_internal_error(request_id)
             return
@@ -827,6 +864,10 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
             logger.exception("ошибка потока %s", request_id)
             if self._send_sse_error(request_id):
                 self._send_sse_done()
+        finally:
+            # Клиент мог уйти или поток оборваться: закрываем генератор
+            # роутера, чтобы клиент провайдера не висел до сборки мусора.
+            _close_iterator(iterator)
 
     # -- SSE ------------------------------------------------------------------
 
@@ -1153,10 +1194,16 @@ def make_handler(router: Any) -> type[EvaRequestHandler]:
 
     ``router`` передаётся как есть: из него берётся и ``answer`` (через
     :func:`as_router`), и необязательный ``stream`` (через
-    :func:`as_stream_router`).
+    :func:`as_stream_router`). ``router=None`` — боевая связка: ``answer`` и
+    ``stream`` берутся из ``eva.router`` раздельно, потому что это две
+    функции модуля, а не методы одного объекта.
     """
-    router_impl = as_router(router)
-    stream_impl = as_stream_router(router)
+    if router is None:
+        router_impl: Any = default_router
+        stream_impl: Any = default_stream_router
+    else:
+        router_impl = as_router(router)
+        stream_impl = as_stream_router(router)
 
     class BoundHandler(EvaRequestHandler):
         _router = staticmethod(router_impl)

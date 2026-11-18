@@ -352,7 +352,7 @@
   {
     "id": "0048",
     "title": "Стриминг в роутере гибрида",
-    "status": "in_progress",
+    "status": "done",
     "file": "0048-eva-stream-router.md",
     "assignee": "agent:eva-stream-router"
   },

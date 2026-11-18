@@ -4,14 +4,16 @@
 
     decide(req, cfg) -> Route
     answer(req, cfg, deps) -> Answer
+    stream(req, cfg, deps) -> Iterator[StreamChunk]
 
 ``deps`` — необязательные подмены зависимостей (в тестах и на сервере)::
 
     {
       "skills":      callable(text, ctx) -> SkillResult|None,
       "classifier":  callable(text, cfg) -> Route,
-      "small":       клиент с .chat(messages, max_tokens=...),
-      "big":         клиент с .chat(messages, max_tokens=...),
+      "small":       клиент с .chat(messages, max_tokens=...)
+                     и необязательным .stream_chat(messages, max_tokens=...),
+      "big":         то же для большой модели,
       # алиасы: try_skills / classify / small_client / big_client,
       #         либо "clients": {"small": ..., "big": ...}
       # контекст каталога (RAG): callable(text, catalog) -> RagContext|str|None
@@ -31,14 +33,15 @@ from __future__ import annotations
 
 import inspect
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 from . import policy
 from .config import Config
 from .types import Answer, Message, Request, Route
 
-__all__ = ["answer", "decide"]
+__all__ = ["StreamChunk", "answer", "decide", "stream"]
 
 _MODEL_KINDS = ("small", "big")
 _SKILL_ALIASES = ("skills", "try_skills", "skill")
@@ -52,6 +55,54 @@ _RAG_ALIASES = ("rag", "retrieve")
 _SKILLS_FN: Any | None = None
 _CLASSIFIER_FN: Any | None = None
 _RAG_FN: Any | None = None
+
+
+@dataclass(frozen=True)
+class StreamChunk(Mapping[str, Any]):
+    """Один кусок потока ``router.stream``.
+
+    * ``done=False`` — текст ответа (для модели — дельта от клиента;
+      ``route`` пуст, потому что маршрут ещё не объявлен клиенту);
+    * ``done=True`` — финальный чанк: ``route``, ``skill``, ``usage``,
+      ``cost_rub`` и ``latency_ms``. У скилла это единственный чанк: ответ
+      детерминирован, дробить его незачем.
+
+    Форма совместима с сервером: у чанка есть ``text`` и (у финального)
+    ``route`` — по ним ``eva.server`` собирает ``delta.content`` и ``eva``.
+    Читается и как объект (``chunk.text``), и как словарь (``chunk["text"]``).
+    """
+
+    text: str = ""
+    route: Route | None = None
+    skill: str | None = None
+    usage: dict[str, Any] = field(default_factory=dict)
+    cost_rub: float = 0.0
+    latency_ms: int = 0
+    done: bool = False
+
+    _FIELDS = ("text", "route", "skill", "usage", "cost_rub", "latency_ms", "done")
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._FIELDS:
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def __iter__(self):
+        return iter(self._FIELDS)
+
+    def __len__(self) -> int:
+        return len(self._FIELDS)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "text": self.text,
+            "route": self.route.to_dict() if self.route is not None else None,
+            "skill": self.skill,
+            "usage": dict(self.usage),
+            "cost_rub": self.cost_rub,
+            "latency_ms": self.latency_ms,
+            "done": self.done,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -82,6 +133,41 @@ def answer(req: Request, cfg: Config, deps: Mapping[str, Any] | Any | None = Non
         )
 
     return _answer_with_models(req, cfg, deps, route, started)
+
+
+def stream(
+    req: Request,
+    cfg: Config,
+    deps: Mapping[str, Any] | Any | None = None,
+) -> Iterator[StreamChunk]:
+    """Ответить на запрос потоком кусков :class:`StreamChunk`.
+
+    Порядок: решение о маршруте → текст (скилл отдаёт один кусок целиком,
+    модель — куски из ``client.stream_chat``) → финальный чанк с ``route``,
+    ``usage`` и ``cost_rub``. Для скилла единственный кусок уже финальный:
+    цена 0, модели не вызываются.
+
+    Ошибка модели/клиента после первого отданного куска пробрасывается
+    вызывающему (сервер превращает её в событие ``error``): повторять поток
+    нельзя, клиент получил бы дубли текста. До первого куска работают те же
+    фолбэки, что и в :func:`answer` (small→big / big→small на 429 и бюджет).
+    """
+    started = time.perf_counter()
+
+    route, skill_result = _decide(req, cfg, deps)
+    if route.kind == "skill":
+        yield StreamChunk(
+            text=_skill_text(skill_result),
+            route=route,
+            skill=_skill_name(skill_result),
+            usage={"prompt_tokens": 0, "completion_tokens": 0, "cost_rub": 0.0},
+            cost_rub=0.0,
+            latency_ms=_elapsed_ms(started),
+            done=True,
+        )
+        return
+
+    yield from _stream_with_models(req, cfg, deps, route, started)
 
 
 # --------------------------------------------------------------------------- #
@@ -342,6 +428,237 @@ def _answer_with_models(
         f"неизвестный маршрут {route.kind!r}: ожидался skill/small/big",
         route_kind=route.kind,
     )
+
+
+# --------------------------------------------------------------------------- #
+# поток через модели
+# --------------------------------------------------------------------------- #
+def _stream_with_models(
+    req: Request,
+    cfg: Config,
+    deps: Mapping[str, Any] | Any | None,
+    route: Route,
+    started: float,
+) -> Iterator[StreamChunk]:
+    """Генератор кусков модели: бюджет, фолбэки и цена — как в :func:`answer`.
+
+    Фолбэк допустим только пока не отдан ни один кусок текста: после первого
+    куска повтор другой моделью дал бы клиенту два разных ответа подряд.
+    """
+    budget = policy.Budget.from_config(cfg)
+    messages = _messages_with_context(req, deps)
+    prompt_text = _prompt_text(req, messages)
+    clients: dict[str, Any | None] = {}
+
+    def client_for(kind: str) -> Any | None:
+        if kind not in clients:
+            clients[kind] = _resolve_client(kind, cfg, deps)
+        return clients[kind]
+
+    kind = route.kind
+    attempted: list[str] = []
+
+    while kind in _MODEL_KINDS:
+        attempted.append(kind)
+        client = client_for(kind)
+
+        if client is None:
+            target = _fallback_if_available(
+                target=policy.fallback_target(kind, policy.ERROR),
+                budget=budget,
+                cfg=cfg,
+                prompt_text=prompt_text,
+                attempted=attempted,
+                client_for=client_for,
+            )
+            if target is not None:
+                route = Route(
+                    kind=target,
+                    reason=policy.fallback_reason(
+                        kind, target, policy.ERROR, f"клиент {kind} не настроен"
+                    ),
+                    confidence=0.5,
+                )
+                kind = target
+                continue
+            raise policy.ModelUnavailable(
+                f"маршрут {route.kind}: модель не настроена и фолбэк недоступен",
+                route_kind=route.kind,
+            )
+
+        estimate = policy.estimate_request_cost(cfg, kind, prompt_text, cfg.max_tokens_for(kind))
+        if not budget.can_afford(estimate):
+            target = None
+            if kind == "big" and "small" not in attempted and client_for("small") is not None:
+                small_estimate = policy.estimate_request_cost(
+                    cfg, "small", prompt_text, cfg.max_tokens_for("small")
+                )
+                if budget.can_afford(small_estimate):
+                    target = "small"
+            if target is not None:
+                route = Route(
+                    kind=target,
+                    reason=policy.budget_downgrade_reason(route.reason, estimate, cfg.max_cost_rub),
+                    confidence=0.5,
+                )
+                kind = target
+                continue
+            budget.check(estimate, route_kind=kind)  # всегда бросает BudgetExceeded
+
+        produced = 0
+        completion_parts: list[str] = []
+        usage_raw: Any = None
+
+        try:
+            for piece in _client_stream(client, messages, cfg.max_tokens_for(kind)):
+                piece_usage = _stream_piece_usage(piece)
+                if piece_usage is not None:
+                    usage_raw = piece_usage
+                text = _stream_piece_text(piece)
+                if not text:
+                    continue
+                produced += 1
+                completion_parts.append(text)
+                yield StreamChunk(text=text)
+        except Exception as exc:  # noqa: BLE001 — политика решает, что делать
+            if produced:
+                # Часть ответа уже у клиента: откат невозможен, только ошибка.
+                raise
+            cause = policy.error_kind(exc)
+            target = _fallback_if_available(
+                target=policy.fallback_target(kind, cause),
+                budget=budget,
+                cfg=cfg,
+                prompt_text=prompt_text,
+                attempted=attempted,
+                client_for=client_for,
+            )
+            if target is not None:
+                route = Route(
+                    kind=target,
+                    reason=(
+                        f"{route.reason}; {policy.fallback_reason(kind, target, cause, str(exc))}"
+                        if route.reason
+                        else policy.fallback_reason(kind, target, cause, str(exc))
+                    ),
+                    confidence=0.5,
+                )
+                kind = target
+                continue
+            raise
+
+        completion_text = "".join(completion_parts)
+        usage = _stream_usage(usage_raw, cfg, kind, prompt_text, completion_text)
+        cost = float(usage["cost_rub"])
+        budget.charge(cost)
+        reason = route.reason
+        if budget.limited and cost > float(budget.max_cost_rub or 0.0) + 1e-9:
+            reason += (
+                f"; фактическая цена {cost:.4f} ₽ превысила бюджет "
+                f"{float(budget.max_cost_rub or 0.0):.4f} ₽ (оценка была ниже)"
+            )
+        yield StreamChunk(
+            text="",
+            route=Route(kind=kind, reason=reason, confidence=route.confidence),
+            usage=usage,
+            cost_rub=cost,
+            latency_ms=_elapsed_ms(started),
+            done=True,
+        )
+        return
+
+    raise policy.ModelUnavailable(
+        f"неизвестный маршрут {route.kind!r}: ожидался skill/small/big",
+        route_kind=route.kind,
+    )
+
+
+def _client_stream(client: Any, messages: list[Message], max_tokens: int):
+    """Поток от клиента: ``stream_chat``, иначе один кусок из ``chat``.
+
+    Запасной путь нужен подменам в тестах и старым клиентам: серверу всё
+    равно, одним куском ответили или многими, а формат событий тот же.
+    """
+    stream_fn = getattr(client, "stream_chat", None)
+    if callable(stream_fn):
+        return stream_fn(list(messages), max_tokens=max_tokens)
+    return iter((client.chat(list(messages), max_tokens=max_tokens),))
+
+
+def _stream_piece_text(piece: Any) -> str:
+    """Текст куска клиента: строка, объект/словарь ``text`` или ``delta``."""
+    if isinstance(piece, str):
+        return piece
+    if isinstance(piece, bytes):
+        return piece.decode("utf-8", "replace")
+    if isinstance(piece, Mapping):
+        text = piece.get("text")
+        if isinstance(text, str):
+            return text
+        delta = piece.get("delta")
+        if isinstance(delta, str):
+            return delta
+        if isinstance(delta, Mapping) and isinstance(delta.get("content"), str):
+            return str(delta["content"])
+        content = piece.get("content")
+        if isinstance(content, str):
+            return content
+        return ""
+    text = getattr(piece, "text", None)
+    if isinstance(text, str):
+        return text
+    delta = getattr(piece, "delta", None)
+    if isinstance(delta, str):
+        return delta
+    return ""
+
+
+def _stream_piece_usage(piece: Any) -> dict[str, Any] | None:
+    """``usage`` куска клиента; пустой словарь — «провайдер промолчал»."""
+    if isinstance(piece, Mapping):
+        usage = piece.get("usage")
+    else:
+        usage = getattr(piece, "usage", None)
+    if isinstance(usage, Mapping) and usage:
+        return dict(usage)
+    return None
+
+
+def _stream_usage(
+    raw: Any,
+    cfg: Config,
+    kind: str,
+    prompt_text: str,
+    completion_text: str,
+) -> dict[str, Any]:
+    """Итоговый ``usage`` потока: данные провайдера, иначе локальная оценка.
+
+    Провайдер отдал токены/цену — используем их (цена провайдера важнее
+    тарифа). Не отдал ничего — оцениваем токены по длине prompt и уже
+    сгенерированного текста и считаем цену по тарифу ``cfg``. Так в потоке
+    цена есть всегда, а не только у провайдеров с ``include_usage``.
+    """
+    if isinstance(raw, Mapping) and raw:
+        usage = _normalize_usage(raw, cfg, kind)
+        if not usage["prompt_tokens"] and not usage["completion_tokens"] and not usage["cost_rub"]:
+            return _estimated_stream_usage(cfg, kind, prompt_text, completion_text)
+        return usage
+    return _estimated_stream_usage(cfg, kind, prompt_text, completion_text)
+
+
+def _estimated_stream_usage(
+    cfg: Config, kind: str, prompt_text: str, completion_text: str
+) -> dict[str, Any]:
+    prompt_tokens = policy.estimate_tokens(prompt_text) if (prompt_text or "").strip() else 0
+    completion_tokens = (
+        policy.estimate_tokens(completion_text) if (completion_text or "").strip() else 0
+    )
+    cost = cfg.estimate_cost(kind, prompt_tokens, completion_tokens)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cost_rub": round(float(cost), 6),
+    }
 
 
 def _fallback_if_available(
