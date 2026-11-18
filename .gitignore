@@ -271,3 +271,4 @@ src/vtm/test_vtm_session
 # локальные python-пакеты (torch/transformers для CPU-обучения)
 .pylibs/
 runs/
+*.dSYM/
