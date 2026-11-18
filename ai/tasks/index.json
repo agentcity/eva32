@@ -243,5 +243,40 @@
     "status": "in_progress",
     "file": "0035-container-v02.md",
     "assignee": "agent:container-v02"
+  },
+  {
+    "id": "0036",
+    "title": "Раннер эксперимента с эмбеддингами",
+    "status": "in_progress",
+    "file": "0036-emb-experiment.md",
+    "assignee": "agent:emb-experiment"
+  },
+  {
+    "id": "0037",
+    "title": "Рунбук аренды GPU под эксперимент",
+    "status": "in_progress",
+    "file": "0037-rental-runbook.md",
+    "assignee": "agent:rental-runbook"
+  },
+  {
+    "id": "0038",
+    "title": "Промпт: перевод по прямой просьбе",
+    "status": "in_progress",
+    "file": "0038-prompt-translate.md",
+    "assignee": "agent:prompt-translate"
+  },
+  {
+    "id": "0039",
+    "title": "Голос: синтез по предложениям",
+    "status": "in_progress",
+    "file": "0039-voice-stream.md",
+    "assignee": "agent:voice-stream"
+  },
+  {
+    "id": "0040",
+    "title": "ВТМ: текстовый прогон через токенизатор",
+    "status": "in_progress",
+    "file": "0040-vtm-text.md",
+    "assignee": "agent:vtm-text"
   }
 ]
