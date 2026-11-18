@@ -43,6 +43,10 @@ class QuantConfig:
     scale_dtype: str = "float16"
     target_suffixes: tuple[str, ...] = field(default=DEFAULT_TARGET_SUFFIXES)
     exclude_suffixes: tuple[str, ...] = field(default=DEFAULT_EXCLUDE_SUFFIXES)
+    # Эмбеддинги отдельным решением: "none" (fp16/fp32), "int8" или "trit".
+    # Задача 0027: у 1.5B таблица словаря — половина модели, но при tied-весах это
+    # ещё и выходной слой, поэтому триты могут ударить по логитам.
+    quantize_embeddings: str = "none"
 
 
 @dataclass

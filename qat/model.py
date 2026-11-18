@@ -41,6 +41,69 @@ class TernaryWeight(nn.Module):
         return f"block_size={self.block_size}"
 
 
+class TernaryEmbedding(nn.Module):
+    """Параметризация ``Embedding.weight``: таблица словаря тоже троичная.
+
+    Масштаб считается по последней оси (hidden), поэтому блок режется вдоль него.
+    Так же работает int8-вариант — через отдельный класс ниже.
+    """
+
+    def __init__(self, block_size: int = BLOCK_SIZE) -> None:
+        super().__init__()
+        self.block_size = block_size
+
+    def forward(self, weight: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            w_tern = ternary_weight_torch(weight, self.block_size).detach()
+        w_tern = w_tern.to(weight.dtype)
+        return weight + (w_tern - weight).detach()
+
+    def extra_repr(self) -> str:
+        return f"block_size={self.block_size}"
+
+
+class Int8Embedding(nn.Module):
+    """Параметризация ``Embedding.weight``: 8-битная таблица с масштабом на блок."""
+
+    def __init__(self, block_size: int = BLOCK_SIZE) -> None:
+        super().__init__()
+        self.block_size = block_size
+
+    def forward(self, weight: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            blocks = weight.reshape(-1, self.block_size) if weight.numel() % self.block_size == 0 else None
+            if blocks is None:
+                scale = weight.detach().abs().max().clamp_min(1e-8) / 127.0
+                w_q = (weight.detach() / scale).round().clamp(-127, 127) * scale
+            else:
+                scale = blocks.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / 127.0
+                w_q = ((blocks / scale).round().clamp(-127, 127) * scale).reshape(weight.shape)
+        w_q = w_q.to(weight.dtype)
+        return weight + (w_q - weight).detach()
+
+    def extra_repr(self) -> str:
+        return f"block_size={self.block_size}"
+
+
+def apply_embedding_quant(model: nn.Module, quant: QuantConfig) -> dict[str, Any] | None:
+    """Троичные или int8 эмбеддинги — по `quant.quantize_embeddings`."""
+    mode = (quant.quantize_embeddings or "none").lower()
+    if mode == "none":
+        return None
+    if mode not in {"trit", "int8"}:
+        raise ValueError(f"quantize_embeddings: неизвестный режим {mode!r}")
+    target = None
+    for name, module in model.named_modules():
+        if name.endswith("embed_tokens") and isinstance(module, nn.Embedding):
+            target = (name, module)
+    if target is None:
+        raise ValueError("в модели не найден слой embed_tokens для квантования эмбеддингов")
+    name, module = target
+    wrapper = TernaryEmbedding(quant.block_size) if mode == "trit" else Int8Embedding(quant.block_size)
+    register_parametrization(module, "weight", wrapper)
+    return {"name": name, "mode": mode, "block_size": quant.block_size}
+
+
 def resolve_device(name: str) -> torch.device:
     """auto -> cuda, иначе mps/cpu; явное имя проверяется на доступность."""
     if name == "auto":

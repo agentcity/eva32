@@ -32,6 +32,11 @@ quant:
   target_suffixes: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
   # Защита от случайного квантования выхода, эмбеддингов и роутеров MoE.
   exclude_suffixes: [lm_head, embed_tokens, router, gate, norm]
+  # Эмбеддинги — отдельное решение (задача 0027). У 1.5B таблица словаря это
+  # половина модели, но при tie_word_embeddings она же выходной слой, поэтому
+  # триты могут ударить по логитам. Режимы: none | int8 | trit.
+  # Эксперимент: три прогона по этому полю, сравнение на eval.
+  quantize_embeddings: none
 
 data:
   # Путь относительно корня репозитория (или абсолютный).

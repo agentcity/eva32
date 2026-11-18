@@ -184,7 +184,7 @@
   {
     "id": "0027",
     "title": "Эксперимент: эмбеддинги в тритах против int8",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0027-trit-embeddings.md",
     "assignee": ""
   },

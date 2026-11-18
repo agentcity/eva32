@@ -335,7 +335,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         DataError, PairDataset, PairStream, RandomTokenStream, data_fingerprint, load_pairs,
     )
     from .model import (  # noqa: PLC0415
-        apply_ternary, build_optimizer, load_model, load_tokenizer, logits_keep_arg, lr_at,
+        apply_embedding_quant, apply_ternary, build_optimizer, load_model, load_tokenizer,
+        logits_keep_arg, lr_at,
         print_model_report, resolve_device,
     )
 
@@ -419,6 +420,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     tokenizer = load_tokenizer(cfg)
     model = load_model(cfg, device)
     ternary_report = apply_ternary(model, cfg.quant)
+    embeddings_report = apply_embedding_quant(model, cfg.quant)
+    if embeddings_report:
+        print(f"[qat] эмбеддинги: {embeddings_report['mode']}, "
+              f"блок {embeddings_report['block_size']} ({embeddings_report['name']})")
     counts = print_model_report(model, ternary_report, device)
     vocab_size = int(getattr(model.config, "vocab_size", len(tokenizer)))
 

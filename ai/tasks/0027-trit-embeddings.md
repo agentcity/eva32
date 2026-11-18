@@ -5,7 +5,7 @@ title: Эксперимент: эмбеддинги в тритах против
 created_at: 2026-11-18T05:20:00Z
 author: yuri
 assignee: ""
-status: pending
+status: in_progress
 scope:
   docs: false
   code: true
@@ -48,7 +48,15 @@ f16, а не триты).
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+**Этап 1 (код, без GPU) — сделан:**
+- `QuantConfig.quantize_embeddings: none | int8 | trit` (по умолчанию none);
+- `TernaryEmbedding` и `Int8Embedding` как параметризации `Embedding.weight` со STE;
+- `apply_embedding_quant(model, quant)` подключается в `qat/train.py` рядом с `apply_ternary`
+  и печатает выбранный режим;
+- флаг в `qat/configs/qwen1.5b.yaml` с объяснением, почему эмбеддинги — отдельное решение;
+- 5 тестов (конфиг + отказ на неизвестный режим; torch-путь пропускается без torch).
+
+**Этап 2 (нужен GPU):** три прогона 1.5B (none / int8 / trit) и сравнение на eval.
 
 ## Ссылки
 
