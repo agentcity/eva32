@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Замер гибридного маршрутизатора без сети, ключей и денег.
 
-Прогоняет ``eval/hybrid_golden.jsonl`` через настоящий ``eva.router.answer``,
+Прогоняет ``eval/golden_catalog.jsonl`` через настоящий ``eva.router.answer``,
 подменив клиентов моделей заглушками: ни один HTTP-запрос не выполняется.
 Считает три вещи, ради которых гибрид и нужен:
 
@@ -66,7 +66,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-GOLDEN = os.path.join(ROOT, "eval", "hybrid_golden.jsonl")
+# Каталог и прайс — регрессия RAG/скиллов, а не golden компетенций.
+GOLDEN = os.path.join(ROOT, "eval", "golden_catalog.jsonl")
 SYSTEM_PROMPT = os.path.join(ROOT, "prompts", "system.ru.md")
 CATALOG = os.path.join(ROOT, "data", "catalog.json")
 

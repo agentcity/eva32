@@ -810,5 +810,12 @@
     "status": "pending",
     "file": "0122-batched-simd.md",
     "assignee": ""
+  },
+  {
+    "id": "0124",
+    "title": "Golden компетенций отдельно от прайса",
+    "status": "done",
+    "file": "0124-golden-competence.md",
+    "assignee": "architect"
   }
 ]

@@ -142,15 +142,29 @@ class TestClassBreakdownMetrics(unittest.TestCase):
                 self.assertGreater(classes[name]["count"], 0)
 
     def test_model_rows_are_counted(self):
-        classes = self.metrics["classes"]
+        # Golden каталога — это регрессия скиллов/RAG, поэтому вопросов «малой модели»
+        # там может не быть. Проверяем механику на синтетических строках: отчёт обязан
+        # посчитать модельные строки, если они есть.
+        import json
+        import tempfile
+
+        rows = [
+            {"question": "Привет!", "expect_route": "small"},
+            {"question": "Сравни PostgreSQL и SQLite.", "expect_route": "big"},
+            {"question": "Сколько стоит тариф «Старт»?", "expect_route": "skill"},
+        ]
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False,
+                                         encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            path = fh.name
+        metrics = eval_hybrid.evaluate(eval_hybrid.load_golden(path),
+                                       eval_hybrid.load_eval_config())
+        classes = metrics["classes"]
         self.assertIn("small", classes)
         self.assertIn("big", classes)
-        self.assertEqual(
-            classes["small"]["count"], len(self.metrics["model_questions"]["small"])
-        )
-        self.assertEqual(
-            classes["big"]["count"], len(self.metrics["model_questions"]["big"])
-        )
+        self.assertEqual(classes["small"]["count"], len(metrics["model_questions"]["small"]))
+        self.assertEqual(classes["big"]["count"], len(metrics["model_questions"]["big"]))
 
     def test_skill_hits_and_unused(self):
         hits = self.metrics["skill_hits"]
