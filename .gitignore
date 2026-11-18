@@ -252,3 +252,6 @@ src/vtm/vtm
 src/vtm/vtm-tok
 src/vtm/test_vtm
 src/vtm/test_tokenizer
+
+# Логи гибрида (телеметрия)
+logs/
