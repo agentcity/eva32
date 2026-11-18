@@ -436,7 +436,7 @@
   {
     "id": "0068",
     "title": "Волна 1: CLI — текстовые стопы, лимиты, таймаут",
-    "status": "in_progress",
+    "status": "done",
     "file": "0068-vtm-cli-limits.md",
     "assignee": "agent:vtm-cli-limits"
   },

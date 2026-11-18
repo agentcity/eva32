@@ -2581,9 +2581,9 @@ static void test_cli_chat(void) {
 
 // Собрать модель-цепочку, прогнать CLI и вернуть его код возврата.
 // out/err — stdout/stderr процесса; stream != 0 — добавить --stream.
-static int stream_cli_run(const int *chain, int n_chain, int max_new,
-                          int stream, char *out, size_t out_cap,
-                          char *err, size_t err_cap) {
+static int chain_cli_run(const int *chain, int n_chain, int max_new,
+                         int stream, const char *extra, char *out,
+                         size_t out_cap, char *err, size_t err_cap) {
     static const char *const cli_paths[] = {
         "./vtm", "src/vtm/vtm", "../../src/vtm/vtm", NULL
     };
@@ -2604,6 +2604,7 @@ static int stream_cli_run(const int *chain, int n_chain, int max_new,
     uint8_t *img = NULL;
     size_t size = 0;
     char model_path[160], out_path[160], err_path[160], cmd[2048];
+    char max_arg[64];
     const char *cli;
     const char *fixture;
     long stamp = (long)time(NULL);
@@ -2664,11 +2665,15 @@ static int stream_cli_run(const int *chain, int n_chain, int max_new,
     fwrite(img, 1, size, f);
     fclose(f);
 
+    if (max_new >= 0)
+        snprintf(max_arg, sizeof max_arg, "--max-new %d", max_new);
+    else
+        max_arg[0] = '\0';
     snprintf(cmd, sizeof cmd,
-             "%s run %s --text hello --tokenizer %s%s --max-new %d "
+             "%s run %s --text hello --tokenizer %s%s %s %s "
              "> %s 2> %s",
-             cli, model_path, fixture, stream ? " --stream" : "", max_new,
-             out_path, err_path);
+             cli, model_path, fixture, stream ? " --stream" : "", max_arg,
+             extra ? extra : "", out_path, err_path);
     rc = system(cmd);
     read_text_file(out_path, out, out_cap);
     read_text_file(err_path, err, err_cap);
@@ -2679,6 +2684,13 @@ static int stream_cli_run(const int *chain, int n_chain, int max_new,
     free(img);
     model_free(&md);
     return cli_exit_code(rc);
+}
+
+static int stream_cli_run(const int *chain, int n_chain, int max_new,
+                          int stream, char *out, size_t out_cap,
+                          char *err, size_t err_cap) {
+    return chain_cli_run(chain, n_chain, max_new, stream, "", out, out_cap,
+                         err, err_cap);
 }
 
 static void test_cli_stream(void) {
@@ -2771,6 +2783,101 @@ static void test_cli_stream(void) {
             snprintf(cmd, sizeof cmd, "/tmp/vtm_stream_%ld.err", stamp);
             remove(cmd);
         }
+    }
+}
+
+// --- CLI --stop / --timeout / --stats (задача 0068) ------------------------
+
+static void test_cli_limits(void) {
+    char out[8192], err[8192];
+    int rc;
+    int seq_stop[] = {65, 10, 10, 66}; /* "A", "\n", "\n", "B" */
+    int seq_a[] = {65};                /* "A" */
+    int seq_loop[] = {65, 66, 65};     /* A B A B ... (цикл в таблице E) */
+
+    // 1. --stop "\n\n" без --stream: генерация обрывается на втором переводе
+    //    строки, стоп-строка не попадает в «ответ:», следующий токен "B" не
+    //    генерируется.
+    rc = chain_cli_run(seq_stop, 4, 4, 0, "--stop \"\\n\\n\"", out,
+                       sizeof out, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(strstr(out, "ответ:   A\n") != NULL);
+    CHECK(strstr(out, "ответ:   A\n\n") == NULL);
+    CHECK(strstr(out, "вывод:  65 10 10\n") != NULL);
+    CHECK(strstr(out, "вывод:  65 10 10 66") == NULL);
+
+    // 2. То же со --stream: stdout — только текст до стопа; стоп-строка и
+    //    следующий "B" не печатаются. Стоп приходит по частям (два токена
+    //    "\n"), поэтому проверяется накопленный буфер.
+    rc = chain_cli_run(seq_stop, 4, 4, 1, "--stop \"\\n\\n\"", out,
+                       sizeof out, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(strcmp(out, "A") == 0);
+    CHECK(strstr(err, "стоп: --stop") != NULL);
+    CHECK(strstr(err, "вывод:  65 10 10\n") != NULL);
+    CHECK(strstr(err, "вывод:  65 10 10 66") == NULL);
+
+    // 3. --timeout 0.01 на зацикленной цепочке: код 124, уже сгенерированное
+    //    напечатано (строка «вывод:» не теряется).
+    rc = chain_cli_run(seq_loop, 3, 500000, 0, "--timeout 0.01", out,
+                       sizeof out, err, sizeof err);
+    CHECK(rc == 124);
+    CHECK(strstr(out, "вывод:  65 66") != NULL);
+
+    // 4. --timeout со --stream: код 124, поток текста не потерян.
+    rc = chain_cli_run(seq_loop, 3, 500000, 1, "--timeout 0.01", out,
+                       sizeof out, err, sizeof err);
+    CHECK(rc == 124);
+    CHECK(strncmp(out, "ABAB", 4) == 0);
+    CHECK(strstr(err, "вывод:  65 66") != NULL);
+
+    // 5. --stats: строка в stderr, stdout/ответ не меняются.
+    rc = chain_cli_run(seq_a, 1, 1, 0, "--stats", out, sizeof out, err,
+                       sizeof err);
+    CHECK(rc == 0);
+    CHECK(strstr(out, "ответ:   A\n") != NULL);
+    CHECK(strstr(err, "stats:") != NULL);
+    CHECK(strstr(err, "токенов=1") != NULL);
+    CHECK(strstr(err, "токенов/с=") != NULL);
+
+    // 6. --stats со --stream тоже пишет статистику в stderr, а не в stdout.
+    rc = chain_cli_run(seq_a, 1, 1, 1, "--stats", out, sizeof out, err,
+                       sizeof err);
+    CHECK(rc == 0);
+    CHECK(strcmp(out, "A") == 0);
+    CHECK(strstr(err, "stats:") != NULL);
+    CHECK(strstr(err, "токенов=1") != NULL);
+
+    // 7. --max-tokens — синоним --max-new (в этой команде --max-new нет).
+    rc = chain_cli_run(seq_a, 1, -1, 0, "--max-tokens 1", out, sizeof out,
+                       err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(strstr(out, "ответ:   A\n") != NULL);
+    CHECK(strstr(out, "вывод:  65\n") != NULL);
+
+    // 8. --stop, который так и не встретился: хвост не теряется ни в стриме,
+    //    ни в обычном ответе.
+    {
+        int seq_ab[] = {65, 66}; /* "AB" */
+        rc = chain_cli_run(seq_ab, 2, 2, 1, "--stop ZZ", out, sizeof out,
+                           err, sizeof err);
+        CHECK(rc == 0);
+        CHECK(strcmp(out, "AB") == 0);
+        rc = chain_cli_run(seq_ab, 2, 2, 0, "--stop ZZ", out, sizeof out,
+                           err, sizeof err);
+        CHECK(rc == 0);
+        CHECK(strstr(out, "ответ:   AB\n") != NULL);
+    }
+
+    // 9. Стоп-строка из кириллицы (2 байта UTF-8): не режем символ посередине.
+    //    Токены 208 и 191 дают вместе «п».
+    {
+        int seq_cyr[] = {208, 191, 65}; /* "п", "A" */
+        rc = chain_cli_run(seq_cyr, 3, 3, 1, "--stop \"\xD0\xBF\"", out,
+                           sizeof out, err, sizeof err);
+        CHECK(rc == 0);
+        CHECK(strcmp(out, "") == 0);
+        CHECK(strstr(err, "вывод:  208 191\n") != NULL);
     }
 }
 
@@ -3603,6 +3710,7 @@ int main(void) {
     test_cli_text();
     test_cli_chat();
     test_cli_stream();
+    test_cli_limits();
     test_mmap_file_load();
     test_mmap_fallback();
     test_mmap_truncated();

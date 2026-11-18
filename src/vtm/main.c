@@ -367,6 +367,14 @@ static void usage(FILE *out) {
         "      --chat                 обернуть текст в чат-шаблон Qwen2.5\n"
         "                             (<|im_start|>system/user/assistant <|im_end|>)\n"
         "      --system \"...\"         системное сообщение; только вместе с --chat\n"
+        "      --stop \"текст\"         остановиться, когда декодированный текст\n"
+        "                             кончается на эту строку; сама строка в вывод\n"
+        "                             не попадает. Можно повторять; в строке\n"
+        "                             понимаются \\n, \\t, \\r и \\\\.\n"
+        "      --timeout SEC          прервать генерацию по таймауту: код 124,\n"
+        "                             уже сгенерированное печатается.\n"
+        "      --stats                статистика в stderr: токены, время, ток/с.\n"
+        "      --max-tokens N         синоним --max-new.\n"
         "      --stream               печатать ответ по мере генерации (stdout,\n"
         "                             без буферизации строки; только с --text).\n"
         "                             Декодер ждёт завершения UTF-8 символа и\n"
@@ -384,7 +392,7 @@ static void usage(FILE *out) {
         "  vtm --help\n"
         "\n"
         "Коды возврата: 0 — успех, 1 — ошибка выполнения, 2 — ошибка аргументов\n"
-        "или токенизатора.\n");
+        "или токенизатора, 124 — таймаут генерации (--timeout).\n");
 }
 
 static int parse_int(const char *s, int *out) {
@@ -397,6 +405,107 @@ static int parse_int(const char *s, int *out) {
     if (v < INT_MIN || v > INT_MAX) return -1;
     *out = (int)v;
     return 0;
+}
+
+static int parse_double(const char *s, double *out) {
+    char *end = NULL;
+    double v;
+    if (!s || !*s) return -1;
+    errno = 0;
+    v = strtod(s, &end);
+    if (errno != 0 || end == s || *end != '\0' || !isfinite(v)) return -1;
+    *out = v;
+    return 0;
+}
+
+// --- --stop: текстовые стоп-последовательности -----------------------------
+//
+// Строка из argv разворачивается как в C-литерале для \n, \t, \r и \\:
+// из shell удобнее писать --stop "\n\n" (обратный слэш и n), чем вставлять
+// настоящий перевод строки. Неизвестная escape-пара остаётся как есть
+// (важно для путей с \).
+typedef struct {
+    char *text;
+    size_t len;
+} stop_text;
+
+// malloc-строка; NULL — не хватило памяти.
+static char *stop_unescape(const char *src) {
+    size_t n = strlen(src);
+    char *out = (char *)malloc(n + 1);
+    size_t i = 0, o = 0;
+
+    if (!out) return NULL;
+    while (i < n) {
+        if (src[i] == '\\' && i + 1 < n) {
+            char c = src[i + 1];
+            if (c == 'n') {
+                out[o++] = '\n';
+                i += 2;
+                continue;
+            }
+            if (c == 't') {
+                out[o++] = '\t';
+                i += 2;
+                continue;
+            }
+            if (c == 'r') {
+                out[o++] = '\r';
+                i += 2;
+                continue;
+            }
+            if (c == '\\') {
+                out[o++] = '\\';
+                i += 2;
+                continue;
+            }
+        }
+        out[o++] = src[i++];
+    }
+    out[o] = '\0';
+    return out;
+}
+
+static void stop_texts_free(stop_text *stops, size_t n) {
+    size_t i;
+    if (!stops) return;
+    for (i = 0; i < n; i++) free(stops[i].text);
+    free(stops);
+}
+
+// 0 — добавлено; -1 — пустая строка; -2 — не хватило памяти.
+static int stop_texts_add(stop_text **stops, size_t *n, size_t *max_len,
+                          const char *raw) {
+    char *text = stop_unescape(raw);
+    stop_text *p;
+
+    if (!text) return -2;
+    if (text[0] == '\0') {
+        free(text);
+        return -1;
+    }
+    p = (stop_text *)realloc(*stops, (*n + 1) * sizeof(stop_text));
+    if (!p) {
+        free(text);
+        return -2;
+    }
+    *stops = p;
+    p[*n].text = text;
+    p[*n].len = strlen(text);
+    if (p[*n].len > *max_len) *max_len = p[*n].len;
+    (*n)++;
+    return 0;
+}
+
+static double monotonic_now(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    return (double)clock() / (double)CLOCKS_PER_SEC;
+}
+
+static int timeout_expired(double started, double timeout_sec) {
+    return timeout_sec > 0.0 && monotonic_now() - started >= timeout_sec;
 }
 
 static int parse_int_list(const char *s, int **out, size_t *out_n) {
@@ -491,11 +600,156 @@ static void print_tokens(FILE *out, const char *label, const int *v, size_t n) {
 // Токен декодируется инкрементально: декодер держит недописанный хвост
 // UTF-8, поэтому stdout получает только целые символы. Спецтокены не
 // печатаются, стоп-токен обрывает генерацию (см. DecoderStream).
+//
+// --stop: декодированный текст проверяется на «кончается на строку» после
+// каждого токена. Хвост, который ещё может оказаться началом стоп-строки,
+// придерживается в hold и не печатается, пока не станет ясно, что стоп не
+// будет собран из нескольких токенов. Так --stop работает и со --stream, и
+// без него (тогда hold — это ещё и текст для строки «ответ:»).
 typedef struct {
     vtm_tok_stream *stream;
-    int stopped;
-    int32_t stop_id;
+    int stopped;              // остановить генерацию
+    int32_t stop_id;          // стоп-токен, если сработал он
+    int text_stopped;         // сработала одна из --stop
+    int no_print;             // без --stream: hold не печатаем, копим ответ
+    const stop_text *stops;
+    size_t n_stops;
+    size_t max_stop_len;
+    char *hold;
+    size_t hold_len;
+    size_t hold_cap;
 } stream_state;
+
+static void stream_state_setup(stream_state *ss, vtm_tok_stream *stream,
+                               const stop_text *stops, size_t n_stops,
+                               size_t max_stop_len, int no_print) {
+    memset(ss, 0, sizeof *ss);
+    ss->stream = stream;
+    ss->stop_id = -1;
+    ss->stops = stops;
+    ss->n_stops = n_stops;
+    ss->max_stop_len = max_stop_len;
+    ss->no_print = no_print;
+}
+
+static void stream_state_free(stream_state *ss) {
+    free(ss->hold);
+    ss->hold = NULL;
+    ss->hold_len = 0;
+    ss->hold_cap = 0;
+}
+
+static int write_stdout_text(const char *text, size_t len, char *err,
+                             size_t errlen) {
+    if (len != 0 && fwrite(text, 1, len, stdout) != len) {
+        snprintf(err, errlen, "не удалось записать текст в stdout");
+        return -1;
+    }
+    if (len != 0) fflush(stdout);
+    return 0;
+}
+
+static int hold_append(stream_state *ss, const char *text, size_t len,
+                       char *err, size_t errlen) {
+    if (len == 0) return 0;
+    if (ss->hold_len + len + 1 > ss->hold_cap) {
+        size_t cap = ss->hold_cap ? ss->hold_cap : 256;
+        char *p;
+        while (cap < ss->hold_len + len + 1) {
+            if (cap > (size_t)-1 / 2) {
+                snprintf(err, errlen, "не хватило памяти под --stop");
+                return -1;
+            }
+            cap *= 2;
+        }
+        p = (char *)realloc(ss->hold, cap);
+        if (!p) {
+            snprintf(err, errlen, "не хватило памяти под --stop");
+            return -1;
+        }
+        ss->hold = p;
+        ss->hold_cap = cap;
+    }
+    memcpy(ss->hold + ss->hold_len, text, len);
+    ss->hold_len += len;
+    ss->hold[ss->hold_len] = '\0';
+    return 0;
+}
+
+// Длина самой длинной стоп-строки, которой кончается hold (0 — нет).
+static size_t matching_stop_len(const stream_state *ss) {
+    size_t best = 0;
+    size_t i;
+    for (i = 0; i < ss->n_stops; i++) {
+        const size_t len = ss->stops[i].len;
+        if (len <= best || len > ss->hold_len) continue;
+        if (memcmp(ss->hold + ss->hold_len - len, ss->stops[i].text, len) == 0)
+            best = len;
+    }
+    return best;
+}
+
+// 0 — ок, -1 — ошибка записи/памяти.
+static int stream_emit(stream_state *ss, const char *text, size_t len,
+                       char *err, size_t errlen) {
+    if (len == 0 || ss->text_stopped) return 0;
+    if (ss->n_stops == 0) return write_stdout_text(text, len, err, errlen);
+
+    if (hold_append(ss, text, len, err, errlen) != 0) return -1;
+    {
+        const size_t m = matching_stop_len(ss);
+        if (m != 0) {
+            // Стоп-строка стоит в конце hold; начало hold — обычный текст.
+            const size_t cut = ss->hold_len - m;
+            ss->text_stopped = 1;
+            ss->stopped = 1;
+            if (ss->no_print) {
+                ss->hold_len = cut;
+                ss->hold[cut] = '\0';
+            } else {
+                if (write_stdout_text(ss->hold, cut, err, errlen) != 0)
+                    return -1;
+                ss->hold_len = 0;
+                ss->hold[0] = '\0';
+            }
+            return 0;
+        }
+    }
+    if (ss->no_print) return 0;
+
+    // Печатаем всё, кроме хвоста, из которого ещё может вырасти стоп-строка.
+    // Начало хвоста сдвигаем назад до границы UTF-8: наружу отдаём только
+    // целые символы.
+    {
+        const size_t keep = ss->max_stop_len > 1 ? ss->max_stop_len - 1 : 0;
+        if (ss->hold_len > keep) {
+            size_t start = ss->hold_len - keep;
+            while (start > 0 &&
+                   ((unsigned char)ss->hold[start] & 0xC0) == 0x80)
+                start--;
+            if (start != 0) {
+                if (write_stdout_text(ss->hold, start, err, errlen) != 0)
+                    return -1;
+                memmove(ss->hold, ss->hold + start, ss->hold_len - start);
+                ss->hold_len -= start;
+                ss->hold[ss->hold_len] = '\0';
+            }
+        }
+    }
+    return 0;
+}
+
+// Дописать в stdout хвост, который больше не может быть началом стопа.
+static int stream_flush_hold(stream_state *ss, char *err, size_t errlen) {
+    if (ss->n_stops == 0 || ss->no_print || ss->text_stopped) return 0;
+    if (ss->hold_len != 0) {
+        if (write_stdout_text(ss->hold, ss->hold_len, err, errlen) != 0)
+            return -1;
+        ss->hold_len = 0;
+        ss->hold[0] = '\0';
+    }
+    return 0;
+}
 
 // 0 — ок, -1 — ошибка декодера/записи (текст в err).
 static int stream_token(stream_state *ss, int token, char *err, size_t errlen) {
@@ -510,18 +764,36 @@ static int stream_token(stream_state *ss, int token, char *err, size_t errlen) {
                              &stop_id, err, errlen);
     if (rc != 0) return -1;
     if (piece != NULL) len = strlen(piece);
-    if (len != 0 && fwrite(piece, 1, len, stdout) != len) {
-        vtm_tok_free_text(piece);
-        snprintf(err, errlen, "не удалось записать текст в stdout");
-        return -1;
-    }
-    if (len != 0) fflush(stdout);
+    rc = stream_emit(ss, piece ? piece : "", len, err, errlen);
     vtm_tok_free_text(piece);
+    if (rc != 0) return -1;
     if (stop) {
         ss->stopped = 1;
         ss->stop_id = stop_id;
     }
     return 0;
+}
+
+// То же для --stop без --stream: только накопление текста и проверка стопа,
+// без печати. Стоп-токен здесь не обрывает генерацию — без новых флагов это
+// прежнее поведение, и --stop не должен его менять.
+static int stop_feed(stream_state *ss, int token, char *err, size_t errlen) {
+    char *piece = NULL;
+    int stop = 0;
+    int32_t stop_id = -1;
+    size_t len = 0;
+    int rc;
+
+    if (ss->stream == NULL) return 0;
+    rc = vtm_tok_stream_push(ss->stream, (int32_t)token, &piece, &stop,
+                             &stop_id, err, errlen);
+    if (rc != 0) return -1;
+    if (piece != NULL) len = strlen(piece);
+    rc = stream_emit(ss, piece ? piece : "", len, err, errlen);
+    vtm_tok_free_text(piece);
+    (void)stop;
+    (void)stop_id;
+    return rc;
 }
 
 // --- чат-шаблон Qwen2.5 ----------------------------------------------------
@@ -672,6 +944,13 @@ static int cmd_run(int argc, char **argv) {
     int chat = 0;
     int stream = 0;
     int max_new = 8;
+    int stats = 0;
+    int timed_out = 0;
+    double timeout_sec = 0.0;
+    double t_start = 0.0, t_end = 0.0;
+    stop_text *stops = NULL;
+    size_t n_stops = 0;
+    size_t max_stop_len = 0;
     int *tokens = NULL;
     size_t n_tokens = 0;
     int *generated = NULL;
@@ -690,82 +969,118 @@ static int cmd_run(int argc, char **argv) {
         if (strcmp(argv[i], "--tokens") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "vtm run: --tokens без значения\n");
-                return 2;
+                goto arg_error;
             }
             tokens_s = argv[i];
         } else if (strcmp(argv[i], "--text") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "vtm run: --text без значения\n");
-                return 2;
+                goto arg_error;
             }
             text_s = argv[i];
         } else if (strcmp(argv[i], "--tokenizer") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "vtm run: --tokenizer без значения\n");
-                return 2;
+                goto arg_error;
             }
             tokenizer_s = argv[i];
         } else if (strcmp(argv[i], "--chat") == 0) {
             chat = 1;
         } else if (strcmp(argv[i], "--stream") == 0) {
             stream = 1;
+        } else if (strcmp(argv[i], "--stats") == 0) {
+            stats = 1;
         } else if (strcmp(argv[i], "--system") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "vtm run: --system без значения\n");
-                return 2;
+                goto arg_error;
             }
             system_s = argv[i];
-        } else if (strcmp(argv[i], "--max-new") == 0) {
+        } else if (strcmp(argv[i], "--stop") == 0) {
+            int rc;
+            if (++i >= argc) {
+                fprintf(stderr, "vtm run: --stop без значения\n");
+                goto arg_error;
+            }
+            rc = stop_texts_add(&stops, &n_stops, &max_stop_len, argv[i]);
+            if (rc == -1) {
+                fprintf(stderr, "vtm run: пустая строка --stop\n");
+                goto arg_error;
+            }
+            if (rc != 0) {
+                fprintf(stderr, "vtm run: не хватило памяти под --stop\n");
+                goto arg_error;
+            }
+        } else if (strcmp(argv[i], "--timeout") == 0) {
+            if (++i >= argc || parse_double(argv[i], &timeout_sec) != 0 ||
+                timeout_sec <= 0.0) {
+                fprintf(stderr,
+                        "vtm run: --timeout ожидает положительное число секунд\n");
+                goto arg_error;
+            }
+        } else if (strcmp(argv[i], "--max-new") == 0 ||
+                   strcmp(argv[i], "--max-tokens") == 0) {
             if (++i >= argc || parse_int(argv[i], &max_new) != 0 ||
                 max_new < 0 || max_new > 1000000) {
-                fprintf(stderr, "vtm run: плохое значение --max-new\n");
-                return 2;
+                fprintf(stderr, "vtm run: плохое значение --max-new/--max-tokens\n");
+                goto arg_error;
             }
         } else if (strcmp(argv[i], "--backend") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "vtm run: --backend без значения\n");
-                return 2;
+                goto arg_error;
             }
             backend_name = argv[i];
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "vtm run: неизвестный аргумент %s\n", argv[i]);
-            return 2;
+            goto arg_error;
         } else if (!path) {
             path = argv[i];
         } else {
             fprintf(stderr, "vtm run: лишний аргумент %s\n", argv[i]);
-            return 2;
+            goto arg_error;
         }
     }
     if (!path || (!tokens_s && !text_s)) {
         fprintf(stderr, "vtm run: нужны model.vtm и --tokens или --text\n");
-        return 2;
+        goto arg_error;
     }
     if (tokens_s && text_s) {
         fprintf(stderr, "vtm run: --tokens и --text взаимоисключающие\n");
-        return 2;
+        goto arg_error;
     }
     if (tokenizer_s && !text_s) {
         fprintf(stderr, "vtm run: --tokenizer имеет смысл только с --text\n");
-        return 2;
+        goto arg_error;
     }
     if (chat && !text_s) {
         fprintf(stderr, "vtm run: --chat имеет смысл только с --text\n");
-        return 2;
+        goto arg_error;
     }
     if (stream && !text_s) {
         fprintf(stderr, "vtm run: --stream имеет смысл только с --text\n");
-        return 2;
+        goto arg_error;
+    }
+    if (n_stops != 0 && !text_s) {
+        fprintf(stderr, "vtm run: --stop имеет смысл только с --text\n");
+        goto arg_error;
     }
     if (system_s && !chat) {
         fprintf(stderr, "vtm run: --system имеет смысл только с --chat\n");
-        return 2;
+        goto arg_error;
     }
     if (backend_name && !vtm_backend_by_name(backend_name)) {
         fprintf(stderr, "vtm run: --backend должен быть auto, simd, scalar, "
                         "lut или direct\n");
-        return 2;
+        goto arg_error;
     }
+    goto args_ok;
+
+arg_error:
+    stop_texts_free(stops, n_stops);
+    return 2;
+
+args_ok:
     if (tokens_s) {
         if (parse_int_list(tokens_s, &tokens, &n_tokens) != 0 ||
             n_tokens > (size_t)INT_MAX) {
@@ -783,11 +1098,13 @@ static int cmd_run(int argc, char **argv) {
             fprintf(stderr,
                     "vtm run: не найден tokenizer.json: укажите "
                     "--tokenizer PATH или $VTM_TOKENIZER\n");
+            stop_texts_free(stops, n_stops);
             return 2;
         }
         tokenizer = vtm_tok_open(tok_path, tok_err, sizeof tok_err);
         if (!tokenizer) {
             fprintf(stderr, "vtm run: токенизатор %s: %s\n", tok_path, tok_err);
+            stop_texts_free(stops, n_stops);
             return 2;
         }
         if (chat) {
@@ -795,6 +1112,7 @@ static int cmd_run(int argc, char **argv) {
                                   sizeof tok_err) != 0) {
                 fprintf(stderr, "vtm run: чат-шаблон: %s\n", tok_err);
                 vtm_tok_close(tokenizer);
+                stop_texts_free(stops, n_stops);
                 return 2;
             }
         }
@@ -803,6 +1121,7 @@ static int cmd_run(int argc, char **argv) {
             fprintf(stderr, "vtm run: токенизатор %s: %s\n", tok_path, tok_err);
             free(prompt);
             vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
             return 2;
         }
         if (n_ids == 0) {
@@ -812,6 +1131,7 @@ static int cmd_run(int argc, char **argv) {
             free(prompt);
             vtm_tok_free_ids(ids);
             vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
             return 2;
         }
         if (n_ids > (size_t)INT_MAX) {
@@ -819,6 +1139,7 @@ static int cmd_run(int argc, char **argv) {
             free(prompt);
             vtm_tok_free_ids(ids);
             vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
             return 2;
         }
         tokens = (int *)malloc(n_ids * sizeof(int));
@@ -827,6 +1148,7 @@ static int cmd_run(int argc, char **argv) {
             free(prompt);
             vtm_tok_free_ids(ids);
             vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
             return 1;
         }
         for (i = 0; i < (int)n_ids; i++) tokens[i] = (int)ids[i];
@@ -840,6 +1162,7 @@ static int cmd_run(int argc, char **argv) {
         free(prompt);
         free(tokens);
         vtm_tok_close(tokenizer);
+        stop_texts_free(stops, n_stops);
         return 1;
     }
     if (backend_name)
@@ -870,13 +1193,13 @@ static int cmd_run(int argc, char **argv) {
             vtm_free(m);
             free(tokens);
             vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
             return 1;
         }
     }
 
-    memset(&ss, 0, sizeof ss);
-    ss.stop_id = -1;
-    if (stream) {
+    stream_state_setup(&ss, NULL, stops, n_stops, max_stop_len, !stream);
+    if (stream || n_stops != 0) {
         tok_stream = vtm_tok_stream_open(tokenizer);
         if (!tok_stream) {
             fprintf(stderr, "vtm run: не удалось создать стриминговый "
@@ -885,12 +1208,14 @@ static int cmd_run(int argc, char **argv) {
             free(tokens);
             free(generated);
             vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
             return 1;
         }
         ss.stream = tok_stream;
     }
 
     c0 = clock();
+    t_start = monotonic_now();
     if (max_new == 0) {
         for (i = 0; i < (int)n_tokens; i++) {
             vtm_status st;
@@ -905,6 +1230,8 @@ static int cmd_run(int argc, char **argv) {
                 free(tokens);
                 free(generated);
                 vtm_tok_close(tokenizer);
+                stop_texts_free(stops, n_stops);
+                stream_state_free(&ss);
                 return 1;
             }
         }
@@ -915,6 +1242,10 @@ static int cmd_run(int argc, char **argv) {
 
         // Все токены промпта, кроме последнего, только наполняют KV-кэш.
         for (i = 0; i + 1 < (int)n_tokens; i++) {
+            if (timeout_expired(t_start, timeout_sec)) {
+                timed_out = 1;
+                goto generation_done;
+            }
             vtm_set_position(m, i);
             vtm_set_token(m, tokens[i]);
             st = vtm_run(m, NULL, NULL);
@@ -926,8 +1257,14 @@ static int cmd_run(int argc, char **argv) {
                 free(tokens);
                 free(generated);
                 vtm_tok_close(tokenizer);
+                stop_texts_free(stops, n_stops);
+                stream_state_free(&ss);
                 return 1;
             }
+        }
+        if (timeout_expired(t_start, timeout_sec)) {
+            timed_out = 1;
+            goto generation_done;
         }
         // Последний токен промпта даёт первый сгенерированный.
         memset(&es, 0, sizeof es);
@@ -942,6 +1279,8 @@ static int cmd_run(int argc, char **argv) {
             free(tokens);
             free(generated);
             vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
+            stream_state_free(&ss);
             return 1;
         }
         if (es.count > 1)
@@ -950,15 +1289,31 @@ static int cmd_run(int argc, char **argv) {
         if (es.have) {
             generated[n_generated++] = es.token;
             last = es.token;
-            if (stream && stream_token(&ss, es.token, tok_err,
-                                       sizeof tok_err) != 0) {
-                fprintf(stderr, "vtm run: --stream: %s\n", tok_err);
-                vtm_tok_stream_close(tok_stream);
-                vtm_free(m);
-                free(tokens);
-                free(generated);
-                vtm_tok_close(tokenizer);
-                return 1;
+            if (stream) {
+                if (stream_token(&ss, es.token, tok_err,
+                                 sizeof tok_err) != 0) {
+                    fprintf(stderr, "vtm run: --stream: %s\n", tok_err);
+                    vtm_tok_stream_close(tok_stream);
+                    vtm_free(m);
+                    free(tokens);
+                    free(generated);
+                    vtm_tok_close(tokenizer);
+                    stop_texts_free(stops, n_stops);
+                    stream_state_free(&ss);
+                    return 1;
+                }
+            } else if (n_stops != 0) {
+                if (stop_feed(&ss, es.token, tok_err, sizeof tok_err) != 0) {
+                    fprintf(stderr, "vtm run: --stop: %s\n", tok_err);
+                    vtm_tok_stream_close(tok_stream);
+                    vtm_free(m);
+                    free(tokens);
+                    free(generated);
+                    vtm_tok_close(tokenizer);
+                    stop_texts_free(stops, n_stops);
+                    stream_state_free(&ss);
+                    return 1;
+                }
             }
         } else {
             fprintf(stderr, "vtm run: программа не вызвала SAMP; "
@@ -968,10 +1323,16 @@ static int cmd_run(int argc, char **argv) {
             free(tokens);
             free(generated);
             vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
+            stream_state_free(&ss);
             return 1;
         }
 
         while (!ss.stopped && n_generated < (size_t)max_new) {
+            if (timeout_expired(t_start, timeout_sec)) {
+                timed_out = 1;
+                break;
+            }
             memset(&es, 0, sizeof es);
             // Входной токен previous стоит на позиции len(prompt)+step-1.
             vtm_set_position(m, (int)(n_tokens + n_generated - 1));
@@ -985,6 +1346,8 @@ static int cmd_run(int argc, char **argv) {
                 free(tokens);
                 free(generated);
                 vtm_tok_close(tokenizer);
+                stop_texts_free(stops, n_stops);
+                stream_state_free(&ss);
                 return 1;
             }
             if (!es.have) break;
@@ -993,21 +1356,42 @@ static int cmd_run(int argc, char **argv) {
                                 "CLI берёт первый токен\n", es.count);
             generated[n_generated++] = es.token;
             last = es.token;
-            if (stream && stream_token(&ss, es.token, tok_err,
-                                       sizeof tok_err) != 0) {
-                fprintf(stderr, "vtm run: --stream: %s\n", tok_err);
-                vtm_tok_stream_close(tok_stream);
-                vtm_free(m);
-                free(tokens);
-                free(generated);
-                vtm_tok_close(tokenizer);
-                return 1;
+            if (stream) {
+                if (stream_token(&ss, es.token, tok_err,
+                                 sizeof tok_err) != 0) {
+                    fprintf(stderr, "vtm run: --stream: %s\n", tok_err);
+                    vtm_tok_stream_close(tok_stream);
+                    vtm_free(m);
+                    free(tokens);
+                    free(generated);
+                    vtm_tok_close(tokenizer);
+                    stop_texts_free(stops, n_stops);
+                    stream_state_free(&ss);
+                    return 1;
+                }
+            } else if (n_stops != 0) {
+                if (stop_feed(&ss, es.token, tok_err, sizeof tok_err) != 0) {
+                    fprintf(stderr, "vtm run: --stop: %s\n", tok_err);
+                    vtm_tok_stream_close(tok_stream);
+                    vtm_free(m);
+                    free(tokens);
+                    free(generated);
+                    vtm_tok_close(tokenizer);
+                    stop_texts_free(stops, n_stops);
+                    stream_state_free(&ss);
+                    return 1;
+                }
             }
         }
     }
+
+generation_done:
     c1 = clock();
+    t_end = monotonic_now();
 
     // Конец генерации: отдать недописанный хвост символа, если он остался.
+    // В режиме --stop хвост проходит ту же проверку: стоп-строка может
+    // собраться только на finish(), и тогда она тоже не попадёт в stdout.
     if (stream) {
         char *tail = NULL;
         size_t len = 0;
@@ -1019,53 +1403,90 @@ static int cmd_run(int argc, char **argv) {
             free(tokens);
             free(generated);
             vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
+            stream_state_free(&ss);
             return 1;
         }
         if (tail != NULL) len = strlen(tail);
-        if (len != 0 && fwrite(tail, 1, len, stdout) != len) {
-            fprintf(stderr, "vtm run: --stream: не удалось записать текст "
-                            "в stdout\n");
+        if (stream_emit(&ss, tail ? tail : "", len, tok_err,
+                        sizeof tok_err) != 0) {
+            fprintf(stderr, "vtm run: --stream: %s\n", tok_err);
             vtm_tok_free_text(tail);
             vtm_tok_stream_close(tok_stream);
             vtm_free(m);
             free(tokens);
             free(generated);
             vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
+            stream_state_free(&ss);
             return 1;
         }
-        if (len != 0) fflush(stdout);
         vtm_tok_free_text(tail);
+        if (stream_flush_hold(&ss, tok_err, sizeof tok_err) != 0) {
+            fprintf(stderr, "vtm run: --stream: %s\n", tok_err);
+            vtm_tok_stream_close(tok_stream);
+            vtm_free(m);
+            free(tokens);
+            free(generated);
+            vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
+            stream_state_free(&ss);
+            return 1;
+        }
+    }
+    if (tok_stream != NULL) {
         vtm_tok_stream_close(tok_stream);
         tok_stream = NULL;
     }
 
     if (text_s && !stream) {
-        int32_t *gen_ids = NULL;
-        if (n_generated != 0) {
-            gen_ids = (int32_t *)malloc(n_generated * sizeof(int32_t));
-            if (!gen_ids) {
+        if (n_stops != 0 && ss.text_stopped) {
+            // --stop без --stream: hold уже содержит текст до стоп-строки.
+            answer = (char *)malloc(ss.hold_len + 1);
+            if (!answer) {
                 fprintf(stderr, "vtm run: не хватило памяти\n");
                 vtm_free(m);
                 free(tokens);
                 free(generated);
                 vtm_tok_close(tokenizer);
+                stop_texts_free(stops, n_stops);
+                stream_state_free(&ss);
                 return 1;
             }
-            for (i = 0; i < (int)n_generated; i++)
-                gen_ids[i] = (int32_t)generated[i];
-        }
-        if (vtm_tok_decode(tokenizer, gen_ids, n_generated, &answer, tok_err,
-                           sizeof tok_err) != 0) {
-            fprintf(stderr, "vtm run: не удалось декодировать вывод: %s\n",
-                    tok_err);
+            if (ss.hold_len != 0) memcpy(answer, ss.hold, ss.hold_len);
+            answer[ss.hold_len] = '\0';
+        } else {
+            int32_t *gen_ids = NULL;
+            if (n_generated != 0) {
+                gen_ids = (int32_t *)malloc(n_generated * sizeof(int32_t));
+                if (!gen_ids) {
+                    fprintf(stderr, "vtm run: не хватило памяти\n");
+                    vtm_free(m);
+                    free(tokens);
+                    free(generated);
+                    vtm_tok_close(tokenizer);
+                    stop_texts_free(stops, n_stops);
+                    stream_state_free(&ss);
+                    return 1;
+                }
+                for (i = 0; i < (int)n_generated; i++)
+                    gen_ids[i] = (int32_t)generated[i];
+            }
+            if (vtm_tok_decode(tokenizer, gen_ids, n_generated, &answer, tok_err,
+                               sizeof tok_err) != 0) {
+                fprintf(stderr, "vtm run: не удалось декодировать вывод: %s\n",
+                        tok_err);
+                free(gen_ids);
+                vtm_free(m);
+                free(tokens);
+                free(generated);
+                vtm_tok_close(tokenizer);
+                stop_texts_free(stops, n_stops);
+                stream_state_free(&ss);
+                return 1;
+            }
             free(gen_ids);
-            vtm_free(m);
-            free(tokens);
-            free(generated);
-            vtm_tok_close(tokenizer);
-            return 1;
         }
-        free(gen_ids);
     }
 
     {
@@ -1077,7 +1498,9 @@ static int cmd_run(int argc, char **argv) {
         else
             fprintf(info, "вывод:  (пусто)\n");
         if (stream) {
-            if (ss.stopped)
+            if (ss.text_stopped)
+                fprintf(info, "стоп: --stop\n");
+            else if (ss.stopped)
                 fprintf(info, "стоп-токен: %d\n", (int)ss.stop_id);
         } else if (text_s) {
             if (answer && *answer)
@@ -1092,12 +1515,25 @@ static int cmd_run(int argc, char **argv) {
         fprintf(info, "\n");
     }
 
+    if (timed_out)
+        fprintf(stderr, "vtm run: таймаут %g с: генерация прервана\n",
+                timeout_sec);
+
+    if (stats) {
+        const double wall = t_end - t_start;
+        fprintf(stderr, "stats: токенов=%zu, время=%.6f с, токенов/с=%.2f\n",
+                n_generated, wall,
+                wall > 0.0 ? (double)n_generated / wall : 0.0);
+    }
+
     vtm_free(m);
     free(tokens);
     free(generated);
     vtm_tok_close(tokenizer);
     vtm_tok_free_text(answer);
-    return 0;
+    stop_texts_free(stops, n_stops);
+    stream_state_free(&ss);
+    return timed_out ? 124 : 0;
 }
 
 // --- inspect ---------------------------------------------------------------
