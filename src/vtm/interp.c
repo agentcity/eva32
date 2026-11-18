@@ -79,7 +79,7 @@ static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     const vtm_tensor *w = need(m, in->a, ins, "a (W)", &st);
     const vtm_tensor *x;
     const vtm_tensor *y;
-    int rows, cols;
+    int rows, cols, r, t;
     int (*fn)(float *, const uint8_t *, const float *, const float *, int, int);
     int (*fn_blocks)(float *, const uint8_t *, const float *, const float *,
                      int, int, int);
@@ -90,11 +90,46 @@ static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     if (!x) return st;
     y = need(m, in->dst, ins, "dst (y)", &st);
     if (!y) return st;
-    if ((st = req_trit(m, w, ins, "a (W)")) != VTM_OK) return st;
     if ((st = req_f32(m, x, ins, "b (x)")) != VTM_OK) return st;
     if ((st = req_f32(m, y, ins, "dst (y)")) != VTM_OK) return st;
     if (w->ndim != 2)
         return fail(m, ins, VTM_E_SHAPE, "W: нужна матрица [rows, cols]");
+    if (x == y)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "dst и x — один тензор; TMV не умеет in-place");
+
+    // Плотный TMV: y = W·x. Нужен для нетернарных весов (эмбеддинги,
+    // lm_head при tied_embeddings), которым в тритной матрице места нет.
+    // VTM_FLAG_TMV_TRANSPOSED читает a как [cols, rows] и считает Wᵀ·x —
+    // так tied lm_head может ссылаться на таблицу эмбеддингов в её
+    // «выходной» ориентации.
+    if (w->kind != VTM_TENSOR_TRIT) {
+        int transposed = (in->flags & VTM_FLAG_TMV_TRANSPOSED) != 0;
+        if (w->kind < VTM_TENSOR_F32 || w->kind > VTM_TENSOR_BF16 || !w->f32)
+            return fail(m, ins, VTM_E_TENSOR,
+                        "a (W): нужен тритный или fp32/fp16/bf16-тензор");
+        rows = transposed ? (int)w->dims[1] : (int)w->dims[0];
+        cols = transposed ? (int)w->dims[0] : (int)w->dims[1];
+        if (x->n_elements != (uint32_t)cols)
+            return fail(m, ins, VTM_E_SHAPE,
+                        "x: элементов %u, у W cols=%d", x->n_elements, cols);
+        if (y->n_elements != (uint32_t)rows)
+            return fail(m, ins, VTM_E_SHAPE,
+                        "y: элементов %u, у W rows=%d", y->n_elements, rows);
+        for (r = 0; r < rows; r++) {
+            double sum = 0.0;
+            for (t = 0; t < cols; t++) {
+                double wv = transposed
+                          ? (double)w->f32[(size_t)t * (size_t)rows + (size_t)r]
+                          : (double)w->f32[(size_t)r * (size_t)cols + (size_t)t];
+                sum += wv * (double)x->f32[t];
+            }
+            y->f32[r] = (float)sum;
+        }
+        return VTM_OK;
+    }
+
+    if ((st = req_trit(m, w, ins, "a (W)")) != VTM_OK) return st;
     rows = (int)w->dims[0];
     cols = (int)w->dims[1];
     if (x->n_elements != (uint32_t)cols)
@@ -103,9 +138,6 @@ static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     if (y->n_elements != (uint32_t)rows)
         return fail(m, ins, VTM_E_SHAPE,
                     "y: элементов %u, у W rows=%d", y->n_elements, rows);
-    if (x == y)
-        return fail(m, ins, VTM_E_SHAPE,
-                    "dst и x — один тензор; TMV не умеет in-place");
 
     if (w->scale_block != VTM_SCALE_BLOCK_128 &&
         w->scale_block != VTM_SCALE_BLOCK_160)
@@ -214,11 +246,14 @@ static vtm_status op_rmsn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 //
 // Стандартный RoPE из Llama/HF (rotate_half): для головы h и пары
 // (i, i + head_dim/2)
-//     theta = pos · 10000^(-2i/head_dim)
+//     theta = pos · base^(-2i/head_dim)
 //     y[i]          = x[i]·cos - x[i+half]·sin
 //     y[i+half]     = x[i+half]·cos + x[i]·sin.
-// Флаг VTM_FLAG_ROPE_INTERLEAVED переключает на пары (2i, 2i+1) — вариант
-// GPT-NeoX. По умолчанию — половинки, как в Qwen/Llama.
+// base (rope_theta) берётся из меты контейнера: у Qwen2.5 это 1e6, у
+// Llama-классики — 1e4. Без меты/с битой метой — 10000, как в v0.1.
+// Раскладку задаёт мета `rope_layout` ("half" по умолчанию, "interleaved" —
+// GPT-NeoX); флаг VTM_FLAG_ROPE_INTERLEAVED тоже включает интерливинг и
+// перекрывает мету для конкретной инструкции.
 static vtm_status op_rope(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     vtm_status st;
     const vtm_tensor *x = need(m, in->a, ins, "a (x)", &st);
@@ -226,6 +261,7 @@ static vtm_status op_rope(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     int heads, head_dim, half, h, p;
     long long pos;
     int interleaved;
+    double theta;
 
     if (!x) return st;
     y = need(m, in->dst, ins, "dst (y)", &st);
@@ -246,10 +282,13 @@ static vtm_status op_rope(vtm_t *m, uint32_t ins, const vtm_instr *in) {
                     "ROPE: head_dim=%d должен быть чётным и >= 2", head_dim);
     half = head_dim / 2;
     pos = (long long)m->position + (long long)in->imm;
-    interleaved = (in->flags & VTM_FLAG_ROPE_INTERLEAVED) != 0;
+    theta = vtm_meta_rope_theta(m);
+    if (!(theta > 0.0) || !isfinite(theta)) theta = VTM_DEFAULT_ROPE_THETA;
+    interleaved = ((in->flags & VTM_FLAG_ROPE_INTERLEAVED) != 0)
+               || (vtm_meta_rope_layout(m) == VTM_ROPE_LAYOUT_INTERLEAVED);
 
     for (p = 0; p < half; p++) {
-        double inv = pow(10000.0, -2.0 * (double)p / (double)head_dim);
+        double inv = pow(theta, -2.0 * (double)p / (double)head_dim);
         double angle = (double)pos * inv;
         double co = cos(angle);
         double si = sin(angle);

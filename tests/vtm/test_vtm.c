@@ -115,6 +115,13 @@ static void put_i32(uint8_t *p, int32_t v) {
     put_u32(p, u);
 }
 
+static uint32_t get_u32(const uint8_t *p) {
+    return (uint32_t)p[0]
+         | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
 // --- модель для тестов -----------------------------------------------------
 
 typedef struct {
@@ -136,10 +143,20 @@ typedef struct {
     vtm_instr prog[64];
     int n_instr;
     uint16_t header_flags;
+    char *meta;        // JSON-мета (копия, как в контейнере); NULL — нет меты
+    size_t meta_len;
 } model_t;
 
 static void model_init(model_t *m) {
     memset(m, 0, sizeof *m);
+}
+
+static void model_set_meta(model_t *m, const char *json) {
+    size_t len = json ? strlen(json) : 0;
+    free(m->meta);
+    m->meta = (char *)xmalloc(len);
+    if (len) memcpy(m->meta, json, len);
+    m->meta_len = len;
 }
 
 static size_t align32(size_t v) {
@@ -302,6 +319,7 @@ static void model_free(model_t *m) {
         free(m->tensors[i].blob);
         free(m->tensors[i].blob2);
     }
+    free(m->meta);
     memset(m, 0, sizeof *m);
 }
 
@@ -309,7 +327,7 @@ static int model_build(model_t *m, uint8_t **out, size_t *out_size) {
     size_t table_size = 32u + (size_t)m->n_tensors * 44u;
     size_t data_start = align32(table_size);
     size_t cursor = data_start;
-    size_t program_off, total;
+    size_t meta_off = 0, program_off, total;
     uint32_t *offsets = (uint32_t *)xmalloc(sizeof(uint32_t)
                                             * (size_t)m->n_tensors);
     uint32_t *soffsets = (uint32_t *)xmalloc(sizeof(uint32_t)
@@ -331,6 +349,10 @@ static int model_build(model_t *m, uint8_t **out, size_t *out_size) {
         }
     }
     program_off = align32(cursor);
+    if (m->meta_len) {
+        meta_off = program_off;
+        program_off = meta_off + align32(m->meta_len);
+    }
     total = program_off + (size_t)m->n_instr * VTM_INSTR_SIZE;
     img = (uint8_t *)calloc(1, total ? total : 1u);
     if (!img) {
@@ -344,6 +366,10 @@ static int model_build(model_t *m, uint8_t **out, size_t *out_size) {
     put_u32(img + 8, (uint32_t)m->n_instr);
     put_u32(img + 12, (uint32_t)m->n_tensors);
     put_u32(img + 16, (uint32_t)m->n_instr * VTM_INSTR_SIZE);
+    // Расширение Python-эталона: смещение программы, меты и её длина.
+    put_u32(img + 20, (uint32_t)program_off);
+    put_u32(img + 24, m->meta_len ? (uint32_t)meta_off : 0);
+    put_u32(img + 28, (uint32_t)m->meta_len);
 
     for (i = 0; i < m->n_tensors; i++) {
         tensor_def *td = &m->tensors[i];
@@ -359,6 +385,8 @@ static int model_build(model_t *m, uint8_t **out, size_t *out_size) {
         if (td->raw)
             memcpy(img + data_start + soffsets[i], td->blob2, td->blob2_len);
     }
+    if (m->meta_len)
+        memcpy(img + meta_off, m->meta, m->meta_len);
     for (i = 0; i < m->n_instr; i++) {
         const vtm_instr *in = &m->prog[i];
         uint8_t *p = img + program_off + (size_t)i * VTM_INSTR_SIZE;
@@ -392,6 +420,28 @@ static int run_ok(vtm_t *m) {
                 vtm_error_message(m));
     CHECK(st == VTM_OK);
     return st == VTM_OK;
+}
+
+// Мини-контейнер (тензор y + HALT) с заданной метой. Всё, кроме машины,
+// освобождается здесь: загрузчик держит собственную копию JSON.
+static vtm_t *mini_with_meta(const char *meta) {
+    model_t md;
+    uint16_t dy[1] = {1};
+    float yv[1] = {0.0f};
+    uint8_t *img;
+    size_t size;
+    vtm_t *m;
+
+    model_init(&md);
+    model_add_f32(&md, "y", 1, dy, yv);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    if (meta) model_set_meta(&md, meta);
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    free(img);
+    model_free(&md);
+    return m;
 }
 
 // --- кодек тритов ----------------------------------------------------------
@@ -1018,6 +1068,427 @@ static void test_rope(void) {
     model_free(&md);
 }
 
+// --- метаданные ------------------------------------------------------------
+//
+// Мета — JSON между данными и программой (docs/vtm.md). Проверяем: theta и
+// раскладка ROPE берутся из меты; fp16-эмбеддинги и tied lm_head (плотный
+// TMV, в т.ч. транспонированный); битая мета не роняет загрузку.
+
+// Сборка: x [8] -> ROPE -> y [8] -> TMV(identity) -> logits [8]. Последний
+// шаг нужен лишь затем, чтобы «логиты» были настоящими логитами (y·I).
+static int run_rope_meta(const char *meta, int pos, float *logits, int n) {
+    model_t md;
+    uint16_t dx[1] = {8};
+    uint16_t di[2] = {8, 8};
+    float xv[8] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+    float zero[8] = {0.0f};
+    float ident[64];
+    uint8_t *img;
+    size_t size;
+    vtm_t *m;
+    int i, k, ok = 0;
+
+    for (i = 0; i < 8; i++)
+        for (k = 0; k < 8; k++)
+            ident[i * 8 + k] = (i == k) ? 1.0f : 0.0f;
+
+    model_init(&md);
+    model_add_f32(&md, "x", 1, dx, xv);
+    model_add_f32(&md, "y", 1, dx, zero);
+    model_add_f32(&md, "I", 2, di, ident);
+    model_add_f32(&md, "logits", 1, dx, zero);
+    model_inst(&md, VTM_OP_ROPE, 0, 1, 0, 1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_TMV, 0, 3, 2, 1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    if (meta) model_set_meta(&md, meta);
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    if (m) {
+        vtm_set_position(m, pos);
+        if (run_ok(m)) {
+            memcpy(logits, vtm_tensor_by_name(m, "logits")->f32,
+                   (size_t)n * sizeof(float));
+            ok = 1;
+        }
+        vtm_free(m);
+    }
+    free(img);
+    model_free(&md);
+    return ok;
+}
+
+// Эталон RoPE в double — независимо от кода интерпретатора.
+static void rope_ref(double *y, const double *x, int heads, int head_dim,
+                     long long pos, double theta, int interleaved) {
+    int half = head_dim / 2, h, p;
+    for (h = 0; h < heads; h++) {
+        int base = h * head_dim;
+        for (p = 0; p < half; p++) {
+            double inv = pow(theta, -2.0 * (double)p / (double)head_dim);
+            double ang = (double)pos * inv;
+            double co = cos(ang), si = sin(ang);
+            int i0 = base + (interleaved ? 2 * p : p);
+            int i1 = base + (interleaved ? 2 * p + 1 : p + half);
+            double x0 = x[i0], x1 = x[i1];
+            y[i0] = x0 * co - x1 * si;
+            y[i1] = x1 * co + x0 * si;
+        }
+    }
+}
+
+static double max_abs_diff(const float *a, const float *b, int n) {
+    int i;
+    double d = 0.0;
+    for (i = 0; i < n; i++) {
+        double v = fabs((double)a[i] - (double)b[i]);
+        if (v > d) d = v;
+    }
+    return d;
+}
+
+static void test_meta_rope(void) {
+    float y_none[8], y4[8], y6[8], y6i[8];
+    double ref[8], x[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    double d;
+    int k;
+
+    CHECK(run_rope_meta(NULL, 13, y_none, 8));
+    CHECK(run_rope_meta("{\"rope_theta\": 10000.0}", 13, y4, 8));
+    CHECK(run_rope_meta("{\"rope_theta\": 1000000.0}", 13, y6, 8));
+    CHECK(run_rope_meta("{\"rope_theta\": 1000000.0, "
+                        "\"rope_layout\": \"interleaved\"}", 13, y6i, 8));
+
+    // Без меты — прежние 10000 побитово.
+    CHECK(memcmp(y_none, y4, sizeof y4) == 0);
+
+    rope_ref(ref, x, 1, 8, 13, 10000.0, 0);
+    for (k = 0; k < 8; k++) CHECK_NEAR(y4[k], ref[k], 1e-6);
+
+    rope_ref(ref, x, 1, 8, 13, 1e6, 0);
+    for (k = 0; k < 8; k++) CHECK_NEAR(y6[k], ref[k], 1e-6);
+
+    rope_ref(ref, x, 1, 8, 13, 1e6, 1);
+    for (k = 0; k < 8; k++) CHECK_NEAR(y6i[k], ref[k], 1e-6);
+
+    // Главный критерий: theta из меты реально меняет логиты.
+    d = max_abs_diff(y4, y6, 8);
+    CHECK(d > 1e-3);
+    CHECK(max_abs_diff(y6, y6i, 8) > 1e-3);
+
+    printf("мета rope_theta (pos=13, head_dim=8):\n");
+    printf("  theta=1e4        logits = [%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f]\n",
+           y4[0], y4[1], y4[2], y4[3], y4[4], y4[5], y4[6], y4[7]);
+    printf("  theta=1e6        logits = [%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f]\n",
+           y6[0], y6[1], y6[2], y6[3], y6[4], y6[5], y6[6], y6[7]);
+    printf("  theta=1e6, interleaved = [%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f]\n",
+           y6i[0], y6i[1], y6i[2], y6i[3], y6i[4], y6i[5], y6i[6], y6i[7]);
+    printf("  max|1e4 - 1e6| = %.6f; max|half - interleaved| = %.6f\n",
+           d, max_abs_diff(y6, y6i, 8));
+
+    // Вложенные ключи (meta["model"]) читаются так же, как верхний уровень,
+    // а синонимы "vocab"/"tie_word_embeddings" — как "vocab_size"/"tied_embeddings".
+    {
+        float ynest[8];
+        vtm_t *mn;
+        CHECK(run_rope_meta("{\"model\": {\"rope_theta\": 1000000.0}}",
+                            13, ynest, 8));
+        CHECK(memcmp(ynest, y6, sizeof y6) == 0);
+        mn = mini_with_meta("{\"model\": {\"rope_theta\": 1000000, "
+                            "\"vocab\": 42, \"tie_word_embeddings\": true}}");
+        CHECK(mn != NULL);
+        if (mn) {
+            CHECK(vtm_meta_rope_theta(mn) == 1000000.0);
+            CHECK(vtm_meta_vocab_size(mn) == 42u);
+            CHECK(vtm_meta_tied_embeddings(mn) == 1);
+            vtm_free(mn);
+        }
+        // Верхний уровень приоритетнее вложенного, даже если вложенный идёт
+        // в JSON позже; ключ только во вложенном — тоже читается.
+        mn = mini_with_meta("{\"rope_theta\": 1000000, \"vocab_size\": 42, "
+                            "\"tied_embeddings\": true, "
+                            "\"model\": {\"rope_theta\": 123, "
+                            "\"vocab\": 9, \"tied_embeddings\": false, "
+                            "\"rope_layout\": \"interleaved\"}}");
+        CHECK(mn != NULL);
+        if (mn) {
+            CHECK(vtm_meta_rope_theta(mn) == 1000000.0);
+            CHECK(vtm_meta_vocab_size(mn) == 42u);
+            CHECK(vtm_meta_tied_embeddings(mn) == 1);
+            CHECK(vtm_meta_rope_layout(mn) == VTM_ROPE_LAYOUT_INTERLEAVED);
+            vtm_free(mn);
+        }
+    }
+
+    // Доступ к мете через API.
+    {
+        model_t md;
+        uint16_t dy[1] = {1};
+        float yv[1] = {0.0f};
+        uint8_t *img;
+        size_t size;
+        vtm_t *m;
+        model_init(&md);
+        model_add_f32(&md, "y", 1, dy, yv);
+        model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+                   VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+        model_set_meta(&md, "{\"format\":\"vtm\",\"rope_theta\":1000000,"
+                            "\"rope_layout\":\"interleaved\","
+                            "\"vocab_size\":151936,"
+                            "\"tied_embeddings\":true}");
+        model_build(&md, &img, &size);
+        m = load_ok(img, size);
+        CHECK(m != NULL);
+        if (m) {
+            CHECK(vtm_meta_present(m) == 1);
+            CHECK(vtm_meta_rope_theta(m) == 1000000.0);
+            CHECK(vtm_meta_rope_layout(m) == VTM_ROPE_LAYOUT_INTERLEAVED);
+            CHECK(vtm_meta_vocab_size(m) == 151936u);
+            CHECK(vtm_meta_tied_embeddings(m) == 1);
+            CHECK(strstr(vtm_meta_json(m), "\"tied_embeddings\":true") != NULL);
+            vtm_free(m);
+        }
+        free(img);
+        model_free(&md);
+    }
+}
+
+// fp16-эмбеддинги: EMB читает fp16-таблицу, а tied lm_head — это та же
+// таблица как плотная матрица (TMV), в том числе в транспонированном виде.
+static void test_meta_fp16_emb_tied(void) {
+    model_t md;
+    uint16_t de[2] = {3, 4};     // E: [vocab, hidden]
+    uint16_t det[2] = {4, 3};    // Et = Eᵀ: [hidden, vocab]
+    uint16_t dy[1] = {4};
+    uint16_t dl[1] = {3};
+    float ev[12] = {0.5f, -1.0f, 2.0f, 3.5f,
+                    1.5f, 0.1f, -2.0f, 0.75f,
+                    -0.5f, 0.5f, 1.0f, -1.5f};
+    float et[12];
+    float yh[4] = {0.0f};
+    float lg[3] = {0.0f};
+    float lgt[3] = {0.0f};
+    double want_y[4], want_l[3];
+    uint8_t *img;
+    size_t size;
+    vtm_t *m;
+    int i, k;
+
+    for (i = 0; i < 3; i++)
+        for (k = 0; k < 4; k++)
+            et[k * 3 + i] = ev[i * 4 + k];
+
+    model_init(&md);
+    model_add_f16(&md, "E", 2, de, ev);
+    model_add_f32(&md, "yh", 1, dy, yh);
+    model_add_f32(&md, "logits", 1, dl, lg);
+    model_add_f32(&md, "logits_t", 1, dl, lgt);
+    model_add_f16(&md, "Et", 2, det, et);
+    // yh = E[1]; logits = E·yh; logits_t = Eᵀᵀ·yh (флаг транспонирования).
+    model_inst(&md, VTM_OP_EMB, 0, 1, 0, VTM_NO_TENSOR, VTM_NO_TENSOR, 1);
+    model_inst(&md, VTM_OP_TMV, 0, 2, 0, 1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_TMV, VTM_FLAG_TMV_TRANSPOSED, 3, 4, 1,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_set_meta(&md, "{\"format\":\"vtm\",\"vocab_size\":3,"
+                        "\"tied_embeddings\":true}");
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    CHECK(m != NULL);
+    if (m) {
+        const vtm_tensor *E;
+        CHECK(vtm_meta_present(m) == 1);
+        CHECK(vtm_meta_vocab_size(m) == 3u);
+        CHECK(vtm_meta_tied_embeddings(m) == 1);
+        CHECK(vtm_meta_rope_theta(m) == 10000.0); // нет ключа — дефолт
+        E = vtm_tensor_by_name(m, "E");
+        CHECK(E != NULL && E->kind == VTM_TENSOR_F16 && E->f32 != NULL);
+        // Сырое чтение fp16: значения арены против fp16-эталона, 1e-3.
+        for (i = 0; i < 12; i++)
+            CHECK_NEAR(E->f32[i],
+                       vtm_half_to_float(vtm_float_to_half(ev[i])), 1e-3);
+        CHECK(run_ok(m));
+
+        // Эталон — значения после округления до fp16, в double.
+        for (k = 0; k < 4; k++)
+            want_y[k] = (double)vtm_half_to_float(
+                vtm_float_to_half(ev[4 + k]));
+        for (i = 0; i < 3; i++) {
+            want_l[i] = 0.0;
+            for (k = 0; k < 4; k++)
+                want_l[i] += (double)vtm_half_to_float(
+                    vtm_float_to_half(ev[i * 4 + k])) * want_y[k];
+        }
+        for (k = 0; k < 4; k++)
+            CHECK_NEAR(vtm_tensor_by_name(m, "yh")->f32[k], want_y[k], 1e-3);
+        for (i = 0; i < 3; i++) {
+            CHECK_NEAR(vtm_tensor_by_name(m, "logits")->f32[i], want_l[i], 1e-3);
+            CHECK_NEAR(vtm_tensor_by_name(m, "logits_t")->f32[i], want_l[i],
+                       1e-3);
+        }
+        {
+            double max_dev = 0.0;
+            for (i = 0; i < 12; i++) {
+                double d = fabs((double)E->f32[i] - (double)ev[i]);
+                if (d > max_dev) max_dev = d;
+            }
+            printf("мета fp16+tied: fp16 E: max|E - исходные float| = %.3e; ",
+                   max_dev);
+        }
+        printf("EMB(yh)=[%.6f %.6f %.6f %.6f] "
+               "logits=[%.6f %.6f %.6f] (эталон %.6f %.6f %.6f), "
+               "транспонированный lm_head совпал\n",
+               (double)vtm_tensor_by_name(m, "yh")->f32[0],
+               (double)vtm_tensor_by_name(m, "yh")->f32[1],
+               (double)vtm_tensor_by_name(m, "yh")->f32[2],
+               (double)vtm_tensor_by_name(m, "yh")->f32[3],
+               (double)vtm_tensor_by_name(m, "logits")->f32[0],
+               (double)vtm_tensor_by_name(m, "logits")->f32[1],
+               (double)vtm_tensor_by_name(m, "logits")->f32[2],
+               want_l[0], want_l[1], want_l[2]);
+        vtm_free(m);
+    }
+    free(img);
+    model_free(&md);
+}
+
+// Битая мета: любой дефект — не ошибка загрузки, а откат на дефолты.
+static void test_meta_broken(void) {
+    static const struct {
+        const char *meta;
+        int present;
+        double theta;
+    } cases[] = {
+        { "{\"rope_theta\":", 0, VTM_DEFAULT_ROPE_THETA }, // обрезанный JSON
+        { "not json", 0, VTM_DEFAULT_ROPE_THETA },          // вообще не JSON
+        { "[1, 2, 3]", 0, VTM_DEFAULT_ROPE_THETA },         // не объект
+        { "{\"rope_theta\": 1000000} мусор", 0,
+          VTM_DEFAULT_ROPE_THETA },                         // мусор после объекта
+        { "{\"rope_theta\": 0}", 1, VTM_DEFAULT_ROPE_THETA }, // theta <= 0
+        { "{\"rope_theta\": \"abc\", \"rope_layout\": 7, "
+          "\"vocab_size\": -5, \"tied_embeddings\": \"yes\"}", 1,
+          VTM_DEFAULT_ROPE_THETA },                         // не те типы
+        { "{\"rope_theta\": 1000000}", 1, 1000000.0 },      // валидная
+    };
+    const size_t n_cases = sizeof cases / sizeof cases[0];
+    size_t c;
+    int ok = 0;
+
+    for (c = 0; c < n_cases; c++) {
+        model_t md;
+        uint16_t dy[1] = {1};
+        float yv[1] = {0.0f};
+        uint8_t *img;
+        size_t size;
+        vtm_t *m;
+
+        model_init(&md);
+        model_add_f32(&md, "y", 1, dy, yv);
+        model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+                   VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+        model_set_meta(&md, cases[c].meta);
+        model_build(&md, &img, &size);
+        m = load_ok(img, size);
+        CHECK(m != NULL);
+        if (m) {
+            memset(vtm_tensor_by_name(m, "y")->f32, 0, sizeof yv);
+            CHECK(vtm_meta_present(m) == cases[c].present);
+            CHECK(vtm_meta_rope_theta(m) == cases[c].theta);
+            CHECK(vtm_meta_rope_layout(m) == VTM_ROPE_LAYOUT_HALF);
+            CHECK(vtm_meta_vocab_size(m) == 0u);
+            CHECK(vtm_meta_tied_embeddings(m) == 0);
+            CHECK(run_ok(m));
+            ok++;
+            vtm_free(m);
+        }
+        free(img);
+        model_free(&md);
+    }
+    CHECK(ok == (int)n_cases);
+
+    // Валидная мета читается как надо, но её содержимое испорчено/смещения
+    // врут — контейнер всё равно грузится.
+    {
+        model_t md;
+        uint16_t dy[1] = {1};
+        float yv[1] = {0.0f};
+        uint8_t *img;
+        uint8_t *copy;
+        size_t size;
+        uint32_t meta_off, meta_len;
+        vtm_t *m;
+
+        model_init(&md);
+        model_add_f32(&md, "y", 1, dy, yv);
+        model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+                   VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+        model_set_meta(&md, "{\"rope_theta\": 1000000, \"vocab_size\": 7}");
+        model_build(&md, &img, &size);
+        meta_off = get_u32(img + 24);
+        meta_len = get_u32(img + 28);
+        CHECK(meta_off != 0 && meta_len != 0);
+
+        // 1) мусор вместо JSON по правильному смещению.
+        copy = (uint8_t *)xmalloc(size);
+        memcpy(copy, img, size);
+        memcpy(copy + meta_off, "\x00\xFF\x01", 3);
+        m = load_ok(copy, size);
+        CHECK(m != NULL);
+        if (m) {
+            CHECK(vtm_meta_present(m) == 0);
+            CHECK(vtm_meta_rope_theta(m) == VTM_DEFAULT_ROPE_THETA);
+            CHECK(run_ok(m));
+            vtm_free(m);
+        }
+        free(copy);
+
+        // 2) meta_len больше, чем есть до программы.
+        copy = (uint8_t *)xmalloc(size);
+        memcpy(copy, img, size);
+        put_u32(copy + 28, 0x7FFFFFFFu);
+        m = load_ok(copy, size);
+        CHECK(m != NULL);
+        if (m) {
+            CHECK(vtm_meta_present(m) == 0);
+            CHECK(run_ok(m));
+            vtm_free(m);
+        }
+        free(copy);
+
+        // 3) meta_offset за концом файла.
+        copy = (uint8_t *)xmalloc(size);
+        memcpy(copy, img, size);
+        put_u32(copy + 24, 0xFFFFFFF0u);
+        m = load_ok(copy, size);
+        CHECK(m != NULL);
+        if (m) {
+            CHECK(vtm_meta_present(m) == 0);
+            CHECK(run_ok(m));
+            vtm_free(m);
+        }
+        free(copy);
+
+        // 4) meta_offset указывает в таблицу тензоров (перекрытие).
+        copy = (uint8_t *)xmalloc(size);
+        memcpy(copy, img, size);
+        put_u32(copy + 24, 32u);
+        m = load_ok(copy, size);
+        CHECK(m != NULL);
+        if (m) {
+            CHECK(vtm_meta_present(m) == 0);
+            CHECK(run_ok(m));
+            vtm_free(m);
+        }
+        free(copy);
+
+        free(img);
+        model_free(&md);
+    }
+    printf("битая мета: %zu вариантов JSON + 4 порчи заголовка — "
+           "все загрузились на дефолтах\n", n_cases);
+}
+
 // --- EMB, MM ---------------------------------------------------------------
 
 static void test_emb(void) {
@@ -1425,6 +1896,9 @@ int main(void) {
     test_rmsnorm();
     test_softmax();
     test_rope();
+    test_meta_rope();
+    test_meta_fp16_emb_tied();
+    test_meta_broken();
     test_emb();
     test_mm();
     test_elementwise();

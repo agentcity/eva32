@@ -5,6 +5,7 @@
 // файл обязан вернуть NULL и внятную причину, а не уронить процесс.
 #include "vtm_internal.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -221,6 +222,333 @@ static void fill_tensor(vtm_tensor *t, const uint8_t *data, uint8_t *dst) {
     }
 }
 
+// --- метаданные: минимальный разбор JSON -----------------------------------
+//
+// Мета — JSON-объект за секцией данных (docs/vtm.md, «Метаданные»). Нужны
+// четыре ключа, поэтому дерево не строим: обходим документ по грамматике
+// JSON, пропуская значения целиком, и запоминаем только интересующие. Значения
+// меты могут быть большими (expected.logits синтетики — мегабайты), поэтому
+// вложенные массивы/объекты не материализуются.
+//
+// Любая порча (нет закрывающей скобки, мусор в конце, глубже
+// VTM_JSON_MAX_DEPTH, не тот тип у ключа) — это НЕ ошибка загрузки: мета
+// просто не применяется, и остаются дефолты. Так требует задача: битая мета
+// не должна ронять контейнер.
+
+#define VTM_JSON_MAX_DEPTH 64
+
+typedef struct {
+    double   rope_theta;
+    int      rope_layout;
+    uint32_t vocab_size;
+    int      tied_embeddings;
+    // Глубина, на которой ключ найден (-1 = ещё не найден). Верхний уровень
+    // приоритетнее вложенного meta["model"]: иначе итог зависел бы от порядка
+    // ключей в JSON.
+    int      theta_depth, layout_depth, vocab_depth, tied_depth;
+} meta_fields;
+
+// Можно ли записать значение с этой глубины: только если ключ ещё не найден
+// или найден глубже.
+static int meta_take(int have_depth, int depth) {
+    return have_depth < 0 || depth < have_depth;
+}
+
+typedef struct {
+    const char *p;
+    size_t      n;
+    size_t      i;
+    int         depth;
+} json_scan;
+
+static void json_ws(json_scan *s) {
+    while (s->i < s->n) {
+        char c = s->p[s->i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') s->i++;
+        else break;
+    }
+}
+
+static int json_hex(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Строка в кавычках. out == NULL — только пропустить. Escape-последовательности
+// съедаются, но в out попадает только их ASCII-смысл; \uXXXX даёт '?'
+// (в читаемых нами ключах и значениях escape не встречается).
+static int json_string(json_scan *s, char *out, size_t cap) {
+    size_t o = 0;
+    if (s->i >= s->n || s->p[s->i] != '"') return -1;
+    s->i++;
+    while (s->i < s->n) {
+        unsigned char c = (unsigned char)s->p[s->i++];
+        if (c == '"') {
+            if (out && cap) out[o < cap ? o : cap - 1u] = '\0';
+            return 0;
+        }
+        if (c < 0x20u) return -1;
+        if (c == '\\') {
+            if (s->i >= s->n) return -1;
+            c = (unsigned char)s->p[s->i++];
+            switch (c) {
+            case '"': case '\\': case '/':
+            case 'b': case 'f': case 'n': case 'r': case 't':
+                break;
+            case 'u': {
+                int k;
+                for (k = 0; k < 4; k++) {
+                    if (s->i >= s->n || json_hex((unsigned char)s->p[s->i]) < 0)
+                        return -1;
+                    s->i++;
+                }
+                c = '?';
+                break;
+            }
+            default:
+                return -1;
+            }
+        }
+        if (out && o + 1u < cap) out[o++] = (char)c;
+    }
+    return -1;
+}
+
+// Число по грамматике JSON; strtod получает уже проверенный кусок.
+static int json_number(json_scan *s, double *out) {
+    size_t start = s->i;
+    char buf[64];
+    size_t len;
+    char *end = NULL;
+    double v;
+
+    if (s->i < s->n && s->p[s->i] == '-') s->i++;
+    if (s->i >= s->n) return -1;
+    if (s->p[s->i] == '0') {
+        s->i++;
+    } else if (s->p[s->i] >= '1' && s->p[s->i] <= '9') {
+        while (s->i < s->n && s->p[s->i] >= '0' && s->p[s->i] <= '9') s->i++;
+    } else {
+        return -1;
+    }
+    if (s->i < s->n && s->p[s->i] == '.') {
+        s->i++;
+        if (s->i >= s->n || s->p[s->i] < '0' || s->p[s->i] > '9') return -1;
+        while (s->i < s->n && s->p[s->i] >= '0' && s->p[s->i] <= '9') s->i++;
+    }
+    if (s->i < s->n && (s->p[s->i] == 'e' || s->p[s->i] == 'E')) {
+        s->i++;
+        if (s->i < s->n && (s->p[s->i] == '+' || s->p[s->i] == '-')) s->i++;
+        if (s->i >= s->n || s->p[s->i] < '0' || s->p[s->i] > '9') return -1;
+        while (s->i < s->n && s->p[s->i] >= '0' && s->p[s->i] <= '9') s->i++;
+    }
+    len = s->i - start;
+    if (len == 0 || len >= sizeof buf) return -1;
+    memcpy(buf, s->p + start, len);
+    buf[len] = '\0';
+    v = strtod(buf, &end);
+    if (end != buf + len || !isfinite(v)) return -1;
+    if (out) *out = v;
+    return 0;
+}
+
+static int json_literal(json_scan *s, const char *lit) {
+    size_t len = strlen(lit);
+    if (s->i > s->n || len > s->n - s->i) return -1;
+    if (memcmp(s->p + s->i, lit, len) != 0) return -1;
+    s->i += len;
+    return 0;
+}
+
+static int json_value(json_scan *s, meta_fields *mf);
+static int json_object(json_scan *s, meta_fields *mf);
+static int json_array(json_scan *s, meta_fields *mf);
+
+// 1 rope_theta, 2 rope_layout, 3 vocab_size, 4 tied_embeddings, 0 — чужой ключ.
+// Ключи ищутся на любом уровне: компилятор кладёт часть конфигурации и в
+// meta["model"], и на верхний уровень, а формат это не запрещает.
+static int json_key_kind(const char *key) {
+    if (strcmp(key, "rope_theta") == 0) return 1;
+    if (strcmp(key, "rope_layout") == 0) return 2;
+    if (strcmp(key, "vocab_size") == 0 || strcmp(key, "vocab") == 0) return 3;
+    if (strcmp(key, "tied_embeddings") == 0 ||
+        strcmp(key, "tie_word_embeddings") == 0) return 4;
+    return 0;
+}
+
+// Разобрать значение известного ключа. Тип не тот — значение пропускается,
+// ключ остаётся с дефолтом (битая мета не должна ничего ломать).
+static int json_known_value(json_scan *s, meta_fields *mf, int kind) {
+    unsigned char c;
+
+    json_ws(s);
+    if (s->i >= s->n) return -1;
+    c = (unsigned char)s->p[s->i];
+    if (c == '"') {
+        char val[32];
+        if (json_string(s, val, sizeof val) != 0) return -1;
+        if (kind == 2 && meta_take(mf->layout_depth, s->depth)) {
+            if (strcmp(val, "half") == 0) {
+                mf->rope_layout = VTM_ROPE_LAYOUT_HALF;
+                mf->layout_depth = s->depth;
+            } else if (strcmp(val, "interleaved") == 0) {
+                mf->rope_layout = VTM_ROPE_LAYOUT_INTERLEAVED;
+                mf->layout_depth = s->depth;
+            }
+        }
+        return 0;
+    }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        double v;
+        if (json_number(s, &v) != 0) return -1;
+        if (kind == 1) {
+            if (v > 0.0 && v <= 1e15 && meta_take(mf->theta_depth, s->depth)) {
+                mf->rope_theta = v;
+                mf->theta_depth = s->depth;
+            }
+        } else if (kind == 3) {
+            if (v >= 1.0 && v <= (double)VTM_MAX_ELEMENTS && v == floor(v) &&
+                meta_take(mf->vocab_depth, s->depth)) {
+                mf->vocab_size = (uint32_t)v;
+                mf->vocab_depth = s->depth;
+            }
+        } else if (kind == 4) {
+            if ((v == 0.0 || v == 1.0) && meta_take(mf->tied_depth, s->depth)) {
+                mf->tied_embeddings = (v != 0.0);
+                mf->tied_depth = s->depth;
+            }
+        }
+        return 0;
+    }
+    if (json_literal(s, "true") == 0) {
+        if (kind == 4 && meta_take(mf->tied_depth, s->depth)) {
+            mf->tied_embeddings = 1;
+            mf->tied_depth = s->depth;
+        }
+        return 0;
+    }
+    if (json_literal(s, "false") == 0) {
+        if (kind == 4 && meta_take(mf->tied_depth, s->depth)) {
+            mf->tied_embeddings = 0;
+            mf->tied_depth = s->depth;
+        }
+        return 0;
+    }
+    if (json_literal(s, "null") == 0) return 0;
+    // Объект/массив вместо скаляра: пропустить, заодно собрав вложенные ключи.
+    return json_value(s, mf);
+}
+
+static int json_object(json_scan *s, meta_fields *mf) {
+    if (s->depth >= VTM_JSON_MAX_DEPTH) return -1;
+    s->depth++;
+    s->i++; // '{'
+    json_ws(s);
+    if (s->i < s->n && s->p[s->i] == '}') {
+        s->i++;
+        s->depth--;
+        return 0;
+    }
+    for (;;) {
+        char key[64];
+        int kind;
+        if (json_string(s, key, sizeof key) != 0) break;
+        json_ws(s);
+        if (s->i >= s->n || s->p[s->i] != ':') break;
+        s->i++;
+        kind = json_key_kind(key);
+        if (kind != 0) {
+            if (json_known_value(s, mf, kind) != 0) break;
+        } else if (json_value(s, mf) != 0) {
+            break;
+        }
+        json_ws(s);
+        if (s->i < s->n && s->p[s->i] == ',') {
+            s->i++;
+            json_ws(s);
+            continue;
+        }
+        if (s->i < s->n && s->p[s->i] == '}') {
+            s->i++;
+            s->depth--;
+            return 0;
+        }
+        break;
+    }
+    s->depth--;
+    return -1;
+}
+
+static int json_array(json_scan *s, meta_fields *mf) {
+    if (s->depth >= VTM_JSON_MAX_DEPTH) return -1;
+    s->depth++;
+    s->i++; // '['
+    json_ws(s);
+    if (s->i < s->n && s->p[s->i] == ']') {
+        s->i++;
+        s->depth--;
+        return 0;
+    }
+    for (;;) {
+        if (json_value(s, mf) != 0) break;
+        json_ws(s);
+        if (s->i < s->n && s->p[s->i] == ',') {
+            s->i++;
+            continue;
+        }
+        if (s->i < s->n && s->p[s->i] == ']') {
+            s->i++;
+            s->depth--;
+            return 0;
+        }
+        break;
+    }
+    s->depth--;
+    return -1;
+}
+
+static int json_value(json_scan *s, meta_fields *mf) {
+    unsigned char c;
+
+    json_ws(s);
+    if (s->i >= s->n) return -1;
+    c = (unsigned char)s->p[s->i];
+    if (c == '{') return json_object(s, mf);
+    if (c == '[') return json_array(s, mf);
+    if (c == '"') return json_string(s, NULL, 0);
+    if (c == '-' || (c >= '0' && c <= '9')) return json_number(s, NULL);
+    if (json_literal(s, "true") == 0) return 0;
+    if (json_literal(s, "false") == 0) return 0;
+    if (json_literal(s, "null") == 0) return 0;
+    return -1;
+}
+
+// 0 — мета разобрана (объект, без мусора после него), -1 — порча.
+// Поля commit'ятся только целиком: недособранный JSON не оставляет полуметы.
+static int meta_parse(const char *json, size_t len, meta_fields *out) {
+    json_scan s;
+    meta_fields f;
+
+    s.p = json;
+    s.n = len;
+    s.i = 0;
+    s.depth = 0;
+    f.rope_theta = VTM_DEFAULT_ROPE_THETA;
+    f.rope_layout = VTM_ROPE_LAYOUT_HALF;
+    f.vocab_size = 0;
+    f.tied_embeddings = 0;
+    f.theta_depth = f.layout_depth = f.vocab_depth = f.tied_depth = -1;
+    json_ws(&s);
+    if (s.i >= s.n || s.p[s.i] != '{') return -1;
+    if (json_object(&s, &f) != 0) return -1;
+    json_ws(&s);
+    if (s.i != s.n) return -1;
+    *out = f;
+    return 0;
+}
+
 // --- загрузка из памяти ----------------------------------------------------
 
 vtm_t *vtm_load_mem(const void *data, size_t size,
@@ -230,6 +558,8 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
     const uint8_t *p = (const uint8_t *)data;
     uint32_t n_instr, n_tensors, n_program;
     size_t table_end, data_start, program_bytes, program_off, data_size;
+    uint32_t meta_off = 0, meta_len = 0;
+    int meta_valid = 0;
     size_t *sizes = NULL;
     uint32_t i;
 
@@ -268,6 +598,9 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
     }
     m->backend = &vtm_backend_scalar_lut;
     m->input_token = -1;
+    // Дефолты меты: без меты/с битой метой ROPE работает на 10000, как раньше.
+    m->rope_theta = VTM_DEFAULT_ROPE_THETA;
+    m->rope_layout = VTM_ROPE_LAYOUT_HALF;
 
 #define FAIL(code, ...) do { \
         st = (code); \
@@ -306,6 +639,19 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
     if (program_off < data_start)
         FAIL(VTM_E_TRUNCATED, "программа перекрывает секцию данных");
     data_size = program_off - data_start;
+
+    // Метаданные — JSON между секцией данных и программой (docs/vtm.md).
+    // Смещение и длину берём из «резерва» заголовка (байты 24 и 28). Если они
+    // врут или указывают мимо программы — это битая мета, а не битый файл:
+    // мету просто не читаем, данные трактуем как раньше (до программы).
+    meta_off = rd32(p + 24);
+    meta_len = rd32(p + 28);
+    if (meta_off != 0 && meta_len != 0 &&
+        (uint64_t)meta_off >= (uint64_t)data_start &&
+        (uint64_t)meta_off + (uint64_t)meta_len <= (uint64_t)program_off) {
+        meta_valid = 1;
+        data_size = (size_t)meta_off - data_start;
+    }
 
     if (n_program != 0) {
         uint64_t as_size = (uint64_t)n_instr * VTM_INSTR_SIZE;
@@ -533,6 +879,27 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
                  i, n_tensors);
     }
 
+    // --- метаданные --------------------------------------------------------
+    // Разбор терпимый: отсутствие, порча, неверные типы, слишком большая мета
+    // — не ошибка загрузки. Поля не сбрасываются, дефолты уже выставлены.
+    if (meta_valid) {
+        meta_fields mf;
+        if ((size_t)meta_len <= VTM_MAX_META_BYTES &&
+            meta_parse((const char *)p + meta_off, (size_t)meta_len, &mf) == 0) {
+            m->meta_present = 1;
+            m->rope_theta = mf.rope_theta;
+            m->rope_layout = mf.rope_layout;
+            m->vocab_size = mf.vocab_size;
+            m->tied_embeddings = mf.tied_embeddings;
+            // Копия JSON для хоста; не удалась — не беда, работает мета-API.
+            m->meta_json = (char *)malloc((size_t)meta_len + 1u);
+            if (m->meta_json) {
+                memcpy(m->meta_json, p + meta_off, (size_t)meta_len);
+                m->meta_json[meta_len] = '\0';
+            }
+        }
+    }
+
     // --- арена -------------------------------------------------------------
     sizes = (size_t *)calloc(n_tensors ? (size_t)n_tensors : 1u, sizeof(size_t));
     if (!sizes)
@@ -663,6 +1030,7 @@ vtm_t *vtm_load(const char *path) {
 
 void vtm_free(vtm_t *m) {
     if (!m) return;
+    free(m->meta_json);
     free(m->tensors);
     free(m->instr);
     free(m->arena_raw);
@@ -742,4 +1110,37 @@ const char *vtm_error_message(const vtm_t *m) {
 
 int vtm_halted(const vtm_t *m) {
     return m ? m->halted : 0;
+}
+
+// --- метаданные ------------------------------------------------------------
+
+int vtm_meta_present(const vtm_t *m) {
+    return m ? m->meta_present : 0;
+}
+
+double vtm_meta_rope_theta(const vtm_t *m) {
+    if (!m || !(m->rope_theta > 0.0) || !isfinite(m->rope_theta))
+        return VTM_DEFAULT_ROPE_THETA;
+    return m->rope_theta;
+}
+
+int vtm_meta_rope_layout(const vtm_t *m) {
+    if (!m) return VTM_ROPE_LAYOUT_HALF;
+    if (m->rope_layout != VTM_ROPE_LAYOUT_HALF &&
+        m->rope_layout != VTM_ROPE_LAYOUT_INTERLEAVED)
+        return VTM_ROPE_LAYOUT_HALF;
+    return m->rope_layout;
+}
+
+uint32_t vtm_meta_vocab_size(const vtm_t *m) {
+    if (!m) return 0;
+    return m->vocab_size <= VTM_MAX_ELEMENTS ? m->vocab_size : 0;
+}
+
+int vtm_meta_tied_embeddings(const vtm_t *m) {
+    return m ? (m->tied_embeddings ? 1 : 0) : 0;
+}
+
+const char *vtm_meta_json(const vtm_t *m) {
+    return (m && m->meta_json) ? m->meta_json : "";
 }

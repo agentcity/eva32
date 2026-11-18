@@ -191,7 +191,7 @@
   {
     "id": "0028",
     "title": "ВТМ: полная модель в контейнере",
-    "status": "in_progress",
+    "status": "done",
     "file": "0028-vtm-full.md",
     "assignee": "agent:vtm-full"
   },
@@ -219,7 +219,7 @@
   {
     "id": "0032",
     "title": "Голос: прототип ASR → eva → TTS",
-    "status": "in_progress",
+    "status": "done",
     "file": "0032-eva-voice.md",
     "assignee": "agent:eva-voice"
   },

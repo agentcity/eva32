@@ -145,6 +145,9 @@ typedef enum {
 #define VTM_FLAG_INPLACE         0x02u  // подсказка: dst может совпадать с a
 #define VTM_FLAG_EMB_INPUT       0x01u  // EMB: взять токен из vtm_set_token()
 #define VTM_FLAG_ROPE_INTERLEAVED 0x02u // ROPE: пары (2i, 2i+1), иначе половинки
+// TMV: поле a задано в транспонированном виде [cols, rows] (например,
+// lm_head = Eᵀ при tied_embeddings хранится как [hidden, vocab]).
+#define VTM_FLAG_TMV_TRANSPOSED  0x04u
 
 // Флаги заголовка контейнера.
 #define VTM_HEADER_FLAG_F32_SCALES       0x0001u // raw-триты: масштабы fp32
@@ -230,6 +233,33 @@ vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user);
 // Текст ошибки последнего прогона (буфер внутри машины).
 const char *vtm_error_message(const vtm_t *m);
 int vtm_halted(const vtm_t *m);
+
+// --- метаданные контейнера -------------------------------------------------
+// JSON-метаданные лежат за секцией данных, перед программой (docs/vtm.md,
+// «Метаданные»). Загрузчик читает их терпимо: нет меты, битый JSON, битые
+// смещения — это не ошибка загрузки, а откат на дефолты. Читаются ключи,
+// влияющие на исполнение: rope_theta, rope_layout, vocab_size,
+// tied_embeddings; ключи ищутся на любом уровне вложенности (в том числе в
+// meta["model"]).
+typedef enum {
+    VTM_ROPE_LAYOUT_HALF = 0,        // пары (i, i + head_dim/2) — Qwen/Llama
+    VTM_ROPE_LAYOUT_INTERLEAVED = 1  // пары (2i, 2i+1) — GPT-NeoX
+} vtm_rope_layout;
+
+#define VTM_DEFAULT_ROPE_THETA 10000.0
+
+// 1 — JSON-объект разобран; 0 — меты нет или она битая (действуют дефолты).
+int vtm_meta_present(const vtm_t *m);
+// theta для ROPE; без меты или с некорректным значением — 10000.
+double vtm_meta_rope_theta(const vtm_t *m);
+// vtm_rope_layout; без меты — VTM_ROPE_LAYOUT_HALF.
+int vtm_meta_rope_layout(const vtm_t *m);
+// vocab_size из меты; 0 — не задан (размер брать из dims тензора EMB).
+uint32_t vtm_meta_vocab_size(const vtm_t *m);
+// 1 — lm_head разделяет таблицу с эмбеддингами (tied); 0 — нет/неизвестно.
+int vtm_meta_tied_embeddings(const vtm_t *m);
+// Сырой JSON (NUL-терминированный) или ""; живёт до vtm_free().
+const char *vtm_meta_json(const vtm_t *m);
 
 // --- кодек тритов ----------------------------------------------------------
 // Контрольные векторы docs/trit-format.md:
