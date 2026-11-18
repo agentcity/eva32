@@ -9,6 +9,25 @@ import json
 import os
 import urllib.request
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_env(path: str | None = None) -> None:
+    """Подхватить .env из корня репозитория, не перетирая уже заданные переменные.
+
+    Ключ не должен ходить через переписку: положили в .env (он в .gitignore) — и всё.
+    """
+    path = path or os.path.join(ROOT, ".env")
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"\''))
+
 MOCK_ANSWERS = [
     "Тариф «Старт» стоит 990 ₽ в месяц и подходит для небольших команд до трёх человек.",
     "Тариф стоит 990 ₽ в месяц — это дешевле, чем у конкурентов, поэтому берите.",
@@ -21,6 +40,7 @@ MOCK_ANSWERS = [
 class Teacher:
     def __init__(self, base: str | None = None, key: str | None = None,
                  model: str | None = None, mock: bool = False):
+        load_env()
         self.base = (base or os.environ.get("TEACHER_BASE", "")).rstrip("/")
         self.key = key or os.environ.get("TEACHER_KEY", "")
         self.model = model or os.environ.get("TEACHER_MODEL", "deepseek-v4.1-flash")
