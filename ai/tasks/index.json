@@ -579,5 +579,47 @@
     "status": "pending",
     "file": "0088-simd-parity.md",
     "assignee": ""
+  },
+  {
+    "id": "0089",
+    "title": "eva ↔ ВТМ: локальный бэкенд через C-ABI",
+    "status": "in_progress",
+    "file": "0089-eva-vtm-backend.md",
+    "assignee": "agent:eva-vtm-backend"
+  },
+  {
+    "id": "0090",
+    "title": "eva: метрики и отмена запросов на сервере",
+    "status": "in_progress",
+    "file": "0090-eva-server-metrics.md",
+    "assignee": "agent:eva-server-metrics"
+  },
+  {
+    "id": "0091",
+    "title": "Скиллы: расширить и измерить маршрутизацию",
+    "status": "in_progress",
+    "file": "0091-eva-skills-expand.md",
+    "assignee": "agent:eva-skills-expand"
+  },
+  {
+    "id": "0092",
+    "title": "Данные: разбиение train/val и предтокенизация для QAT",
+    "status": "in_progress",
+    "file": "0092-qat-data-prep.md",
+    "assignee": "agent:qat-data-prep"
+  },
+  {
+    "id": "0093",
+    "title": "Голос: адаптер TTS с фолбэком (Piper)",
+    "status": "in_progress",
+    "file": "0093-eva-tts-piper.md",
+    "assignee": "agent:eva-tts-piper"
+  },
+  {
+    "id": "0094",
+    "title": "Рунбуки: аренда и гибрид под текущие числа",
+    "status": "in_progress",
+    "file": "0094-runbooks-refresh.md",
+    "assignee": "agent:runbooks-refresh"
   }
 ]
