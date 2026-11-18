@@ -180,5 +180,12 @@
     "status": "done",
     "file": "0026-eva-integration.md",
     "assignee": "agent:eva-integration"
+  },
+  {
+    "id": "0027",
+    "title": "Эксперимент: эмбеддинги в тритах против int8",
+    "status": "pending",
+    "file": "0027-trit-embeddings.md",
+    "assignee": ""
   }
 ]
