@@ -82,5 +82,12 @@
     "status": "in_progress",
     "file": "0012-bpe-tokenizer.md",
     "assignee": "agent:tokenizer"
+  },
+  {
+    "id": "0013",
+    "title": "Реестр архитектурных решений в docs/adr",
+    "status": "done",
+    "file": "0013-adr-process.md",
+    "assignee": "saron"
   }
 ]
