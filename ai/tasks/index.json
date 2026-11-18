@@ -555,28 +555,28 @@
   {
     "id": "0082",
     "title": "Метрики по операциям вместо оценки (trace)",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0082-vtm-metrics.md",
     "assignee": ""
   },
   {
     "id": "0086",
     "title": "UBSan: misaligned load в ядрах (memcpy)",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0086-unaligned-loads.md",
     "assignee": ""
   },
   {
     "id": "0087",
     "title": "Кэш промпта в C-ABI: не сбрасывать между запросами",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0087-api-cache.md",
     "assignee": ""
   },
   {
     "id": "0088",
     "title": "Паритет SIMD: измерить и задокументировать расхождение",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0088-simd-parity.md",
     "assignee": ""
   },
