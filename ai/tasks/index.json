@@ -1,0 +1,65 @@
+[
+  {
+    "id": "0001",
+    "title": "Бандл EVA32: промпт, конфиг, eval, serving",
+    "status": "done",
+    "file": "0001-eva32-bundle.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0002",
+    "title": "Виртуальная троичная машина: C-интерпретатор",
+    "status": "in_progress",
+    "file": "0002-vtm-runtime-c.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0003",
+    "title": "Виртуальная троичная машина: Python-эталон и компилятор графа",
+    "status": "in_progress",
+    "file": "0003-vtm-python-reference.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0004",
+    "title": "Конвейер сбора пар «вопрос → ответ» и оценка стоимости",
+    "status": "done",
+    "file": "0004-distill-pipeline.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0005",
+    "title": "Заготовка QAT и рунбук запуска на аренде",
+    "status": "done",
+    "file": "0005-qat-scaffold.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0006",
+    "title": "Сверка C-рантайма с Python-эталоном (parity)",
+    "status": "pending",
+    "file": "0006-vtm-parity.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0007",
+    "title": "Банк вопросов из каталога orioncode",
+    "status": "blocked",
+    "file": "0007-catalog-questions.md",
+    "assignee": "yuri"
+  },
+  {
+    "id": "0008",
+    "title": "Пилот QAT на арендованной GPU",
+    "status": "blocked",
+    "file": "0008-qat-pilot-run.md",
+    "assignee": "yuri"
+  },
+  {
+    "id": "0009",
+    "title": "Реестр задач и ссылки на задачи в коммитах",
+    "status": "done",
+    "file": "0009-task-registry.md",
+    "assignee": "saron"
+  }
+]
