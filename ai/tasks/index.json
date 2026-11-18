@@ -443,7 +443,7 @@
   {
     "id": "0069",
     "title": "Волна 4: фаззинг и санитайзеры в CI",
-    "status": "in_progress",
+    "status": "done",
     "file": "0069-vtm-fuzz.md",
     "assignee": "agent:vtm-fuzz"
   },
@@ -457,7 +457,7 @@
   {
     "id": "0071",
     "title": "Волна 2: профиль полного прохода — где теряется время",
-    "status": "in_progress",
+    "status": "done",
     "file": "0071-vtm-bench.md",
     "assignee": "agent:vtm-bench"
   },
@@ -481,5 +481,12 @@
     "status": "pending",
     "file": "0074-fast-integrity.md",
     "assignee": ""
+  },
+  {
+    "id": "0075",
+    "title": "ATTN: переполнение q_start+q_len (SIGBUS)",
+    "status": "done",
+    "file": "0075-attn-overflow.md",
+    "assignee": "saron"
   }
 ]

@@ -14,6 +14,7 @@
 #include "vtm_internal.h"
 #include "vtm_backend.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -742,15 +743,22 @@ static vtm_status op_attn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         n_kv_heads = kv_dim / head_dim;
         if (n_kv_heads <= 0)
             return fail(m, ins, VTM_E_SHAPE, "ATTN: kv_heads=0");
-        q_start = m->position + in->imm;
-        if (q_start < 0)
-            return fail(m, ins, VTM_E_BOUNDS,
-                        "ATTN: q_start=%d отрицателен", q_start);
-        key_count = q_start + q_len;
-        if (key_count > ctx)
-            return fail(m, ins, VTM_E_BOUNDS,
-                        "ATTN: q_start+q_len=%d больше ctx=%d",
-                        key_count, ctx);
+        // Считаем в long long: malformed-контейнер с imm=INT_MAX раньше давал
+        // signed overflow (q_start+q_len < 0), проверка "больше ctx" его пропускала,
+        // и malloc получал отрицательную длину — SIGBUS. Фаззинг 0069 нашёл это.
+        {
+            long long qs = (long long)m->position + (long long)in->imm;
+            long long keys = qs + (long long)q_len;
+
+            if (qs < 0 || qs > (long long)INT_MAX)
+                return fail(m, ins, VTM_E_BOUNDS,
+                            "ATTN: q_start=%lld вне диапазона", qs);
+            if (keys > (long long)ctx)
+                return fail(m, ins, VTM_E_BOUNDS,
+                            "ATTN: q_start+q_len=%lld больше ctx=%d", keys, ctx);
+            q_start = (int)qs;
+            key_count = (int)keys;
+        }
         kv_len = ctx;
     } else {
         return fail(m, ins, VTM_E_SHAPE,

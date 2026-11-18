@@ -2693,6 +2693,24 @@ static int stream_cli_run(const int *chain, int n_chain, int max_new,
                          err, err_cap);
 }
 
+// Регрессия из фаззинга (0069): malformed-контейнер с imm=INT_MAX у ATTN давал
+// signed overflow q_start+q_len, проверка "больше ctx" его пропускала, и malloc
+// получал отрицательную длину — SIGBUS. Теперь q_start считается в long long.
+static void test_attn_imm_overflow(void) {
+    vtm_t *m = vtm_load("../../tests/vtm/fixtures/attn_imm_int_max.vtm");
+    vtm_status st;
+
+    CHECK(m != NULL);
+    if (!m) return;
+    vtm_set_token(m, 1);
+    st = vtm_run(m, NULL, NULL);
+    CHECK(st != VTM_OK);
+    // Код обёртки зависит от слоя (файл/интерпретатор), поэтому проверяем, что
+    // ошибка именно про ATTN, а не падение где-то ещё.
+    CHECK(strstr(vtm_last_error(), "ATTN") != NULL);
+    vtm_free(m);
+}
+
 static void test_cli_stream(void) {
     char out[8192], err[8192];
     int rc;
@@ -3709,6 +3727,7 @@ int main(void) {
     test_large_dims_u32();
     test_cli_text();
     test_cli_chat();
+    test_attn_imm_overflow();
     test_cli_stream();
     test_cli_limits();
     test_mmap_file_load();
