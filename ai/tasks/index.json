@@ -341,5 +341,26 @@
     "status": "done",
     "file": "0046-eval-torch.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0047",
+    "title": "3B на 24 ГБ: bf16-мастер и экономия памяти",
+    "status": "in_progress",
+    "file": "0047-qat-3b-24gb.md",
+    "assignee": "agent:qat-3b-24gb"
+  },
+  {
+    "id": "0048",
+    "title": "Стриминг в роутере гибрида",
+    "status": "in_progress",
+    "file": "0048-eva-stream-router.md",
+    "assignee": "agent:eva-stream-router"
+  },
+  {
+    "id": "0049",
+    "title": "Бенчмарк гибрида: латентность и цена",
+    "status": "in_progress",
+    "file": "0049-eva-bench.md",
+    "assignee": "agent:eva-bench"
   }
 ]
