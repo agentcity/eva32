@@ -261,7 +261,7 @@
   {
     "id": "0038",
     "title": "Промпт: перевод по прямой просьбе",
-    "status": "in_progress",
+    "status": "done",
     "file": "0038-prompt-translate.md",
     "assignee": "agent:prompt-translate"
   },
