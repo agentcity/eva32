@@ -765,7 +765,7 @@
   {
     "id": "0116",
     "title": "Документация: prefill, скорость, форма 1.5B",
-    "status": "in_progress",
+    "status": "done",
     "file": "0116-docs-prefill.md",
     "assignee": "agent:docs-prefill"
   },
