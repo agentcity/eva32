@@ -37,7 +37,7 @@ quant:
   target_suffixes: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
   exclude_suffixes: [lm_head, embed_tokens, router, gate, norm]
   # Эмбеддинги не квантуем: таблица словаря у 3B — 0.29B параметров.
-  quantize_embeddings: none
+  quantize_embeddings: trit
 
 data:
   path: distill/out/pairs.jsonl

@@ -76,6 +76,8 @@ NUM_HIDDEN_LAYERS = 4
 NUM_ATTENTION_HEADS = 4
 NUM_KEY_VALUE_HEADS = 2
 HEAD_DIM = HIDDEN_SIZE // NUM_ATTENTION_HEADS
+EMBED_MODE = "trit"  # none | trit; ставится из --embed-mode
+
 MAX_POSITIONS = 1024
 RMS_NORM_EPS = 1e-6
 ROPE_THETA = 10000.0
@@ -347,14 +349,14 @@ def build_model() -> Any:
     return model
 
 
-def quant_config(scale_dtype: str = "float32") -> Any:
-    """``QuantConfig``: тернарные q/k/v/o/gate/up/down, эмбеддинги fp32."""
+def quant_config(scale_dtype: str = "float32", embed_mode: str = "trit") -> Any:
+    """``QuantConfig``: тернарные q/k/v/o/gate/up/down + эмбеддинг (none|trit)."""
     from qat.config import QuantConfig  # noqa: PLC0415
 
     return QuantConfig(
         block_size=128,
         scale_dtype=scale_dtype,
-        quantize_embeddings="none",
+        quantize_embeddings=embed_mode,
     )
 
 
@@ -381,7 +383,7 @@ def run_config(scale_dtype: str) -> Any:
         quant=QuantConfig(
             block_size=128,
             scale_dtype=scale_dtype,
-            quantize_embeddings="none",
+            quantize_embeddings=EMBED_MODE,
         ),
         data=DataConfig(path="data/train.jsonl", max_seq_len=MAX_SEQ_LEN,
                         max_samples=0, min_answer_tokens=MIN_ANSWER_TOKENS),
@@ -482,7 +484,7 @@ def stage_train(args: argparse.Namespace) -> dict[str, Any]:
 
     model = build_model()
     model.train()
-    quant = quant_config(args.scale_dtype)
+    quant = quant_config(args.scale_dtype, args.embed_mode)
     ternary_report = apply_ternary(model, quant)
     counts = print_model_report(model, ternary_report, torch.device("cpu"))
     if counts["total"] != EXPECTED_PARAMS:
@@ -861,16 +863,37 @@ def hf_logits(args: argparse.Namespace, token_ids: Sequence[int]) -> dict[str, A
     import torch  # noqa: PLC0415
 
     from qat import checkpoint as checkpoint_mod  # noqa: PLC0415
-    from qat.model import apply_ternary  # noqa: PLC0415
+    from qat.model import apply_embedding_quant, apply_ternary  # noqa: PLC0415
 
     out_dir = Path(args.out)
     ckpt = checkpoint_mod.latest_checkpoint(out_dir)
     if ckpt is None:
         raise TinyError(f"в {out_dir}/checkpoints нет чекпоинтов: сначала train")
     model = build_model()
-    apply_ternary(model, quant_config(args.scale_dtype))
+    quant = quant_config(args.scale_dtype, args.embed_mode)
+    apply_ternary(model, quant)
     state = checkpoint_mod.load_model_state(ckpt)
     model.load_state_dict(state, strict=True)
+    # Эмбеддинг квантуется ПОСЛЕ загрузки мастер-весов (0043): обёртка меняет
+    # имена ключей, поэтому до load_state_dict она несовместима с чекпоинтом.
+    # Без неё эталон остаётся fp32, а C читает тритовую таблицу — Δ = 3.07.
+    apply_embedding_quant(model, quant)
+    # При tied-весах lm_head — та же таблица, но параметризация висит на
+    # embed_tokens, и lm_head.weight остаётся мастер-весами. В контейнере C
+    # считает выход тритовой таблицей, поэтому эталон обязан тоже: иначе
+    # сравниваются разные модели (Δ = 3.7 при правильном рантайме).
+    if (quant.quantize_embeddings or "none") != "none" and getattr(
+        model.config, "tie_word_embeddings", False
+    ):
+        from qat import ternary  # noqa: PLC0415
+        w = model.model.embed_tokens.weight.detach()
+        q = ternary.quantize_torch(w, quant.block_size)
+        deq = q["trits"].float() * q["scales"].repeat_interleave(
+            quant.block_size
+        ).reshape(w.shape)
+        model.model.embed_tokens.weight.data = deq.clone()
+        if getattr(model, "lm_head", None) is not None:
+            model.lm_head.weight.data = deq.clone()
     del state
     model.to(torch.device("cpu"))
     model.eval()
@@ -1038,6 +1061,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-every", type=int, default=100,
                         help="мерить val loss каждые N шагов (100)")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="clip градиентов (1.0)")
+    parser.add_argument("--embed-mode", choices=("none", "trit"), default="trit",
+                        help="эмбеддинги: trit (по умолчанию, 0043) или none (fp32)")
     parser.add_argument("--scale-dtype", choices=("float32", "float16"), default="float32",
                         help="масштабы тритов в .trit (float32 — чтобы порог 1e-4 "
                              "мерил рантайм, float16 — продовый вариант)")
