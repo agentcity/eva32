@@ -1,0 +1,50 @@
+{"question": "Сколько стоит тариф «Старт»?", "expect_route": "skill", "expect_contains": ["990"]}
+{"question": "Какая цена у тарифа «Профи» в месяц?", "expect_route": "skill", "expect_contains": ["2490"]}
+{"question": "Сколько стоит тариф «Бизнес»?", "expect_route": "skill", "expect_contains": ["7900"]}
+{"question": "Сколько стоит услуга «Аудит сайта»?", "expect_route": "skill", "expect_contains": ["12000"]}
+{"question": "Сколько стоит настройка CRM под ключ?", "expect_route": "skill", "expect_contains": ["34000"]}
+{"question": "Сколько стоит ведение соцсетей?", "expect_route": "skill", "expect_contains": ["19500"]}
+{"question": "Сколько стоит контекстная реклама?", "expect_route": "skill", "expect_contains": ["25000"]}
+{"question": "Сколько стоит разработка лендинга?", "expect_route": "skill", "expect_contains": ["48000"]}
+{"question": "Сколько стоит поддержка сайта?", "expect_route": "skill", "expect_contains": ["6000"]}
+{"question": "Сколько стоит доставка документов по Москве?", "expect_route": "skill", "expect_contains": ["490"]}
+{"question": "Сколько стоит доставка за МКАД?", "expect_route": "skill", "expect_contains": ["790"]}
+{"question": "Сколько стоит доставка документов по России?", "expect_route": "skill", "expect_contains": ["1200"]}
+{"question": "Сколько стоит дополнительный сотрудник на тарифе «Старт»?", "expect_route": "skill", "expect_contains": ["290"]}
+{"question": "Сколько услуг можно разместить на тарифе «Старт»?", "expect_route": "skill", "expect_contains": ["100"]}
+{"question": "Сколько сотрудников можно подключить на тарифе «Профи»?", "expect_route": "skill", "expect_contains": ["10"]}
+{"question": "Сколько сотрудников поддерживает тариф «Бизнес»?", "expect_route": "skill", "expect_contains": ["50"]}
+{"question": "Сколько стоит тариф «Профи» при оплате за год со скидкой?", "expect_route": "skill", "expect_contains": ["20"]}
+{"question": "Какие часы работы офиса?", "expect_route": "skill", "expect_contains": ["9:00"]}
+{"question": "Какие часы работы у службы поддержки?", "expect_route": "skill", "expect_contains": ["21:00"]}
+{"question": "Сколько дней даётся на возврат денег?", "expect_route": "skill", "expect_contains": ["14"]}
+{"question": "Какие у вас контакты для связи?", "expect_route": "skill", "expect_contains": ["@"]}
+{"question": "Какой адрес офиса?", "expect_route": "skill", "expect_contains": ["Москв"]}
+{"question": "Привет!", "expect_route": "small", "expect_contains": []}
+{"question": "Здравствуйте, как дела?", "expect_route": "small", "expect_contains": []}
+{"question": "Спасибо, что помогли!", "expect_route": "small", "expect_contains": []}
+{"question": "Представься, пожалуйста.", "expect_route": "small", "expect_contains": []}
+{"question": "Ты человек или программа?", "expect_route": "small", "expect_contains": []}
+{"question": "Как тебя зовут?", "expect_route": "small", "expect_contains": []}
+{"question": "Доброе утро!", "expect_route": "small", "expect_contains": []}
+{"question": "Скажи что-нибудь приятное.", "expect_route": "small", "expect_contains": []}
+{"question": "Ты умеешь шутить?", "expect_route": "small", "expect_contains": []}
+{"question": "Как настроение?", "expect_route": "small", "expect_contains": []}
+{"question": "Пока, до встречи!", "expect_route": "small", "expect_contains": []}
+{"question": "Перескажи коротко: мы обновили условия.", "expect_route": "small", "expect_contains": []}
+{"question": "Ответь вежливо: клиент просит подождать.", "expect_route": "small", "expect_contains": []}
+{"question": "Поздоровайся с клиентом.", "expect_route": "small", "expect_contains": []}
+{"question": "Почему небо голубое?", "expect_route": "big", "expect_contains": []}
+{"question": "Объясни, как работает HTTP.", "expect_route": "big", "expect_contains": []}
+{"question": "Напиши код на Python для сортировки списка.", "expect_route": "big", "expect_contains": []}
+{"question": "Сравни PostgreSQL и SQLite.", "expect_route": "big", "expect_contains": []}
+{"question": "Переведи на английский: «Добро пожаловать в наш сервис».", "expect_route": "big", "expect_contains": []}
+{"question": "Посчитай 17% от 4800.", "expect_route": "big", "expect_contains": []}
+{"question": "Что такое транзакция в базах данных?", "expect_route": "big", "expect_contains": []}
+{"question": "Как приготовить борщ?", "expect_route": "big", "expect_contains": []}
+{"question": "Почему моя программа на Python падает с IndexError?", "expect_route": "big", "expect_contains": []}
+{"question": "Explain the difference between a process and a thread.", "expect_route": "big", "expect_contains": []}
+{"question": "Переведи инструкцию: Keep the device dry.", "expect_route": "big", "expect_contains": []}
+{"question": "Придумай план запуска продукта за 30 дней.", "expect_route": "big", "expect_contains": []}
+{"question": "Напиши SQL-запрос: топ-10 клиентов по выручке.", "expect_route": "big", "expect_contains": []}
+{"question": "Какая столица Австралии?", "expect_route": "big", "expect_contains": []}
