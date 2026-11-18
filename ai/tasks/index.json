@@ -744,7 +744,7 @@
   {
     "id": "0113",
     "title": "Декод 10,8 ток/с: профиль и ускорение ядер",
-    "status": "in_progress",
+    "status": "done",
     "file": "0113-decode-kernels.md",
     "assignee": "agent:decode-kernels"
   },
@@ -795,6 +795,13 @@
     "title": "Роутер отдаёт границу prefill для метрик TTFT",
     "status": "pending",
     "file": "0120-router-prefill-ms.md",
+    "assignee": ""
+  },
+  {
+    "id": "0121",
+    "title": "TSan для пула потоков: безмьютексный горячий путь",
+    "status": "pending",
+    "file": "0121-tsan-pool.md",
     "assignee": ""
   }
 ]

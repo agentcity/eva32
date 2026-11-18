@@ -747,6 +747,39 @@ done:
     free(got);
 }
 
+// --- стоимость барьера пула (задача 0113) -----------------------------------
+//
+// Пустое задание через vtm_parallel_rows() измеряет накладные расходы
+// барьера: разбудить воркеров, опубликовать параметры, дождаться нуля в
+// workers_left. На 1.5B-форме таких барьеров ~200 на токен, поэтому цена
+// одного барьера при 8 потоках была заметной долей времени декода.
+// Печатается минимум из 32 замеров (меньше страдают от чужой нагрузки).
+static void pool_nop(void *p, int tid, int r0, int r1) {
+    (void)p; (void)tid; (void)r0; (void)r1;
+}
+
+static int run_pool(int iters) {
+    int nt;
+    (void)iters;
+    printf("Стоимость пустого задания (барьер пула), мкс/вызов:\n");
+    for (nt = 1; nt <= VTM_THREADS_MAX; nt++) {
+        double best = 0.0;
+        int rep, i;
+        vtm_threads_set(nt);
+        vtm_parallel_rows(8, 1e9, pool_nop, NULL);   // прогрев, создать воркеров
+        for (rep = 0; rep < 32; rep++) {
+            double t0 = now_ms();
+            for (i = 0; i < 20; i++) vtm_parallel_rows(8, 1e9, pool_nop, NULL);
+            t0 = (now_ms() - t0) / 20.0;
+            if (best <= 0.0 || t0 < best) best = t0;
+        }
+        printf("  nt=%d %8.2f мкс\n", nt, best * 1000.0);
+    }
+    printf("порог параллели %.0f MAC; потолок на задание — min(запрошенное, 6)\n",
+           VTM_PAR_MIN_WORK);
+    return 0;
+}
+
 // Числа и проверка детерминизма 1/2/4/8 потоков. Возврат != 0 — расхождение
 // больше 1e-5 (тогда это FAIL в make test).
 static int run_threads(int iters) {
@@ -903,7 +936,7 @@ static int run_logits(const char *explicit_path, const vtm_backend *cand) {
 static void usage(const char *prog) {
     printf("usage: %s [--rows N] [--cols N] [--iters N] [--scale-block 128|160]\n"
            "          [--backend auto|scalar|simd|direct] [--check] "
-           "[--threads] [--logits PATH] [--no-mm]\n"
+           "[--threads] [--pool] [--logits PATH] [--no-mm]\n"
            "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
            "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8)\n",
            prog);
@@ -911,7 +944,7 @@ static void usage(const char *prog) {
 
 int main(int argc, char **argv) {
     int rows = 1024, cols = 1024, iters = 50, scale_block = 160;
-    int check = 0, no_mm = 0, threads = 0;
+    int check = 0, no_mm = 0, threads = 0, pool = 0;
     const char *logits_path = NULL;
     const char *backend_name = NULL;
     const vtm_backend *cand;
@@ -932,6 +965,8 @@ int main(int argc, char **argv) {
             check = 1;
         } else if (strcmp(argv[i], "--threads") == 0) {
             threads = 1;
+        } else if (strcmp(argv[i], "--pool") == 0) {
+            pool = 1;
         } else if (strcmp(argv[i], "--no-mm") == 0) {
             no_mm = 1;
         } else if (strcmp(argv[i], "--logits") == 0) {
@@ -965,6 +1000,8 @@ int main(int argc, char **argv) {
     if (!backend_name && (!getenv("VTM_BACKEND") || !*getenv("VTM_BACKEND")))
         cand = &vtm_backend_simd;  // бенчмарк по умолчанию меряет SIMD
 
+    if (pool)
+        return run_pool(iters);
     if (threads)
         return run_threads(iters);
     if (logits_path)

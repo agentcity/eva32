@@ -49,24 +49,59 @@
 
 #if VTM_HAVE_PTHREAD
 
+// Горячий путь задания — без мьютекса. Раньше воркер на каждое задание
+// брал мьютекс дважды (прочитать параметры, сообщить о готовности), а
+// вызвавший после своего диапазона ждал, пока последний воркер под тем же
+// мьютексом выставит job = 0. На мелких заданиях (TMV k_proj: 0,39 MMAC,
+// ~55 мкс) это стоило дороже самого счёта: `bench_backend --pool` на
+// прежнем пуле даёт 4,95 мкс на задание при 4 потоках и 51,7 мкс при 8
+// (теперь 1,1 и 1,4 мкс). На 1.5B-форме это была половина времени 8
+// потоков. Теперь параметры задания публикуются одним release-сохранением
+// gen, а «задание досчитано» — отдельным счётчиком done, который двигает
+// только тот, чей декремент workers_left дал ноль.
+//
+// Мьютекс остался только на медленном пути — заснуть, когда работы нет, и
+// проснуться, когда её опубликовали. В обычном цикле ядер модель зовёт
+// TMV/MM подряд, и воркеры успевают поймать gen на спине.
+//
+// У каждого воркера свой слот команды (g_cmd[tid]) с номером задания.
+// Общий на всех слот параметров читать нельзя: воркер, не участвовавший в
+// задании (tid >= nthreads), может прочитать поле уже следующего задания и
+// лишний раз декрементировать workers_left — счётчик «съедет», и вызвавший
+// зависнет в ожидании нуля (такой редкий дедлок ловился на 1.5B-форме).
+// Слот свой у каждого, номер задания строго растёт, поэтому совпадение
+// g_cmd[tid].gen == gen означает ровно «этот поток — участник этого
+// задания», а писатель слота (вызвавший) не тронет его, пока воркер не
+// декрементировал workers_left.
+
+typedef struct {
+    vtm_rows_fn fn;      // ядро строк
+    void *ctx;           // его контекст
+    unsigned gen;        // номер задания (0 — не участник)
+} vtm_cmd;
+
 typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t work_cv;   // воркеры ждут новое задание
     pthread_cond_t done_cv;   // вызвавший ждёт, пока досчитают диапазоны
     int workers;              // сколько воркеров создано (без вызвавшего)
     int create_failed;        // pthread_create отказал — больше не пробуем
-    unsigned gen;             // номер задания; растёт на каждом
-    int job;                  // 1 — задание выполняется
+    unsigned gen;             // номер опубликованного задания (атомарно)
+    unsigned sub;             // заданий выдано (атомарно)
+    unsigned done;            // заданий досчитано (атомарно, монотонно)
+    unsigned workers_left;    // сколько потоков ещё не закончили задание
+    unsigned sleep_work;      // воркеров в cond_wait(work_cv)
+    unsigned sleep_done;      // вызвавших в cond_wait(done_cv)
+    unsigned next_row;        // первая невзятая строка (динамическая раздача)
     int total;                // строк в задании
-    int nthreads;             // логических потоков в этом задании
-    unsigned workers_left;    // сколько диапазонов ещё не досчитано (атомарно)
-    vtm_rows_fn fn;
-    void *ctx;
+    int chunk;                // строк в одной порции
+    vtm_cmd cmd[VTM_THREADS_MAX];   // по слоту на tid
 } vtm_pool;
 
 static vtm_pool g_pool = {
     PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
-    PTHREAD_COND_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, NULL, NULL
+    PTHREAD_COND_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    {{0, NULL, 0}}
 };
 
 // Спин перед сном. Ядра вызываются подряд (слой модели — десятки вызовов),
@@ -78,17 +113,48 @@ static vtm_pool g_pool = {
 #if defined(__GNUC__) || defined(__clang__)
 #define VTM_GEN_LOAD() __atomic_load_n(&g_pool.gen, __ATOMIC_ACQUIRE)
 #define VTM_GEN_STORE(v) __atomic_store_n(&g_pool.gen, (v), __ATOMIC_RELEASE)
+#define VTM_SUB_LOAD() __atomic_load_n(&g_pool.sub, __ATOMIC_ACQUIRE)
+#define VTM_SUB_STORE(v) __atomic_store_n(&g_pool.sub, (v), __ATOMIC_RELEASE)
+#define VTM_DONE_LOAD() __atomic_load_n(&g_pool.done, __ATOMIC_ACQUIRE)
+#define VTM_DONE_STORE(v) \
+    __atomic_store_n(&g_pool.done, (unsigned)(v), __ATOMIC_RELEASE)
 #define VTM_LEFT_LOAD() __atomic_load_n(&g_pool.workers_left, __ATOMIC_ACQUIRE)
 #define VTM_LEFT_STORE(v) \
     __atomic_store_n(&g_pool.workers_left, (unsigned)(v), __ATOMIC_RELEASE)
 #define VTM_LEFT_DEC() \
     __atomic_sub_fetch(&g_pool.workers_left, 1u, __ATOMIC_ACQ_REL)
+#define VTM_SLEEP_WORK_LOAD() \
+    __atomic_load_n(&g_pool.sleep_work, __ATOMIC_ACQUIRE)
+#define VTM_SLEEP_WORK_ADD(d) \
+    __atomic_add_fetch(&g_pool.sleep_work, (unsigned)(d), __ATOMIC_ACQ_REL)
+#define VTM_SLEEP_DONE_LOAD() \
+    __atomic_load_n(&g_pool.sleep_done, __ATOMIC_ACQUIRE)
+#define VTM_SLEEP_DONE_ADD(d) \
+    __atomic_add_fetch(&g_pool.sleep_done, (unsigned)(d), __ATOMIC_ACQ_REL)
+#define VTM_NEXT_ROW() \
+    __atomic_fetch_add(&g_pool.next_row, (unsigned)g_pool.chunk, \
+                       __ATOMIC_RELAXED)
+#define VTM_CMD_GEN_LOAD(i) \
+    __atomic_load_n(&g_pool.cmd[(i)].gen, __ATOMIC_ACQUIRE)
+#define VTM_CMD_GEN_STORE(i, v) \
+    __atomic_store_n(&g_pool.cmd[(i)].gen, (v), __ATOMIC_RELEASE)
 #else
 #define VTM_GEN_LOAD() (g_pool.gen)
 #define VTM_GEN_STORE(v) (g_pool.gen = (v))
+#define VTM_SUB_LOAD() (g_pool.sub)
+#define VTM_SUB_STORE(v) (g_pool.sub = (v))
+#define VTM_DONE_LOAD() (g_pool.done)
+#define VTM_DONE_STORE(v) (g_pool.done = (unsigned)(v))
 #define VTM_LEFT_LOAD() (g_pool.workers_left)
 #define VTM_LEFT_STORE(v) (g_pool.workers_left = (unsigned)(v))
 #define VTM_LEFT_DEC() (--g_pool.workers_left)
+#define VTM_SLEEP_WORK_LOAD() (g_pool.sleep_work)
+#define VTM_SLEEP_WORK_ADD(d) (g_pool.sleep_work += (unsigned)(d))
+#define VTM_SLEEP_DONE_LOAD() (g_pool.sleep_done)
+#define VTM_SLEEP_DONE_ADD(d) (g_pool.sleep_done += (unsigned)(d))
+#define VTM_NEXT_ROW() (g_pool.next_row += (unsigned)g_pool.chunk)
+#define VTM_CMD_GEN_LOAD(i) (g_pool.cmd[(i)].gen)
+#define VTM_CMD_GEN_STORE(i, v) (g_pool.cmd[(i)].gen = (v))
 #endif
 
 static void cpu_relax(void) {
@@ -123,13 +189,32 @@ static int wait_left_zero(void) {
     return 1;
 }
 
+/* Задание досчитано: done двигается только вперёд (номера заданий растут),
+   поэтому запоздавший воркер не может откатить счётчик следующего задания.
+   Если кто-то спит в ожидании done — будим. */
+static void set_done(unsigned g) {
+    pthread_mutex_lock(&g_pool.mu);
+    VTM_DONE_STORE(g);   // done только растёт: g — номер закрытого задания
+    if (VTM_SLEEP_DONE_LOAD())
+        pthread_cond_broadcast(&g_pool.done_cv);
+    pthread_mutex_unlock(&g_pool.mu);
+}
+
+// Аргумент воркера: (gen на момент создания) << 8 | tid. Номер задания
+// важен: новый воркер создаётся, когда предыдущее задание уже закрыто, и
+// без него он принял бы in-flight gen за новое задание и посчитал бы
+// чужой диапазон по старым параметрам.
 static void *pool_worker(void *arg) {
-    const int tid = (int)(intptr_t)arg;
-    unsigned seen = 0;
+    const uintptr_t packed = (uintptr_t)arg;
+    const int tid = (int)(packed & 0xffu);
+    unsigned seen = (unsigned)(packed >> 8);
 
     for (;;) {
         struct timespec t0;
         long spins = 0;
+        unsigned g;
+
+        // Спин на gen: пока задание не опубликовано, не трогаем мьютекс.
         clock_gettime(CLOCK_MONOTONIC, &t0);
         while (VTM_GEN_LOAD() == seen) {
             struct timespec t;
@@ -139,30 +224,58 @@ static void *pool_worker(void *arg) {
             }
             cpu_relax();
         }
-        pthread_mutex_lock(&g_pool.mu);
-        while (VTM_GEN_LOAD() == seen)
-            pthread_cond_wait(&g_pool.work_cv, &g_pool.mu);
-        seen = VTM_GEN_LOAD();
-        /* Потоков попросили меньше, чем создано: этот воркер отдыхает.
-           Ядро по tid берёт scratch, поэтому tid обязан быть < nthreads. */
-        if (tid < g_pool.nthreads) {
-            vtm_rows_fn fn = g_pool.fn;
-            void *ctx = g_pool.ctx;
-            int r0 = (int)((int64_t)g_pool.total * tid
-                           / g_pool.nthreads);
-            int r1 = (int)((int64_t)g_pool.total * (tid + 1)
-                           / g_pool.nthreads);
-            pthread_mutex_unlock(&g_pool.mu);
-            fn(ctx, tid, r0, r1);
+        g = VTM_GEN_LOAD();
+        if (g == seen) {
+            // Спин истёк — засыпаем до публикации следующего задания.
             pthread_mutex_lock(&g_pool.mu);
-            if (VTM_LEFT_DEC() == 0) {
-                g_pool.job = 0;
-                pthread_cond_broadcast(&g_pool.done_cv);
-            }
+            VTM_SLEEP_WORK_ADD(1);
+            while (VTM_GEN_LOAD() == seen)
+                pthread_cond_wait(&g_pool.work_cv, &g_pool.mu);
+            VTM_SLEEP_WORK_ADD(-1);
+            g = VTM_GEN_LOAD();
+            pthread_mutex_unlock(&g_pool.mu);
         }
-        pthread_mutex_unlock(&g_pool.mu);
+        /* Свой слот: gen в нём равен g только у участника задания. Гонки с
+           писателем нет — вызвавший пишет слот, только когда workers_left
+           уже ноль, то есть этот воркер давно декрементировал. */
+        if (VTM_CMD_GEN_LOAD(tid) == g) {
+            vtm_rows_fn fn = g_pool.cmd[tid].fn;
+            void *ctx = g_pool.cmd[tid].ctx;
+            const int total = g_pool.total;
+            const int chunk = g_pool.chunk;
+            for (;;) {
+                int r0 = (int)VTM_NEXT_ROW();
+                int r1;
+                if (r0 >= total) break;   // порции кончились
+                r1 = r0 + chunk;
+                if (r1 > total) r1 = total;
+                fn(ctx, tid, r0, r1);
+            }
+            if (VTM_LEFT_DEC() == 0) set_done(g);
+        }
+        seen = g;
     }
     return NULL;
+}
+
+/* Ждать, пока предыдущее задание закроется. В норме (один отправитель —
+   модель считает слой за слоем в одном потоке) done уже равен sub, и это
+   одна атомарная загрузка; спин и сон — для чужого отправителя и для
+   окна в пару наносекунд между декрементом и set_done. */
+static void wait_prev_done(void) {
+    unsigned spins = 0;
+    while (VTM_DONE_LOAD() != VTM_SUB_LOAD()) {
+        if (++spins > 4096) {
+            pthread_mutex_lock(&g_pool.mu);
+            VTM_SLEEP_DONE_ADD(1);
+            while (VTM_DONE_LOAD() != VTM_SUB_LOAD())
+                pthread_cond_wait(&g_pool.done_cv, &g_pool.mu);
+            VTM_SLEEP_DONE_ADD(-1);
+            pthread_mutex_unlock(&g_pool.mu);
+            return;
+        }
+        cpu_relax();
+    }
 }
 
 // Выполнить задание в пуле: N диапазонов строк, вызвавший — диапазон 0
@@ -170,51 +283,85 @@ static void *pool_worker(void *arg) {
 // nthreads-1) под мьютексом; если создать не удалось — считает тем, что
 // есть, вплоть до одного потока.
 static void pool_run(int n, int nthreads, vtm_rows_fn fn, void *ctx) {
-    int r0, r1;
+    unsigned mygen;
+    int i, chunk;
 
-    pthread_mutex_lock(&g_pool.mu);
-    while (g_pool.job) pthread_cond_wait(&g_pool.done_cv, &g_pool.mu);
-    while (!g_pool.create_failed && g_pool.workers < nthreads - 1) {
-        pthread_t th;
-        if (pthread_create(&th, NULL, pool_worker,
-                           (void *)(intptr_t)(g_pool.workers + 1)) != 0) {
-            g_pool.create_failed = 1;
-            break;
+    wait_prev_done();
+    if (!g_pool.create_failed && g_pool.workers < nthreads - 1) {
+        pthread_mutex_lock(&g_pool.mu);
+        while (!g_pool.create_failed && g_pool.workers < nthreads - 1) {
+            pthread_t th;
+            uintptr_t arg = ((uintptr_t)VTM_GEN_LOAD() << 8)
+                          | (uintptr_t)(g_pool.workers + 1);
+            if (pthread_create(&th, NULL, pool_worker, (void *)arg) != 0) {
+                g_pool.create_failed = 1;
+                break;
+            }
+            pthread_detach(th);
+            g_pool.workers++;
         }
-        pthread_detach(th);
-        g_pool.workers++;
+        pthread_mutex_unlock(&g_pool.mu);
     }
     if (g_pool.workers < nthreads - 1) nthreads = g_pool.workers + 1;
     if (nthreads > n) nthreads = n;   // строк меньше потоков — лишние не нужны
     if (nthreads < 2) {
-        pthread_mutex_unlock(&g_pool.mu);
         fn(ctx, 0, 0, n);
         return;
     }
-    g_pool.fn = fn;
-    g_pool.ctx = ctx;
+    /* Порция раздачи: каждый поток берёт ~8 порций, чтобы медленный (чужой
+       поток планировщика, E-ядро) не задерживал барьер. Строки независимы,
+       поэтому порядок и число порций на результат не влияют. */
+    chunk = n / (nthreads * 8);
+    if (chunk < 1) chunk = 1;
+    mygen = VTM_SUB_LOAD() + 1;
+    /* Слоты участников пишутся до публикации gen; слоты остальных не
+       трогаем — у них там gen прошлых заданий, а номера не повторяются. */
     g_pool.total = n;
-    g_pool.nthreads = nthreads;
+    g_pool.chunk = chunk;
+    g_pool.next_row = 0;
+    for (i = 0; i < nthreads; i++) {
+        g_pool.cmd[i].fn = fn;
+        g_pool.cmd[i].ctx = ctx;
+        VTM_CMD_GEN_STORE(i, mygen);
+    }
     VTM_LEFT_STORE(nthreads);
-    g_pool.job = 1;
-    VTM_GEN_STORE(VTM_GEN_LOAD() + 1);
-    pthread_cond_broadcast(&g_pool.work_cv);
+    VTM_SUB_STORE(mygen);
+    /* Публикация под мьютексом, хотя быстрые пути его не берут. Иначе
+       теряется пробуждение: воркер успевает прочитать старый gen, решить
+       «работы нет» и заснуть, а вызвавший в это же время видит
+       sleep_work == 0 и не будит — оба спят (дедлок ловился на 1.5B).
+       Мьютекс сериализует store gen с проверкой gen в воркере. */
+    pthread_mutex_lock(&g_pool.mu);
+    VTM_GEN_STORE(mygen);   // release: слоты участников опубликованы
+    if (VTM_SLEEP_WORK_LOAD())
+        pthread_cond_broadcast(&g_pool.work_cv);
     pthread_mutex_unlock(&g_pool.mu);
 
-    r0 = 0;
-    r1 = (int)((int64_t)n / nthreads);
-    fn(ctx, 0, r0, r1);
+    // Вызвавший — тоже участник: берёт порции из общей раздачи.
+    for (;;) {
+        int r0 = (int)VTM_NEXT_ROW();
+        int r1;
+        if (r0 >= n) break;
+        r1 = r0 + chunk;
+        if (r1 > n) r1 = n;
+        fn(ctx, 0, r0, r1);
+    }
 
     if (VTM_LEFT_DEC() == 0) {
-        pthread_mutex_lock(&g_pool.mu);
-        g_pool.job = 0;
-        pthread_cond_broadcast(&g_pool.done_cv);
-        pthread_mutex_unlock(&g_pool.mu);
+        set_done(mygen);
         return;
     }
-    if (wait_left_zero()) return;
+    if (wait_left_zero()) {
+        // Диапазоны досчитаны; done выставит тот, чей декремент дал ноль.
+        // Если он ещё не успел — следующее задание подождёт его в
+        // wait_prev_done (окно в пару наносекунд, без мьютекса).
+        return;
+    }
     pthread_mutex_lock(&g_pool.mu);
-    while (g_pool.job) pthread_cond_wait(&g_pool.done_cv, &g_pool.mu);
+    VTM_SLEEP_DONE_ADD(1);
+    while (VTM_DONE_LOAD() < mygen)
+        pthread_cond_wait(&g_pool.done_cv, &g_pool.mu);
+    VTM_SLEEP_DONE_ADD(-1);
     pthread_mutex_unlock(&g_pool.mu);
 }
 
@@ -266,8 +413,23 @@ int vtm_threads_set(int n) {
     return n;
 }
 
+// Минимум работы на поток. Меньше ~65 тыс. MAC (десяток микросекунд) —
+// барьер пула дороже выигрыша от лишнего потока.
+#define VTM_PAR_CHUNK 65536.0
+
+// Потолок параллелизма одного задания. Замер на 1.5B-форме (10 ядер,
+// задания TMV 0,39–13,8 MMAC, 224 мс/токен при 4 потоках):
+//   потоки 4     5     6     7     8
+//   ток/с  15,5  17,7  17,9  16,1  14,6
+// Дальше шести выигрыша нет: задание короткое (сотни микросекунд), и
+// накладные расходы барьера — разбудить воркеров и дождаться самого
+// медленного — съедают прибавку, а на занятой машине лишние потоки ещё и
+// стоят в очереди планировщика. VTM_THREADS остаётся верхней границей:
+// просили меньше — используем меньше.
+#define VTM_PAR_THREADS_TOP 6
+
 void vtm_parallel_rows(int n, double work, vtm_rows_fn fn, void *ctx) {
-    int vt;
+    int vt, want;
     if (!fn || n <= 0) return;
     vt = vtm_threads();
     /* !(work >= порога) — заодно отсекает NaN. */
@@ -275,7 +437,18 @@ void vtm_parallel_rows(int n, double work, vtm_rows_fn fn, void *ctx) {
         fn(ctx, 0, 0, n);
         return;
     }
-    pool_run(n, vt, fn, ctx);
+    /* Сколько потоков оправдано: не больше запрошенного, не больше
+       VTM_PAR_THREADS_TOP и не больше, чем work / VTM_PAR_CHUNK (каждому
+       потоку — не меньше порции работы). */
+    want = (int)(work / VTM_PAR_CHUNK);
+    if (want > VTM_PAR_THREADS_TOP) want = VTM_PAR_THREADS_TOP;
+    if (want > vt) want = vt;
+    if (want > n) want = n;
+    if (want < 2) {
+        fn(ctx, 0, 0, n);
+        return;
+    }
+    pool_run(n, want, fn, ctx);
 }
 
 #else // !VTM_HAVE_PTHREAD: откат — прежнее однопоточное поведение
