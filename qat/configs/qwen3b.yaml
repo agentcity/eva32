@@ -33,10 +33,14 @@ model:
 quant:
   # absmax по 128 элементам вдоль входной размерности (последней оси веса).
   block_size: 128
-  scale_dtype: float16
+  # float32: fp16-масштабы дают max|Δ| ~1,7e-03 (4,3e-03 с тритовым эмбеддингом)
+  # и не проходят порог паритета 1e-4 (0095, 0099). Цена — ~2% размера.
+  scale_dtype: float32
   target_suffixes: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
   exclude_suffixes: [lm_head, embed_tokens, router, gate, norm]
-  # Эмбеддинги не квантуем: таблица словаря у 3B — 0.29B параметров.
+  # Эмбеддинги в триты (решение 0099): у 3B таблица — 0,29B параметров, в fp16 это
+  # ~580 МиБ против ~70 МиБ. При tied она же выходной слой — качество логитов
+  # проверить на eval; откат — вернуть none, это одно поле.
   quantize_embeddings: trit
 
 data:

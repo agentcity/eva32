@@ -695,7 +695,7 @@
   {
     "id": "0106",
     "title": "Документация под текущее состояние: fp32, тритовый эмбеддинг, политики",
-    "status": "in_progress",
+    "status": "done",
     "file": "0106-docs-current.md",
     "assignee": "agent:docs-current"
   },
