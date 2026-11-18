@@ -20,7 +20,7 @@ class TestCompetenceGolden(unittest.TestCase):
         cats = {r["category"] for r in self.rows}
         self.assertEqual(
             cats,
-            {"reasoning", "clarify", "marketing", "writing",
+            {"reasoning", "clarify", "client_questions", "marketing", "writing",
              "client", "language", "behavior", "limits"},
         )
 
