@@ -296,8 +296,15 @@
   {
     "id": "0043",
     "title": "Квантованные эмбеддинги сквозь путь",
-    "status": "in_progress",
+    "status": "done",
     "file": "0043-trit-embeddings-e2e.md",
     "assignee": "agent:trit-emb-e2e"
+  },
+  {
+    "id": "0044",
+    "title": "Kind 4 — int8-тензоры в контейнере",
+    "status": "pending",
+    "file": "0044-kind4-int8.md",
+    "assignee": ""
   }
 ]

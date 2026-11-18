@@ -505,9 +505,11 @@ class TestSequentialRun(unittest.TestCase):
                 [prefix for prefix, _ in calls if prefix in ee.MODES],
                 ["none", "int8", "trit"],
             )
+            # int8-экспорт отложен (нужен kind 4 в контейнере, задача 0044),
+            # поэтому экспорт запускается только для none и trit.
             self.assertEqual(
                 [prefix for prefix, _ in calls if prefix.endswith("/export")],
-                ["none/export", "int8/export", "trit/export"],
+                ["none/export", "trit/export"],
             )
             for mode in ee.MODES:
                 config = (tmp_path / "emb" / "_configs" / f"{mode}.yaml").read_text(
@@ -518,7 +520,11 @@ class TestSequentialRun(unittest.TestCase):
             self.assertEqual([run["mode"] for run in summary["runs"]], list(ee.MODES))
             self.assertTrue(all(run["status"] == "done" for run in summary["runs"]))
             self.assertTrue(all(run["loss"] == 1.5 for run in summary["runs"]))
-            self.assertTrue(all(run["export_bytes"] == 12 for run in summary["runs"]))
+            by_mode = {run["mode"]: run for run in summary["runs"]}
+            self.assertEqual(by_mode["none"]["export_bytes"], 12)
+            self.assertEqual(by_mode["trit"]["export_bytes"], 12)
+            self.assertFalse(by_mode["int8"].get("export_bytes"))
+            self.assertIn("отложен", by_mode["int8"].get("note") or "")
             table = stdout.getvalue()
             header = next(line for line in table.splitlines() if "метрика eval" in line)
             self.assertEqual(

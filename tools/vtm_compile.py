@@ -82,6 +82,12 @@ python3 tools/vtm_compile.py --qwen-config qat/configs/qwen1.5b.yaml
 таблицу, что `EMB` (индекс `emb.w`), поэтому размер контейнера не растёт на
 `vocab × hidden × 4` байт.
 
+Если в манифесте `architecture.embed == "trit"` (задача 0043), таблица словаря
+лежит не в `non_ternary.bin`, а тритовым сегментом `model.embed_tokens.weight`
+в `ternary.trit`: `EMB` читает её как kind 0 (C — через LUT243), а tied lm_head
+по-прежнему считается `MM` по `emb.w`, только A уже тритовая. `embed == "int8"`
+компилятор отвергает: kind 4 в контейнере пока не реализован.
+
 `--qwen-config` — только каркас: реальные веса не читаются, файл не пишется,
 печатается план (число тензоров/инструкций и оценка размера). Запись
 контейнера без весов запрещена (`vtm_ref.write_vtm` бросит `ValueError`).
@@ -188,9 +194,24 @@ class ModelConfig(LayerConfig):
     #: embed_tokens.weight. В контейнере отдельного тензора нет, MM читает
     #: `emb.w`; экономия vocab × hidden × 4 байт.
     tie_word_embeddings: bool = False
+    #: Где лежит таблица словаря: "none" — fp32 в non_ternary.bin,
+    #: "trit" — сегмент ternary.trit (kind: trit, задача 0043).
+    #: "int8" в контейнере пока не поддержан (нужен kind 4).
+    embed_quant: str = "none"
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.embed_quant = str(self.embed_quant or "none").lower()
+        if self.embed_quant not in ("none", "trit", "int8"):
+            raise ValueError(
+                f"embed_quant={self.embed_quant!r}, допустимо none|trit|int8"
+            )
+        if self.embed_quant == "int8":
+            raise ValueError(
+                "int8-эмбеддинги в контейнере отложены: нужен kind 4 "
+                "(int8 + масштабы) и его чтение в src/vtm/loader.c и "
+                "tools/vtm_ref.py; пока поддержаны none и trit"
+            )
         if self.vocab <= 0:
             raise ValueError("vocab должен быть > 0")
         if self.n_layers <= 0:
@@ -201,7 +222,7 @@ class ModelConfig(LayerConfig):
             raise ValueError(
                 "tie_word_embeddings вместе с lm_head='tmv' невозможен: "
                 "tied-таблица хранится как fp32-эмбеддинг, а TMV ждёт триты; "
-                "тритовые эмбеддинги — отдельная задача (0027)"
+                "тритовые эмбеддинги идут через EMB + MM (embed_quant='trit')"
             )
 
 
@@ -497,9 +518,10 @@ def compile_model(
     `ternary.trit` и `non_ternary.bin` (см. `load_export`), а `weights`
     должен быть `None`: смешивать источники нельзя.
 
-    `weights` (все ключи опциональны): `embed` (vocab×hidden fp32), `layers`
-    (список словарей для `compile_layer`), `final_norm` (hidden), `lm_head`
-    (матрица; для `lm_head="tmv"` — триты, для `"mm"` — плотная fp32).
+    `weights` (все ключи опциональны): `embed` (vocab×hidden: fp32-список или
+    тритовый `vtm_ref.Tensor`), `layers` (список словарей для
+    `compile_layer`), `final_norm` (hidden), `lm_head` (матрица; для
+    `lm_head="tmv"` — триты, для `"mm"` — плотная fp32).
     При `tie_word_embeddings=True` ключ `lm_head` игнорируется, а `MM` читает
     ту же таблицу, что `EMB` (отдельного тензора в контейнере нет).
     Без весов получается каркас: его нельзя записать в файл, но можно оценить
@@ -523,7 +545,28 @@ def compile_model(
     hidden = cfg.hidden
 
     # --- эмбеддинг ----------------------------------------------------------
-    embed = matrix_tensor(g, "emb.w", cfg.vocab, hidden, w.get("embed"), dense=True)
+    # Таблица словаря может быть плотной (fp32/fp16/bf16) или тритовой:
+    # при quantize_embeddings: trit экспорт кладёт её сегментом в
+    # ternary.trit, и EMB читает триты (C — через LUT243, задача 0043).
+    embed_spec = w.get("embed")
+    if isinstance(embed_spec, vtm_ref.Tensor) and embed_spec.kind == vtm_ref.KIND_TRITS:
+        if tuple(embed_spec.dims) != (cfg.vocab, hidden):
+            raise ValueError(
+                f"emb.w: форма {tuple(embed_spec.dims)}, ожидалась "
+                f"{(cfg.vocab, hidden)} (тритовая таблица словаря)"
+            )
+        embed_spec.name = "emb.w"
+        embed = g.add(embed_spec)
+        embed_storage = "trit"
+    else:
+        embed = matrix_tensor(g, "emb.w", cfg.vocab, hidden, embed_spec, dense=True)
+        embed_storage = "fp32"
+    if cfg.embed_quant == "trit" and embed_storage != "trit":
+        raise ValueError(
+            "в architecture embed='trit', а таблица словаря плотная: "
+            "экспорт должен положить model.embed_tokens.weight в ternary.trit "
+            "(kind: trit), либо уберите embed=trit из манифеста"
+        )
     x = g.act("x", (hidden,))
     g.emit(Op.EMB, dst=x, a=embed, flags=vtm_ref.IFLAG_EMB_INPUT, imm=0)
 
@@ -579,6 +622,10 @@ def compile_model(
         "tied_embeddings": tied,
         "tie_word_embeddings": tied,
         "lm_head": cfg.lm_head,
+        # Где лежит таблица словаря: по этому ключу C/B-код и отладка
+        # понимают, что EMB читает триты (kind 0), а не fp32.
+        "embed": embed_storage,
+        "quantize_embeddings": "trit" if embed_storage == "trit" else "none",
         "rms_norm_eps": cfg.eps,
         "context_len": cfg.context_len,
         "scale_block": vtm_ref.SCALE_BLOCK,
@@ -846,6 +893,11 @@ def _manifest_architecture(manifest: dict[str, Any]) -> ModelConfig:
             rope_layout=str(arch.get("rope_layout", "half")),
             lm_head=str(arch.get("lm_head", "mm")),
             tie_word_embeddings=bool(arch.get("tie_word_embeddings", False)),
+            embed_quant=str(
+                arch.get("embed")
+                or (manifest.get("embeddings") or {}).get("mode")
+                or "none"
+            ),
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"architecture в манифесте некорректна: {exc}") from exc
@@ -918,12 +970,34 @@ def load_export(
                 f"ternary.trit ({len(trit_data)} байт)"
             )
         kind, layer, key = _weight_role(name)
-        if kind in ("embed", "bias", "norm", "final_norm"):
-            raise ValueError(
-                f"{name}: триты допустимы только для матриц Linear и lm_head; "
-                f"эмбеддинги/нормы/bias должны лежать в non_ternary.bin"
+        if kind == "embed":
+            # Тритовая таблица словаря (задача 0043): экспорт кладёт её
+            # сегментом ternary.trit при quantize_embeddings: trit.
+            if cfg.embed_quant != "trit":
+                raise ValueError(
+                    f"{name}: тритовая таблица словаря, а в architecture "
+                    f"embed={cfg.embed_quant!r}; переэкспортируйте чекпоинт "
+                    "с quantize_embeddings: trit или оставьте эмбеддинги fp32"
+                )
+            _expect_shape(shape, (cfg.vocab, cfg.hidden), name)
+            trits, scales, scale_dtype = vtm_ref.decode_trit_segment(
+                trit_data[offset:offset + length]
             )
-        if kind == "lm_head":
+            weights["embed"] = vtm_ref.Tensor(
+                name="emb.w",
+                kind=vtm_ref.KIND_TRITS,
+                dims=shape,
+                trits=array.array("b", trits),
+                scales=scales,
+                scale_dtype=scale_dtype,
+            )
+        elif kind in ("bias", "norm", "final_norm"):
+            raise ValueError(
+                f"{name}: триты допустимы только для матриц Linear, lm_head "
+                f"и таблицы словаря; нормы/bias должны лежать в "
+                f"non_ternary.bin"
+            )
+        elif kind == "lm_head":
             if cfg.tie_word_embeddings:
                 continue  # tied: отдельная матрица не нужна
             if cfg.lm_head != "tmv":
@@ -999,12 +1073,17 @@ def load_export(
             entry, payload, _short_weight_name(kind, layer, key)
         )
         if kind == "embed":
+            if cfg.embed_quant == "trit":
+                raise ValueError(
+                    f"{name}: в architecture embed='trit', а в "
+                    f"{non_file} лежит плотная таблица; манифест противоречив"
+                )
             _expect_shape(shape, (cfg.vocab, cfg.hidden), name)
             if cfg.tie_word_embeddings and tensor.kind != vtm_ref.KIND_F32:
                 raise ValueError(
-                    f"{name}: tied lm_head работает через MM, ему нужен fp32; "
-                    f"а эмбеддинг {tensor.kind_name}. Храните его fp32 либо "
-                    "отключите tie_word_embeddings"
+                    f"{name}: tied lm_head считается через MM по этой же "
+                    f"таблице; нужен fp32 или тритовая таблица (embed=trit), "
+                    f"а пришёл {tensor.kind_name}"
                 )
             weights["embed"] = tensor
         elif kind == "final_norm":
@@ -1044,6 +1123,12 @@ def load_export(
 
     # --- обязательные части графа ------------------------------------------
     if "embed" not in weights:
+        if cfg.embed_quant == "trit":
+            raise ValueError(
+                "в экспорте нет тритовой таблицы словаря: architecture "
+                "embed='trit', но сегмента model.embed_tokens.weight нет в "
+                "ternary.trit и записи с kind: trit в манифесте тоже нет"
+            )
         raise ValueError(
             "в экспорте нет эмбеддингов (model.embed_tokens.weight): "
             "полный граф без них не собрать"
@@ -1408,6 +1493,26 @@ def _print_manifest(
         )
     else:
         print(f"lm_head: отдельная матрица ({cfg.lm_head})")
+    embed = export.weights.get("embed")
+    if embed is not None:
+        payload = (
+            vtm_ref.tensor_payload_size(embed)
+            if embed.trits is not None or embed.data is not None
+            else 0
+        )
+        fp32_bytes = cfg.vocab * cfg.hidden * 4
+        if embed.kind == vtm_ref.KIND_TRITS:
+            print(
+                f"эмбеддинги: trit, сегмент ternary.trit "
+                f"({_human_bytes(payload)} против {_human_bytes(fp32_bytes)} fp32, "
+                f"EMB читает триты через LUT243"
+                + ("; tied lm_head — MM по той же таблице)" if export.tied else ")")
+            )
+        else:
+            print(
+                f"эмбеддинги: {embed.kind_name} в non_ternary.bin "
+                f"({_human_bytes(fp32_bytes)})"
+            )
     print(f"тензоров: {len(vtm.tensors)}, инструкций: {len(vtm.program)}")
     print("операции: " + ", ".join(f"{name}×{count}" for name, count in sorted(ops.items())))
     cache_bytes = cfg.n_layers * cfg.context_len * cfg.kv_dim * 2 * 4

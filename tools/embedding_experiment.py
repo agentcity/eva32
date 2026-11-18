@@ -340,6 +340,14 @@ def build_train_command(
     return command
 
 
+#: Режимы, для которых экспорт пока невозможен: нужен контейнерный kind 4 (int8 +
+#: масштабы) и чтение в src/vtm/loader.c. Качество при этом меряется на чекпоинте,
+#: а размер считается формулой — поэтому прогон не считается проваленным.
+EXPORT_DEFERRED: dict[str, str] = {
+    "int8": "экспорт int8 отложен: нужен kind 4 в контейнере (задача 0044)",
+}
+
+
 def build_export_command(*, run: Path, export: Path) -> list[str]:
     """Команда экспорта чекпоинта в ``ternary.pt/.trit`` + ``manifest.json``."""
     return [sys.executable, "-m", "qat.export", "--run", str(run), "--out", str(export)]
@@ -768,7 +776,9 @@ def run_experiment(args: argparse.Namespace) -> int:
             else:
                 result.status = "done"
 
-        if not args.no_export and result.status == "done":
+        deferred_note = EXPORT_DEFERRED.get(mode)
+        if (not args.no_export and result.status == "done"
+                and deferred_note is None):
             command = build_export_command(run=run_dir, export=export_dir)
             print(f"{head}: экспорт → {display_path(export_dir)}")
             code = run_streamed(
@@ -785,6 +795,10 @@ def run_experiment(args: argparse.Namespace) -> int:
                 result.export_dir = export_dir
                 result.export_bytes = directory_size(export_dir)
 
+        if deferred_note is not None and result.status == "done":
+            result.note = deferred_note
+            print(f"{head}: {deferred_note}")
+
         result.hours = (time.monotonic() - started) / 3600.0
         if finished_before:
             old = _previous_run(previous, mode)
@@ -792,13 +806,14 @@ def run_experiment(args: argparse.Namespace) -> int:
             result.hours = float(old_hours) if isinstance(old_hours, (int, float)) else None
 
         result.loss = read_last_loss(run_dir / "log.jsonl")
-        export_ok = args.no_export or result.export_dir is not None
+        export_ok = (args.no_export or result.export_dir is not None
+                     or mode in EXPORT_DEFERRED)
         eval_json = out_root / f"eval-{mode}.json"
         if args.eval_cmd and result.status == "done" and export_ok:
             eval_command = args.eval_cmd.format(
                 mode=mode,
                 run=str(run_dir),
-                export=str(export_dir),
+                export=str(result.export_dir or run_dir),
                 out=str(out_root),
                 eval_json=str(eval_json),
             )

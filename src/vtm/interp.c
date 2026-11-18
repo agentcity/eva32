@@ -72,6 +72,52 @@ static vtm_status same_count(vtm_t *m, const vtm_tensor *x, const vtm_tensor *y,
     return VTM_OK;
 }
 
+// --- LUT243: чтение тритов без делений на 3 --------------------------------
+//
+// Слово pack20 — 20 тритов; оно делится на 4 группы по 5 тритов, каждая
+// группа — число 0..242 (база 3). Таблица даёт сразу пять тритов группы.
+// Те же 243 записи, что в backend_scalar.c, но там она static и наружу не
+// отдаётся, а EMB/MM живут здесь: держим свою копию (1,2 КБ) и инициализируем
+// лениво при первом тритовом EMB/MM.
+static int8_t g_lut243[243][5];
+static int g_lut243_ready;
+
+static void lut243_init(void) {
+    unsigned v;
+    int k;
+    if (g_lut243_ready) return;
+    for (v = 0; v < 243u; v++) {
+        unsigned x = v;
+        for (k = 0; k < 5; k++) {
+            unsigned d = x % 3u;  // 0 -> -1, 1 -> 0, 2 -> +1
+            g_lut243[v][k] = (int8_t)(d == 2u ? 1 : (d == 0u ? -1 : 0));
+            x /= 3u;
+        }
+    }
+    g_lut243_ready = 1;
+}
+
+// Трит номер index из потока слов тритового тензора.
+static int trit_at(const vtm_tensor *t, size_t index) {
+    size_t local = index % (size_t)VTM_TRITS_PER_WORD;
+    uint32_t word = t->words[index / (size_t)VTM_TRITS_PER_WORD];
+    unsigned group = (unsigned)(local / 5u);
+    unsigned g;
+    for (g = 0; g < group; g++) word /= 243u;
+    return (int)g_lut243[word % 243u][local % 5u];
+}
+
+// w = trit * scale блока. 0 — успех, -1 — индекс или масштаб вне тензора.
+static int trit_weight_at(const vtm_tensor *t, size_t index, float *out) {
+    size_t scale_index;
+    if (!t->words || !t->scales || t->scale_block == 0) return -1;
+    if (index >= (size_t)t->n_elements) return -1;
+    scale_index = index / (size_t)t->scale_block;
+    if (scale_index >= (size_t)t->n_scales) return -1;
+    *out = (float)trit_at(t, index) * t->scales[scale_index];
+    return 0;
+}
+
 // --- TMV -------------------------------------------------------------------
 
 static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
@@ -164,20 +210,35 @@ static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 }
 
 // --- MM --------------------------------------------------------------------
-
+//
+// Y = A·B. A может быть тритовой матрицей (tied lm_head: A = emb.w,
+// B = [hidden, 1]): триты расквантовываются при чтении (LUT243), копии
+// матрицы в fp32 не делаем — у словаря Qwen это 233 М элементов.
 static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     vtm_status st;
     const vtm_tensor *a = need(m, in->a, ins, "a (A)", &st);
     const vtm_tensor *b;
     const vtm_tensor *y;
     int mm, kk, nn, r, c, t;
+    int a_trit;
 
     if (!a) return st;
     b = need(m, in->b, ins, "b (B)", &st);
     if (!b) return st;
     y = need(m, in->dst, ins, "dst (Y)", &st);
     if (!y) return st;
-    if ((st = req_f32(m, a, ins, "a (A)")) != VTM_OK) return st;
+    a_trit = a->kind == VTM_TENSOR_TRIT;
+    if (a_trit) {
+        if (!a->words || !a->scales)
+            return fail(m, ins, VTM_E_TENSOR,
+                        "a (A): тритовая матрица без слов/масштабов");
+        if (a->scale_block != VTM_SCALE_BLOCK_128 &&
+            a->scale_block != VTM_SCALE_BLOCK_160)
+            return fail(m, ins, VTM_E_FORMAT,
+                        "MM: неизвестный блок масштаба %u", a->scale_block);
+    } else if ((st = req_f32(m, a, ins, "a (A)")) != VTM_OK) {
+        return st;
+    }
     if ((st = req_f32(m, b, ins, "b (B)")) != VTM_OK) return st;
     if ((st = req_f32(m, y, ins, "dst (Y)")) != VTM_OK) return st;
     if (a->ndim != 2 || b->ndim != 2 || y->ndim != 2)
@@ -195,6 +256,27 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
                     (unsigned)y->dims[0], (unsigned)y->dims[1], mm, nn);
     if (y == a || y == b)
         return fail(m, ins, VTM_E_SHAPE, "MM: dst совпадает с входом");
+
+    if (a_trit) {
+        lut243_init();
+        for (r = 0; r < mm; r++) {
+            for (c = 0; c < nn; c++) {
+                double sum = 0.0;
+                for (t = 0; t < kk; t++) {
+                    size_t index = (size_t)r * (size_t)kk + (size_t)t;
+                    float wv;
+                    if (trit_weight_at(a, index, &wv) != 0)
+                        return fail(m, ins, VTM_E_BOUNDS,
+                                    "MM: элемент %zu матрицы A вне "
+                                    "таблицы/масштабов", index);
+                    sum += (double)wv
+                         * (double)b->f32[(size_t)t * (size_t)nn + (size_t)c];
+                }
+                y->f32[(size_t)r * (size_t)nn + (size_t)c] = (float)sum;
+            }
+        }
+        return VTM_OK;
+    }
 
     for (r = 0; r < mm; r++) {
         for (c = 0; c < nn; c++) {
@@ -431,6 +513,10 @@ static vtm_status op_cpy(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 //
 // imm >= 0 — статический token id из программы. С флагом VTM_FLAG_EMB_INPUT
 // токен берётся из vtm_set_token(); это точка входа для хоста.
+//
+// Таблица может быть тритовой (quantize_embeddings: trit у экспорта):
+// строка расквантовывается на месте через LUT243, y[i] = trit * scale.
+// В fp32 таблицу не разворачиваем: у Qwen таблица словаря — сотни мегабайт.
 static vtm_status op_emb(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     vtm_status st;
     const vtm_tensor *e = need(m, in->a, ins, "a (E)", &st);
@@ -441,7 +527,6 @@ static vtm_status op_emb(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     if (!e) return st;
     y = need(m, in->dst, ins, "dst (y)", &st);
     if (!y) return st;
-    if ((st = req_f32(m, e, ins, "a (E)")) != VTM_OK) return st;
     if ((st = req_f32(m, y, ins, "dst (y)")) != VTM_OK) return st;
     if (e->ndim != 2)
         return fail(m, ins, VTM_E_SHAPE, "EMB: E должен быть [vocab, dim]");
@@ -457,6 +542,30 @@ static vtm_status op_emb(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     if (y->n_elements != (uint32_t)dim)
         return fail(m, ins, VTM_E_SHAPE,
                     "EMB: y=%u элементов, dim=%d", y->n_elements, dim);
+
+    if (e->kind == VTM_TENSOR_TRIT) {
+        size_t base, i;
+        if (!e->words || !e->scales)
+            return fail(m, ins, VTM_E_TENSOR,
+                        "EMB: тритовая таблица без слов/масштабов");
+        if (e->scale_block != VTM_SCALE_BLOCK_128 &&
+            e->scale_block != VTM_SCALE_BLOCK_160)
+            return fail(m, ins, VTM_E_FORMAT,
+                        "EMB: неизвестный блок масштаба %u", e->scale_block);
+        lut243_init();
+        base = (size_t)token * (size_t)dim;
+        for (i = 0; i < (size_t)dim; i++) {
+            float value;
+            if (trit_weight_at(e, base + i, &value) != 0)
+                return fail(m, ins, VTM_E_BOUNDS,
+                            "EMB: элемент %zu вне таблицы/масштабов",
+                            base + i);
+            y->f32[i] = value;
+        }
+        return VTM_OK;
+    }
+
+    if ((st = req_f32(m, e, ins, "a (E)")) != VTM_OK) return st;
     fn = m->backend && m->backend->emb ? m->backend->emb
                                        : vtm_backend_scalar_lut.emb;
     if (!fn) return fail(m, ins, VTM_E_UNSUPPORTED, "нет ядра EMB");
