@@ -7,6 +7,9 @@
 
 * **точность маршрутов** — совпал ли ``Answer.route.kind`` с ``expect_route``;
 * **долю скиллов** — какая часть запросов обошлась без модели (0 ₽);
+* **разбивку по классам** — какой скилл поймал вопрос, что ушло в модель и
+  какие промахи содержания остались (видно, куда расти: скилл без попаданий
+  значит, что в наборе нет вопросов его класса);
 * **ожидаемую цену на 1000 запросов** — по тарифу моделей и оценке токенов.
 
 Формат строки ``eval/hybrid_golden.jsonl``::
@@ -19,6 +22,10 @@
 большой модели в замере — заглушка, судить по нему нечего. Для маршрутов
 ``small``/``big`` список обычно пуст. Регистр, ``ё`` и пробелы (включая
 неразрывные) при сравнении не важны — «2 490» и «2490» считаются одним числом.
+
+Время. Скилл ``time`` получает фиксированное «сейчас» (``EVAL_NOW``) через
+``meta`` запроса: иначе ответ «который час» менялся бы от прогона к прогону и
+метрики не воспроизводились бы.
 
 Цена. Тариф задаётся в ₽ за **1000 токенов** и берётся из ``eva.config``
 (``Config.prices``), а если модуля нет — из констант ``DEFAULT_PRICES_RUB_PER_1K``
@@ -119,6 +126,10 @@ EVAL_ENV = {
 #: Текст-маркер ответа заглушки; по нему видно, что модель «вызвана», а не
 #: скилл. В метрики содержание модельных ответов не входит.
 STUB_PREFIX = "[заглушка "
+
+#: Фиксированное «сейчас» для скилла времени. Без него вопрос «который час»
+#: в замере отвечал бы реальными часами, и метрики не воспроизводились бы.
+EVAL_NOW = "2026-11-18T08:54:00+03:00"
 
 
 class EvalUnavailable(RuntimeError):
@@ -409,7 +420,10 @@ def _make_request(types_module: Any, text: str) -> Any:
         message = {"role": "user", "content": text}
     request_cls = getattr(types_module, "Request")
     try:
-        return request_cls(messages=[message], meta={"user_id": "eval", "channel": "eval"})
+        return request_cls(
+            messages=[message],
+            meta={"user_id": "eval", "channel": "eval", "now": EVAL_NOW},
+        )
     except TypeError:
         return request_cls(messages=[message])
 
@@ -428,6 +442,96 @@ def _normalize(text: str) -> str:
 def contains_all(answer: str, needles: Iterable[str]) -> bool:
     normalized = _normalize(answer)
     return all(_normalize(needle) in normalized for needle in needles if needle)
+
+
+def _answer_class(record: Mapping[str, Any]) -> str:
+    """Класс ответа: ``skill:<имя>``, ``small``, ``big`` или ``error``.
+
+    Именно класс, а не маршрут: двадцать вопросов, пойманных ``pricing``, и
+    два, пойманных ``hours``, — это разные строки отчёта, хотя маршрут один.
+    """
+    if record.get("error"):
+        return "error"
+    route = str(record.get("actual_route") or "").strip().lower()
+    if route == "skill":
+        name = str(record.get("skill") or "").strip()
+        return f"skill:{name}" if name else "skill:?"
+    return route or "error"
+
+
+def _class_breakdown(
+    records: list[dict],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Счётчики по классам ответа: сколько, верно, что с содержанием."""
+    classes: dict[str, dict[str, Any]] = {}
+    for record in records:
+        name = record.get("class") or "error"
+        entry = classes.setdefault(
+            name,
+            {
+                "count": 0,
+                "correct": 0,
+                "content_checked": 0,
+                "content_ok": 0,
+                "questions": [],
+            },
+        )
+        entry["count"] += 1
+        if record.get("actual_route") == record.get("expect_route"):
+            entry["correct"] += 1
+        if record.get("content_checked"):
+            entry["content_checked"] += 1
+            if record.get("content_ok"):
+                entry["content_ok"] += 1
+        entry["questions"].append(record.get("question", ""))
+    return classes, list(classes)
+
+
+def _class_sort_key(name: str, order_index: Mapping[str, int]) -> tuple:
+    """Порядок строк отчёта: скиллы в порядке реестра, потом модели, потом ошибки."""
+    if name.startswith("skill:"):
+        skill = name.split(":", 1)[1]
+        return (0, order_index.get(skill, 10_000), skill)
+    rank = {"small": 1, "big": 2, "error": 3}.get(name, 4)
+    return (rank, 0, name)
+
+
+def _class_title(name: str) -> str:
+    if name.startswith("skill:"):
+        return f"скилл {name.split(':', 1)[1]}"
+    return {"small": "модель малая", "big": "модель большая", "error": "ошибки"}.get(
+        name, name
+    )
+
+
+def registered_skill_names() -> list[str]:
+    """Имена скиллов из реестра; пустой список — реестр недоступен.
+
+    Нужны, чтобы отчёт показал и скиллы **без попаданий**: это не ошибка, а
+    пустой класс в наборе — сигнал, какие вопросы стоит добавить в eval.
+    """
+    try:
+        module = importlib.import_module("eva.skills.registry")
+    except Exception:  # noqa: BLE001 — без реестра отчёт просто неполный
+        return []
+    entries = getattr(module, "skills", None)
+    if callable(entries):
+        try:
+            entries = entries()
+        except Exception:  # noqa: BLE001
+            return []
+    if entries is None:
+        return []
+    try:
+        items = list(entries)
+    except TypeError:
+        return []
+    names: list[str] = []
+    for entry in items:
+        name = str(getattr(entry, "name", "") or type(entry).__name__).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 # --------------------------------------------------------------------------- #
@@ -511,6 +615,7 @@ def evaluate(
             # содержания, а не «нечего проверять».
             record["content_checked"] = True
             record["content_ok"] = False
+        record["class"] = _answer_class(record)
         records.append(record)
 
     total = len(records)
@@ -545,6 +650,33 @@ def evaluate(
         actual = r["actual_route"] if r["actual_route"] in ROUTE_KINDS else "error"
         confusion[r["expect_route"]][actual] = confusion[r["expect_route"]].get(actual, 0) + 1
 
+    classes, class_order = _class_breakdown(records)
+    registered = registered_skill_names()
+    order_index = {name: index for index, name in enumerate(registered)}
+    class_order.sort(key=lambda name: _class_sort_key(name, order_index))
+    skill_hits: dict[str, int] = {
+        name: classes.get(f"skill:{name}", {}).get("count", 0) for name in registered
+    }
+    for name in classes:
+        if name.startswith("skill:"):
+            skill_hits.setdefault(name.split(":", 1)[1], classes[name]["count"])
+    unused_skills = [name for name, count in skill_hits.items() if not count]
+    content_misses = [
+        {
+            "question": r["question"],
+            "actual_route": r["actual_route"],
+            "skill": r["skill"],
+            "expect_contains": list(r["expect_contains"]),
+            "text": r["text"][:160],
+        }
+        for r in records
+        if r["content_checked"] and not r["content_ok"]
+    ]
+    model_questions: dict[str, list[str]] = {"small": [], "big": []}
+    for r in records:
+        if r["actual_route"] in model_questions:
+            model_questions[r["actual_route"]].append(r["question"])
+
     questions = [r["question"] for r in records]
     actual_kinds = [r["actual_route"] for r in records]
     expected_kinds = [r["expect_route"] for r in records]
@@ -565,6 +697,12 @@ def evaluate(
         "expected_skill_share": expected_counts["skill"] / total if total else 0.0,
         "confusion": confusion,
         "mismatches": mismatches,
+        "classes": classes,
+        "class_order": class_order,
+        "skill_hits": skill_hits,
+        "unused_skills": unused_skills,
+        "content_misses": content_misses,
+        "model_questions": model_questions,
         "content_checked": len(content_checked),
         "content_ok": len(content_ok),
         "content_accuracy": (len(content_ok) / len(content_checked)) if content_checked else 0.0,
@@ -630,6 +768,34 @@ def format_report(metrics: Mapping[str, Any]) -> str:
             lines.append(f"    - [{arrow}] «{item['question']}»  {reason[:90]}")
         if len(mismatches) > 20:
             lines.append(f"    ... ещё {len(mismatches) - 20}")
+
+    classes = metrics.get("classes") or {}
+    if classes:
+        lines.append("")
+        lines.append("разбивка по классам (кто ответил, что проверено):")
+        for name in metrics.get("class_order") or sorted(classes):
+            entry = classes[name]
+            tail = ""
+            if entry.get("content_checked"):
+                tail = (
+                    f"   содержание {entry['content_ok']}/"
+                    f"{entry['content_checked']}"
+                )
+            lines.append(f"  {_class_title(name):<20}{_share(entry['count'], total)}{tail}")
+        unused = metrics.get("unused_skills") or []
+        if unused:
+            lines.append(
+                "  без попаданий: " + ", ".join(unused)
+                + "  (в наборе нет вопросов этих классов — или скилл не срабатывает)"
+            )
+        misses = metrics.get("content_misses") or []
+        lines.append(f"  промахов содержания: {len(misses)}")
+        for item in misses[:10]:
+            expected = ", ".join(item.get("expect_contains") or [])
+            lines.append(
+                f"    - «{item['question']}» → {item['actual_route'] or 'error'}"
+                f" (скилл {item.get('skill') or '—'}), ждали: {expected}"
+            )
 
     prices = metrics["prices_rub_per_1k"]
     lines.append("")
@@ -720,6 +886,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-cost-per-1000", type=float, default=None, help="порог цены на 1000 запросов, ₽"
     )
+    parser.add_argument(
+        "--min-skill-share", type=float, default=None, help="минимальная доля скиллов (0..1)"
+    )
     parser.add_argument("--traceback", action="store_true", help="показать трейсбек при сбое")
     args = parser.parse_args(argv)
 
@@ -786,6 +955,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.min_accuracy is not None and metrics["accuracy"] < args.min_accuracy:
         print(
             f"порог точности не пройден: {metrics['accuracy']:.3f} < {args.min_accuracy:.3f}",
+            file=sys.stderr,
+        )
+        failed = True
+    if (
+        args.min_skill_share is not None
+        and metrics["skill_share"] < args.min_skill_share
+    ):
+        print(
+            f"порог доли скиллов не пройден: {metrics['skill_share']:.3f} < "
+            f"{args.min_skill_share:.3f}",
             file=sys.stderr,
         )
         failed = True

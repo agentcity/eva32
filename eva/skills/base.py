@@ -26,6 +26,7 @@ __all__ = [
     "SOURCE",
     "Skill",
     "SkillResult",
+    "format_number",
     "get_catalog",
     "is_third_party",
     "make_result",
@@ -104,10 +105,42 @@ def make_result(
     sources: list[str] | None = None,
     catalog_ids: list[str] | None = None,
 ) -> SkillResult:
-    """Собрать ``SkillResult`` с одним источником по умолчанию."""
+    """Собрать ``SkillResult``.
+
+    ``sources`` по умолчанию — каталог ``[1]``. Явный пустой список значит
+    «ответ вычислен, позиции каталога у него нет»: приписывать вычисленному
+    времени или курсу источник ``[1]`` было бы ложью.
+    """
     return {
         "text": text,
-        "sources": list(sources or [SOURCE]),
+        "sources": [SOURCE] if sources is None else list(sources),
         "catalog_ids": list(catalog_ids or []),
         "skill": skill,
     }
+
+
+def format_number(value: Any, decimals: int = 3) -> str:
+    """Число по-русски: пробел между тысячами, запятая перед дробью.
+
+    Вычисляемые ответы (время, единицы, арифметика, курс) не берутся из
+    каталога, поэтому ``[1]`` им не подходит — но формат чисел должен
+    совпадать с остальными ответами: «9 250», «6,214», «3,333333».
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        return "—"
+    places = max(0, int(decimals))
+    rounded = round(number, places)
+    if abs(rounded) < 1e-12:
+        rounded = 0.0
+    text = f"{rounded:.{places}f}"
+    if "." in text:
+        whole, fraction = text.split(".", 1)
+        fraction = fraction.rstrip("0")
+    else:
+        whole, fraction = text, ""
+    whole = f"{int(whole):,}".replace(",", " ")
+    return f"{whole},{fraction}" if fraction else whole
