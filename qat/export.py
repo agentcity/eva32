@@ -3,13 +3,18 @@
 
     python3 -m qat.export --run runs/pilot1 --out export/
 
-Пишет три файла:
+Пишет четыре файла:
 
 * ``ternary.pt`` — int8-триты и масштабы по тензорам (основной артефакт);
 * ``ternary.trit`` — те же веса, упакованные по 20 тритов в 32-битное слово
   (формат docs/trit-format.md), сегментами подряд;
-* ``manifest.json`` — ревизия базовой модели, конфиг, шаг, контрольные суммы
-  и таблица смещений тензоров в ``.trit``.
+* ``non_ternary.bin`` — эмбеддинги, финальная норма, lm_head и bias в fp32:
+  без них ``tools/vtm_compile.py`` не соберёт полный граф. При
+  ``tie_word_embeddings`` lm_head не дублируется, а ссылается на таблицу
+  эмбеддингов;
+* ``manifest.json`` — ревизия базовой модели, конфиг, шаг, контрольные суммы,
+  архитектура для VTM, таблицы смещений тензоров в ``.trit`` и
+  ``non_ternary.bin``.
 
 Экспорт не требует transformers: он читает state_dict чекпоинта и квантует
 мастер-веса заново тем же кодом, что и обучение (qat.ternary).
@@ -19,9 +24,11 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import re
 import struct
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -31,6 +38,428 @@ from .util import human_bytes, human_count, sha256_file, utc_now, write_json_ato
 
 PARAM_SUFFIX = ".parametrizations.weight.original"
 REQUIRED_MODULES = (("torch", "torch"), ("numpy", "numpy"))
+#: Нетернарные веса (эмбеддинги, нормы, lm_head, bias) лежат отдельным
+#: файлом, чтобы компилятор VTM читал их без torch.
+NON_TERNARY_FILE = "non_ternary.bin"
+#: 2: добавлены architecture и non_ternary; v1 неполный и компилятором отвергается.
+MANIFEST_VERSION = 2
+
+_LAYER_RE = re.compile(r"(?:^|\.)(?:layers|h)\.(\d+)\.")
+_MATRIX_KEYS = {
+    "self_attn.q_proj": "q_proj", "attn.q_proj": "q_proj",
+    "attention.q_proj": "q_proj", "q_proj": "q_proj",
+    "self_attn.k_proj": "k_proj", "attn.k_proj": "k_proj",
+    "attention.k_proj": "k_proj", "k_proj": "k_proj",
+    "self_attn.v_proj": "v_proj", "attn.v_proj": "v_proj",
+    "attention.v_proj": "v_proj", "v_proj": "v_proj",
+    "self_attn.o_proj": "o_proj", "attn.o_proj": "o_proj",
+    "attention.o_proj": "o_proj", "o_proj": "o_proj",
+    "mlp.gate_proj": "gate_proj", "ffn.gate_proj": "gate_proj",
+    "feed_forward.gate_proj": "gate_proj", "gate_proj": "gate_proj",
+    "mlp.up_proj": "up_proj", "ffn.up_proj": "up_proj",
+    "feed_forward.up_proj": "up_proj", "up_proj": "up_proj",
+    "mlp.down_proj": "down_proj", "ffn.down_proj": "down_proj",
+    "feed_forward.down_proj": "down_proj", "down_proj": "down_proj",
+}
+_NORM_KEYS = {
+    "input_layernorm": "norm1", "ln1": "norm1", "norm1": "norm1",
+    "attn_norm": "norm1",
+    "post_attention_layernorm": "norm2", "ln2": "norm2", "norm2": "norm2",
+    "ffn_norm": "norm2",
+}
+_KEY_PRIORITY = {
+    "embed": 0, "final_norm": 1, "lm_head": 2,
+    "norm": 3, "matrix": 4, "bias": 5,
+}
+
+
+@dataclass(frozen=True)
+class WeightRole:
+    """Роль имени тензора в state_dict HF/Qwen."""
+
+    kind: str
+    layer: int | None
+    key: str
+
+
+def classify_state_key(name: str) -> WeightRole:
+    """Разобрать имя тензора: embed | final_norm | lm_head | matrix | bias |
+    norm | unknown, номер слоя и короткий ключ (`q_proj`, `q_bias`, `norm1`).
+    """
+    base = name
+    is_bias = name.endswith(".bias")
+    if is_bias:
+        base = name[:-len(".bias")]
+    elif name.endswith(".weight"):
+        base = name[:-len(".weight")]
+    if base in ("model.embed_tokens", "embed_tokens", "embed", "emb"):
+        return WeightRole("embed", None, "embed")
+    if base in ("model.norm", "transformer.ln_f", "final_norm", "ln_f", "norm"):
+        return WeightRole("final_norm", None, "final_norm")
+    if base == "lm_head":
+        return WeightRole("lm_head", None, "lm_head")
+    match = _LAYER_RE.search(name)
+    if not match:
+        return WeightRole("unknown", None, base)
+    layer = int(match.group(1))
+    tail = name[match.end():]
+    if tail.endswith(".weight"):
+        tail = tail[:-len(".weight")]
+    elif tail.endswith(".bias"):
+        tail = tail[:-len(".bias")]
+    if tail in _NORM_KEYS:
+        return WeightRole("norm" if not is_bias else "unknown", layer, _NORM_KEYS[tail])
+    key = _MATRIX_KEYS.get(tail)
+    if key is None:
+        return WeightRole("unknown", layer, tail)
+    if is_bias:
+        return WeightRole("bias", layer, key[:-len("_proj")] + "_bias")
+    return WeightRole("matrix", layer, key)
+
+
+def _config_value(config: dict[str, Any] | None, *names: str) -> Any:
+    if not config:
+        return None
+    for name in names:
+        value = config.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def infer_architecture(
+    state_shapes: dict[str, Sequence[int]],
+    model_config: dict[str, Any] | None = None,
+    *,
+    tie_hint: bool | None = None,
+    overrides: dict[str, Any] | None = None,
+    lm_head_trit: bool = False,
+) -> dict[str, Any]:
+    """Вывести архитектуру для VTM из форм state_dict и HF-конфига.
+
+    Формы дают hidden/vocab/intermediate/q_dim/kv_dim и число слоёв, но не
+    делят q_dim на головы. Если `model_config` (HF) не прочитан, `n_heads` и
+    `head_dim` обязательны в `overrides` — иначе ошибка с подсказкой.
+    """
+    overrides = dict(overrides or {})
+    shapes = {
+        str(name): tuple(int(x) for x in shape)
+        for name, shape in state_shapes.items()
+        if shape
+    }
+    layers: dict[int, dict[str, tuple[int, ...]]] = {}
+    embed_shape: tuple[int, ...] | None = None
+    final_norm_shape: tuple[int, ...] | None = None
+    lm_head_shape: tuple[int, ...] | None = None
+    for name, shape in shapes.items():
+        role = classify_state_key(name)
+        if role.kind == "embed":
+            embed_shape = shape
+        elif role.kind == "final_norm":
+            final_norm_shape = shape
+        elif role.kind == "lm_head":
+            lm_head_shape = shape
+        elif role.layer is not None:
+            layers.setdefault(role.layer, {})[role.key] = shape
+
+    if not layers:
+        raise RuntimeError("в state_dict нет слоёв model.layers.N — это не декодер?")
+    n_layers = max(layers) + 1
+    if set(layers) != set(range(n_layers)):
+        raise RuntimeError(
+            f"слои идут не подряд: есть {sorted(layers)}, ожидалось 0..{n_layers - 1}"
+        )
+    first = layers[0]
+    for key in ("q_proj", "k_proj", "v_proj", "gate_proj", "norm1", "norm2"):
+        if key not in first:
+            raise RuntimeError(f"в слое 0 нет {key}: неподдерживаемая архитектура")
+    for index, layer in layers.items():
+        for key, shape in layer.items():
+            if key in first and shape != first[key]:
+                raise RuntimeError(
+                    f"слой {index}: {key} формы {shape}, а в слое 0 {first[key]}"
+                )
+
+    hidden = int(first["norm1"][0])
+    q_dim = int(first["q_proj"][0])
+    kv_dim = int(first["k_proj"][0])
+    intermediate = int(first["gate_proj"][0])
+    if final_norm_shape is not None and int(final_norm_shape[0]) != hidden:
+        raise RuntimeError(
+            f"model.norm: размер {final_norm_shape[0]}, а hidden={hidden}"
+        )
+    if embed_shape is not None and int(embed_shape[-1]) != hidden:
+        raise RuntimeError(
+            f"embed_tokens: последняя размерность {embed_shape[-1]}, "
+            f"а hidden={hidden}"
+        )
+    if embed_shape is not None:
+        vocab = int(embed_shape[0])
+    else:
+        vocab = int(_config_value(model_config, "vocab_size", "vocab") or 0)
+    if not vocab:
+        raise RuntimeError("не удалось определить vocab: нет model.embed_tokens.weight")
+
+    config = dict(model_config or {})
+    cfg_hidden = _config_value(config, "hidden_size", "d_model", "hidden")
+    if cfg_hidden is not None and int(cfg_hidden) != hidden:
+        raise RuntimeError(
+            f"HF-конфиг: hidden_size={cfg_hidden}, а state_dict даёт hidden={hidden}"
+        )
+    cfg_layers = _config_value(config, "num_hidden_layers", "n_layer", "n_layers")
+    if cfg_layers is not None and int(cfg_layers) != n_layers:
+        raise RuntimeError(
+            f"HF-конфиг: слоёв {cfg_layers}, а state_dict даёт {n_layers}"
+        )
+    cfg_vocab = _config_value(config, "vocab_size", "vocab")
+    if cfg_vocab is not None and int(cfg_vocab) != vocab:
+        raise RuntimeError(
+            f"HF-конфиг: vocab_size={cfg_vocab}, а state_dict даёт {vocab}"
+        )
+    cfg_inter = _config_value(config, "intermediate_size", "ffn_dim", "intermediate")
+    if cfg_inter is not None and int(cfg_inter) != intermediate:
+        raise RuntimeError(
+            f"HF-конфиг: intermediate_size={cfg_inter}, "
+            f"а state_dict даёт {intermediate}"
+        )
+
+    n_heads = overrides.get("n_heads")
+    if n_heads is None:
+        n_heads = _config_value(config, "num_attention_heads", "n_head", "n_heads")
+    head_dim = overrides.get("head_dim")
+    if head_dim is None:
+        head_dim = _config_value(config, "head_dim")
+    if head_dim is None and n_heads:
+        if q_dim % int(n_heads):
+            raise RuntimeError(f"q_dim={q_dim} не делится на n_heads={n_heads}")
+        head_dim = q_dim // int(n_heads)
+    if n_heads is None and head_dim:
+        if q_dim % int(head_dim):
+            raise RuntimeError(f"q_dim={q_dim} не делится на head_dim={head_dim}")
+        n_heads = q_dim // int(head_dim)
+    if n_heads is None or head_dim is None:
+        raise RuntimeError(
+            "не удалось определить n_heads/head_dim: нет HF-конфига "
+            "(transformers или architecture в run.json). Задайте "
+            "--n-heads и --head-dim при экспорте"
+        )
+    n_heads, head_dim = int(n_heads), int(head_dim)
+    if n_heads * head_dim != q_dim:
+        raise RuntimeError(
+            f"n_heads×head_dim={n_heads * head_dim}, а q_proj даёт q_dim={q_dim}"
+        )
+    n_kv_heads = overrides.get("n_kv_heads")
+    if n_kv_heads is None:
+        n_kv_heads = _config_value(config, "num_key_value_heads", "n_head_kv", "n_kv_heads")
+    if n_kv_heads is None:
+        if kv_dim % head_dim:
+            raise RuntimeError(
+                f"kv_dim={kv_dim} не делится на head_dim={head_dim}; "
+                "задайте --n-kv-heads"
+            )
+        n_kv_heads = kv_dim // head_dim
+    n_kv_heads = int(n_kv_heads)
+    if n_kv_heads * head_dim != kv_dim:
+        raise RuntimeError(
+            f"n_kv_heads×head_dim={n_kv_heads * head_dim}, а k_proj даёт kv_dim={kv_dim}"
+        )
+    if n_heads % n_kv_heads:
+        raise RuntimeError(f"n_heads={n_heads} не делится на n_kv_heads={n_kv_heads}")
+
+    tie_override = overrides.get("tie_word_embeddings")
+    if tie_override is None:
+        tie_override = _config_value(config, "tie_word_embeddings", "tied_embeddings")
+    if tie_override is None:
+        if tie_hint is not None:
+            tie = bool(tie_hint)
+        else:
+            tie = lm_head_shape is None
+    else:
+        tie = bool(tie_override)
+    if tie and lm_head_trit:
+        raise RuntimeError(
+            "lm_head попал в тернарные слои, а tie_word_embeddings=true: "
+            "tied-таблица хранится как fp32-эмбеддинг. Исключите lm_head из "
+            "quant.target_suffixes или выставьте --tie-embeddings no"
+        )
+
+    eps = overrides.get("rms_norm_eps")
+    if eps is None:
+        eps = _config_value(config, "rms_norm_eps", "layer_norm_eps", "eps")
+    rope_theta = overrides.get("rope_theta")
+    if rope_theta is None:
+        rope_theta = _config_value(config, "rope_theta")
+    max_context = _config_value(
+        config, "max_position_embeddings", "n_positions", "max_context"
+    )
+    context_len = overrides.get("context_len")
+    if context_len is None:
+        context_len = _config_value(config, "context_len")
+    if context_len is None:
+        # VTM v0.1 держит KV-кэш в контейнере: 32768 токенов на 28 слоёв —
+        # это ~1.9 ГиБ нулей. Рабочая длина по умолчанию 2048; больше — через
+        # --context-len осознанно.
+        context_len = min(int(max_context), 2048) if max_context else 2048
+    context_len = int(context_len)
+
+    return {
+        "hidden": hidden,
+        "n_heads": n_heads,
+        "n_kv_heads": n_kv_heads,
+        "head_dim": head_dim,
+        "intermediate": intermediate,
+        "vocab": vocab,
+        "n_layers": n_layers,
+        "context_len": context_len,
+        "max_context": int(max_context) if max_context else None,
+        "rope_theta": float(rope_theta or 10000.0),
+        "rms_norm_eps": float(eps if eps is not None else 1e-6),
+        "tie_word_embeddings": tie,
+        "lm_head": "tmv" if lm_head_trit else "mm",
+    }
+
+
+def _state_tie_hint(state_dict: dict[str, Any]) -> bool | None:
+    """Один ли тензор у embed_tokens и lm_head (Qwen tie по умолчанию)."""
+    embed = state_dict.get("model.embed_tokens.weight")
+    head = state_dict.get("lm_head.weight")
+    if embed is None or head is None:
+        return None
+    if not (hasattr(embed, "data_ptr") and hasattr(head, "data_ptr")):
+        return None
+    return int(embed.data_ptr()) == int(head.data_ptr())
+
+
+def _load_hf_config(model_cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """HF-конфиг без жёсткой зависимости: он нужен ради n_heads/rope/eps."""
+    name = model_cfg.get("name_or_path")
+    if not name:
+        return None
+    try:
+        from transformers import AutoConfig  # noqa: PLC0415 - опционален
+
+        config = AutoConfig.from_pretrained(
+            str(name),
+            revision=model_cfg.get("revision") or None,
+            trust_remote_code=bool(model_cfg.get("trust_remote_code", False)),
+        )
+        return config.to_dict()
+    except Exception as exc:  # noqa: BLE001 - сеть/кэш/версии падают по-разному
+        print(f"[qat.export] ВНИМАНИЕ: HF-конфиг {name} не прочитан ({exc}); "
+              f"n_heads/head_dim/rope_theta/eps берутся из --* или state_dict")
+        return None
+
+
+def _write_non_ternary(
+    out_dir: Path,
+    state_dict: dict[str, Any],
+    architecture: dict[str, Any],
+) -> tuple[Path, list[dict[str, Any]], int]:
+    """Выгрузить эмбеддинги, нормы, lm_head и bias в `<out>/non_ternary.bin`.
+
+    Дедупликация по `data_ptr`: при tie_word_embeddings lm_head и
+    embed_tokens — один тензор, в файле он лежит один раз и помечается
+    `tied_to`. Offsets/длины пишутся в манифест, чтобы компилятор VTM читал
+    файл без torch.
+    """
+    records: list[tuple[str, Any, WeightRole, int]] = []
+    for key in sorted(state_dict):
+        value = state_dict[key]
+        if not hasattr(value, "numel"):
+            continue
+        if key.endswith(PARAM_SUFFIX) or ".parametrizations." in key:
+            continue
+        role = classify_state_key(key)
+        if role.kind == "unknown":
+            raise RuntimeError(
+                f"{key}: компилятор VTM не знает этот тензор; поддержаны "
+                "model.embed_tokens/model.norm/lm_head и Qwen/Llama-слои"
+            )
+        records.append((key, value, role, int(value.data_ptr())))
+
+    groups: dict[int, list[tuple[str, Any, WeightRole, int]]] = {}
+    for record in records:
+        groups.setdefault(record[3], []).append(record)
+
+    entries: list[dict[str, Any]] = []
+    total_params = 0
+    tie = bool(architecture.get("tie_word_embeddings"))
+    tmp_path = out_dir / ("." + NON_TERNARY_FILE + ".tmp")
+    final_path = out_dir / NON_TERNARY_FILE
+    with tmp_path.open("wb") as handle:
+        offset = 0
+        for ptr, group in groups.items():
+            group.sort(key=lambda item: (
+                _KEY_PRIORITY.get(item[2].kind, 9), item[0],
+            ))
+            canonical_key, value, role, _ptr = group[0]
+            if role.kind == "lm_head" and tie:
+                # tied: lm_head — ссылка на embed_tokens, байт не пишем.
+                continue
+            payload = _to_numpy_bytes(value, "<f4")
+            expected = int(value.numel()) * 4
+            if len(payload) != expected:
+                raise RuntimeError(
+                    f"{canonical_key}: {len(payload)} байт, ожидалось {expected}"
+                )
+            entry = {
+                "name": canonical_key,
+                "role": role.kind,
+                "layer": role.layer,
+                "key": role.key,
+                "shape": [int(x) for x in value.shape],
+                "dtype": "float32",
+                "offset": offset,
+                "length": len(payload),
+                "params": int(value.numel()),
+            }
+            aliases = [key for key, _v, _r, _p in group[1:] if key != canonical_key]
+            if aliases:
+                entry["aliases"] = aliases
+            handle.write(payload)
+            offset += len(payload)
+            total_params += int(value.numel())
+            entries.append(entry)
+
+    if tie:
+        embed = next(
+            (entry for entry in entries if entry["role"] == "embed"), None
+        )
+        if embed is None:
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                "tie_word_embeddings=true, но model.embed_tokens.weight не найден"
+            )
+        entries.append({
+            "name": "lm_head.weight",
+            "role": "lm_head",
+            "layer": None,
+            "key": "lm_head",
+            "shape": list(embed["shape"]),
+            "dtype": "float32",
+            "tied_to": embed["name"],
+            "params": int(embed["params"]),
+        })
+    elif architecture.get("lm_head") == "tmv":
+        # lm_head тернаризован и лежит в ternary.trit, не в non_ternary.bin.
+        pass
+    else:
+        heads = [entry for entry in entries if entry["role"] == "lm_head"]
+        if not heads:
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                "tie_word_embeddings=false, но lm_head.weight не найден"
+            )
+        if len(heads) > 1:
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError("больше одного кандидата в lm_head")
+    tmp_path.replace(final_path)
+    return final_path, entries, total_params
+
+
+def _read_run_architecture(run_meta: dict[str, Any]) -> dict[str, Any] | None:
+    arch = run_meta.get("architecture")
+    return arch if isinstance(arch, dict) else None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,6 +486,23 @@ def build_parser() -> argparse.ArgumentParser:
                         help="тип масштабов (по умолчанию из конфига прогона)")
     parser.add_argument("--force", action="store_true",
                         help="перезаписать существующий экспорт")
+    parser.add_argument("--n-heads", type=int, default=None,
+                        help="число голов attention, если HF-конфиг недоступен")
+    parser.add_argument("--n-kv-heads", type=int, default=None,
+                        help="число KV-голов (GQA), если HF-конфиг недоступен")
+    parser.add_argument("--head-dim", type=int, default=None,
+                        help="размер головы, если HF-конфиг недоступен")
+    parser.add_argument("--rope-theta", type=float, default=None,
+                        help="theta RoPE (по умолчанию из HF-конфига или 10000)")
+    parser.add_argument("--rms-norm-eps", type=float, default=None,
+                        help="eps RMSNorm (по умолчанию из HF-конфига или 1e-6)")
+    parser.add_argument("--context-len", type=int, default=None,
+                        help="длина KV-кэша в контейнере VTM; по умолчанию "
+                             "min(max_position_embeddings, 2048): полный "
+                             "контекст 32k — это гигабайты нулей")
+    parser.add_argument("--tie-embeddings", choices=("auto", "yes", "no"),
+                        default="auto",
+                        help="tie_word_embeddings: auto — из HF-конфига/state_dict")
     return parser
 
 
@@ -181,7 +627,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     pt_path = out_dir / "ternary.pt"
     trit_path = out_dir / "ternary.trit"
     manifest_path = out_dir / "manifest.json"
-    if not args.force and (pt_path.exists() or trit_path.exists() or manifest_path.exists()):
+    non_ternary_path = out_dir / NON_TERNARY_FILE
+    if not args.force and (
+        pt_path.exists() or trit_path.exists() or manifest_path.exists()
+        or non_ternary_path.exists()
+    ):
         print(f"[qat.export] в {out_dir} уже есть экспорт; добавьте --force, чтобы перезаписать")
         return 2
 
@@ -213,21 +663,51 @@ def main(argv: Sequence[str] | None = None) -> int:
         if extra_mods:
             print(f"               лишние в чекпоинте: {extra_mods[:5]}")
 
-    # Считаем нетернарные параметры для manifest: они остаются в чекпоинте.
-    # data_ptr дедуплицирует tied-веса (lm_head и embed_tokens — один тензор).
-    non_ternary_params = 0
-    non_ternary_names: list[str] = []
-    seen_ptrs: set[int] = set()
-    for key, value in state_dict.items():
-        if key.endswith(PARAM_SUFFIX) or ".parametrizations." in key:
-            continue
-        if hasattr(value, "numel"):
-            ptr = int(value.data_ptr())
-            if ptr in seen_ptrs:
-                continue
-            seen_ptrs.add(ptr)
-            non_ternary_params += int(value.numel())
-            non_ternary_names.append(key)
+    # --- архитектура и нетернарные веса ------------------------------------
+    # Формы state_dict дают hidden/vocab/intermediate и число слоёв; n_heads,
+    # head_dim, rope_theta и eps — из HF-конфига (или --* флагов).
+    state_shapes = {
+        key: tuple(int(x) for x in value.shape)
+        for key, value in state_dict.items()
+        if hasattr(value, "shape") and len(value.shape) >= 1
+    }
+    overrides: dict[str, Any] = {}
+    for field_name in (
+        "n_heads", "n_kv_heads", "head_dim", "rope_theta",
+        "rms_norm_eps", "context_len",
+    ):
+        value = getattr(args, field_name)
+        if value is not None:
+            overrides[field_name] = value
+    if args.tie_embeddings != "auto":
+        overrides["tie_word_embeddings"] = args.tie_embeddings == "yes"
+    hf_config = _read_run_architecture(run_meta) or _load_hf_config(model_cfg)
+    lm_head_trit = any(key.startswith("lm_head.") for key in target_keys)
+    architecture = infer_architecture(
+        state_shapes,
+        hf_config,
+        tie_hint=_state_tie_hint(state_dict),
+        overrides=overrides,
+        lm_head_trit=lm_head_trit,
+    )
+    print(
+        f"[qat.export] архитектура: hidden={architecture['hidden']} "
+        f"heads={architecture['n_heads']}/{architecture['n_kv_heads']} "
+        f"head_dim={architecture['head_dim']} "
+        f"intermediate={architecture['intermediate']} "
+        f"vocab={architecture['vocab']} layers={architecture['n_layers']} "
+        f"rope_theta={architecture['rope_theta']:g} "
+        f"tie={architecture['tie_word_embeddings']} "
+        f"lm_head={architecture['lm_head']}"
+    )
+    non_ternary_path, non_ternary_entries, non_ternary_params = _write_non_ternary(
+        out_dir, state_dict, architecture
+    )
+    print(
+        f"[qat.export] нетернарных тензоров: {len(non_ternary_entries)}, "
+        f"параметров: {human_count(non_ternary_params)}; "
+        f"{non_ternary_path.name}: {human_bytes(non_ternary_path.stat().st_size)}"
+    )
 
     tensors: dict[str, Any] = {}
     manifest_tensors: list[dict[str, Any]] = []
@@ -361,9 +841,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     pt_hash = sha256_file(pt_path)
     trit_hash = sha256_file(trit_path)
+    non_ternary_hash = sha256_file(non_ternary_path)
     manifest = {
         "format": "eva32.ternary.manifest",
-        "format_version": 1,
+        "format_version": MANIFEST_VERSION,
         "created_at": utc_now(),
         "training": {
             "run": run_dir.name,
@@ -378,6 +859,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "name_or_path": model_cfg.get("name_or_path"),
             "revision": model_cfg.get("revision"),
         },
+        # Всё, что нужно tools/vtm_compile.py, чтобы собрать полный граф без
+        # HF/torch: размерности, rope/eps и политика tied-эмбеддингов.
+        "architecture": architecture,
         "quantization": {
             "block_size": block_size,
             "scale_dtype": scale_dtype,
@@ -403,18 +887,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
         },
         "non_ternary": {
-            "stored_in_this_export": False,
-            "count": len(non_ternary_names),
+            "stored_in_this_export": True,
+            "file": non_ternary_path.name,
+            "dtype": "float32",
+            "count": len(non_ternary_entries),
             "params": non_ternary_params,
             "source": str(ckpt / "model.pt"),
+            "tensors": non_ternary_entries,
             "note": (
-                "эмбеддинги, lm_head, layernorm, bias и прочее в ternary.pt не входят: "
-                "их берут из этого же чекпоинта (или из базовой модели, если слой не обучался)"
+                "эмбеддинги, финальная норма, lm_head и bias лежат в "
+                "non_ternary.bin (fp32, little-endian), offsets — в tensors[]. "
+                "При tie_word_embeddings lm_head не дублируется: запись "
+                "ссылается через tied_to на embed_tokens"
             ),
         },
         "files": {
             "ternary.pt": {"bytes": pt_path.stat().st_size, "sha256": pt_hash},
             "ternary.trit": {"bytes": trit_path.stat().st_size, "sha256": trit_hash},
+            non_ternary_path.name: {
+                "bytes": non_ternary_path.stat().st_size,
+                "sha256": non_ternary_hash,
+            },
         },
         "totals": {
             "tensors": len(manifest_tensors),
@@ -432,7 +925,11 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"sha256 {pt_hash[:16]}…")
     print(f"[qat.export] {trit_path.name}: {human_bytes(trit_path.stat().st_size)}  "
           f"sha256 {trit_hash[:16]}…")
-    print(f"[qat.export] {manifest_path.name}: {len(manifest_tensors)} записей")
+    print(f"[qat.export] {non_ternary_path.name}: "
+          f"{human_bytes(non_ternary_path.stat().st_size)}  "
+          f"sha256 {non_ternary_hash[:16]}…")
+    print(f"[qat.export] {manifest_path.name}: {len(manifest_tensors)} записей; "
+          f"tie={architecture['tie_word_embeddings']}")
     print(f"[qat.export] готово за {elapsed:.0f} с -> {out_dir}")
     return 0
 
