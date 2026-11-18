@@ -674,7 +674,7 @@
   {
     "id": "0103",
     "title": "Синтетический контейнер 1.5B-формы: скорость и память без обучения",
-    "status": "in_progress",
+    "status": "done",
     "file": "0103-bench-shape.md",
     "assignee": "agent:bench-shape"
   },
@@ -732,6 +732,20 @@
     "title": "Логиты учителя: top-k формат и потоковое чтение",
     "status": "pending",
     "file": "0111-topk-logits.md",
+    "assignee": ""
+  },
+  {
+    "id": "0112",
+    "title": "Батчевый prefill: промпт 512 токенов считается 38 секунд",
+    "status": "pending",
+    "file": "0112-batched-prefill.md",
+    "assignee": ""
+  },
+  {
+    "id": "0113",
+    "title": "Декод 10 ток/с на 1.5B: куда уходит время",
+    "status": "pending",
+    "file": "0113-decode-speed.md",
     "assignee": ""
   }
 ]
