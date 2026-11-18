@@ -1,0 +1,84 @@
+# QAT-конфиг пилота EVA32: Qwen2.5-1.5B-Instruct -> тернарная модель.
+#
+# Запуск на GPU-машине:
+#   python3 -m pip install -r qat/requirements-qat.txt
+#   python3 -m qat.train --dry-run
+#   python3 -m qat.train --config qat/configs/qwen1.5b.yaml \
+#       --data distill/out/pairs.jsonl --out runs/pilot1
+#
+# Все значения — стартовые для одного RTX 4090 24 ГБ. Если ловите OOM:
+# сначала уменьшайте micro_batch_size (до 4/2/1), потом max_seq_len.
+# Тернарными становятся только Linear в attention и FFN; эмбеддинги, lm_head,
+# layernorm, bias и роутеры остаются в fp32.
+
+model:
+  name_or_path: Qwen/Qwen2.5-1.5B-Instruct
+  # На аренде зафиксируйте commit, а не "main": иначе прогон не воспроизведётся.
+  revision: main
+  trust_remote_code: false
+  # Мастер-веса. float32 обязателен: при lr ~3e-5 обновления в bfloat16
+  # округляются до нуля, и QAT не учится. bf16 используется только в autocast.
+  torch_dtype: float32
+  # sdpa — быстрее и экономнее по памяти, чем eager; flash_attention_2 — если стоит.
+  attn_implementation: sdpa
+
+quant:
+  # absmax по 128 элементам вдоль входной размерности (последней оси веса).
+  # 1536 и 8960 делятся на 128 без остатка, поэтому padding не нужен.
+  block_size: 128
+  # float16 экономит половину места под масштабы; float32 — если нужна точность.
+  scale_dtype: float16
+  # Только эти проекции. gate_proj/up_proj/down_proj — FFN, q/k/v/o — attention.
+  target_suffixes: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  # Защита от случайного квантования выхода, эмбеддингов и роутеров MoE.
+  exclude_suffixes: [lm_head, embed_tokens, router, gate, norm]
+
+data:
+  # Путь относительно корня репозитория (или абсолютный).
+  path: distill/out/pairs.jsonl
+  # Длина последовательности: вопрос + ответ. 2048 — компромисс памяти и качества.
+  max_seq_len: 2048
+  # 0 — все пары; для быстрой проверки поставьте 1000.
+  max_samples: 0
+  # Примеры с меньшим числом обучаемых токенов отбрасываются.
+  min_answer_tokens: 1
+  # KL по логитам учителя. По умолчанию выключен: обычная CE на ответе.
+  # Включать только если в JSONL есть поле "logits" и словарь учителя совпадает
+  # со словарём ученика (иначе KL бессмыслен). Полные логиты — это гигабайты.
+  use_teacher_logits: false
+  kl_temperature: 1.0
+  kl_weight: 0.5
+  # Сколько токенов ответа считать за раз в KL, чтобы не раздувать VRAM.
+  kl_chunk_size: 64
+
+train:
+  # Эффективный батч = 4 * 8 = 32 последовательности на шаг.
+  micro_batch_size: 4
+  grad_accum_steps: 8
+  # 2000 шагов × ~40 тыс. токенов ответа ≈ 80 млн токенов (несколько эпох на 30 млн).
+  max_steps: 2000
+  # Тернарный QAT нестабилен: большой LR убивает модель за сотню шагов.
+  lr: 3.0e-5
+  min_lr_ratio: 0.1
+  warmup_steps: 50
+  weight_decay: 0.0
+  grad_clip: 1.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  seed: 42
+  # bfloat16 | float16 | none. bf16 — на 4090/A100/H100; fp16 включает GradScaler.
+  amp_dtype: bfloat16
+  gradient_checkpointing: true
+  # adam8bit — bitsandbytes; если библиотека недоступна, будет AdamW с предупреждением
+  # (и сильно больше памяти). adamw — принудительно обычный.
+  optimizer: adam8bit
+  log_every: 10
+  # Чекпоинт каждые N шагов + в конце. Каталог ~9-10 ГБ (fp32-веса + оптимизатор),
+  # держим последние keep_last_checkpoints, старые удаляются.
+  save_every: 100
+  keep_last_checkpoints: 2
+  save_optimizer: true
+  # auto -> cuda, если доступна; можно задать cuda:0 / mps / cpu.
+  device: auto
+  # CE считается кусками по длине, чтобы fp32-копия логитов не съела VRAM.
+  loss_chunk_size: 512

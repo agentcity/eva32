@@ -1,0 +1,32 @@
+# Зависимости QAT — ставятся ТОЛЬКО на GPU-машине.
+#
+# Python 3.10–3.12 и CUDA-сборка torch. Для 4090/A100/H100:
+#   python3 -m pip install -r qat/requirements-qat.txt
+# Если pip тянет CPU-сборку torch, поставьте её явно с индексом CUDA:
+#   python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu124
+#
+# На машине разработчика этот файл не нужен: qat/ternary.py и тесты
+# работают на чистом Python.
+
+# Ядро обучения: модели, автокаст, чекпоинты.
+torch>=2.3
+
+# Qwen2.5 и загрузка токенизатора/весов.
+transformers>=4.44
+
+# Устройство/загрузка без лишних копий; transformers использует его для accelerate-путей.
+accelerate>=0.33
+
+# 8-bit Adam: состояния оптимизатора в 1 байт вместо 4. Без него — AdamW
+# с предупреждением и заметно большим потреблением памяти.
+bitsandbytes>=0.43
+
+# Чтение YAML-конфига.
+pyyaml>=6.0
+
+# Нужен для записи .trit (tensor.numpy()); приходит с torch/transformers,
+# но фиксируем явно, чтобы не зависеть от транзитивной зависимости.
+numpy>=1.24
+
+# datasets намеренно не нужен: JSONL читаем напрямую, меньше зависимостей
+# и полный контроль над полями question/answer/logits.
