@@ -247,7 +247,7 @@
   {
     "id": "0036",
     "title": "Раннер эксперимента с эмбеддингами",
-    "status": "in_progress",
+    "status": "done",
     "file": "0036-emb-experiment.md",
     "assignee": "agent:emb-experiment"
   },
