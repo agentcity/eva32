@@ -411,5 +411,61 @@
     "status": "done",
     "file": "0064-atomic-writes.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0065",
+    "title": "Волна 1: eps, окно контекста, сброс KV, трассировка",
+    "status": "in_progress",
+    "file": "0065-vtm-core-correct.md",
+    "assignee": "agent:vtm-core-correct"
+  },
+  {
+    "id": "0066",
+    "title": "Волна 1: целостность контейнера (sha256)",
+    "status": "in_progress",
+    "file": "0066-vtm-integrity.md",
+    "assignee": "agent:vtm-integrity"
+  },
+  {
+    "id": "0067",
+    "title": "Волна 1: C-ABI для сервера — колбэк и отмена",
+    "status": "in_progress",
+    "file": "0067-vtm-c-api.md",
+    "assignee": "agent:vtm-c-api"
+  },
+  {
+    "id": "0068",
+    "title": "Волна 1: CLI — текстовые стопы, лимиты, таймаут",
+    "status": "in_progress",
+    "file": "0068-vtm-cli-limits.md",
+    "assignee": "agent:vtm-cli-limits"
+  },
+  {
+    "id": "0069",
+    "title": "Волна 4: фаззинг и санитайзеры в CI",
+    "status": "in_progress",
+    "file": "0069-vtm-fuzz.md",
+    "assignee": "agent:vtm-fuzz"
+  },
+  {
+    "id": "0070",
+    "title": "Волна 4: спецификация ВТМ к текущему состоянию",
+    "status": "in_progress",
+    "file": "0070-vtm-docs.md",
+    "assignee": "agent:vtm-docs"
+  },
+  {
+    "id": "0071",
+    "title": "Волна 2: профиль полного прохода — где теряется время",
+    "status": "in_progress",
+    "file": "0071-vtm-bench.md",
+    "assignee": "agent:vtm-bench"
+  },
+  {
+    "id": "0072",
+    "title": "Волна 4: случайный паритет C↔Python",
+    "status": "in_progress",
+    "file": "0072-vtm-parity-random.md",
+    "assignee": "agent:vtm-parity-random"
   }
 ]
