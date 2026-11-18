@@ -829,7 +829,16 @@ class TestMainJson(unittest.TestCase):
             os.path.join(self.tmp.name, "m.vtm"), context=8, with_samp=True
         )
         self.workdir = os.path.join(self.tmp.name, "work")
+        # Класс не запускает настоящий vtm (runner подменяется), но main()
+        # проверяет существование бинарника до вызова раннера. В чистом клоне
+        # src/vtm/vtm не собран, поэтому даём заглушку-скрипт: тесты не должны
+        # зависеть от собранного C.
+        self.vtm_stub = os.path.join(self.tmp.name, "vtm-stub")
+        with open(self.vtm_stub, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(self.vtm_stub, 0o755)
         self.base_args = [
+            "--vtm", self.vtm_stub,
             "--model", self.model,
             "--contexts", "8",
             "--gen", "2",
