@@ -31,6 +31,18 @@ class TestPrice(unittest.TestCase):
     def test_without_price(self):
         self.assertFalse(filters.has_invented_price("Не нашла в данных. Уточните услугу.", "Сколько?"))
 
+    def test_price_from_context_ok(self):
+        ctx = "[1] Тариф «Старт» стоит 990 ₽, до 3 сотрудников."
+        self.assertFalse(filters.has_invented_price("Тариф стоит 990 ₽ [1].", ctx))
+
+    def test_price_not_in_context(self):
+        ctx = "[1] Тариф «Старт» до 3 сотрудников."
+        self.assertTrue(filters.has_invented_price("Тариф стоит 1500 ₽ [1].", ctx))
+
+    def test_thousands_spacing(self):
+        ctx = "[1] Обучение стоит 120 000 рублей."
+        self.assertFalse(filters.has_invented_price("Обучение — 120000 рублей [1].", ctx))
+
     def test_date_is_not_price(self):
         self.assertFalse(filters.has_invented_price("Возврат в течение 14 дней.", "Условия?"))
 

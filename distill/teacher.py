@@ -48,6 +48,9 @@ class Teacher:
         self._i = 0
         self.last_usage: dict = {}
         self.last_reasoning: str = ""
+        # reasoning стоит 30-45% цены, а в обучение не идёт: по умолчанию выключен
+        self.reasoning = os.environ.get("TEACHER_REASONING", "off").lower() == "on"
+        self.max_tokens = 900
 
     @staticmethod
     def build_message(question: str, context: str | None = None) -> str:
@@ -61,7 +64,7 @@ class Teacher:
         return f"Контекст:\n{context}\n\nВопрос: {question}"
 
     def ask(self, question: str, context: str | None = None,
-            system: str | None = None) -> str:
+            system: str | None = None, max_tokens: int | None = None) -> str:
         if self.mock:
             answer = MOCK_ANSWERS[self._i % len(MOCK_ANSWERS)]
             self._i += 1
@@ -74,8 +77,10 @@ class Teacher:
             "model": self.model,
             "messages": messages,
             "temperature": 0.7,
-            "max_tokens": 800,
+            "max_tokens": max_tokens or self.max_tokens,
         }
+        if not self.reasoning:
+            payload["reasoning"] = {"exclude": True}
         req = urllib.request.Request(
             self.base + "/v1/chat/completions",
             data=json.dumps(payload).encode(),

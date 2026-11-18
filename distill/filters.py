@@ -23,13 +23,23 @@ def has_foreign(text: str) -> bool:
     return bool(CJK.search(text) or LATIN_RUN.search(text))
 
 
-def has_invented_price(answer: str, question: str) -> bool:
-    """Цена в ответе, хотя никакого каталога не передавали.
+def _numbers(text: str) -> set[str]:
+    """Все числа в тексте без пробелов между разрядами: «1 500» → «1500»."""
+    return {m.replace(" ", "") for m in re.findall(r"\d[\d\s]{0,12}", text)}
 
-    На этапе сбора учителю не дают контекста, значит любая конкретная цена — выдумка.
+
+def has_invented_price(answer: str, context: str | None = None) -> bool:
+    """Цена в ответе, которой нет в контексте.
+
+    Если контекст передан и цена в нём есть — это цитата, а не выдумка. Если контекста
+    нет, любая конкретная цена — фантазия: учителю неоткуда её взять.
     """
-    del question  # интерфейс единый: фильтр может понадобиться и с контекстом
-    return bool(PRICE_ANY.search(answer) or PRICE.search(answer))
+    if not (PRICE_ANY.search(answer) or PRICE.search(answer)):
+        return False
+    if not context:
+        return True
+    known = _numbers(context)
+    return not _numbers(answer).issubset(known)
 
 
 def is_refusal(answer: str) -> bool:
@@ -54,14 +64,14 @@ def norm_question(text: str) -> str:
     return re.sub(r"[\s?!.]+$", "", t)
 
 
-def check(question: str, answer: str) -> list[str]:
+def check(question: str, answer: str, context: str | None = None) -> list[str]:
     """Вернуть список проблем; пустой список — пара годится для обучения."""
     problems: list[str] = []
     if not length_ok(answer):
         problems.append("length")
     if has_foreign(answer):
         problems.append("foreign")
-    if has_invented_price(answer, question):
+    if has_invented_price(answer, context):
         problems.append("invented_price")
     if not question.strip() or len(question) > 2000:
         problems.append("bad_question")

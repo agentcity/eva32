@@ -66,12 +66,14 @@ def main() -> int:
 
     pairs, rejected = [], []
     tok_in = tok_out = 0
+    cost_rub = 0.0
     for item in questions:
         q = item["question"]
         answer = teacher.ask(q, item.get("context"), system)
         tok_in += int(teacher.last_usage.get("prompt_tokens") or 0)
         tok_out += int(teacher.last_usage.get("completion_tokens") or 0)
-        problems = filters.check(q, answer)
+        cost_rub += float(teacher.last_usage.get("cost_rub") or 0)
+        problems = filters.check(q, answer, item.get("context"))
         row = {
             "question": q,
             "context": item.get("context"),
@@ -101,6 +103,8 @@ def main() -> int:
     print(f"отброшено: {len(rejected)}  " + (", ".join(f"{k}={v}" for k, v in by_reason.items()) or ""))
     if tok_in or tok_out:
         print(f"токены: вход {tok_in}, выход {tok_out}")
+    if cost_rub:
+        print(f"потрачено: {cost_rub:.2f} ₽  (за запрос: {cost_rub / max(total, 1):.4f} ₽)")
     print(f"-> {os.path.relpath(args.out, ROOT)}")
     return 0 if pairs else 1
 
