@@ -499,7 +499,7 @@
   {
     "id": "0077",
     "title": "Многопоточность ядер: TMV/MM/RMSN по строкам",
-    "status": "in_progress",
+    "status": "done",
     "file": "0077-vtm-threads.md",
     "assignee": "agent:vtm-threads"
   },

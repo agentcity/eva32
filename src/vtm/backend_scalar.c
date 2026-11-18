@@ -4,10 +4,296 @@
 //   * direct  — триты достаются делением слова на 3.
 // Оба варианта считают одно и то же; разница только в скорости. Замер —
 // `./vtm bench` и таблица в src/vtm/README.md.
+//
+// Здесь же — пул потоков (pthread) для строчных ядер TMV/MM/RMSN: этот TU
+// собирается в любом варианте сборки, поэтому пул живёт в нём, а ядра
+// SIMD-бэкендов зовут те же vtm_threads()/vtm_parallel_rows().
+//
+// _DARWIN_C_SOURCE нужен до первого include: на macOS sysconf(_SC_NPROCESSORS_ONLN)
+// спрятан за __DARWIN_C_FULL, а Makefile задаёт строгий _POSIX_C_SOURCE.
+// Константа нужна только для «по умолчанию — число ядер».
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
 #include "vtm.h"
+#include "vtm_backend.h"
 
 #include <math.h>
 #include <string.h>
+
+#if !defined(_WIN32) && !defined(VTM_NO_THREADS)
+#define VTM_HAVE_PTHREAD 1
+#include <pthread.h>
+#include <unistd.h>
+#else
+#define VTM_HAVE_PTHREAD 0
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+// --- пул потоков (задача 0077) --------------------------------------------
+//
+// Постоянные воркеры создаются лениво при первом задании выше порога и живут
+// до конца процесса (detached). Строки [0, n) делятся на N непрерывных
+// диапазонов (статическое деление): строка TMV/MM/RMSN стоит одинаково,
+// поэтому балансировка не нужна, а мьютекс на каждую строку не нужен тем
+// более. Строки независимы, и каждая считается тем же кодом в том же
+// порядке, что и при одном потоке, поэтому результат побитово не зависит ни
+// от числа потоков, ни от того, кому достался диапазон.
+//
+// Вызовы из разных потоков сериализуются: задание одно на пул. Вложенный
+// вызов из колбэка (сейчас таких нет) привёл бы к взаимной блокировке —
+// поэтому в ядрах ровно один уровень параллелизма.
+
+#if VTM_HAVE_PTHREAD
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t work_cv;   // воркеры ждут новое задание
+    pthread_cond_t done_cv;   // вызвавший ждёт, пока досчитают диапазоны
+    int workers;              // сколько воркеров создано (без вызвавшего)
+    int create_failed;        // pthread_create отказал — больше не пробуем
+    unsigned gen;             // номер задания; растёт на каждом
+    int job;                  // 1 — задание выполняется
+    int total;                // строк в задании
+    int nthreads;             // логических потоков в этом задании
+    unsigned workers_left;    // сколько диапазонов ещё не досчитано (атомарно)
+    vtm_rows_fn fn;
+    void *ctx;
+} vtm_pool;
+
+static vtm_pool g_pool = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
+    PTHREAD_COND_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, NULL, NULL
+};
+
+// Спин перед сном. Ядра вызываются подряд (слой модели — десятки вызовов),
+// а пробуждение спящего на cond_wait потока на macOS стоит десятки
+// микросекунд — для матрицы 1024x1024 SIMD это половина выигрыша. Спин
+// ограничен VTM_POOL_SPIN_NS, чтобы в простое поток засыпал и не жёг ядро.
+#define VTM_POOL_SPIN_NS 100000L   // 100 мкс
+
+#if defined(__GNUC__) || defined(__clang__)
+#define VTM_GEN_LOAD() __atomic_load_n(&g_pool.gen, __ATOMIC_ACQUIRE)
+#define VTM_GEN_STORE(v) __atomic_store_n(&g_pool.gen, (v), __ATOMIC_RELEASE)
+#define VTM_LEFT_LOAD() __atomic_load_n(&g_pool.workers_left, __ATOMIC_ACQUIRE)
+#define VTM_LEFT_STORE(v) \
+    __atomic_store_n(&g_pool.workers_left, (unsigned)(v), __ATOMIC_RELEASE)
+#define VTM_LEFT_DEC() \
+    __atomic_sub_fetch(&g_pool.workers_left, 1u, __ATOMIC_ACQ_REL)
+#else
+#define VTM_GEN_LOAD() (g_pool.gen)
+#define VTM_GEN_STORE(v) (g_pool.gen = (v))
+#define VTM_LEFT_LOAD() (g_pool.workers_left)
+#define VTM_LEFT_STORE(v) (g_pool.workers_left = (unsigned)(v))
+#define VTM_LEFT_DEC() (--g_pool.workers_left)
+#endif
+
+static void cpu_relax(void) {
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause");
+#else
+    __asm__ __volatile__("");
+#endif
+}
+
+static long ns_between(const struct timespec *a, const struct timespec *b) {
+    return (long)(b->tv_sec - a->tv_sec) * 1000000000L
+         + (long)(b->tv_nsec - a->tv_nsec);
+}
+
+/* Дождаться, пока все диапазоны досчитают, коротким спином по счётчику.
+   Пробуждение из cond_wait на критическом пути замера стоит десятки мкс.
+   1 — дождались, 0 — истёк спин (дальше — cond_wait). */
+static int wait_left_zero(void) {
+    struct timespec t0, t;
+    long spins = 0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (VTM_LEFT_LOAD() != 0) {
+        if ((++spins & 127) == 0) {
+            clock_gettime(CLOCK_MONOTONIC, &t);
+            if (ns_between(&t0, &t) >= VTM_POOL_SPIN_NS) return 0;
+        }
+        cpu_relax();
+    }
+    return 1;
+}
+
+static void *pool_worker(void *arg) {
+    const int tid = (int)(intptr_t)arg;
+    unsigned seen = 0;
+
+    for (;;) {
+        struct timespec t0;
+        long spins = 0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        while (VTM_GEN_LOAD() == seen) {
+            struct timespec t;
+            if ((++spins & 127) == 0) {
+                clock_gettime(CLOCK_MONOTONIC, &t);
+                if (ns_between(&t0, &t) >= VTM_POOL_SPIN_NS) break;
+            }
+            cpu_relax();
+        }
+        pthread_mutex_lock(&g_pool.mu);
+        while (VTM_GEN_LOAD() == seen)
+            pthread_cond_wait(&g_pool.work_cv, &g_pool.mu);
+        seen = VTM_GEN_LOAD();
+        /* Потоков попросили меньше, чем создано: этот воркер отдыхает.
+           Ядро по tid берёт scratch, поэтому tid обязан быть < nthreads. */
+        if (tid < g_pool.nthreads) {
+            vtm_rows_fn fn = g_pool.fn;
+            void *ctx = g_pool.ctx;
+            int r0 = (int)((int64_t)g_pool.total * tid
+                           / g_pool.nthreads);
+            int r1 = (int)((int64_t)g_pool.total * (tid + 1)
+                           / g_pool.nthreads);
+            pthread_mutex_unlock(&g_pool.mu);
+            fn(ctx, tid, r0, r1);
+            pthread_mutex_lock(&g_pool.mu);
+            if (VTM_LEFT_DEC() == 0) {
+                g_pool.job = 0;
+                pthread_cond_broadcast(&g_pool.done_cv);
+            }
+        }
+        pthread_mutex_unlock(&g_pool.mu);
+    }
+    return NULL;
+}
+
+// Выполнить задание в пуле: N диапазонов строк, вызвавший — диапазон 0
+// (tid 0), остальные — воркеры 1..N-1. Создаёт недостающих воркеров (до
+// nthreads-1) под мьютексом; если создать не удалось — считает тем, что
+// есть, вплоть до одного потока.
+static void pool_run(int n, int nthreads, vtm_rows_fn fn, void *ctx) {
+    int r0, r1;
+
+    pthread_mutex_lock(&g_pool.mu);
+    while (g_pool.job) pthread_cond_wait(&g_pool.done_cv, &g_pool.mu);
+    while (!g_pool.create_failed && g_pool.workers < nthreads - 1) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, pool_worker,
+                           (void *)(intptr_t)(g_pool.workers + 1)) != 0) {
+            g_pool.create_failed = 1;
+            break;
+        }
+        pthread_detach(th);
+        g_pool.workers++;
+    }
+    if (g_pool.workers < nthreads - 1) nthreads = g_pool.workers + 1;
+    if (nthreads > n) nthreads = n;   // строк меньше потоков — лишние не нужны
+    if (nthreads < 2) {
+        pthread_mutex_unlock(&g_pool.mu);
+        fn(ctx, 0, 0, n);
+        return;
+    }
+    g_pool.fn = fn;
+    g_pool.ctx = ctx;
+    g_pool.total = n;
+    g_pool.nthreads = nthreads;
+    VTM_LEFT_STORE(nthreads);
+    g_pool.job = 1;
+    VTM_GEN_STORE(VTM_GEN_LOAD() + 1);
+    pthread_cond_broadcast(&g_pool.work_cv);
+    pthread_mutex_unlock(&g_pool.mu);
+
+    r0 = 0;
+    r1 = (int)((int64_t)n / nthreads);
+    fn(ctx, 0, r0, r1);
+
+    if (VTM_LEFT_DEC() == 0) {
+        pthread_mutex_lock(&g_pool.mu);
+        g_pool.job = 0;
+        pthread_cond_broadcast(&g_pool.done_cv);
+        pthread_mutex_unlock(&g_pool.mu);
+        return;
+    }
+    if (wait_left_zero()) return;
+    pthread_mutex_lock(&g_pool.mu);
+    while (g_pool.job) pthread_cond_wait(&g_pool.done_cv, &g_pool.mu);
+    pthread_mutex_unlock(&g_pool.mu);
+}
+
+#endif // VTM_HAVE_PTHREAD
+
+// --- число потоков ---------------------------------------------------------
+
+#if VTM_HAVE_PTHREAD
+static pthread_once_t g_cfg_once = PTHREAD_ONCE_INIT;
+static int g_cfg_threads = 1;    // из VTM_THREADS или по числу ядер
+static int g_cfg_override;       // 0 — переопределения нет (тест-хук)
+
+static void cfg_init(void) {
+    const char *env = getenv("VTM_THREADS");
+    long n = 0, cores;
+
+    if (env && *env) {
+        char *end = NULL;
+        n = strtol(env, &end, 10);
+        if (!end || *end != '\0' || n <= 0 || n > 1000000L) {
+            fprintf(stderr, "vtm: VTM_THREADS='%s' — не число из 1..%d, "
+                            "беру по числу ядер\n", env, VTM_THREADS_MAX);
+            n = 0;
+        }
+    }
+    if (n <= 0) {
+#if defined(_SC_NPROCESSORS_ONLN)
+        cores = sysconf(_SC_NPROCESSORS_ONLN);
+#else
+        cores = 4;   // константа недоступна (не POSIX-система) — дефолт
+#endif
+        if (cores < 1) cores = 1;
+        n = cores;
+    }
+    if (n > VTM_THREADS_MAX) n = VTM_THREADS_MAX;
+    g_cfg_threads = (int)n;
+}
+
+int vtm_threads(void) {
+    pthread_once(&g_cfg_once, cfg_init);
+    return g_cfg_override > 0 ? g_cfg_override : g_cfg_threads;
+}
+
+int vtm_threads_set(int n) {
+    pthread_once(&g_cfg_once, cfg_init);
+    if (n <= 0) n = g_cfg_threads;
+    if (n > VTM_THREADS_MAX) n = VTM_THREADS_MAX;
+    g_cfg_override = n;
+    return n;
+}
+
+void vtm_parallel_rows(int n, double work, vtm_rows_fn fn, void *ctx) {
+    int vt;
+    if (!fn || n <= 0) return;
+    vt = vtm_threads();
+    /* !(work >= порога) — заодно отсекает NaN. */
+    if (vt < 2 || n < 2 || !(work >= VTM_PAR_MIN_WORK)) {
+        fn(ctx, 0, 0, n);
+        return;
+    }
+    pool_run(n, vt, fn, ctx);
+}
+
+#else // !VTM_HAVE_PTHREAD: откат — прежнее однопоточное поведение
+
+int vtm_threads(void) { return 1; }
+
+int vtm_threads_set(int n) {
+    (void)n;
+    return 1;
+}
+
+void vtm_parallel_rows(int n, double work, vtm_rows_fn fn, void *ctx) {
+    (void)work;
+    if (!fn || n <= 0) return;
+    fn(ctx, 0, 0, n);
+}
+
+#endif // VTM_HAVE_PTHREAD
 
 // --- LUT на 5 тритов -------------------------------------------------------
 
@@ -43,16 +329,16 @@ static int tmv_check(const float *y, const uint8_t *w, const float *scales,
 // кратен 20, все 20 тритов слова лежат в одном блоке масштаба; иначе
 // (128) граница может проходить внутри слова, и масштаб применяется к
 // частичной сумме блока поэлементно.
-static int tmv_direct_blocks(float *y, const uint8_t *w, const float *scales,
-                             const float *x, int rows, int cols,
-                             int scale_block) {
+// Строки [r0, r1) одного варианта ядра. Разбиение по строкам не меняет
+// порядок сложения внутри строки: base по-прежнему r*cols, поэтому
+// результат не зависит от числа потоков (побитово).
+static void tmv_direct_rows(float *y, const uint8_t *w, const float *scales,
+                            const float *x, int cols, int scale_block,
+                            int r0, int r1) {
     const uint32_t *words = (const uint32_t *)w;
     int r;
-    if (tmv_check(y, w, scales, x, rows, cols) != 0) return -1;
-    if (scale_block != 128 && scale_block != 160) return -1;
-    if (rows == 0 || cols == 0) return 0;
 
-    for (r = 0; r < rows; r++) {
+    for (r = r0; r < r1; r++) {
         int64_t base = (int64_t)r * (int64_t)cols;
         int64_t end = base + (int64_t)cols;
         int64_t wi = base / (int64_t)VTM_TRITS_PER_WORD;
@@ -108,6 +394,40 @@ static int tmv_direct_blocks(float *y, const uint8_t *w, const float *scales,
         }
         y[r] = (float)acc;
     }
+}
+
+// Общий контекст задания TMV: ядро строк и параметры.
+typedef struct {
+    float *y;
+    const uint8_t *w;
+    const float *scales;
+    const float *x;
+    int cols;
+    int scale_block;
+} tmv_job;
+
+static void tmv_direct_worker(void *p, int tid, int r0, int r1) {
+    tmv_job *j = (tmv_job *)p;
+    (void)tid;
+    tmv_direct_rows(j->y, j->w, j->scales, j->x, j->cols, j->scale_block,
+                    r0, r1);
+}
+
+static int tmv_direct_blocks(float *y, const uint8_t *w, const float *scales,
+                             const float *x, int rows, int cols,
+                             int scale_block) {
+    tmv_job job;
+    if (tmv_check(y, w, scales, x, rows, cols) != 0) return -1;
+    if (scale_block != 128 && scale_block != 160) return -1;
+    if (rows == 0 || cols == 0) return 0;
+    job.y = y;
+    job.w = w;
+    job.scales = scales;
+    job.x = x;
+    job.cols = cols;
+    job.scale_block = scale_block;
+    vtm_parallel_rows(rows, (double)rows * (double)cols, tmv_direct_worker,
+                      &job);
     return 0;
 }
 
@@ -118,17 +438,13 @@ static int tmv_direct(float *y, const uint8_t *w, const float *scales,
 }
 
 // LUT243: 4 выборки из таблицы на слово вместо 20 делений.
-static int tmv_lut_blocks(float *y, const uint8_t *w, const float *scales,
-                          const float *x, int rows, int cols,
-                          int scale_block) {
+static void tmv_lut_rows(float *y, const uint8_t *w, const float *scales,
+                         const float *x, int cols, int scale_block,
+                         int r0, int r1) {
     const uint32_t *words = (const uint32_t *)w;
     int r;
-    if (tmv_check(y, w, scales, x, rows, cols) != 0) return -1;
-    if (scale_block != 128 && scale_block != 160) return -1;
-    if (rows == 0 || cols == 0) return 0;
-    lut_init();
 
-    for (r = 0; r < rows; r++) {
+    for (r = r0; r < r1; r++) {
         int64_t base = (int64_t)r * (int64_t)cols;
         int64_t end = base + (int64_t)cols;
         int64_t wi = base / (int64_t)VTM_TRITS_PER_WORD;
@@ -192,6 +508,31 @@ static int tmv_lut_blocks(float *y, const uint8_t *w, const float *scales,
         }
         y[r] = (float)acc;
     }
+}
+
+static void tmv_lut_worker(void *p, int tid, int r0, int r1) {
+    tmv_job *j = (tmv_job *)p;
+    (void)tid;
+    tmv_lut_rows(j->y, j->w, j->scales, j->x, j->cols, j->scale_block,
+                 r0, r1);
+}
+
+static int tmv_lut_blocks(float *y, const uint8_t *w, const float *scales,
+                          const float *x, int rows, int cols,
+                          int scale_block) {
+    tmv_job job;
+    if (tmv_check(y, w, scales, x, rows, cols) != 0) return -1;
+    if (scale_block != 128 && scale_block != 160) return -1;
+    if (rows == 0 || cols == 0) return 0;
+    lut_init();   // до потоков: таблица пишется один раз, не в воркерах
+    job.y = y;
+    job.w = w;
+    job.scales = scales;
+    job.x = x;
+    job.cols = cols;
+    job.scale_block = scale_block;
+    vtm_parallel_rows(rows, (double)rows * (double)cols, tmv_lut_worker,
+                      &job);
     return 0;
 }
 
@@ -203,8 +544,10 @@ static int tmv_lut(float *y, const uint8_t *w, const float *scales,
 
 // --- остальные ядра --------------------------------------------------------
 
-static int rmsnorm_scalar(float *y, const float *x, const float *w,
-                          int n, float eps) {
+// Однопоточный RMSN — прежний код без изменений: при VTM_THREADS=1 и на
+// малых n выполняется ровно он.
+static int rmsnorm_scalar_serial(float *y, const float *x, const float *w,
+                                 int n, float eps) {
     double sum = 0.0, mean, rms;
     int i;
     if (!y || !x || !w || n < 0) return -1;
@@ -219,6 +562,91 @@ static int rmsnorm_scalar(float *y, const float *x, const float *w,
     }
     for (i = 0; i < n; i++)
         y[i] = (float)((double)x[i] / rms * (double)w[i]);
+    return 0;
+}
+
+// --- RMSN по блокам для больших n -----------------------------------------
+//
+// Сумма квадратов режется на фиксированные блоки VTM_RMSN_BLOCK: каждый блок
+// считается одним потоком целиком (порядок внутри блока прежний), затем
+// частичные суммы складываются по возрастанию номера блока. Поэтому
+// результат один и тот же при 2/4/8 потоках (побитово), а от
+// VTM_THREADS=1 отличается только порядком сложения double — на уровне
+// ~1e-16 относительной ошибки (в f32-выходе обычно не видно).
+//
+// Поэлементная часть — та же формула, что в serial-версии, и каждый элемент
+// независим, поэтому тут совпадение побитовое при любом числе потоков.
+
+#define VTM_RMSN_BLOCK 4096
+
+typedef struct {
+    const float *x;
+    const float *w;
+    float *y;
+    double *sums;      // частичные суммы по блокам
+    int n;
+    double rms;
+} rmsn_job;
+
+static void rmsnorm_sum_worker(void *p, int tid, int b0, int b1) {
+    rmsn_job *j = (rmsn_job *)p;
+    int b, i;
+    (void)tid;
+    for (b = b0; b < b1; b++) {
+        int i0 = b * VTM_RMSN_BLOCK;
+        int i1 = i0 + VTM_RMSN_BLOCK;
+        double sum = 0.0;
+        if (i1 > j->n) i1 = j->n;
+        for (i = i0; i < i1; i++) sum += (double)j->x[i] * (double)j->x[i];
+        j->sums[b] = sum;
+    }
+}
+
+static void rmsnorm_scale_worker(void *p, int tid, int b0, int b1) {
+    rmsn_job *j = (rmsn_job *)p;
+    int b, i;
+    (void)tid;
+    for (b = b0; b < b1; b++) {
+        int i0 = b * VTM_RMSN_BLOCK;
+        int i1 = i0 + VTM_RMSN_BLOCK;
+        if (i1 > j->n) i1 = j->n;
+        for (i = i0; i < i1; i++)
+            j->y[i] = (float)((double)j->x[i] / j->rms * (double)j->w[i]);
+    }
+}
+
+static int rmsnorm_scalar(float *y, const float *x, const float *w,
+                          int n, float eps) {
+    rmsn_job job;
+    double sum = 0.0, mean, rms;
+    int nblocks, b;
+
+    if (!y || !x || !w || n < 0) return -1;
+    if (n == 0) return 0;
+    if (vtm_threads() < 2 || n < VTM_PAR_RMSN_MIN)
+        return rmsnorm_scalar_serial(y, x, w, n, eps);
+
+    nblocks = (n + VTM_RMSN_BLOCK - 1) / VTM_RMSN_BLOCK;
+    job.x = x;
+    job.w = w;
+    job.y = y;
+    job.n = n;
+    job.sums = (double *)calloc((size_t)nblocks, sizeof(double));
+    if (!job.sums)   // нет памяти — считаем как раньше
+        return rmsnorm_scalar_serial(y, x, w, n, eps);
+
+    vtm_parallel_rows(nblocks, 2.0 * (double)n, rmsnorm_sum_worker, &job);
+    for (b = 0; b < nblocks; b++) sum += job.sums[b];
+    free(job.sums);
+
+    mean = sum / (double)n;
+    rms = sqrt(mean + (double)eps);
+    if (rms == 0.0) {
+        memset(y, 0, (size_t)n * sizeof(float));
+        return 0;
+    }
+    job.rms = rms;
+    vtm_parallel_rows(nblocks, (double)n, rmsnorm_scale_worker, &job);
     return 0;
 }
 

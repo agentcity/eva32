@@ -528,6 +528,263 @@ done:
     free(y_cand);
 }
 
+// --- многопоточность (задача 0077) -----------------------------------------
+//
+// Каждое ядро считается при 1/2/4/8 потоках в одном процессе
+// (vtm_threads_set — тот же механизм, что VTM_THREADS в env). Проверяется,
+// что результат не зависит от числа потоков, и печатается время.
+// TMV/MM делят строки выхода, поэтому совпадение с nt=1 побитовое; RMSN
+// параллелит сумму квадратов по блокам — расхождение только в порядке
+// double-сложения (в f32-выходе обычно не видно), печатается max|diff|.
+
+static const int g_nts[] = {1, 2, 4, 8};
+static int g_thr_fail;
+
+static void thr_report(const char *label, int nt, const float *got,
+                       const float *ref, size_t n, double ms,
+                       double base_ms) {
+    size_t i;
+    int bitwise = 1;
+    double d, mr = 0.0;
+
+    for (i = 0; i < n; i++)
+        if (got[i] != ref[i]) {
+            bitwise = 0;
+            break;
+        }
+    d = max_diff(got, ref, n, &mr);
+    printf("  %-38s nt=%d %9.3f мс %6.2fx  max|diff|=%.2e %s\n", label, nt,
+           ms, base_ms > 0.0 ? base_ms / ms : 0.0, d,
+           bitwise ? "(побитово)"
+                   : (d <= CHECK_TOL ? "(<=1e-5)" : "(FAIL)"));
+    if (d > CHECK_TOL) g_thr_fail++;
+}
+
+static void thr_tmv(const vtm_backend *b, int rows, int cols,
+                    int scale_block, int iters) {
+    int n_trits = rows * cols;
+    uint32_t seed = 0xb007u + (uint32_t)rows * 3u + (uint32_t)cols;
+    uint32_t *words = make_words(n_trits, seed);
+    float *scales = make_scales(n_trits, scale_block, 0.0f, seed ^ 0x9e37u);
+    float *x = make_vec((size_t)cols, seed ^ 0x51u);
+    float *ref = (float *)calloc((size_t)rows, sizeof(float));
+    float *got = (float *)calloc((size_t)rows, sizeof(float));
+    char label[96];
+    double base_ms = 0.0;
+    int i;
+
+    if (!words || !scales || !x || !ref || !got) {
+        fprintf(stderr, "thr_tmv: нет памяти\n");
+        g_thr_fail++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "%s TMV %dx%d", b->name, rows, cols);
+    for (i = 0; i < 4; i++) {
+        double ms;
+        vtm_threads_set(g_nts[i]);
+        ms = bench_tmv(b, got, (const uint8_t *)words, scales, x, rows, cols,
+                       scale_block, iters);
+        if (ms < 0.0) {
+            printf("  %-38s nt=%d ошибка ядра\n", label, g_nts[i]);
+            g_thr_fail++;
+            continue;
+        }
+        if (i == 0) {
+            memcpy(ref, got, (size_t)rows * sizeof(float));
+            base_ms = ms;
+        }
+        thr_report(label, g_nts[i], got, ref, (size_t)rows, ms, base_ms);
+    }
+done:
+    free(words);
+    free(scales);
+    free(x);
+    free(ref);
+    free(got);
+}
+
+static double thr_time_mm_trit(const uint8_t *words, const float *scales,
+                               const float *b, float *y, int m, int k, int n,
+                               int scale_block, int iters) {
+    double t0, t1;
+    int i;
+    if (vtm_simd_mm_trit(y, words, scales, b, m, k, n, scale_block) != 0)
+        return -1.0;
+    t0 = now_ms();
+    for (i = 0; i < iters; i++)
+        vtm_simd_mm_trit(y, words, scales, b, m, k, n, scale_block);
+    t1 = now_ms();
+    return (t1 - t0) / (double)iters;
+}
+
+static void thr_mm_trit(int m, int k, int n, int scale_block, int iters) {
+    int n_trits = m * k;
+    uint32_t seed = 0xdd77u + (uint32_t)m * 17u + (uint32_t)k * 3u
+                  + (uint32_t)n;
+    uint32_t *words = make_words(n_trits, seed);
+    float *scales = make_scales(n_trits, scale_block, 0.0f, seed ^ 0x77u);
+    float *b = make_vec((size_t)k * (size_t)n, seed ^ 0x99u);
+    float *ref = (float *)calloc((size_t)m * (size_t)n, sizeof(float));
+    float *got = (float *)calloc((size_t)m * (size_t)n, sizeof(float));
+    char label[96];
+    double base_ms = 0.0;
+    int i;
+
+    if (!words || !scales || !b || !ref || !got) {
+        fprintf(stderr, "thr_mm_trit: нет памяти\n");
+        g_thr_fail++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "MM trit %dx%dx%d", m, k, n);
+    for (i = 0; i < 4; i++) {
+        double ms;
+        vtm_threads_set(g_nts[i]);
+        ms = thr_time_mm_trit((const uint8_t *)words, scales, b, got, m, k,
+                              n, scale_block, iters);
+        if (ms < 0.0) {
+            printf("  %-38s nt=%d ошибка ядра\n", label, g_nts[i]);
+            g_thr_fail++;
+            continue;
+        }
+        if (i == 0) {
+            memcpy(ref, got, (size_t)m * (size_t)n * sizeof(float));
+            base_ms = ms;
+        }
+        thr_report(label, g_nts[i], got, ref, (size_t)m * (size_t)n, ms,
+                   base_ms);
+    }
+done:
+    free(words);
+    free(scales);
+    free(b);
+    free(ref);
+    free(got);
+}
+
+static void thr_mm_f32(int m, int k, int n, int iters) {
+    uint32_t seed = 0x77u + (uint32_t)m + (uint32_t)k + (uint32_t)n;
+    float *a = make_vec((size_t)m * (size_t)k, seed);
+    float *b = make_vec((size_t)k * (size_t)n, seed ^ 0x42u);
+    float *ref = (float *)calloc((size_t)m * (size_t)n, sizeof(float));
+    float *got = (float *)calloc((size_t)m * (size_t)n, sizeof(float));
+    char label[96];
+    double base_ms = 0.0;
+    int i;
+
+    if (!a || !b || !ref || !got) {
+        fprintf(stderr, "thr_mm_f32: нет памяти\n");
+        g_thr_fail++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "MM f32 %dx%dx%d", m, k, n);
+    for (i = 0; i < 4; i++) {
+        double t0, t1, ms;
+        int it;
+        vtm_threads_set(g_nts[i]);
+        if (vtm_simd_mm_f32(got, a, b, m, k, n) != 0) {
+            printf("  %-38s nt=%d ошибка ядра\n", label, g_nts[i]);
+            g_thr_fail++;
+            continue;
+        }
+        t0 = now_ms();
+        for (it = 0; it < iters; it++)
+            vtm_simd_mm_f32(got, a, b, m, k, n);
+        t1 = now_ms();
+        ms = (t1 - t0) / (double)iters;
+        if (i == 0) {
+            memcpy(ref, got, (size_t)m * (size_t)n * sizeof(float));
+            base_ms = ms;
+        }
+        thr_report(label, g_nts[i], got, ref, (size_t)m * (size_t)n, ms,
+                   base_ms);
+    }
+done:
+    free(a);
+    free(b);
+    free(ref);
+    free(got);
+}
+
+static void thr_rmsnorm(const vtm_backend *b, int n, int iters) {
+    uint32_t seed = 0x31337u + (uint32_t)n;
+    float *x = make_vec((size_t)n, seed);
+    float *w = make_vec((size_t)n, seed ^ 0x99u);
+    float *ref = (float *)calloc((size_t)n, sizeof(float));
+    float *got = (float *)calloc((size_t)n, sizeof(float));
+    char label[96];
+    double base_ms = 0.0;
+    int i;
+
+    if (!x || !w || !ref || !got) {
+        fprintf(stderr, "thr_rmsnorm: нет памяти\n");
+        g_thr_fail++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "%s RMSN n=%d", b->name, n);
+    for (i = 0; i < 4; i++) {
+        double t0, t1, ms;
+        int it;
+        vtm_threads_set(g_nts[i]);
+        if (b->rmsnorm(got, x, w, n, 0.001f) != 0) {
+            printf("  %-38s nt=%d ошибка ядра\n", label, g_nts[i]);
+            g_thr_fail++;
+            continue;
+        }
+        t0 = now_ms();
+        for (it = 0; it < iters; it++) b->rmsnorm(got, x, w, n, 0.001f);
+        t1 = now_ms();
+        ms = (t1 - t0) / (double)iters;
+        if (i == 0) {
+            memcpy(ref, got, (size_t)n * sizeof(float));
+            base_ms = ms;
+        }
+        thr_report(label, g_nts[i], got, ref, (size_t)n, ms, base_ms);
+    }
+done:
+    free(x);
+    free(w);
+    free(ref);
+    free(got);
+}
+
+// Числа и проверка детерминизма 1/2/4/8 потоков. Возврат != 0 — расхождение
+// больше 1e-5 (тогда это FAIL в make test).
+static int run_threads(int iters) {
+    const vtm_backend *simd = &vtm_backend_simd;
+    int def = vtm_threads();
+
+    g_thr_fail = 0;
+    printf("Многопоточность: VTM_THREADS по умолчанию = %d (ядер ≤ %d), "
+           "порог параллели %.0f MAC\n", def, VTM_THREADS_MAX,
+           VTM_PAR_MIN_WORK);
+    printf("nt=1 — прежнее однопоточное поведение; эталон для сравнения — "
+           "результат при nt=1.\n");
+    printf("\nTMV 1024x1024 (блок 160):\n");
+    thr_tmv(&vtm_backend_scalar_lut, 1024, 1024, 160, iters);
+    thr_tmv(simd, 1024, 1024, 160, iters);
+    printf("\nTMV 512x512 (блок 160, тоже выше порога):\n");
+    thr_tmv(&vtm_backend_scalar_lut, 512, 512, 160, iters);
+    thr_tmv(simd, 512, 512, 160, iters);
+    printf("\nTMV 128x128 (ниже порога — обязан остаться однопоточным):\n");
+    thr_tmv(simd, 128, 128, 160, iters);
+    printf("\nMM trit 1024x1024x1 (tied lm_head):\n");
+    thr_mm_trit(1024, 1024, 1, 160, iters);
+    printf("\nMM trit 128x1024x32:\n");
+    thr_mm_trit(128, 1024, 32, 160, iters);
+    printf("\nMM f32 256x256x256:\n");
+    thr_mm_f32(256, 256, 256, iters > 10 ? 10 : iters);
+    printf("\nRMSN n=524288 (порог %d):\n", VTM_PAR_RMSN_MIN);
+    thr_rmsnorm(&vtm_backend_scalar_lut, 524288, iters);
+    thr_rmsnorm(simd, 524288, iters);
+
+    if (g_thr_fail) {
+        printf("\nпотоки: FAIL (%d случаев > %.0e)\n", g_thr_fail, CHECK_TOL);
+        return 1;
+    }
+    printf("\nпотоки: ok (результат не зависит от числа потоков)\n");
+    return 0;
+}
+
 // --- логиты модели ---------------------------------------------------------
 
 static int emit_first(void *user, int token, int position) {
@@ -646,14 +903,15 @@ static int run_logits(const char *explicit_path, const vtm_backend *cand) {
 static void usage(const char *prog) {
     printf("usage: %s [--rows N] [--cols N] [--iters N] [--scale-block 128|160]\n"
            "          [--backend auto|scalar|simd|direct] [--check] "
-           "[--logits PATH] [--no-mm]\n"
-           "  env VTM_BACKEND — то же, что --backend (по умолчанию simd)\n",
+           "[--threads] [--logits PATH] [--no-mm]\n"
+           "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
+           "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8)\n",
            prog);
 }
 
 int main(int argc, char **argv) {
     int rows = 1024, cols = 1024, iters = 50, scale_block = 160;
-    int check = 0, no_mm = 0;
+    int check = 0, no_mm = 0, threads = 0;
     const char *logits_path = NULL;
     const char *backend_name = NULL;
     const vtm_backend *cand;
@@ -672,6 +930,8 @@ int main(int argc, char **argv) {
             backend_name = argv[++i];
         } else if (strcmp(argv[i], "--check") == 0) {
             check = 1;
+        } else if (strcmp(argv[i], "--threads") == 0) {
+            threads = 1;
         } else if (strcmp(argv[i], "--no-mm") == 0) {
             no_mm = 1;
         } else if (strcmp(argv[i], "--logits") == 0) {
@@ -705,6 +965,8 @@ int main(int argc, char **argv) {
     if (!backend_name && (!getenv("VTM_BACKEND") || !*getenv("VTM_BACKEND")))
         cand = &vtm_backend_simd;  // бенчмарк по умолчанию меряет SIMD
 
+    if (threads)
+        return run_threads(iters);
     if (logits_path)
         return run_logits(*logits_path ? logits_path : NULL, cand);
     if (check)

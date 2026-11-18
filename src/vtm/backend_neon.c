@@ -60,21 +60,27 @@ extern int vtm_avx2_mm_f32(float *y, const float *a, const float *b,
 // скалярное ядро MM держим здесь: vtm_simd_mm_* должны работать всегда, в
 // том числе на сборке без SIMD.
 
-static int mm_trit_scalar(float *y, const uint8_t *w, const float *scales,
-                          const float *b, int m, int k, int n,
-                          int scale_block) {
-    const uint32_t *words = (const uint32_t *)w;
+typedef struct {
+    float *y;
+    const uint32_t *words;
+    const float *scales;
+    const float *b;
+    int k;
+    int n;
+    int scale_block;
+} mm_scalar_job;
+
+static void mm_trit_scalar_rows(mm_scalar_job *j, int r0, int r1) {
+    const uint32_t *words = j->words;
+    const float *scales = j->scales;
+    const float *b = j->b;
+    const int k = j->k;
+    const int n = j->n;
+    const int scale_block = j->scale_block;
+    float *y = j->y;
     int r, c;
-    if (!y || !w || !scales || !b) return -1;
-    if (m < 0 || k < 0 || n < 0) return -1;
-    if (scale_block != VTM_SCALE_BLOCK_128 &&
-        scale_block != VTM_SCALE_BLOCK_160) return -1;
-    if (m == 0 || n == 0) return 0;
-    if (k == 0) {
-        memset(y, 0, (size_t)m * (size_t)n * sizeof(float));
-        return 0;
-    }
-    for (r = 0; r < m; r++) {
+
+    for (r = r0; r < r1; r++) {
         for (c = 0; c < n; c++) {
             int64_t base = (int64_t)r * (int64_t)k;
             double acc = 0.0;
@@ -109,20 +115,42 @@ static int mm_trit_scalar(float *y, const uint8_t *w, const float *scales,
             y[(size_t)r * (size_t)n + (size_t)c] = (float)acc;
         }
     }
-    return 0;
 }
 
-static int mm_f32_scalar(float *y, const float *a, const float *b,
-                         int m, int k, int n) {
-    int r, c, t;
-    if (!y || !a || !b) return -1;
+static void mm_trit_scalar_worker(void *p, int tid, int r0, int r1) {
+    (void)tid;
+    mm_trit_scalar_rows((mm_scalar_job *)p, r0, r1);
+}
+
+static int mm_trit_scalar(float *y, const uint8_t *w, const float *scales,
+                          const float *b, int m, int k, int n,
+                          int scale_block) {
+    mm_scalar_job job;
+    if (!y || !w || !scales || !b) return -1;
     if (m < 0 || k < 0 || n < 0) return -1;
+    if (scale_block != VTM_SCALE_BLOCK_128 &&
+        scale_block != VTM_SCALE_BLOCK_160) return -1;
     if (m == 0 || n == 0) return 0;
     if (k == 0) {
         memset(y, 0, (size_t)m * (size_t)n * sizeof(float));
         return 0;
     }
-    for (r = 0; r < m; r++) {
+    job.y = y;
+    job.words = (const uint32_t *)w;
+    job.scales = scales;
+    job.b = b;
+    job.k = k;
+    job.n = n;
+    job.scale_block = scale_block;
+    vtm_parallel_rows(m, (double)m * (double)k * (double)n,
+                      mm_trit_scalar_worker, &job);
+    return 0;
+}
+
+static void mm_f32_scalar_rows(const float *a, const float *b, float *y,
+                               int k, int n, int r0, int r1) {
+    int r, c, t;
+    for (r = r0; r < r1; r++) {
         for (c = 0; c < n; c++) {
             double acc = 0.0;
             for (t = 0; t < k; t++)
@@ -131,6 +159,39 @@ static int mm_f32_scalar(float *y, const float *a, const float *b,
             y[(size_t)r * (size_t)n + (size_t)c] = (float)acc;
         }
     }
+}
+
+typedef struct {
+    float *y;
+    const float *a;
+    const float *b;
+    int k;
+    int n;
+} mm_f32_scalar_job;
+
+static void mm_f32_scalar_worker(void *p, int tid, int r0, int r1) {
+    mm_f32_scalar_job *j = (mm_f32_scalar_job *)p;
+    (void)tid;
+    mm_f32_scalar_rows(j->a, j->b, j->y, j->k, j->n, r0, r1);
+}
+
+static int mm_f32_scalar(float *y, const float *a, const float *b,
+                         int m, int k, int n) {
+    mm_f32_scalar_job job;
+    if (!y || !a || !b) return -1;
+    if (m < 0 || k < 0 || n < 0) return -1;
+    if (m == 0 || n == 0) return 0;
+    if (k == 0) {
+        memset(y, 0, (size_t)m * (size_t)n * sizeof(float));
+        return 0;
+    }
+    job.y = y;
+    job.a = a;
+    job.b = b;
+    job.k = k;
+    job.n = n;
+    vtm_parallel_rows(m, (double)m * (double)k * (double)n,
+                      mm_f32_scalar_worker, &job);
     return 0;
 }
 
@@ -247,27 +308,61 @@ static double row_dot_trit(const uint32_t *words, const float *scales,
     return acc;
 }
 
+// Строки [r0, r1) TMV: base по-прежнему r*cols, порядок внутри строки тот
+// же, что при одном потоке, — поэтому разбиение по строкам побитово
+// ничего не меняет.
+static void tmv_neon_rows(float *y, const uint32_t *words,
+                          const float *scales, const float *x, int cols,
+                          int scale_block, int r0, int r1) {
+    int r;
+
+    for (r = r0; r < r1; r++) {
+        int64_t base = (int64_t)r * (int64_t)cols;
+        y[r] = (float)row_dot_trit(words, scales, x, base, cols,
+                                   scale_block);
+    }
+}
+
+typedef struct {
+    float *y;
+    const uint32_t *words;
+    const float *scales;
+    const float *x;
+    int cols;
+    int scale_block;
+} tmv_neon_job;
+
+static void tmv_neon_worker(void *p, int tid, int r0, int r1) {
+    tmv_neon_job *j = (tmv_neon_job *)p;
+    (void)tid;
+    tmv_neon_rows(j->y, j->words, j->scales, j->x, j->cols, j->scale_block,
+                  r0, r1);
+}
+
 static int tmv_neon_blocks(float *y, const uint8_t *w, const float *scales,
                            const float *x, int rows, int cols,
                            int scale_block) {
-    const uint32_t *words = (const uint32_t *)w;
-    int r;
+    tmv_neon_job job;
     if (!y || !w || !scales || !x) return -1;
     if (rows < 0 || cols < 0) return -1;
     if (scale_block != (int)VTM_SCALE_BLOCK_128 &&
         scale_block != (int)VTM_SCALE_BLOCK_160) return -1;
     if (rows == 0 || cols == 0) return 0;
-    lut_init();
-    for (r = 0; r < rows; r++) {
-        int64_t base = (int64_t)r * (int64_t)cols;
-        y[r] = (float)row_dot_trit(words, scales, x, base, cols,
-                                   scale_block);
-    }
+    lut_init();   // до потоков: таблица пишется один раз, не в воркерах
+    job.y = y;
+    job.words = (const uint32_t *)w;
+    job.scales = scales;
+    job.x = x;
+    job.cols = cols;
+    job.scale_block = scale_block;
+    vtm_parallel_rows(rows, (double)rows * (double)cols, tmv_neon_worker,
+                      &job);
     return 0;
 }
 
-static int rmsnorm_neon(float *y, const float *x, const float *w,
-                        int n, float eps) {
+// Однопоточный RMSN — прежний код (VTM_THREADS=1 и малые n).
+static int rmsnorm_neon_serial(float *y, const float *x, const float *w,
+                               int n, float eps) {
     float64x2_t a0 = vdupq_n_f64(0.0);
     float64x2_t a1 = vdupq_n_f64(0.0);
     double sum, mean, rms;
@@ -306,41 +401,150 @@ static int rmsnorm_neon(float *y, const float *x, const float *w,
     return 0;
 }
 
+// RMSN для больших n: сумма квадратов по фиксированным блокам
+// VTM_RMSN_BLOCK (порядок внутри блока прежний, частичные суммы
+// складываются по возрастанию номера блока), затем поэлементная часть.
+// Как и в скалярном бэкенде: при 2/4/8 потоках результат один и тот же
+// (побитово), от VTM_THREADS=1 отличается только порядком double-сложения
+// суммы квадратов (~1e-16 относительно; в f32-выходе обычно не видно).
+#define VTM_RMSN_BLOCK 4096
+
+typedef struct {
+    const float *x;
+    const float *w;
+    float *y;
+    double *sums;
+    int n;
+    float inv;
+} rmsn_neon_job;
+
+static void rmsnorm_neon_sum_worker(void *p, int tid, int b0, int b1) {
+    rmsn_neon_job *j = (rmsn_neon_job *)p;
+    int b;
+    (void)tid;
+    for (b = b0; b < b1; b++) {
+        int i0 = b * VTM_RMSN_BLOCK;
+        int i1 = i0 + VTM_RMSN_BLOCK;
+        float64x2_t a0 = vdupq_n_f64(0.0);
+        float64x2_t a1 = vdupq_n_f64(0.0);
+        double sum;
+        int i = i0;
+        if (i1 > j->n) i1 = j->n;
+        // То же векторное накопление double, что в serial-версии, но блок
+        // начинается с нуля: порядок сложения внутри блока прежний, а
+        // группировка по блокам даёт ~1e-16 относительной разницы.
+        for (; i + 4 <= i1; i += 4) {
+            float32x4_t v = vld1q_f32(j->x + i);
+            float64x2_t lo = vcvt_f64_f32(vget_low_f32(v));
+            float64x2_t hi = vcvt_f64_f32(vget_high_f32(v));
+            a0 = vfmaq_f64(a0, lo, lo);
+            a1 = vfmaq_f64(a1, hi, hi);
+        }
+        sum = vaddvq_f64(vaddq_f64(a0, a1));
+        for (; i < i1; i++) sum += (double)j->x[i] * (double)j->x[i];
+        j->sums[b] = sum;
+    }
+}
+
+static void rmsnorm_neon_scale_worker(void *p, int tid, int b0, int b1) {
+    rmsn_neon_job *j = (rmsn_neon_job *)p;
+    const float32x4_t vinv = vdupq_n_f32(j->inv);
+    int b;
+    (void)tid;
+    for (b = b0; b < b1; b++) {
+        int i0 = b * VTM_RMSN_BLOCK;
+        int i1 = i0 + VTM_RMSN_BLOCK;
+        int i = i0;
+        if (i1 > j->n) i1 = j->n;
+        // Формула та же, что в serial-версии (f32: x*w*inv); каждый элемент
+        // независим — совпадение побитовое.
+        for (; i + 4 <= i1; i += 4) {
+            float32x4_t xv = vld1q_f32(j->x + i);
+            float32x4_t wv = vld1q_f32(j->w + i);
+            vst1q_f32(j->y + i, vmulq_f32(vmulq_f32(xv, wv), vinv));
+        }
+        for (; i < i1; i++) j->y[i] = j->x[i] * j->w[i] * j->inv;
+    }
+}
+
+static int rmsnorm_neon(float *y, const float *x, const float *w,
+                        int n, float eps) {
+    rmsn_neon_job job;
+    double sum = 0.0, mean, rms;
+    int nblocks, b;
+
+    if (!y || !x || !w || n < 0) return -1;
+    if (n == 0) return 0;
+    if (vtm_threads() < 2 || n < VTM_PAR_RMSN_MIN)
+        return rmsnorm_neon_serial(y, x, w, n, eps);
+
+    nblocks = (n + VTM_RMSN_BLOCK - 1) / VTM_RMSN_BLOCK;
+    job.x = x;
+    job.w = w;
+    job.y = y;
+    job.n = n;
+    job.sums = (double *)calloc((size_t)nblocks, sizeof(double));
+    if (!job.sums)
+        return rmsnorm_neon_serial(y, x, w, n, eps);
+
+    vtm_parallel_rows(nblocks, 2.0 * (double)n, rmsnorm_neon_sum_worker,
+                      &job);
+    for (b = 0; b < nblocks; b++) sum += job.sums[b];
+    free(job.sums);
+
+    mean = sum / (double)n;
+    rms = sqrt(mean + (double)eps);
+    if (rms == 0.0) {
+        memset(y, 0, (size_t)n * sizeof(float));
+        return 0;
+    }
+    job.inv = (float)(1.0 / rms);
+    vtm_parallel_rows(nblocks, (double)n, rmsnorm_neon_scale_worker, &job);
+    return 0;
+}
+
 // MM с тритовой A. n == 1 — это фактически TMV по одной строке (tied
 // lm_head: [vocab, hidden] * [hidden, 1]), поэтому идём тем же путём, что
 // и TMV. Для n > 1 — rank-1 обновление по столбцам: 16 значений t копим в
 // f32, складываем в double-аккумулятор (точность как у скаляра).
-static int mm_trit_neon(float *y, const uint8_t *w, const float *scales,
-                        const float *b, int m, int k, int n,
-                        int scale_block) {
-    const uint32_t *words = (const uint32_t *)w;
-    const int64_t sb = (int64_t)scale_block;
+//
+// Многопоточность: строки m делятся между потоками, у каждого свой
+// double-аккумулятор на n столбцов (acc_all + tid*n). Каждая строка
+// считается тем же кодом и в том же порядке, поэтому результат от числа
+// потоков не зависит.
+typedef struct {
+    float *y;
+    const uint32_t *words;
+    const float *scales;
+    const float *b;
+    int k;
+    int n;
+    int64_t sb;
+    int scale_block;
+    double *acc_all;   // vt * n; NULL при n == 1 (аккумулятор не нужен)
+} mm_neon_job;
+
+static void mm_trit_neon_rows(mm_neon_job *j, int tid, int r0, int r1) {
+    const int k = j->k;
+    const int n = j->n;
+    const float *b = j->b;
+    const float *scales = j->scales;
+    const uint32_t *words = j->words;
+    const int64_t sb = j->sb;
+    const int scale_block = j->scale_block;
+    float *y = j->y;
     double *acc;
     int r;
 
-    if (!y || !w || !scales || !b) return -1;
-    if (m < 0 || k < 0 || n < 0) return -1;
-    if (scale_block != (int)VTM_SCALE_BLOCK_128 &&
-        scale_block != (int)VTM_SCALE_BLOCK_160) return -1;
-    if (m == 0 || n == 0) return 0;
-    if (k == 0) {
-        memset(y, 0, (size_t)m * (size_t)n * sizeof(float));
-        return 0;
-    }
-    lut_init();
-
     if (n == 1) {
-        for (r = 0; r < m; r++) {
-            int64_t base = (int64_t)r * (int64_t)k;
-            y[r] = (float)row_dot_trit(words, scales, b, base, k,
+        for (r = r0; r < r1; r++)
+            y[r] = (float)row_dot_trit(words, scales, b, (int64_t)r * k, k,
                                        scale_block);
-        }
-        return 0;
+        return;
     }
 
-    acc = (double *)calloc((size_t)n, sizeof(double));
-    if (!acc) return -1;
-    for (r = 0; r < m; r++) {
+    acc = j->acc_all + (size_t)tid * (size_t)n;
+    for (r = r0; r < r1; r++) {
         const int64_t base = (int64_t)r * (int64_t)k;
         const int64_t end = base + (int64_t)k;
         int8_t buf[VTM_SCALE_BLOCK_160 + 64];
@@ -407,24 +611,69 @@ static int mm_trit_neon(float *y, const uint8_t *w, const float *scales,
         for (c = 0; c < n; c++)
             y[(size_t)r * (size_t)n + (size_t)c] = (float)acc[c];
     }
-    free(acc);
-    return 0;
 }
 
-static int mm_f32_neon(float *y, const float *a, const float *b,
-                       int m, int k, int n) {
-    int r, c, t;
-    if (!y || !a || !b) return -1;
+static void mm_trit_neon_worker(void *p, int tid, int r0, int r1) {
+    mm_trit_neon_rows((mm_neon_job *)p, tid, r0, r1);
+}
+
+static int mm_trit_neon(float *y, const uint8_t *w, const float *scales,
+                        const float *b, int m, int k, int n,
+                        int scale_block) {
+    mm_neon_job job;
+    int vt;
+
+    if (!y || !w || !scales || !b) return -1;
     if (m < 0 || k < 0 || n < 0) return -1;
+    if (scale_block != (int)VTM_SCALE_BLOCK_128 &&
+        scale_block != (int)VTM_SCALE_BLOCK_160) return -1;
     if (m == 0 || n == 0) return 0;
     if (k == 0) {
         memset(y, 0, (size_t)m * (size_t)n * sizeof(float));
         return 0;
     }
+    lut_init();
+    job.y = y;
+    job.words = (const uint32_t *)w;
+    job.scales = scales;
+    job.b = b;
+    job.k = k;
+    job.n = n;
+    job.sb = (int64_t)scale_block;
+    job.scale_block = scale_block;
+    job.acc_all = NULL;
+    // Аккумуляторы по числу потоков; при отказе пула на один поток хватит
+    // одного, лишние слоты просто не используются.
+    vt = vtm_threads();
+    if (n > 1) {
+        job.acc_all = (double *)calloc((size_t)vt * (size_t)n,
+                                       sizeof(double));
+        if (!job.acc_all) return -1;
+    }
+    vtm_parallel_rows(m, (double)m * (double)k * (double)n,
+                      mm_trit_neon_worker, &job);
+    free(job.acc_all);
+    return 0;
+}
 
-    // 4 столбца за раз; внутри — куски по 16 t с суммой в f32, затем
-    // накопление в double. Так ошибка как у скалярного double-эталона.
-    for (r = 0; r < m; r++) {
+typedef struct {
+    float *y;
+    const float *a;
+    const float *b;
+    int k;
+    int n;
+} mm_f32_neon_job;
+
+static void mm_f32_neon_rows(mm_f32_neon_job *j, int tid, int r0, int r1) {
+    const int k = j->k;
+    const int n = j->n;
+    const float *a = j->a;
+    const float *b = j->b;
+    float *y = j->y;
+    int r, c, t;
+    (void)tid;
+
+    for (r = r0; r < r1; r++) {
         const float *ar = a + (size_t)r * (size_t)k;
         float *yr = y + (size_t)r * (size_t)n;
         for (c = 0; c + 4 <= n; c += 4) {
@@ -463,6 +712,29 @@ static int mm_f32_neon(float *y, const float *a, const float *b,
             yr[c] = (float)acc;
         }
     }
+}
+
+static void mm_f32_neon_worker(void *p, int tid, int r0, int r1) {
+    mm_f32_neon_rows((mm_f32_neon_job *)p, tid, r0, r1);
+}
+
+static int mm_f32_neon(float *y, const float *a, const float *b,
+                       int m, int k, int n) {
+    mm_f32_neon_job job;
+    if (!y || !a || !b) return -1;
+    if (m < 0 || k < 0 || n < 0) return -1;
+    if (m == 0 || n == 0) return 0;
+    if (k == 0) {
+        memset(y, 0, (size_t)m * (size_t)n * sizeof(float));
+        return 0;
+    }
+    job.y = y;
+    job.a = a;
+    job.b = b;
+    job.k = k;
+    job.n = n;
+    vtm_parallel_rows(m, (double)m * (double)k * (double)n,
+                      mm_f32_neon_worker, &job);
     return 0;
 }
 
