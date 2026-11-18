@@ -12,7 +12,8 @@
       "skills":      callable(text, ctx) -> SkillResult|None,
       "classifier":  callable(text, cfg) -> Route,
       "small":       клиент с .chat(messages, max_tokens=...)
-                     и необязательным .stream_chat(messages, max_tokens=...),
+                     и необязательным .stream_chat(messages, max_tokens=...);
+                     это может быть и локальная ВТМ (eva.backends.VtmBackend),
       "big":         то же для большой модели,
       # алиасы: try_skills / classify / small_client / big_client,
       #         либо "clients": {"small": ..., "big": ...}
@@ -20,6 +21,39 @@
       # и/или "catalog": Catalog | путь | список позиций,
       # алиасы: "rag" / "retrieve"
     }
+
+Локальная модель и порядок деградации (задача 0104)
+----------------------------------------------------
+
+«Маленькой моделью» может быть не только HTTP-клиент, но и своя ВТМ
+(``eva.backends.VtmBackend``): у неё та же форма ``chat``/``stream_chat``.
+Маршрутизатор распознаёт её :func:`is_local_model` (явный флаг
+``is_local``/``local``, модуль ``eva.backends`` или duck-typing
+``model_path``/``generate`` без HTTP-полей ``base``/``endpoint``) и берёт в
+работу как есть — без сети, ключей и демона.
+
+Источник «малой» выбирается так:
+
+1. ``deps["small"]``, если передан (локальная ВТМ или HTTP-клиент);
+2. иначе — свой ``VtmBackend`` по ``cfg.local_model`` (``EVA_LOCAL_MODEL``);
+3. иначе — HTTP-клиент малой модели по ``cfg.small_*``.
+
+Деградация при отказе идёт **по порядку**, и первый удачный шаг завершает
+ответ; каждый шаг заменяет только «малую» модель, маршрут остаётся ``small``:
+
+1. локальная ВТМ (если она выбрана первой — ``EVA_LOCAL_MODEL_PRIORITY=1``);
+2. HTTP-клиент малой модели (``eva.clients`` по ``cfg.small_*``);
+3. большая модель — по общей политике :mod:`eva.policy` (таймаут, 429,
+   бюджет: ``small`` → ``big``);
+4. если не осталось никого — исходная ошибка наружу (``VtmUnavailable`` и
+   прочие ошибки локальной модели не глотаются, а служат причиной отката).
+
+Приоритет выключается ``EVA_LOCAL_MODEL_PRIORITY=0``: тогда первым идёт
+HTTP-клиент, а локальная ВТМ — запасной путь для него. Каждый ответ маршрута
+``small`` помечается признаком ``local`` (``True`` — ответила ВТМ, ``False`` —
+HTTP), чтобы телеметрия могла их различить: признак лежит в
+``Answer.usage["local"]`` и в атрибуте ``Route.local``; для чтения из чужого
+кода есть :func:`route_is_local`.
 
 Контекст каталога (``eva.rag``) подмешивается в сообщения для маршрутов
 ``small`` и ``big`` отдельным system-сообщением после уже имеющихся system;
@@ -41,7 +75,14 @@ from . import policy
 from .config import Config
 from .types import Answer, Message, Request, Route
 
-__all__ = ["StreamChunk", "answer", "decide", "stream"]
+__all__ = [
+    "StreamChunk",
+    "answer",
+    "decide",
+    "is_local_model",
+    "route_is_local",
+    "stream",
+]
 
 _MODEL_KINDS = ("small", "big")
 _SKILL_ALIASES = ("skills", "try_skills", "skill")
@@ -49,6 +90,13 @@ _CLASSIFIER_ALIASES = ("classifier", "classify")
 _SMALL_ALIASES = ("small", "small_client", "client_small")
 _BIG_ALIASES = ("big", "big_client", "client_big")
 _RAG_ALIASES = ("rag", "retrieve")
+
+#: Явные пометки «это локальная модель» у клиента (bool или вызываемое).
+_LOCAL_FLAG_ATTRS = ("is_local", "local")
+#: Пакет, чьи объекты — заведомо локальная ВТМ, а не HTTP-клиент.
+_LOCAL_MODULE_PREFIX = "eva.backends"
+#: Пакет HTTP-клиентов: даже с ``stream_chat`` это не локальная модель.
+_HTTP_MODULE_PREFIXES = ("eva.clients",)
 
 # Кэш только успешной загрузки: если модуля ещё нет, пробуем импорт при
 # следующем вызове (другие агенты кладут файлы параллельно).
@@ -410,16 +458,22 @@ def _answer_with_models(
         text, usage, cost = _unpack_result(result, cfg, kind)
         budget.charge(cost)
         reason = route.reason
+        note = _local_fallback_note(client)
+        if note:
+            reason = f"{reason}; {note}" if reason else note
         if budget.limited and cost > float(budget.max_cost_rub or 0.0) + 1e-9:
             reason += (
                 f"; фактическая цена {cost:.4f} ₽ превысила бюджет "
                 f"{float(budget.max_cost_rub or 0.0):.4f} ₽ (оценка была ниже)"
             )
+        local = _local_marker(client, kind)
+        answer_route = Route(kind=kind, reason=reason, confidence=route.confidence)
+        _attach_local(answer_route, local)
         return Answer(
             text=text,
-            route=Route(kind=kind, reason=reason, confidence=route.confidence),
+            route=answer_route,
             skill=None,
-            usage=usage,
+            usage=_usage_with_local(usage, local),
             cost_rub=cost,
             latency_ms=_elapsed_ms(started),
         )
@@ -552,15 +606,21 @@ def _stream_with_models(
         cost = float(usage["cost_rub"])
         budget.charge(cost)
         reason = route.reason
+        note = _local_fallback_note(client)
+        if note:
+            reason = f"{reason}; {note}" if reason else note
         if budget.limited and cost > float(budget.max_cost_rub or 0.0) + 1e-9:
             reason += (
                 f"; фактическая цена {cost:.4f} ₽ превысила бюджет "
                 f"{float(budget.max_cost_rub or 0.0):.4f} ₽ (оценка была ниже)"
             )
+        local = _local_marker(client, kind)
+        final_route = Route(kind=kind, reason=reason, confidence=route.confidence)
+        _attach_local(final_route, local)
         yield StreamChunk(
             text="",
-            route=Route(kind=kind, reason=reason, confidence=route.confidence),
-            usage=usage,
+            route=final_route,
+            usage=_usage_with_local(usage, local),
             cost_rub=cost,
             latency_ms=_elapsed_ms(started),
             done=True,
@@ -722,6 +782,205 @@ def _load_rag() -> Any | None:
     return _RAG_FN
 
 
+def _local_flag(client: Any) -> bool | None:
+    """Явная пометка локальности: ``is_local``/``local`` (bool или вызов).
+
+    Не-булево значение (например, ``Mock``) пометкой не считается: иначе
+    подмена в тестах случайно выглядела бы локальной моделью.
+    """
+    for name in _LOCAL_FLAG_ATTRS:
+        try:
+            value = getattr(client, name)
+        except Exception:  # noqa: BLE001 — свойство чужого класса может падать
+            continue
+        if isinstance(value, bool):
+            return value
+        if callable(value):
+            try:
+                result = value()
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(result, bool):
+                return result
+    return None
+
+
+def is_local_model(client: Any) -> bool:
+    """Похож ли объект на локальную модель (ВТМ), а не на HTTP-клиент.
+
+    Порядок проверок:
+
+    1. явный флаг ``is_local``/``local`` — он важнее эвристик;
+    2. модуль класса из ``eva.backends`` — да, из ``eva.clients`` — нет;
+    3. duck-typing: есть ``chat``, нет HTTP-полей ``base``/``endpoint`` и есть
+       ``model_path``/``generate`` (форма :class:`eva.backends.VtmBackend`).
+
+    ``False`` — обычный HTTP-клиент (``OpenAIClient``), ``True`` — локальная
+    модель, которую можно звать без сети.
+    """
+    if client is None:
+        return False
+    flag = _local_flag(client)
+    if flag is not None:
+        return flag
+    module = str(getattr(type(client), "__module__", "") or "")
+    if module.startswith(_HTTP_MODULE_PREFIXES):
+        return False
+    if module.startswith(_LOCAL_MODULE_PREFIX):
+        return True
+    if not callable(getattr(client, "chat", None)):
+        return False
+    if any(hasattr(client, attr) for attr in ("base", "endpoint")):
+        return False
+    return callable(getattr(client, "generate", None)) or hasattr(client, "model_path")
+
+
+def route_is_local(route: Any) -> bool | None:
+    """Признак ``local`` (``True``/``False``/``None``) у маршрута ``small``.
+
+    Маркер ставит :func:`answer`/:func:`stream` на объект ``Route`` (атрибут
+    ``Route.local``): ``True`` — ответила локальная ВТМ, ``False`` — HTTP-клиент.
+    ``None`` — маршрут не про малую модель (``skill``/``big``) или старый ответ.
+    """
+    if route is None:
+        return None
+    value = getattr(route, "local", None)
+    return value if isinstance(value, bool) else None
+
+
+def _local_marker(client: Any, kind: str) -> bool | None:
+    """Ответила ли локальная модель для этого маршрута; ``None`` — не про неё."""
+    if kind != "small":
+        return None
+    used = getattr(client, "last_local", None)
+    if isinstance(used, bool):
+        return used
+    return is_local_model(client)
+
+
+def _usage_with_local(usage: dict[str, Any], local: bool | None) -> dict[str, Any]:
+    """Тот же ``usage`` плюс маркер ``local`` (счётчики токенов не трогаем)."""
+    if local is None:
+        return usage
+    return {**usage, "local": bool(local)}
+
+
+def _attach_local(route: Route, local: bool | None) -> Route:
+    """Пометить маршрут признаком ``local`` (``None`` — маршрут не про малую).
+
+    Поле не добавляется в :class:`eva.types.Route` (это общий контракт, его
+    правят отдельной задачей): маркер — динамический атрибут ``route.local``,
+    читается через :func:`route_is_local` и не влияет на ``to_dict()``.
+    """
+    if local is not None:
+        try:
+            route.local = bool(local)
+        except Exception:  # noqa: BLE001 — замороженный Route не должен ронять ответ
+            pass
+    return route
+
+
+def _local_fallback_note(client: Any) -> str:
+    """Пояснение к причине, если внутри ``small`` был откат между моделями."""
+    local = getattr(client, "last_local", None)
+    error = str(getattr(client, "last_error", "") or "").strip()
+    if not isinstance(local, bool) or not error:
+        return ""
+    if local:
+        return f"HTTP-клиент малой модели не ответил ({error}) — ответила локальная ВТМ"
+    return f"локальная модель не ответила ({error}) — откат на HTTP-клиент малой модели"
+
+
+class _SmallWithFallback:
+    """«Малая модель» из двух источников: первичный и запасной.
+
+    Нужна для локальной ВТМ: при :class:`~eva.backends.VtmUnavailable` (или
+    любой другой ошибке генерации) она молча уступает HTTP-клиенту, а маршрут
+    остаётся ``small``. В потоке откат возможен только пока не отдан ни один
+    кусок текста — после первого куска повтор дал бы клиенту два ответа.
+
+    Поля ``last_local``/``last_error``/``fallbacks`` — для маршрутизатора и
+    тестов: кто в итоге ответил и почему пришлось переключаться.
+    """
+
+    def __init__(
+        self,
+        primary: Any,
+        secondary: Any | None = None,
+        *,
+        primary_local: bool = False,
+        secondary_local: bool = False,
+    ) -> None:
+        self._primary = primary
+        self._secondary = secondary
+        self._primary_local = bool(primary_local)
+        self._secondary_local = bool(secondary_local)
+        self.last_local: bool | None = None
+        self.last_error: str = ""
+        self.fallbacks = 0
+
+    @property
+    def local(self) -> bool:
+        """Локальная ли модель выбрана первой (для :func:`is_local_model`)."""
+        return self._primary_local
+
+    def _failed(self, exc: BaseException) -> str:
+        return f"{type(exc).__name__}: {exc}"
+
+    def chat(self, messages: Any, max_tokens: int = 512) -> Any:
+        try:
+            result = self._primary.chat(list(messages), max_tokens=max_tokens)
+        except Exception as exc:  # noqa: BLE001 — решает наличие запасного клиента
+            self.last_error = self._failed(exc)
+            if self._secondary is None:
+                self.last_local = None
+                raise
+            self.fallbacks += 1
+            result = self._secondary.chat(list(messages), max_tokens=max_tokens)
+            self.last_local = self._secondary_local
+            return result
+        self.last_local = self._primary_local
+        return result
+
+    def stream_chat(self, messages: Any, max_tokens: int = 512):
+        produced = False
+        try:
+            for piece in _client_stream(self._primary, messages, max_tokens):
+                produced = True
+                yield piece
+        except Exception as exc:  # noqa: BLE001 — как в chat(), но до первого куска
+            self.last_error = self._failed(exc)
+            if produced or self._secondary is None:
+                # Часть ответа уже у клиента: откат дал бы дубли текста.
+                self.last_local = None if produced else self.last_local
+                raise
+            self.fallbacks += 1
+            self.last_local = self._secondary_local
+            yield from _client_stream(self._secondary, messages, max_tokens)
+            return
+        self.last_local = self._primary_local
+
+
+def _make_local_client(cfg: Config) -> Any | None:
+    """Собрать локальную ВТМ по ``cfg.local_model``; ``None`` — не вышло.
+
+    Импорт и сборка ленивые: без ``EVA_LOCAL_MODEL`` ничего не грузится, а
+    ``libvtm`` ищется/собирается только при первом ``chat``. Ошибка сборки
+    конфига (например, мусор в ``EVA_VTM_BACKEND``) не роняет маршрутизатор:
+    локальной модели просто нет, работает HTTP.
+    """
+    if not getattr(cfg, "local_available", False):
+        return None
+    try:
+        from eva.backends.vtm_backend import VTMConfig, VtmBackend
+    except Exception:  # noqa: BLE001 — пакета/модуля может ещё не быть
+        return None
+    try:
+        return VtmBackend(VTMConfig.from_env(model=cfg.local_model_path))
+    except Exception:  # noqa: BLE001 — путь/бэкенд негодны: деградируем на HTTP
+        return None
+
+
 def _make_client(kind: str, cfg: Config) -> Any | None:
     """Ленивая сборка клиента модели; ``None`` — модель не настроена."""
     if kind == "big" and not cfg.big_available:
@@ -764,9 +1023,50 @@ def _resolve_client(
                 if container.get(alias) is not None:
                     injected = container[alias]
                     break
+    if kind == "small":
+        return _resolve_small(cfg, injected)
     if injected is not None:
         return injected
     return _make_client(kind, cfg)
+
+
+def _http_small_client(cfg: Config) -> Any | None:
+    """HTTP-клиент малой модели; ``None`` — не настроен или конфиг негоден.
+
+    Кривой ``EVA_SMALL_BASE`` не должен отменять работу локальной ВТМ: при
+    локальном приоритете HTTP — только запасной путь, а не обязательный.
+    """
+    try:
+        return _make_client("small", cfg)
+    except Exception:  # noqa: BLE001 — деградируем, а не падаем на старте
+        return None
+
+
+def _resolve_small(cfg: Config, injected: Any | None) -> Any | None:
+    """«Малая модель»: внедрённая, локальная ВТМ и/или HTTP — по порядку.
+
+    Внедрённый HTTP-клиент не переопределяется: ``deps`` — контракт сервера и
+    тестов. Локальная ВТМ из ``deps["small"]`` оборачивается в откат на HTTP,
+    HTTP из конфига — в откат на локальную, если приоритет выключен.
+    """
+    if injected is not None:
+        if not is_local_model(injected):
+            return injected
+        http_small = _http_small_client(cfg)
+        if http_small is None:
+            return injected
+        return _SmallWithFallback(injected, http_small, primary_local=True)
+
+    http_small = _http_small_client(cfg)
+    local = _make_local_client(cfg)
+    if local is None:
+        return http_small
+    if not getattr(cfg, "local_first", True):
+        # Приоритет выключен: решает HTTP, локальная ВТМ — запасной путь.
+        if http_small is None:
+            return local
+        return _SmallWithFallback(http_small, local, secondary_local=True)
+    return _SmallWithFallback(local, http_small, primary_local=True)
 
 
 def _skills_provider(deps: Mapping[str, Any] | Any | None) -> Any | None:

@@ -15,6 +15,8 @@
 ``EVA_SMALL_PRICE_PROMPT``    ₽ за 1000 prompt-токенов
 ``EVA_SMALL_PRICE_COMPLETION``₽ за 1000 completion-токенов
 ``EVA_BIG_*``                 то же для большой модели
+``EVA_LOCAL_MODEL``           путь к своей ВТМ (``.vtm``) — малая модель без HTTP
+``EVA_LOCAL_MODEL_PRIORITY``  ``1`` — локальная ВТМ важнее HTTP-малой (по умолчанию)
 ``EVA_MAX_COST_RUB``          бюджет на запрос, ₽ (``none``/отрицательное — без лимита)
 ``EVA_MAX_TOKENS``            максимум completion-токенов на ответ
 ``EVA_AUTH_TOKEN``            Bearer-токен HTTP-сервера (пусто — без проверки)
@@ -96,6 +98,25 @@ def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
         raise ValueError(f"{name}: ожидалось целое число, получено {value!r}") from exc
 
 
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on", "y", "t", "да", "вкл"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "off", "n", "f", "нет", "выкл"})
+
+
+def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+    """Флаг из окружения: ``1/0``, ``true/false``, ``да/нет``; прочее — ошибка."""
+    value = _clean(env.get(name))
+    if value is None:
+        return default
+    lowered = value.lower()
+    if lowered in _TRUE_WORDS:
+        return True
+    if lowered in _FALSE_WORDS:
+        return False
+    raise ValueError(
+        f"{name}: ожидалось true/false (1/0, да/нет), получено {value!r}"
+    )
+
+
 def auth_settings(env: Mapping[str, str] | None = None) -> tuple[str, int]:
     """Токен и лимит запросов из окружения — только эти две настройки.
 
@@ -123,6 +144,13 @@ class Config:
     small_retries: int = 1
     small_price_prompt_rub_per_1k: float = 0.0
     small_price_completion_rub_per_1k: float = 0.0
+
+    # --- своя ВТМ как «маленькая модель» (задача 0104) ---
+    #: Путь к ``.vtm``: непустой — маршрутизатор собирает ``VtmBackend`` сам,
+    #: без HTTP-демона и без ключей.
+    local_model: str = ""
+    #: ``True`` — локальная ВТМ пробуется раньше HTTP-клиента малой модели.
+    local_model_priority: bool = True
 
     # --- большая (облачная) модель ---
     big_base: str = ""
@@ -157,6 +185,21 @@ class Config:
     @property
     def small_available(self) -> bool:
         return bool(self.small_base and self.small_model)
+
+    @property
+    def local_available(self) -> bool:
+        """Настроена ли своя ВТМ (путь к ``.vtm``)."""
+        return bool(str(self.local_model or "").strip())
+
+    @property
+    def local_model_path(self) -> str:
+        """Путь к ``.vtm`` как строка (пустая — локальная модель выключена)."""
+        return str(self.local_model or "").strip()
+
+    @property
+    def local_first(self) -> bool:
+        """Пробовать локальную ВТМ раньше HTTP-малой (флаг приоритета)."""
+        return bool(self.local_model_priority)
 
     @property
     def reason_markers(self) -> tuple[str, ...]:
@@ -235,6 +278,8 @@ class Config:
             small_retries=_env_int(source, "EVA_SMALL_RETRIES", 1),
             small_price_prompt_rub_per_1k=_env_float(source, "EVA_SMALL_PRICE_PROMPT", 0.0),
             small_price_completion_rub_per_1k=_env_float(source, "EVA_SMALL_PRICE_COMPLETION", 0.0),
+            local_model=_env_str(source, "EVA_LOCAL_MODEL", ""),
+            local_model_priority=_env_bool(source, "EVA_LOCAL_MODEL_PRIORITY", True),
             big_base=_env_str(source, "EVA_BIG_BASE", ""),
             big_key=_env_str(source, "EVA_BIG_KEY", ""),
             big_model=_env_str(source, "EVA_BIG_MODEL", ""),

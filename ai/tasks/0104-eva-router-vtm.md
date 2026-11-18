@@ -5,7 +5,7 @@ title: eva: локальная ВТМ как «маленькая модель»
 created_at: 2026-11-18T16:20:00Z
 author: yuri
 assignee: agent:eva-router-vtm
-status: in_progress
+status: done
 scope:
   docs: false
   code: true
@@ -47,4 +47,16 @@ HTTP-клиентом. То есть «своя модель» в гибриде
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: `EVA_LOCAL_MODEL` и `EVA_LOCAL_MODEL_PRIORITY` в конфиге, распознавание
+локального клиента (`is_local_model`/`route_is_local`), ленивая сборка `VtmBackend`,
+деградация `_SmallWithFallback`: локальная → HTTP small → big. В потоке откат только
+до первого отданного куска. Маркер `Answer.usage["local"]` и `route_is_local()`.
+
+Проверено: 31 тест роутера зелёный; eval на 60 исторических вопросах даёт прежние
+60/60, 40,0%, 230,15 ₽ (регрессии нет), на текущих 80 — 80/80, 55,0%, 172,61 ₽.
+Живая проверка: `VtmBackend` на demo падает на токенизаторе → ответ уходит в HTTP,
+`local=False`, причина с текстом ошибки.
+
+Хвост записан: `Route.local` — динамический атрибут, `to_dict()` его не содержит, и
+`telemetry.normalize_record` маркер пока не видит. Нужна задача 0109: поле в `Route`
+и проброс в JSONL.

@@ -681,7 +681,7 @@
   {
     "id": "0104",
     "title": "eva: локальная ВТМ как «маленькая модель» в маршрутизаторе",
-    "status": "in_progress",
+    "status": "done",
     "file": "0104-eva-router-vtm.md",
     "assignee": "agent:eva-router-vtm"
   },
@@ -712,5 +712,12 @@
     "status": "in_progress",
     "file": "0108-server-limits.md",
     "assignee": "agent:server-limits"
+  },
+  {
+    "id": "0109",
+    "title": "Телеметрия: маркер локальной модели в Route и JSONL",
+    "status": "pending",
+    "file": "0109-telemetry-local.md",
+    "assignee": ""
   }
 ]
