@@ -772,7 +772,7 @@
   {
     "id": "0117",
     "title": "CI: порог регрессии производительности",
-    "status": "in_progress",
+    "status": "done",
     "file": "0117-ci-perf.md",
     "assignee": "agent:ci-perf"
   },
