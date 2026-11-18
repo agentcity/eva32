@@ -9,14 +9,14 @@
   {
     "id": "0002",
     "title": "Виртуальная троичная машина: C-интерпретатор",
-    "status": "in_progress",
+    "status": "done",
     "file": "0002-vtm-runtime-c.md",
     "assignee": "saron"
   },
   {
     "id": "0003",
     "title": "Виртуальная троичная машина: Python-эталон и компилятор графа",
-    "status": "in_progress",
+    "status": "done",
     "file": "0003-vtm-python-reference.md",
     "assignee": "saron"
   },
@@ -79,7 +79,7 @@
   {
     "id": "0012",
     "title": "BPE-токенизатор для ВТМ (C++17)",
-    "status": "in_progress",
+    "status": "done",
     "file": "0012-bpe-tokenizer.md",
     "assignee": "agent:tokenizer"
   },

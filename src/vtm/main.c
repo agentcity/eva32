@@ -1,0 +1,534 @@
+// CLI VTM: run / inspect / bench.
+//
+//   vtm run model.vtm --tokens 1,2,3 --max-new 8
+//   vtm inspect model.vtm
+//   vtm bench [--rows 512 --cols 512 --iters 200]
+//
+// Без аргументов печатается справка и код возврата 2 (как принято для CLI).
+#include "vtm.h"
+
+#include <errno.h>
+#include <limits.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+static void usage(FILE *out) {
+    fprintf(out,
+        "VTM — скалярный интерпретатор виртуальной троичной машины (v0.1)\n"
+        "\n"
+        "  vtm run model.vtm --tokens 1,2,3 --max-new 8\n"
+        "      прогнать программу по токенам и напечатать выбранные токены\n"
+        "      --backend lut|direct   вариант скалярного TMV (по умолчанию lut)\n"
+        "\n"
+        "  vtm inspect model.vtm\n"
+        "      показать заголовок, тензоры и инструкции\n"
+        "\n"
+        "  vtm bench [--rows N] [--cols N] [--iters N] [--scale-block 128|160]\n"
+        "      замерить TMV: LUT243 против прямой распаковки\n"
+        "\n"
+        "  vtm --help\n"
+        "\n"
+        "Коды возврата: 0 — успех, 1 — ошибка выполнения, 2 — ошибка аргументов.\n");
+}
+
+static int parse_int(const char *s, int *out) {
+    char *end = NULL;
+    long v;
+    if (!s || !*s) return -1;
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') return -1;
+    if (v < INT_MIN || v > INT_MAX) return -1;
+    *out = (int)v;
+    return 0;
+}
+
+static int parse_int_list(const char *s, int **out, size_t *out_n) {
+    const char *p = s;
+    int *arr = NULL;
+    size_t n = 0, cap = 0;
+
+    *out = NULL;
+    *out_n = 0;
+    if (!s || !*s) return -1;
+
+    while (*p) {
+        char *end = NULL;
+        long v;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        errno = 0;
+        v = strtol(p, &end, 10);
+        if (errno != 0 || end == p || v < 0 || v > INT_MAX) {
+            free(arr);
+            return -1;
+        }
+        if (n == cap) {
+            size_t ncap = cap ? cap * 2u : 8u;
+            int *tmp = (int *)realloc(arr, ncap * sizeof(int));
+            if (!tmp) {
+                free(arr);
+                return -1;
+            }
+            arr = tmp;
+            cap = ncap;
+        }
+        arr[n++] = (int)v;
+        p = end;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+        if (*p != '\0') {
+            free(arr);
+            return -1;
+        }
+    }
+    if (n == 0) {
+        free(arr);
+        return -1;
+    }
+    *out = arr;
+    *out_n = n;
+    return 0;
+}
+
+static const char *kind_name(uint8_t kind) {
+    switch (kind) {
+    case VTM_TENSOR_TRIT: return "trit";
+    case VTM_TENSOR_F32:  return "f32";
+    case VTM_TENSOR_F16:  return "f16";
+    case VTM_TENSOR_BF16: return "bf16";
+    default:              return "?";
+    }
+}
+
+// --- run -------------------------------------------------------------------
+
+typedef struct {
+    int token;
+    int have;
+    int count;
+} emit_state;
+
+static int emit_first(void *user, int token, int position) {
+    emit_state *s = (emit_state *)user;
+    (void)position;
+    if (!s->have) {
+        s->token = token;
+        s->have = 1;
+    }
+    s->count++;
+    return 0;
+}
+
+static void print_tokens(const char *label, const int *v, size_t n) {
+    size_t i;
+    printf("%s", label);
+    for (i = 0; i < n; i++) printf("%s%d", i ? " " : "", v[i]);
+    printf("\n");
+}
+
+static int cmd_run(int argc, char **argv) {
+    const char *path = NULL;
+    const char *tokens_s = NULL;
+    const char *backend_name = "lut";
+    int max_new = 8;
+    int *tokens = NULL;
+    size_t n_tokens = 0;
+    int *generated = NULL;
+    size_t n_generated = 0;
+    vtm_t *m;
+    clock_t c0, c1;
+    int i;
+
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--tokens") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "vtm run: --tokens без значения\n");
+                return 2;
+            }
+            tokens_s = argv[i];
+        } else if (strcmp(argv[i], "--max-new") == 0) {
+            if (++i >= argc || parse_int(argv[i], &max_new) != 0 ||
+                max_new < 0 || max_new > 1000000) {
+                fprintf(stderr, "vtm run: плохое значение --max-new\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--backend") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "vtm run: --backend без значения\n");
+                return 2;
+            }
+            backend_name = argv[i];
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "vtm run: неизвестный аргумент %s\n", argv[i]);
+            return 2;
+        } else if (!path) {
+            path = argv[i];
+        } else {
+            fprintf(stderr, "vtm run: лишний аргумент %s\n", argv[i]);
+            return 2;
+        }
+    }
+    if (!path || !tokens_s) {
+        fprintf(stderr, "vtm run: нужны model.vtm и --tokens\n");
+        return 2;
+    }
+    if (strcmp(backend_name, "lut") != 0 &&
+        strcmp(backend_name, "direct") != 0) {
+        fprintf(stderr, "vtm run: --backend должен быть lut или direct\n");
+        return 2;
+    }
+    if (parse_int_list(tokens_s, &tokens, &n_tokens) != 0 ||
+        n_tokens > (size_t)INT_MAX) {
+        fprintf(stderr, "vtm run: --tokens ожидает список неотрицательных чисел\n");
+        return 2;
+    }
+
+    m = vtm_load(path);
+    if (!m) {
+        fprintf(stderr, "vtm: %s\n", vtm_last_error());
+        free(tokens);
+        return 1;
+    }
+    vtm_set_backend(m, strcmp(backend_name, "direct") == 0
+                           ? &vtm_backend_scalar_direct
+                           : &vtm_backend_scalar_lut);
+
+    printf("модель: %s\n", path);
+    printf("тензоров: %u, инструкций: %u, бэкенд: %s\n",
+           (unsigned)vtm_tensor_count(m), (unsigned)vtm_instr_count(m),
+           vtm_backend_name(m));
+
+    if (max_new > 0) {
+        generated = (int *)calloc((size_t)max_new, sizeof(int));
+        if (!generated) {
+            fprintf(stderr, "vtm run: не хватило памяти\n");
+            vtm_free(m);
+            free(tokens);
+            return 1;
+        }
+    }
+
+    c0 = clock();
+    if (max_new == 0) {
+        for (i = 0; i < (int)n_tokens; i++) {
+            vtm_status st;
+            vtm_set_position(m, i);
+            vtm_set_token(m, tokens[i]);
+            st = vtm_run(m, NULL, NULL);
+            if (st != VTM_OK) {
+                fprintf(stderr, "vtm run: %s: %s\n", vtm_strerror(st),
+                        vtm_error_message(m));
+                vtm_free(m);
+                free(tokens);
+                free(generated);
+                return 1;
+            }
+        }
+    } else {
+        vtm_status st;
+        emit_state es;
+        int last;
+
+        // Все токены промпта, кроме последнего, только наполняют KV-кэш.
+        for (i = 0; i + 1 < (int)n_tokens; i++) {
+            vtm_set_position(m, i);
+            vtm_set_token(m, tokens[i]);
+            st = vtm_run(m, NULL, NULL);
+            if (st != VTM_OK) {
+                fprintf(stderr, "vtm run: %s: %s\n", vtm_strerror(st),
+                        vtm_error_message(m));
+                vtm_free(m);
+                free(tokens);
+                free(generated);
+                return 1;
+            }
+        }
+        // Последний токен промпта даёт первый сгенерированный.
+        memset(&es, 0, sizeof es);
+        vtm_set_position(m, (int)n_tokens - 1);
+        vtm_set_token(m, tokens[n_tokens - 1]);
+        st = vtm_run(m, emit_first, &es);
+        if (st != VTM_OK) {
+            fprintf(stderr, "vtm run: %s: %s\n", vtm_strerror(st),
+                    vtm_error_message(m));
+            vtm_free(m);
+            free(tokens);
+            free(generated);
+            return 1;
+        }
+        if (es.count > 1)
+            fprintf(stderr, "vtm run: предупреждение: SAMP сработал %d раз, "
+                            "CLI берёт первый токен\n", es.count);
+        if (es.have) {
+            generated[n_generated++] = es.token;
+            last = es.token;
+        } else {
+            fprintf(stderr, "vtm run: программа не вызвала SAMP; "
+                            "генерировать нечего\n");
+            vtm_free(m);
+            free(tokens);
+            free(generated);
+            return 1;
+        }
+
+        while (n_generated < (size_t)max_new) {
+            memset(&es, 0, sizeof es);
+            // Входной токен previous стоит на позиции len(prompt)+step-1.
+            vtm_set_position(m, (int)(n_tokens + n_generated - 1));
+            vtm_set_token(m, last);
+            st = vtm_run(m, emit_first, &es);
+            if (st != VTM_OK) {
+                fprintf(stderr, "vtm run: %s: %s\n", vtm_strerror(st),
+                        vtm_error_message(m));
+                vtm_free(m);
+                free(tokens);
+                free(generated);
+                return 1;
+            }
+            if (!es.have) break;
+            if (es.count > 1)
+                fprintf(stderr, "vtm run: предупреждение: SAMP сработал %d раз, "
+                                "CLI берёт первый токен\n", es.count);
+            generated[n_generated++] = es.token;
+            last = es.token;
+        }
+    }
+    c1 = clock();
+
+    {
+        double sec = (double)(c1 - c0) / (double)CLOCKS_PER_SEC;
+        print_tokens("prompt: ", tokens, n_tokens);
+        if (n_generated)
+            print_tokens("вывод:  ", generated, n_generated);
+        else
+            printf("вывод:  (пусто)\n");
+        printf("время: %.3f мс", sec * 1000.0);
+        if (n_generated)
+            printf(", %zu токен(ов), %.1f ток/с", n_generated,
+                   sec > 0.0 ? (double)n_generated / sec : 0.0);
+        printf("\n");
+    }
+
+    vtm_free(m);
+    free(tokens);
+    free(generated);
+    return 0;
+}
+
+// --- inspect ---------------------------------------------------------------
+
+static int cmd_inspect(int argc, char **argv) {
+    const char *path;
+    vtm_t *m;
+    uint32_t i;
+
+    if (argc != 1) {
+        fprintf(stderr, "vtm inspect: нужен ровно один файл\n");
+        return 2;
+    }
+    path = argv[0];
+    m = vtm_load(path);
+    if (!m) {
+        fprintf(stderr, "vtm: %s\n", vtm_last_error());
+        return 1;
+    }
+    printf("файл: %s\n", path);
+    printf("тензоров: %u, инструкций: %u, бэкенд: %s\n",
+           (unsigned)vtm_tensor_count(m), (unsigned)vtm_instr_count(m),
+           vtm_backend_name(m));
+    for (i = 0; i < vtm_tensor_count(m); i++) {
+        const vtm_tensor *t = vtm_tensor_by_index(m, i);
+        int d;
+        printf("[%u] %-23s kind=%-4s ndim=%u dims=[", i, t->name,
+               kind_name(t->kind), (unsigned)t->ndim);
+        for (d = 0; d < (int)t->ndim; d++)
+            printf("%s%u", d ? "," : "", (unsigned)t->dims[d]);
+        printf("] elems=%u offset=%u", t->n_elements, t->offset);
+        if (t->kind == VTM_TENSOR_TRIT)
+            printf(" blocks=%u scales=%u block=%u scale=%s", t->n_blocks,
+                   t->n_scales, t->scale_block,
+                   t->scale_is_f32 ? "f32" : "f16");
+        printf("\n");
+    }
+    for (i = 0; i < vtm_instr_count(m); i++) {
+        const vtm_instr *in = vtm_instruction(m, i);
+        printf("%04u  %-4s flags=0x%02x dst=%u a=%u b=%u c=%u imm=%d\n",
+               i, vtm_opcode_name(in->opcode), (unsigned)in->flags,
+               (unsigned)in->dst, (unsigned)in->a, (unsigned)in->b,
+               (unsigned)in->c, in->imm);
+    }
+    vtm_free(m);
+    return 0;
+}
+
+// --- bench -----------------------------------------------------------------
+
+static uint32_t rng_state = 0x9E3779B9u;
+
+static uint32_t rng_next(void) {
+    uint32_t x = rng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    rng_state = x;
+    return x;
+}
+
+static int cmd_bench(int argc, char **argv) {
+    int rows = 512, cols = 512, iters = 200;
+    int scale_block = (int)VTM_SCALE_BLOCK_160;
+    int i;
+    uint32_t n, storage_blocks, scale_blocks, n_words, w, b;
+    int8_t *trits;
+    uint32_t *words;
+    float *scales, *x, *y_lut, *y_direct;
+    clock_t c0, c1;
+    double t_lut, t_direct, speedup;
+    double max_diff = 0.0;
+    uint64_t total_elems;
+    volatile float sink = 0.0f;
+
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--rows") == 0) {
+            if (++i >= argc || parse_int(argv[i], &rows) != 0 || rows <= 0) {
+                fprintf(stderr, "vtm bench: плохие --rows\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--cols") == 0) {
+            if (++i >= argc || parse_int(argv[i], &cols) != 0 || cols <= 0) {
+                fprintf(stderr, "vtm bench: плохие --cols\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--iters") == 0) {
+            if (++i >= argc || parse_int(argv[i], &iters) != 0 ||
+                iters <= 0 || iters > 100000) {
+                fprintf(stderr, "vtm bench: плохие --iters\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--scale-block") == 0) {
+            if (++i >= argc || parse_int(argv[i], &scale_block) != 0 ||
+                (scale_block != 128 && scale_block != 160)) {
+                fprintf(stderr, "vtm bench: --scale-block 128|160\n");
+                return 2;
+            }
+        } else {
+            fprintf(stderr, "vtm bench: неизвестный аргумент %s\n", argv[i]);
+            return 2;
+        }
+    }
+    total_elems = (uint64_t)(uint32_t)rows * (uint64_t)(uint32_t)cols;
+    if (total_elems == 0 || total_elems > VTM_MAX_ELEMENTS) {
+        fprintf(stderr, "vtm bench: слишком большая матрица\n");
+        return 2;
+    }
+    n = (uint32_t)total_elems;
+    storage_blocks = (n + VTM_TRITS_PER_BLOCK - 1u) / VTM_TRITS_PER_BLOCK;
+    scale_blocks = (n + (uint32_t)scale_block - 1u) / (uint32_t)scale_block;
+    n_words = storage_blocks * VTM_WORDS_PER_BLOCK;
+
+    trits = (int8_t *)calloc((size_t)storage_blocks * VTM_TRITS_PER_BLOCK, 1);
+    words = (uint32_t *)malloc((size_t)n_words * sizeof(uint32_t));
+    scales = (float *)malloc((size_t)scale_blocks * sizeof(float));
+    x = (float *)malloc((size_t)cols * sizeof(float));
+    y_lut = (float *)calloc((size_t)rows, sizeof(float));
+    y_direct = (float *)calloc((size_t)rows, sizeof(float));
+    if (!trits || !words || !scales || !x || !y_lut || !y_direct) {
+        fprintf(stderr, "vtm bench: не хватило памяти\n");
+        free(trits); free(words); free(scales); free(x);
+        free(y_lut); free(y_direct);
+        return 1;
+    }
+    for (w = 0; w < n; w++)
+        trits[w] = (int8_t)((int)(rng_next() % 3u) - 1);
+    for (w = 0; w < n_words; w++)
+        words[w] = vtm_trit_pack(trits + (size_t)w * VTM_TRITS_PER_WORD,
+                                 VTM_TRITS_PER_WORD);
+    for (b = 0; b < scale_blocks; b++)
+        scales[b] = 0.5f + (float)(rng_next() % 1000u) / 1000.0f;
+    for (i = 0; i < cols; i++)
+        x[i] = (float)((int)(rng_next() % 2001u) - 1000) / 100.0f;
+
+    // Прогрев и проверка совпадения двух алгоритмов.
+    vtm_backend_scalar_lut.tmv_blocks(y_lut, (const uint8_t *)words, scales, x,
+                                      rows, cols, scale_block);
+    vtm_backend_scalar_direct.tmv_blocks(y_direct, (const uint8_t *)words, scales,
+                                         x, rows, cols, scale_block);
+    for (i = 0; i < rows; i++) {
+        double diff = fabs((double)y_lut[i] - (double)y_direct[i]);
+        if (diff > max_diff) max_diff = diff;
+    }
+    sink += y_lut[0] + y_direct[0];
+
+    c0 = clock();
+    for (i = 0; i < iters; i++) {
+        vtm_backend_scalar_lut.tmv_blocks(y_lut, (const uint8_t *)words, scales,
+                                          x, rows, cols, scale_block);
+        sink += y_lut[0];
+    }
+    c1 = clock();
+    t_lut = (double)(c1 - c0) / (double)CLOCKS_PER_SEC;
+
+    c0 = clock();
+    for (i = 0; i < iters; i++) {
+        vtm_backend_scalar_direct.tmv_blocks(y_direct, (const uint8_t *)words,
+                                             scales, x, rows, cols, scale_block);
+        sink += y_direct[0];
+    }
+    c1 = clock();
+    t_direct = (double)(c1 - c0) / (double)CLOCKS_PER_SEC;
+    (void)sink;
+
+    printf("TMV, матрица %d×%d (%u весов), блок масштаба %d, "
+           "%d итераций, скалярный C\n",
+           rows, cols, n, scale_block, iters);
+    printf("  LUT243: %8.3f мс/итерацию  %8.1f Мтрит/с  %6.2f ГБ/с чтения\n",
+           t_lut * 1e3 / (double)iters,
+           (double)n * (double)iters / (t_lut > 0.0 ? t_lut : 1.0) / 1e6,
+           (double)storage_blocks * 32.0 * (double)iters
+               / (t_lut > 0.0 ? t_lut : 1.0) / 1e9);
+    printf("  direct: %8.3f мс/итерацию  %8.1f Мтрит/с  %6.2f ГБ/с чтения\n",
+           t_direct * 1e3 / (double)iters,
+           (double)n * (double)iters / (t_direct > 0.0 ? t_direct : 1.0) / 1e6,
+           (double)storage_blocks * 32.0 * (double)iters
+               / (t_direct > 0.0 ? t_direct : 1.0) / 1e9);
+    if (t_lut <= 0.0 || t_direct <= 0.0) {
+        printf("  (время меньше разрешения clock(); увеличьте --iters)\n");
+    } else if (t_lut < t_direct) {
+        speedup = t_direct / t_lut;
+        printf("  быстрее LUT243 в %.2fx\n", speedup);
+    } else {
+        speedup = t_lut / t_direct;
+        printf("  быстрее direct в %.2fx\n", speedup);
+    }
+    printf("  расхождение LUT/direct: %.3g (должно быть ~0)\n", max_diff);
+
+    free(trits); free(words); free(scales); free(x);
+    free(y_lut); free(y_direct);
+    return 0;
+}
+
+// --- main ------------------------------------------------------------------
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        usage(stdout);
+        return 2;
+    }
+    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+        usage(stdout);
+        return 0;
+    }
+    if (strcmp(argv[1], "run") == 0) return cmd_run(argc - 2, argv + 2);
+    if (strcmp(argv[1], "inspect") == 0) return cmd_inspect(argc - 2, argv + 2);
+    if (strcmp(argv[1], "bench") == 0) return cmd_bench(argc - 2, argv + 2);
+    fprintf(stderr, "vtm: неизвестная команда %s\n\n", argv[1]);
+    usage(stderr);
+    return 2;
+}

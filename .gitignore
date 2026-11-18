@@ -243,3 +243,12 @@ distill/out/
 .idea/
 .DS_Store
 **/.DS_Store
+
+# Артефакты сборки C/C++
+src/vtm/*.o
+src/vtm/*.a
+src/vtm/*.d
+src/vtm/vtm
+src/vtm/vtm-tok
+src/vtm/test_vtm
+src/vtm/test_tokenizer
