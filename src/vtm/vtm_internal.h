@@ -125,6 +125,13 @@ struct vtm {
     int             cache_samp_hist[VTM_MAX_REPETITION_WINDOW];
     uint64_t        cache_hits;       // попаданий vtm_run_cached()
     uint64_t        cache_misses;     // полных прогонов vtm_run_cached()
+
+    // --- трассировка по инструкциям (задача 0082) --------------------------
+    // Оба поля NULL после calloc в loader.c: без колбэка интерпретатор не
+    // читает часы и не делает ничего лишнего — одна проверка указателя на
+    // инструкцию. vtm_free() их не освобождает: память не выделяется.
+    vtm_trace_fn    trace_cb;
+    void           *trace_user;
 };
 
 // Записать ошибку в машину и в глобальный буфер vtm_last_error().

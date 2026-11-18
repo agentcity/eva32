@@ -3141,6 +3141,68 @@ static void test_attn_imm_overflow(void) {
     vtm_free(m);
 }
 
+// Трассировка (0082): один вызов на инструкцию, порядок и размеры сходятся,
+// результат с хуком и без — побитово тот же, возврат 1 из колбэка останавливает.
+typedef struct {
+    int calls;
+    uint64_t last_index;
+    uint32_t last_pc;
+    uint32_t ops_seen[64];  // опкоды 0x01..0x0F
+    int bad_order;
+    int bad_fields;
+    int stop_after;
+} trace_probe;
+
+static int trace_cb(void *user, const vtm_trace_rec *rec) {
+    trace_probe *p = (trace_probe *)user;
+
+    if (rec == NULL || p == NULL) return 1;
+    if (p->calls > 0 && rec->index <= p->last_index) p->bad_order = 1;
+    if (rec->out_bytes != rec->out_elems * sizeof(float)) p->bad_fields = 1;
+    if (rec->opcode > VTM_OP_HALT) p->bad_fields = 1;
+    else p->ops_seen[rec->opcode]++;
+    p->last_index = rec->index;
+    p->last_pc = rec->pc;
+    p->calls++;
+    return p->stop_after > 0 && p->calls >= p->stop_after;
+}
+
+static void test_trace_hook(void) {
+    trace_probe probe;
+    vtm_t *m = mini_with_meta(NULL);
+    uint32_t before = 0, after = 0;
+
+    CHECK(m != NULL);
+    if (!m) return;
+    before = vtm_tensor_by_name(m, "y")->f32[0];
+
+    memset(&probe, 0, sizeof probe);
+    vtm_set_trace(m, trace_cb, &probe);
+    CHECK(run_ok(m));
+    after = vtm_tensor_by_name(m, "y")->f32[0];
+
+    CHECK(probe.calls == (int)vtm_instr_count(m));
+    CHECK(probe.bad_order == 0);
+    CHECK(probe.bad_fields == 0);
+    CHECK(probe.ops_seen[VTM_OP_HALT] == 1);
+    // Трассировка не меняет результат: тот же байт, что и без хука.
+    CHECK(before == after);
+    vtm_free(m);
+
+    // Колбэк, вернувший 1, останавливает прогон на первой же инструкции.
+    m = mini_with_meta(NULL);
+    CHECK(m != NULL);
+    if (!m) return;
+    memset(&probe, 0, sizeof probe);
+    probe.stop_after = 1;
+    vtm_set_trace(m, trace_cb, &probe);
+    CHECK(run_ok(m));
+    CHECK(probe.calls == 1);
+    vtm_set_trace(m, NULL, NULL);
+    CHECK(run_ok(m));
+    vtm_free(m);
+}
+
 static void test_cli_stream(void) {
     char out[8192], err[8192];
     int rc;
@@ -4770,6 +4832,7 @@ int main(void) {
     test_cli_text();
     test_cli_chat();
     test_attn_imm_overflow();
+    test_trace_hook();
     test_cli_stream();
     test_cli_limits();
     test_mmap_file_load();

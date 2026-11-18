@@ -374,6 +374,10 @@ static void usage(FILE *out) {
         "      --timeout SEC          прервать генерацию по таймауту: код 124,\n"
         "                             уже сгенерированное печатается.\n"
         "      --stats                статистика в stderr: токены, время, ток/с.\n"
+        "      --trace                трасса в stderr: строка на инструкцию\n"
+        "                             (pc, opcode, номер, выход, время в нс)\n"
+        "      --trace-summary        сводка в stderr: по опкоду вызовы, время,\n"
+        "                             доля; время — реальный замер (0082)\n"
         "      --max-tokens N         синоним --max-new.\n"
         "      --stream               печатать ответ по мере генерации (stdout,\n"
         "                             без буферизации строки; только с --text).\n"
@@ -502,6 +506,74 @@ static double monotonic_now(void) {
     if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
         return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
     return (double)clock() / (double)CLOCKS_PER_SEC;
+}
+
+// --- трассировка по инструкциям (--trace / --trace-summary, задача 0082) ---
+//
+// Трасса — диагностика, поэтому идёт в stderr (как --stats): stdout остаётся
+// разбору «prompt:/вывод:/время:». Строка --trace начинается с имени opcode и
+// заканчивается длительностью в нс — тот же вид, что у строк --trace-summary,
+// поэтому tools/bench_vtm.py разбирает оба режима одним парсером.
+
+#define TRACE_OP_SLOTS 256
+
+typedef struct trace_state {
+    int lines;                  // 1 — печатать каждую инструкцию (--trace)
+    int summary;                // 1 — сводка в конце (--trace-summary)
+    uint64_t events;            // сколько инструкций прошло через callback
+    uint64_t events_ns;         // сумма их длительностей
+    uint64_t per_op_ns[TRACE_OP_SLOTS];
+    uint64_t per_op_count[TRACE_OP_SLOTS];
+    uint64_t per_op_bytes[TRACE_OP_SLOTS];
+} trace_state;
+
+static int trace_cli_cb(void *user, const vtm_trace_rec *rec) {
+    trace_state *ts = (trace_state *)user;
+
+    if (!ts || !rec) return 0;
+    ts->events++;
+    ts->events_ns += rec->dur_ns;
+    if ((unsigned)rec->opcode < TRACE_OP_SLOTS) {
+        ts->per_op_ns[rec->opcode] += rec->dur_ns;
+        ts->per_op_count[rec->opcode]++;
+        ts->per_op_bytes[rec->opcode] += rec->out_bytes;
+    }
+    if (ts->lines) {
+        fprintf(stderr, "%s pc=%u seq=%u out=%u dur=%.1f ns\n",
+                vtm_opcode_name(rec->opcode), (unsigned)rec->pc,
+                (unsigned)rec->index, (unsigned)rec->out_elems,
+                (double)rec->dur_ns);
+    }
+    return 0;
+}
+
+// Сводка: опкод -> вызовов, суммарное время, доля от суммы времён инструкций.
+// Строки начинаются с имени opcode (машинный разбор), шапка — кириллицей.
+static void trace_print_summary(const trace_state *ts, double run_ms) {
+    unsigned op;
+    double total_ns = (double)ts->events_ns;
+
+    fprintf(stderr, "trace-summary: инструкций=%llu, время в инструкциях="
+                    "%.6f мс",
+            (unsigned long long)ts->events, total_ns / 1e6);
+    if (run_ms > 0.0 && total_ns > 0.0)
+        fprintf(stderr, " (%.1f%% времени прогона %.3f мс по монотонным часам)",
+                100.0 * (total_ns / 1e6) / run_ms, run_ms);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "опкод   вызовов     время, мс      доля    выход, КиБ\n");
+    for (op = 0; op < TRACE_OP_SLOTS; op++) {
+        if (ts->per_op_count[op] == 0) continue;
+        fprintf(stderr, "%-6s %9llu %12.6f ms %7.2f%% %12.1f\n",
+                vtm_opcode_name((uint8_t)op),
+                (unsigned long long)ts->per_op_count[op],
+                (double)ts->per_op_ns[op] / 1e6,
+                total_ns > 0.0 ? 100.0 * (double)ts->per_op_ns[op] / total_ns
+                               : 0.0,
+                (double)ts->per_op_bytes[op] / 1024.0);
+    }
+    fprintf(stderr, "итого  %9llu %12.6f мс %7.2f%%\n",
+            (unsigned long long)ts->events, total_ns / 1e6,
+            total_ns > 0.0 ? 100.0 : 0.0);
 }
 
 static int timeout_expired(double started, double timeout_sec) {
@@ -945,6 +1017,9 @@ static int cmd_run(int argc, char **argv) {
     int stream = 0;
     int max_new = 8;
     int stats = 0;
+    int trace_lines = 0;
+    int trace_summary = 0;
+    trace_state trace;
     int timed_out = 0;
     double timeout_sec = 0.0;
     double t_start = 0.0, t_end = 0.0;
@@ -990,6 +1065,10 @@ static int cmd_run(int argc, char **argv) {
             stream = 1;
         } else if (strcmp(argv[i], "--stats") == 0) {
             stats = 1;
+        } else if (strcmp(argv[i], "--trace") == 0) {
+            trace_lines = 1;
+        } else if (strcmp(argv[i], "--trace-summary") == 0) {
+            trace_summary = 1;
         } else if (strcmp(argv[i], "--system") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "vtm run: --system без значения\n");
@@ -1167,6 +1246,12 @@ args_ok:
     }
     if (backend_name)
         vtm_set_backend(m, vtm_backend_by_name(backend_name));
+
+    memset(&trace, 0, sizeof trace);
+    trace.lines = trace_lines;
+    trace.summary = trace_summary;
+    if (trace_lines || trace_summary)
+        vtm_set_trace(m, trace_cli_cb, &trace);
 
     // В режиме --stream stdout отдан только тексту ответа (его читают голос и
     // SSE), поэтому вся служебная информация уходит в stderr. Без --stream
@@ -1514,6 +1599,9 @@ generation_done:
                     sec > 0.0 ? (double)n_generated / sec : 0.0);
         fprintf(info, "\n");
     }
+
+    if (trace_summary)
+        trace_print_summary(&trace, (t_end - t_start) * 1000.0);
 
     if (timed_out)
         fprintf(stderr, "vtm run: таймаут %g с: генерация прервана\n",

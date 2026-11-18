@@ -13,16 +13,19 @@
 2. считает мс/токен, токенов/с, мс/шаг (полный проход) и wall-время, отдельно
    отдаёт «вне CL» — запуск процесса и загрузку контейнера (таймер CLI идёт
    после ``vtm_load``);
-3. **разбивает время по операциям**. Идеальный источник — ``--trace`` из задачи
-   0065, но в текущей сборке его нет (проверяется через ``vtm --help``), поэтому
-   по умолчанию используется **оценка через сравнение конфигураций**: в
-   байткод копируются инструкции одного класса (TMV, ATTN, RMSN, SAMP, KVW), и
-   прирост времени на копию даёт вклад класса в проход. Это именно оценка:
-   копии меняют кэш-поведение и порядок памяти, а накладные расходы
-   диспетчеризации попадают в остаток. Скрипт честно помечает метод в JSON
-   (``breakdown.method``) и в отчёте;
-4. если ``--trace`` в сборке есть и его вывод разбирается — разбивка берётся из
-   trace, а оценка дублированием остаётся как перекрёстная проверка;
+3. **разбивает время по операциям**. Источник — трасса интерпретатора (задача
+   0082: ``vtm run --trace-summary`` или ``--trace``, проверяется через
+   ``vtm --help``): интерпретатор снимает ``clock_gettime(CLOCK_MONOTONIC)``
+   вокруг каждой инструкции, так что доли — **реальный замер**, а не оценка.
+   Если сборка трассы не умеет (старый бинарник), остаётся **оценка через
+   сравнение конфигураций**: в байткод копируются инструкции одного класса
+   (TMV, ATTN, RMSN, SAMP, KVW), и прирост времени на копию даёт вклад класса в
+   проход. Оценка шумит (копии меняют кэш-поведение, диспетчеризация уходит в
+   остаток), поэтому она — резерв и перекрёстная проверка; метод честно
+   помечен в JSON (``breakdown.method``) и в отчёте;
+4. тайминги сценариев снимаются **без** трассировки (хук замедляет прогон), а
+   доли — отдельным прогоном с трассой; при наличии trace оценка дублированием
+   всё равно считается и лежит в ``breakdown.dup_estimate``;
 5. ``--json`` — машинный отчёт, иначе таблица; ``--budget-ms-token`` включает
    сравнение с бюджетом (превышение — код возврата 1).
 
@@ -129,7 +132,9 @@ BREAKDOWN_NOTE = (
     "копии меняют кэш-поведение, неучтённое — в остатке"
 )
 TRACE_NOTE = (
-    "разбивка из --trace: интерпретатор сам печатает время по операциям"
+    "разбивка из трассы интерпретатора (задача 0082): время каждой инструкции — "
+    "clock_gettime(CLOCK_MONOTONIC), интерпретатор суммирует по опкодам; это "
+    "реальный замер, а не оценка"
 )
 
 #: Ключ меты с sha256-блоком (задача 0066). Производные контейнеры нельзя
@@ -236,14 +241,22 @@ def build_run_command(
     *,
     backend: str | None = None,
     trace: bool = False,
+    trace_summary: bool = False,
 ) -> list[str]:
-    """Собрать команду ``vtm run`` (без текстового режима и токенизатора)."""
+    """Собрать команду ``vtm run`` (без текстового режима и токенизатора).
+
+    ``trace`` — построчная трасса (``--trace``), ``trace_summary`` — сводка по
+    опкодам (``--trace-summary``, задача 0082). Для разбивки нужен ровно один
+    из них: сводку интерпретатор считает сам и печатает одну строку на опкод.
+    """
     if not token_ids:
         raise BenchError("build_run_command: пустой промпт")
     if max_new < 0:
         raise BenchError("build_run_command: max_new < 0")
     if backend is not None and backend not in BACKEND_CHOICES:
         raise BenchError(f"build_run_command: неизвестный бэкенд {backend!r}")
+    if trace and trace_summary:
+        raise BenchError("build_run_command: --trace и --trace-summary взаимоисключающие")
     command = [
         str(vtm_bin),
         "run",
@@ -257,6 +270,8 @@ def build_run_command(
         command += ["--backend", backend]
     if trace:
         command.append("--trace")
+    if trace_summary:
+        command.append("--trace-summary")
     return command
 
 
@@ -549,13 +564,29 @@ def detect_trace(vtm_bin: str, *, runner: Runner | None = None) -> bool:
     help — единственный надёжный способ не ловить ложный код 2 на каждом
     запуске.
     """
+    return "--trace" in _help_text(vtm_bin, runner=runner)
+
+
+def detect_trace_summary(vtm_bin: str, *, runner: Runner | None = None) -> bool:
+    """Есть ли ``--trace-summary`` (задача 0082).
+
+    Сводка по опкодам — та же длительность инструкций, что у ``--trace``, но
+    интерпретатор суммирует её сам: на прогоне с предзаполнением это в сотни
+    раз меньше вывода, поэтому разбивка предпочитает её. Старые сборки (и
+    mock-раннер в тестах) знают только ``--trace`` — тогда остаётся он.
+    """
+    return "--trace-summary" in _help_text(vtm_bin, runner=runner)
+
+
+def _help_text(vtm_bin: str, *, runner: Runner | None = None) -> str:
+    """Вывод ``vtm --help`` ("" — если бинарника нет или он не ответил)."""
     if not os.path.exists(vtm_bin):
-        return False
+        return ""
     try:
         proc = run_cli([str(vtm_bin), "--help"], runner=runner, timeout=30.0)
     except BenchError:
-        return False
-    return "--trace" in ((proc.stdout or "") + (proc.stderr or ""))
+        return ""
+    return (proc.stdout or "") + (proc.stderr or "")
 
 
 # ---------------------------------------------------------------------------
@@ -1016,13 +1047,15 @@ def duplicate_instructions(
 
 
 def parse_trace_output(text: str) -> dict[str, float] | None:
-    """Разобрать ``--trace``, если он есть, в ``{OP: мс}``.
+    """Разобрать ``--trace``/``--trace-summary`` в ``{OP: мс}``.
 
-    Формат trace задачей 0065 не зафиксирован, поэтому разбор терпимый:
-    сначала JSON (``{"op": ms}``, ``{"ops": {...}}`` или список записей
-    ``{"op","ms"}``), затем строки вида ``TMV ... 12.3 мс`` / ``ATTN: 4.5 ms``.
-    Если ничего не разобралось — ``None``: лучше честно откатиться на оценку,
-    чем показывать выдуманные числа.
+    Формат 0082: строка начинается с имени opcode, время — последнее число
+    с единицей (``TMV pc=3 seq=12 out=128 dur=3500.0 ns``; ``TMV 24 0.129000 ms
+    94.4%``). Разбор при этом терпимый, потому что старые/сторонние сборки
+    могут писать иначе: сначала JSON (``{"TMV": ms}``, ``{"ops": {...}}`` или
+    список ``{"op","ms"}``), затем строки вида ``TMV ... 12.3 мс`` /
+    ``ATTN: 4.5 ms``. Ничего не разобралось — ``None``: лучше честно откатиться
+    на оценку, чем показывать выдуманные числа.
     """
     if not text or not text.strip():
         return None
@@ -1204,7 +1237,13 @@ def breakdown_from_trace(
     backend: str,
     forwards: int,
 ) -> list[dict[str, Any]]:
-    """Строки разбивки из trace: ``{OP: мс}`` -> классы и доли."""
+    """Строки разбивки из trace: ``{OP: мс}`` -> классы и доли.
+
+    Доля считается от суммы измеренных времён инструкций, поэтому доли
+    складываются в 100%. Насколько эта сумма покрывает базу без трассировки
+    (цикл диспетчеризации, замедление от хука) — поле ``covered_pct_of_base``
+    у элемента разбивки.
+    """
     totals = {str(name).upper(): float(value) for name, value in trace_measured.items()}
     total_ms = sum(totals.values())
     rows: list[dict[str, Any]] = []
@@ -1518,7 +1557,8 @@ def format_report(report: Mapping[str, Any]) -> str:
     lines.append(f"  операции : {ops}")
     lines.append(
         f"  vtm      : {cli.get('vtm_bin')}  "
-        f"--trace: {'есть' if cli.get('trace') else 'нет'}"
+        f"--trace: {'есть' if cli.get('trace') else 'нет'}, "
+        f"--trace-summary: {'есть' if cli.get('trace_summary') else 'нет'}"
     )
     host = report.get("host", {})
     lines.append(
@@ -1547,19 +1587,21 @@ def format_report(report: Mapping[str, Any]) -> str:
     lines.append("")
     for item in report["breakdown"]:
         scenario = item["scenario"]
+        # У trace-разбивки method — реальный замер; остальное — оценка.
+        method = item["method"] if item["method"] == "trace" else item["method"] + " (оценка)"
         lines.append(
             f"Разбивка, ctx={scenario['context']} gen={scenario['gen']} "
-            f"{scenario['backend']}: метод — {item['method']}"
-            + ("" if item["method"] == "trace" else " (оценка)")
+            f"{scenario['backend']}: метод — {method}"
         )
         lines.append(breakdown_table(item["rows"], item.get("residual_ms")))
-        if item["method"] != "trace":
-            lines.append(f"  {item['note']}")
-            lines.append(
-                f"  покрыто: {_ms(item.get('covered_ms'))} мс из "
-                f"{_ms(item.get('base_time_ms'))} мс, остаток "
-                f"{_pct(item.get('residual_share_pct'))}"
-            )
+        lines.append(f"  {item['note']}")
+        coverage = item.get("covered_pct_of_base")
+        lines.append(
+            f"  покрыто: {_ms(item.get('covered_ms'))} мс из "
+            f"{_ms(item.get('base_time_ms'))} мс"
+            + (f" ({coverage:.1f}% базы)" if coverage is not None else "")
+            + f", остаток {_pct(item.get('residual_share_pct'))}"
+        )
         lines.append("")
     crosscheck = report.get("crosscheck")
     if crosscheck:
@@ -1719,6 +1761,11 @@ def main(argv: Sequence[str] | None = None, *, runner: Runner | None = None) -> 
                 "(проверено через vtm --help); используйте --trace auto/off"
             )
         trace_available = args.trace == "on" or (args.trace == "auto" and detected_trace)
+        # Сводка (--trace-summary, задача 0082) — предпочтительный источник:
+        # интерпретатор суммирует сам, вывод не растёт с числом инструкций.
+        summary_available = trace_available and detect_trace_summary(
+            vtm_bin, runner=runner
+        )
 
         notes: list[str] = []
         if synthetic:
@@ -1729,8 +1776,17 @@ def main(argv: Sequence[str] | None = None, *, runner: Runner | None = None) -> 
             )
         if args.no_breakdown:
             notes.append("разбивка отключена (--no-breakdown): таблица без долей")
+        elif summary_available:
+            notes.append(
+                "разбивка — реальный замер: vtm run --trace-summary, сумма "
+                "длительностей инструкций по опкодам (CLOCK_MONOTONIC), "
+                "не оценка; оценка дублированием остаётся для сверки"
+            )
         elif trace_available:
-            notes.append("--trace есть: разбивка берётся из него")
+            notes.append(
+                "разбивка — реальный замер: vtm run --trace, длительности "
+                "инструкций по опкодам (оценка дублированием — для сверки)"
+            )
         else:
             notes.append(
                 "в этой сборке vtm нет --trace (проверено через vtm --help): "
@@ -1774,7 +1830,9 @@ def main(argv: Sequence[str] | None = None, *, runner: Runner | None = None) -> 
                 seed=args.seed,
                 runner=runner,
                 timeout=args.timeout,
-                trace=trace_available,
+                # Трасса замедляет прогон, поэтому тайминги сценариев снимаются
+                # без неё: доли берёт отдельный прогон с --trace-summary.
+                trace=False,
             )
             if args.budget_ms_token is not None:
                 measured["budget_ok"] = (
@@ -1810,7 +1868,7 @@ def main(argv: Sequence[str] | None = None, *, runner: Runner | None = None) -> 
                         runner=runner,
                         timeout=args.timeout,
                         seed=args.seed,
-                        trace=trace_available,
+                        trace=False,
                     )
                     if trace_available:
                         item = _try_trace_breakdown(
@@ -1825,6 +1883,7 @@ def main(argv: Sequence[str] | None = None, *, runner: Runner | None = None) -> 
                             seed=args.seed,
                             runner=runner,
                             timeout=args.timeout,
+                            summary=summary_available,
                         )
                     breakdown.append(item)
 
@@ -1834,6 +1893,7 @@ def main(argv: Sequence[str] | None = None, *, runner: Runner | None = None) -> 
             cli={
                 "vtm_bin": vtm_bin,
                 "trace": trace_available,
+                "trace_summary": summary_available,
                 "trace_mode": args.trace,
             },
             config={
@@ -1901,17 +1961,32 @@ def _try_trace_breakdown(
     seed: int,
     runner: Runner | None,
     timeout: float | None,
+    summary: bool = False,
 ) -> dict[str, Any]:
-    """Пересчитать разбивку из trace, если его вывод действительно разобрался."""
+    """Пересчитать разбивку из trace, если его вывод действительно разобрался.
+
+    ``summary`` — сборка умеет ``--trace-summary`` (0082): тогда берётся
+    сводка, иначе построчный ``--trace``. В обоих случаях это реальные
+    длительности инструкций, а не оценка.
+    """
     trace = None
+    mode = "summary" if summary else "lines"
     try:
         tokens = token_ids(context, vocab, seed)
         command = build_run_command(
-            vtm_bin, prepared, tokens, gen, backend=backend, trace=True
+            vtm_bin,
+            prepared,
+            tokens,
+            gen,
+            backend=backend,
+            trace=not summary,
+            trace_summary=summary,
         )
         collected: list[dict[str, float]] = []
         for _ in range(repeat):
             proc = run_cli(command, runner=runner, timeout=timeout)
+            # --trace/--trace-summary печатаются в stderr (диагностика), но
+            # старые/сторонние сборки могли писать в stdout — смотрим оба.
             parsed = parse_trace_output(proc.stdout) or parse_trace_output(
                 proc.stderr or ""
             )
@@ -1936,14 +2011,17 @@ def _try_trace_breakdown(
             trace = None
     if not trace:
         result = dict(item)
-        result["trace"] = {"available": True, "parsed": False}
+        result["trace"] = {"available": True, "parsed": False, "mode": mode}
         result["note"] = (
             item.get("note", BREAKDOWN_NOTE)
-            + "; --trace есть, но его вывод не разобран или не сходится с "
-            "временем CLI (формат не зафиксирован) — оставлена оценка дублированием"
+            + "; трассировка есть, но её вывод не разобран или не сходится с "
+            "временем CLI — оставлена оценка дублированием"
         )
         return result
     forwards = context + gen - 1
+    # Доли — от измеренной суммы времён инструкций (складываются в 100%).
+    # Сколько эта сумма покрывает от базы без трассировки, видно отдельно:
+    # расхождение — цикл диспетчеризации плюс замедление от самого хука.
     rows = breakdown_from_trace(
         trace,
         context=context,
@@ -1951,18 +2029,21 @@ def _try_trace_breakdown(
         backend=backend,
         forwards=forwards,
     )
+    covered_ms = sum(trace.values())
+    covered_pct = (covered_ms / float(base_ms) * 100.0) if base_ms else None
     result = dict(item)
     result.update(
         {
             "method": "trace",
             "method_estimation": False,
-            "note": TRACE_NOTE,
+            "note": TRACE_NOTE + (" (--trace-summary)" if summary else " (--trace)"),
             "rows": rows,
             "trace_totals_ms": trace,
-            "trace": {"available": True, "parsed": True},
+            "trace": {"available": True, "parsed": True, "mode": mode},
+            "covered_ms": covered_ms,
+            "covered_pct_of_base": covered_pct,
             "residual_ms": 0.0,
             "residual_share_pct": 0.0,
-            "covered_ms": sum(trace.values()),
             "dup_estimate": {
                 "base_time_ms": item.get("base_time_ms"),
                 "rows": item.get("rows"),

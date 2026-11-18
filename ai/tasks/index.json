@@ -555,7 +555,7 @@
   {
     "id": "0082",
     "title": "Метрики по операциям вместо оценки (trace)",
-    "status": "in_progress",
+    "status": "done",
     "file": "0082-vtm-metrics.md",
     "assignee": ""
   },

@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // --- диагностика -----------------------------------------------------------
 
@@ -1838,17 +1839,67 @@ vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
 
 // --- главный цикл ----------------------------------------------------------
 
+// --- трассировка по инструкциям (задача 0082) ------------------------------
+//
+// Стоимость хука — два clock_gettime на инструкцию плюс сам callback. Без
+// callback (trace_cb == NULL) цикл ниже не читает часы: tracing снимается
+// один раз на входе в vtm_run(), поэтому цена выключенной трассировки — одна
+// проверка int на инструкцию.
+
+static uint64_t trace_now_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0u;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+// Размер выхода инструкции: элементов в dst (все dst в VTM — f32-тензоры).
+// HALT ничего не пишет, его dst — мусор из байткода, поэтому 0.
+static uint32_t trace_out_elems(const vtm_t *m, const vtm_instr *in) {
+    if (in->opcode == VTM_OP_HALT) return 0u;
+    if (in->dst == VTM_NO_TENSOR || (uint32_t)in->dst >= m->n_tensors) return 0u;
+    return m->tensors[in->dst].n_elements;
+}
+
+// Отдать запись в callback. 1 — callback просит остановить прогон.
+static int trace_emit(vtm_t *m, uint32_t *seq, uint32_t pc,
+                      const vtm_instr *in, uint64_t t0) {
+    vtm_trace_rec rec;
+    uint64_t t1 = trace_now_ns();
+
+    memset(&rec, 0, sizeof rec);
+    rec.index = *seq;
+    rec.pc = pc;
+    rec.opcode = in->opcode;
+    rec.flags = in->flags;
+    rec.out_elems = trace_out_elems(m, in);
+    rec.out_bytes = rec.out_elems * (uint32_t)sizeof(float);
+    rec.t_ns = t0;
+    rec.dur_ns = (t1 >= t0) ? (t1 - t0) : 0u;
+    (*seq)++;
+    return m->trace_cb(m->trace_user, &rec) != 0 ? 1 : 0;
+}
+
+void vtm_set_trace(vtm_t *m, vtm_trace_fn cb, void *user) {
+    if (!m) return;
+    m->trace_cb = cb;
+    m->trace_user = cb ? user : NULL;
+}
+
 vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {
     uint32_t i;
+    uint32_t seq = 0;
+    int tracing;
     vtm_status st;
 
     if (!m) return VTM_E_ARG;
     if (!m->backend) m->backend = &vtm_backend_scalar_lut;
     m->halted = 0;
     m->error[0] = '\0';
+    tracing = m->trace_cb != NULL;
 
     for (i = 0; i < m->n_instr; i++) {
         const vtm_instr *in = &m->instr[i];
+        uint64_t trace_t0 = tracing ? trace_now_ns() : 0u;
         switch (in->opcode) {
         case VTM_OP_TMV:
             st = op_tmv(m, i, in);
@@ -1886,7 +1937,11 @@ vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {
         case VTM_OP_SAMP: {
             int stop = 0;
             st = op_samp(m, i, in, emit, user, &stop);
-            if (st == VTM_OK && stop) return VTM_OK;
+            if (st == VTM_OK && stop) {
+                // Запись нужна и на остановке по emit: инструкция исполнена.
+                if (tracing) (void)trace_emit(m, &seq, i, in, trace_t0);
+                return VTM_OK;
+            }
             break;
         }
         case VTM_OP_CPY:
@@ -1897,12 +1952,16 @@ vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {
             break;
         case VTM_OP_HALT:
             m->halted = 1;
+            if (tracing) (void)trace_emit(m, &seq, i, in, trace_t0);
             return VTM_OK;
         default:
             st = fail(m, i, VTM_E_OPCODE, "неизвестный opcode 0x%02x",
                       (unsigned)in->opcode);
             break;
         }
+        // Неуспешная инструкция тоже попадает в трассу — по ней видно, где
+        // прогон кончился; callback может попросить вежливую остановку.
+        if (tracing && trace_emit(m, &seq, i, in, trace_t0) != 0) return VTM_OK;
         if (st != VTM_OK) return st;
     }
     return VTM_OK;
