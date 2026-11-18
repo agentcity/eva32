@@ -292,5 +292,12 @@
     "status": "done",
     "file": "0042-demo-ternary.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0043",
+    "title": "Квантованные эмбеддинги сквозь путь",
+    "status": "in_progress",
+    "file": "0043-trit-embeddings-e2e.md",
+    "assignee": "agent:trit-emb-e2e"
   }
 ]
