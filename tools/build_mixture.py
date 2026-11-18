@@ -22,24 +22,24 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 #: Слои смеси: имя → (доля, файлы-кандидаты по убыванию приоритета).
 LAYERS: dict[str, tuple[float, list[str]]] = {
-    "code": (0.40, [
+    "code": (0.45, [
         "distill/out/code_pairs.jsonl",
         "distill/pulled/ru_codefeedback.jsonl",
         "distill/pulled/russian_code_qa.jsonl",
         "distill/pulled/magicoder_ru.jsonl",
     ]),
-    "business": (0.30, [
+    "business": (0.35, [
         # Делексикализованные пары: модель учит форму ответа по контексту, а не наши
         # цены. Реальные пары (business_grounded.jsonl) идут в проверку RAG, не в веса.
         "distill/out/business_script.jsonl",
         "distill/out/business_grounded_delex.jsonl",
         "distill/out/pairs.jsonl",
     ]),
-    "general": (0.20, [
+    "general": (0.15, [
         "distill/pulled/russian_instructions.jsonl",
         "distill/pulled/easy_instructions.jsonl",
     ]),
-    "behavior": (0.10, [
+    "behavior": (0.05, [
         "distill/out/behavior_pairs.jsonl",
     ]),
 }

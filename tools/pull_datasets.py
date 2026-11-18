@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import sys
@@ -298,20 +299,47 @@ def _dedupe_key(question: str) -> str:
     return re.sub(r"[^а-яa-z0-9]+", "", question.lower())[:200]
 
 
-def pull(key: str, *, limit: int, out: pathlib.Path) -> int:
+def pull(key: str, *, limit: int, out: pathlib.Path, resume: bool = False) -> int:
+    """Скачать и дописать пары. Запись атомарная: сбой не убивает прежние данные.
+
+    Качалка раньше писала прямо в файл: таймаут на середине обнулил уже собранные
+    3 000 пар. Теперь пишем во временный файл, при --resume подмешиваем прежние строки
+    (без дублей), и только потом переименовываем.
+    """
     src = SOURCES[key]
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: list[dict] = []
     seen: set[str] = set()
-    written = 0
-    with out.open("w", encoding="utf-8") as fh:
-        for pair in iter_pairs(src, limit):
-            k = _dedupe_key(pair["question"])
-            if not k or k in seen:
+    if resume and out.exists():
+        for line in out.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
                 continue
-            seen.add(k)
-            fh.write(json.dumps(pair, ensure_ascii=False) + "\n")
-            written += 1
-    return written
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            key_ = _dedupe_key(row.get("question", ""))
+            if key_ and key_ not in seen:
+                seen.add(key_)
+                existing.append(row)
+
+    fresh: list[dict] = []
+    for pair in iter_pairs(src, limit):
+        k = _dedupe_key(pair["question"])
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        fresh.append(pair)
+
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        for row in existing + fresh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, out)
+    return len(fresh)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -320,6 +348,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--list", action="store_true", help="показать источники")
     parser.add_argument("--limit", type=int, default=0, help="0 — все строки")
     parser.add_argument("--out", type=pathlib.Path, default=None)
+    parser.add_argument("--resume", action="store_true",
+                        help="не терять уже скачанное: дописать новые пары к файлу")
     args = parser.parse_args(argv)
 
     if args.list or not args.source:
@@ -329,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     out = args.out or (OUT_DIR / f"{args.source}.jsonl")
-    n = pull(args.source, limit=args.limit, out=out)
+    n = pull(args.source, limit=args.limit, out=out, resume=args.resume)
     print(f"{args.source}: {n} пар → {out}")
     if n == 0:
         print("предупреждение: ни одной пары не прошло фильтры", file=sys.stderr)

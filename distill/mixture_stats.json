@@ -1,0 +1,48 @@
+{
+  "total": 75000,
+  "train": 67500,
+  "val": 7500,
+  "seed": 42,
+  "layers": {
+    "code": {
+      "нужно": 33750,
+      "взято": 33750,
+      "файлы": {
+        "distill/out/code_pairs.jsonl": 4037,
+        "distill/pulled/ru_codefeedback.jsonl": 29978
+      },
+      "добрано": 265
+    },
+    "business": {
+      "нужно": 26250,
+      "взято": 26250,
+      "файлы": {
+        "distill/out/business_script.jsonl": 24920,
+        "distill/out/business_grounded_delex.jsonl": 1330
+      }
+    },
+    "general": {
+      "нужно": 11250,
+      "взято": 11250,
+      "файлы": {
+        "distill/pulled/russian_instructions.jsonl": 13073
+      },
+      "добрано": 1823
+    },
+    "behavior": {
+      "нужно": 3750,
+      "взято": 1662,
+      "файлы": {
+        "distill/out/behavior_pairs.jsonl": 1662
+      }
+    }
+  },
+  "доли_факт": {
+    "code": 0.454,
+    "business": 0.35,
+    "general": 0.174,
+    "behavior": 0.022
+  },
+  "train_sha256": "451a2e202f77fa10d58bfdaa7f6b9f19e336b36a2c5286afe52d8e3271dacab7",
+  "val_sha256": "004f641ba8e801a66c538ceb9200cde71d2cc74405fc497f07c440d48f3c730b"
+}

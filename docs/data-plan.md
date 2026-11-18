@@ -78,6 +78,39 @@
 5. Eval: `MERA-evaluation/ruCodeEval` (164 задачи) как внешний бенчмарк кода
    + наш golden для бизнеса.
 
+## Как собрать с нуля
+
+```bash
+# 1. Внешние наборы (curl качает быстрее Python-стриминга)
+curl -L -C - -o /tmp/ri.jsonl \
+  https://huggingface.co/datasets/Lev384501/russian_instructions_2_cleaned/resolve/main/dataset.jsonl
+HF_HOME=$PWD/.hfcache PYTHONPATH=.pylibs python3.13 tools/pull_datasets.py \
+  --source ru_codefeedback --limit 30000 --resume
+
+# 2. Наши банки вопросов (в git)
+python3 distill/gen_code_questions.py --count 4064
+python3 distill/gen_business_questions.py --count 25000
+python3 distill/gen_business_questions.py --count 2200 --from-catalog
+python3 distill/gen_behavior_questions.py --count 2000
+
+# 3. Пары (в git, чтобы не платить дважды) → делексикализация каталога
+python3 -m distill.delex --in distill/out/business_grounded.jsonl \
+  --out distill/out/business_grounded_delex.jsonl
+
+# 4. Смесь
+python3 tools/build_mixture.py --total 75000 --out runs/mixture
+```
+
+## Итоговая смесь (2026-11-18)
+
+| Слой | Пар | Доля |
+|---|---|---|
+| Код | 34 037 | 45,4% |
+| Бизнес | 26 250 | 35,0% |
+| Общие инструкции | 13 073 | 17,4% |
+| Поведение | 1 662 | 2,2% |
+| **Всего** | **75 000** | train 67 500 / val 7 500 |
+
 ## Стоимость
 
 | Этап | Объём | Цена |
