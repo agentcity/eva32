@@ -519,9 +519,37 @@
   },
   {
     "id": "0080",
-    "title": "Синхронизировать эталон: окно контекста и доки ATTN",
-    "status": "pending",
-    "file": "0080-ref-window.md",
-    "assignee": ""
+    "title": "Эталон догоняет окно контекста",
+    "status": "in_progress",
+    "file": "0080-vtm-ref-window.md",
+    "assignee": "agent:vtm-ref-window"
+  },
+  {
+    "id": "0081",
+    "title": "Кэш промпта: не пересчитывать одинаковый префикс",
+    "status": "in_progress",
+    "file": "0081-vtm-prompt-cache.md",
+    "assignee": "agent:vtm-prompt-cache"
+  },
+  {
+    "id": "0083",
+    "title": "Сессии: дедуплицировать SHA и добавить лимит с LRU",
+    "status": "in_progress",
+    "file": "0083-vtm-session-lru.md",
+    "assignee": "agent:vtm-session-lru"
+  },
+  {
+    "id": "0084",
+    "title": "Портируемость: Windows и big-endian — честный отказ вместо тихой ошибки",
+    "status": "in_progress",
+    "file": "0084-vtm-portability.md",
+    "assignee": "agent:vtm-portability"
+  },
+  {
+    "id": "0085",
+    "title": "status.md: привести к текущему состоянию проекта",
+    "status": "in_progress",
+    "file": "0085-vtm-status-doc.md",
+    "assignee": "agent:vtm-status-doc"
   }
 ]
