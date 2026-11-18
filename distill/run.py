@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import os
 import sys
 from datetime import datetime, timezone
@@ -53,39 +54,120 @@ def main() -> int:
     ap.add_argument("--mock", action="store_true", help="без сети: учитель-заглушка")
     ap.add_argument("--no-system", action="store_true",
                     help="не передавать prompts/system.ru.md (учим свободному стилю, не нашему)")
+    ap.add_argument("--system", default=None,
+                    help="путь к системному промпту (по умолчанию prompts/system.ru.md)")
+    ap.add_argument("--profile", choices=("prose", "code"), default="prose",
+                    help="набор проверок ответа: проза (каталог) или код")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="параллельных запросов к учителю (по умолчанию 1)")
+    ap.add_argument("--incremental", action="store_true",
+                    help="писать каждую принятую пару сразу (переживает обрыв)")
+    ap.add_argument("--resume", action="store_true",
+                    help="пропустить вопросы, на которые уже есть ответы в --out")
     args = ap.parse_args()
 
     questions = load_questions(args.questions)
     if args.limit:
         questions = questions[: args.limit]
     teacher = Teacher(mock=args.mock)
+    system_path = args.system or SYSTEM
     system = None
     if not args.no_system:
-        with open(SYSTEM, encoding="utf-8") as fh:
+        with open(system_path, encoding="utf-8") as fh:
             system = fh.read().strip()
+
+    sink = None
+    if args.incremental:
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        mode = "a" if args.resume else "w"
+        sink = open(args.out, mode, encoding="utf-8")
+
+    def emit(row: dict) -> None:
+        if sink is None:
+            return
+        sink.write(json.dumps(row, ensure_ascii=False) + "\n")
+        sink.flush()
+
+    if args.resume and os.path.exists(args.out):
+        done = set()
+        with open(args.out, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    done.add(json.loads(line)["question"])
+        before = len(questions)
+        questions = [q for q in questions if q["question"] not in done]
+        print(f"возобновление: уже готово {before - len(questions)}, осталось {len(questions)}")
 
     pairs, rejected = [], []
     tok_in = tok_out = 0
     cost_rub = 0.0
-    for item in questions:
+    workers = max(1, args.workers)
+    local = threading.local()
+
+    def worker(item: dict) -> dict:
+        t = getattr(local, "teacher", None)
+        if t is None:
+            t = Teacher(mock=args.mock)
+            local.teacher = t
         q = item["question"]
-        answer = teacher.ask(q, item.get("context"), system)
-        tok_in += int(teacher.last_usage.get("prompt_tokens") or 0)
-        tok_out += int(teacher.last_usage.get("completion_tokens") or 0)
-        cost_rub += float(teacher.last_usage.get("cost_rub") or 0)
-        problems = filters.check(q, answer, item.get("context"))
-        row = {
-            "question": q,
-            "context": item.get("context"),
+        answer = t.ask(q, item.get("context"), system)
+        return {
+            "item": item,
             "answer": answer,
+            "usage": dict(getattr(t, "last_usage", {}) or {}),
+            "model": t.model if not args.mock else "mock",
+        }
+
+    def to_row(result: dict) -> dict:
+        item = result["item"]
+        return {
+            "question": item["question"],
+            "context": item.get("context"),
+            "answer": result["answer"],
             "meta": {
-                "model": teacher.model if not args.mock else "mock",
+                "model": result["model"],
                 "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "flags": problems,
+                "flags": filters.check(item["question"], result["answer"],
+                                       item.get("context"), profile=args.profile),
+                "gen": (item.get("meta") or {}),
             },
         }
-        (rejected if problems else pairs).append(row)
 
+    if workers == 1:
+        results_iter = map(worker, questions)
+        for idx, result in enumerate(results_iter, 1):
+            usage = result["usage"]
+            tok_in += int(usage.get("prompt_tokens") or 0)
+            tok_out += int(usage.get("completion_tokens") or 0)
+            cost_rub += float(usage.get("cost_rub") or 0)
+            row = to_row(result)
+            (rejected if row["meta"]["flags"] else pairs).append(row)
+            if not row["meta"]["flags"]:
+                emit(row)
+            if idx % 50 == 0:
+                print(f"  {idx}/{len(questions)}: принято {len(pairs)}, "
+                      f"потрачено {cost_rub:.2f} ₽", flush=True)
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(worker, item) for item in questions]
+            for idx, fut in enumerate(as_completed(futures), 1):
+                result = fut.result()
+                usage = result["usage"]
+                tok_in += int(usage.get("prompt_tokens") or 0)
+                tok_out += int(usage.get("completion_tokens") or 0)
+                cost_rub += float(usage.get("cost_rub") or 0)
+                row = to_row(result)
+                (rejected if row["meta"]["flags"] else pairs).append(row)
+                if not row["meta"]["flags"]:
+                    emit(row)
+                if idx % 100 == 0:
+                    print(f"  {idx}/{len(questions)}: принято {len(pairs)}, "
+                          f"потрачено {cost_rub:.2f} ₽", flush=True)
+
+    if sink is not None:
+        sink.close()
     pairs = filters.dedupe(pairs)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as fh:

@@ -327,5 +327,12 @@
     "status": "in_progress",
     "file": "0053-vtm-chat.md",
     "assignee": "agent:vtm-chat"
+  },
+  {
+    "id": "0045",
+    "title": "Данные по программированию на русском",
+    "status": "in_progress",
+    "file": "0045-code-data.md",
+    "assignee": "saron"
   }
 ]

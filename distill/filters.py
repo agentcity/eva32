@@ -64,8 +64,16 @@ def norm_question(text: str) -> str:
     return re.sub(r"[\s?!.]+$", "", t)
 
 
-def check(question: str, answer: str, context: str | None = None) -> list[str]:
-    """Вернуть список проблем; пустой список — пара годится для обучения."""
+def check(question: str, answer: str, context: str | None = None,
+          profile: str = "prose") -> list[str]:
+    """Вернуть список проблем; пустой список — пара годится для обучения.
+
+    ``profile="code"`` — ответы по программированию: латиница и длинные листинги
+    нормальны, поэтому проверки «чужой язык» и «длина» заменены на «есть русское
+    объяснение» и «нет внешних ссылок».
+    """
+    if profile == "code":
+        return _check_code(question, answer)
     problems: list[str] = []
     if not length_ok(answer):
         problems.append("length")
@@ -77,6 +85,28 @@ def check(question: str, answer: str, context: str | None = None) -> list[str]:
         problems.append("bad_question")
     if has_other_vendor(answer):
         problems.append("other_vendor")
+    return problems
+
+
+_CODE_FENCE = re.compile(r"```")
+
+
+def _check_code(question: str, answer: str) -> list[str]:
+    problems: list[str] = []
+    if not question.strip() or len(question) > 2000:
+        problems.append("bad_question")
+    if not answer.strip():
+        problems.append("empty")
+        return problems
+    # Без кода ответ должен быть короче, иначе это простыня.
+    if "```" not in answer and len(answer) > 4000:
+        problems.append("length")
+    # Должна остаться русская речь: код сам по себе модель не научит объяснять.
+    cyrillic = sum(1 for ch in answer if "а" <= ch.lower() <= "я" or ch.lower() == "ё")
+    if cyrillic < 40:
+        problems.append("no_russian")
+    if re.search(r"https?://", answer):
+        problems.append("link")
     return problems
 
 

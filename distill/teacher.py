@@ -50,7 +50,7 @@ class Teacher:
         self.last_reasoning: str = ""
         # reasoning стоит 30-45% цены, а в обучение не идёт: по умолчанию выключен
         self.reasoning = os.environ.get("TEACHER_REASONING", "off").lower() == "on"
-        self.max_tokens = 900
+        self.max_tokens = 1800
 
     @staticmethod
     def build_message(question: str, context: str | None = None) -> str:
@@ -80,7 +80,10 @@ class Teacher:
             "max_tokens": max_tokens or self.max_tokens,
         }
         if not self.reasoning:
-            payload["reasoning"] = {"exclude": True}
+            # exclude только ПРЯЧЕТ рассуждения, но модель всё равно думает и платит
+            # за токены. enabled=false отключает их совсем: замер на кодовых парах
+            # 0,104 -> 0,032 ₽ за пару при том же качестве ответа.
+            payload["reasoning"] = {"enabled": False}
         req = urllib.request.Request(
             self.base + "/v1/chat/completions",
             data=json.dumps(payload).encode(),
