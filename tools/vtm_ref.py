@@ -31,7 +31,8 @@
  46  scale_offset u32               0xFFFFFFFF (VTM_NO_OFFSET) — масштабы лежат
                                     внутри TRT1-сегмента по offset; для fp — 0
                                     (читатель принимает и offset+18 как синоним)
- 50  reserved u16                   0
+ 50  flags/резерв u16              0 — обычный тензор; бит 0 — KV-кэш
+                                    (VTM_TENSOR_FLAG_KV_CACHE, payload'а нет)
      (20 из 32 байт заголовка — это поля спеки; 12 байт «резерва» заняты
       program_offset/meta_offset/meta_len, что обратно совместимо: C может
       игнорировать эти три слова и читать программу с конца файла.)
@@ -41,6 +42,16 @@ meta_start = data_start + data_size   (JSON, опционально, допол�
 program_offset = meta_start + align32(meta_len)  — программа идёт ПОСЛЕДНЕЙ
 программа:          n_instr * 16 байт, файл заканчивается ровно на ней
 ```
+
+KV-кэши вне контейнера (задача 0101). Поле по смещению 50 было резервом и
+всегда 0; младший бит занят ролью `KV_CACHE`. Такой тензор существует только
+в таблице (`name`/`kind`/`dims`), а его payload в секцию данных **не пишется**:
+`offset = 0`, `scale_offset = 0`. Кэш пуст на старте и заполняется KVW, поэтому
+хранить под него `ctx × kv_dim × 4` байт в файле незачем — для 1.5B-раскладки
+(28 слоёв, ctx 2048, kv_dim 256) это 112 МиБ. Читатель создаёт буфер сам
+(Python — список нулей, C — буфер в арене); старые контейнеры присылают 0 в
+этом поле и читаются прежним путём, с содержимым из файла. Тензор с флагом
+обязан быть fp (kind 1..3); неизвестные биты читатель игнорирует.
 
 Почему программа в конце: C-читатель, который ничего не знает про метаданные,
 всё равно может взять её как `file_size - n_instr*16`; `program_offset` из
@@ -262,6 +273,13 @@ KIND_NAMES = {
     KIND_BF16: "bf16",
 }
 
+#: Флаги записи таблицы тензоров (поле по смещению 50, бывший «резерв»).
+#: TFLAG_KV_CACHE — K/V-кэш внимания: содержимого в файле нет (offset=0),
+#: читатель создаёт буфер сам (см. докстроку модуля, «KV-кэши вне контейнера»).
+#: Как и в C (src/vtm/vtm.h), осмыслен только бит 0; остальные биты
+#: сохраняются, но поведение не меняют — контейнер будущей версии читается.
+TFLAG_KV_CACHE = 0x0001
+
 #: Флаги контейнера (заголовок).
 VFLAG_F32_SCALES = 0x0001  # масштабы тритов по умолчанию float32
 VFLAG_CAUSAL = 0x0002      # модель причинная (LM)
@@ -416,6 +434,10 @@ class Tensor:
     `data is None` / `trits is None` означает «тензор без полезной нагрузки»
     (каркас графа без весов): такой тензор нельзя записать в файл, но можно
     оценить по размеру.
+
+    Исключение — `flags & TFLAG_KV_CACHE` (K/V-кэш внимания, задача 0101):
+    данных у него нет и в файл они не пишутся, но это не каркас, а полноценный
+    тензор — читатель сам создаёт буфер нужного размера по `dims`.
     """
 
     name: str
@@ -428,6 +450,8 @@ class Tensor:
     block_size: int = SCALE_BLOCK
     offset: int = 0
     scale_offset: int = 0
+    #: Флаги записи таблицы (поле 50 в файле), см. TFLAG_KV_CACHE.
+    flags: int = 0
 
     def __post_init__(self) -> None:
         self.dims = tuple(int(d) for d in self.dims)
@@ -451,6 +475,24 @@ class Tensor:
             raise ValueError(f"тензор {self.name!r}: неизвестный kind={self.kind}")
         if self.scale_dtype not in ("float32", "float16"):
             raise ValueError(f"тензор {self.name!r}: scale_dtype={self.scale_dtype!r}")
+        if not 0 <= int(self.flags) <= 0xFFFF:
+            raise ValueError(
+                f"тензор {self.name!r}: flags={self.flags}, а поле таблицы — u16"
+            )
+        if self.flags & TFLAG_KV_CACHE:
+            # Кэш существует только в таблице: содержимое не пишется и не
+            # читается (его создаёт исполнитель), поэтому данные запрещены —
+            # иначе легко решить, что они попадут в файл.
+            if self.kind == KIND_TRITS:
+                raise ValueError(
+                    f"тензор {self.name!r}: KV-кэш обязан быть fp-тензором (kind {self.kind})"
+                )
+            if self.data is not None or self.trits is not None or self.scales is not None:
+                raise ValueError(
+                    f"тензор {self.name!r}: у KV-кэша нет данных — буфер создаёт "
+                    "читатель (Tensor.kv_cache())"
+                )
+            return
         if self.kind == KIND_TRITS:
             if self.block_size != SCALE_BLOCK:
                 raise ValueError(
@@ -497,6 +539,21 @@ class Tensor:
     @property
     def kind_name(self) -> str:
         return KIND_NAMES[self.kind]
+
+    @property
+    def is_kv_cache(self) -> bool:
+        """1 — K/V-кэш: payload'а в файле нет, буфер создаёт читатель."""
+        return bool(getattr(self, "flags", 0) & TFLAG_KV_CACHE)
+
+    @classmethod
+    def kv_cache(cls, name: str, dims: Sequence[int]) -> "Tensor":
+        """K/V-кэш внимания `(ctx, kv_dim)`: в контейнере только запись таблицы.
+
+        Содержимое не пишется: кэш пуст на старте, его заполняет KVW. Загрузчик
+        (C — арена, Python — список нулей) создаёт буфер по `dims`, поэтому
+        тензор занимает `ctx × kv_dim × 4` байт только в памяти.
+        """
+        return cls(name=name, kind=KIND_F32, dims=tuple(dims), flags=TFLAG_KV_CACHE)
 
     @classmethod
     def f32(cls, name: str, dims: Sequence[int], values: Iterable[float]) -> "Tensor":
@@ -640,7 +697,13 @@ class Instr:
 
 
 def tensor_payload_size(tensor: Tensor) -> int:
-    """Размер payload'а тензора в байтах (без выравнивания)."""
+    """Размер payload'а тензора в байтах (без выравнивания).
+
+    У KV-кэша payload'а нет (TFLAG_KV_CACHE) — 0 байт: место под кэш
+    выделяется при загрузке, а не хранится в файле (задача 0101).
+    """
+    if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+        return 0
     if tensor.kind == KIND_TRITS:
         n_values = tensor.n_elements
         scale_bytes = 4 if tensor.scale_dtype == "float32" else 2
@@ -723,6 +786,9 @@ def decode_trit_segment(data: bytes) -> tuple[list[int], list[float], str]:
 
 def encode_tensor_payload(tensor: Tensor) -> bytes:
     """Payload тензора в том виде, в каком он лежит в секции данных."""
+    if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+        # KV-кэш в файл не пишется: тензор живёт только в таблице.
+        return b""
     if tensor.kind == KIND_TRITS:
         return encode_trit_segment(tensor)
     if tensor.data is None:
@@ -1056,6 +1122,14 @@ def write_vtm(
     digest = hashlib.sha256() if write_integrity else None
     data_size = 0
     for tensor, payload in zip(tensor_list, payloads):
+        if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+            # KV-кэш места в секции данных не занимает: offset/scale_offset
+            # нули (payload'а нет), размер известен из dims. Старые читатели,
+            # которые флаг не знают, увидят тензор по offset 0 — но их KVW всё
+            # равно перезапишет слоты до чтения, так что старый бинарь живёт.
+            tensor.offset = 0
+            tensor.scale_offset = 0
+            continue
         tensor.offset = data_size
         tensor.scale_offset = NO_OFFSET if tensor.kind == KIND_TRITS else 0
         if tensor.offset % ALIGNMENT:
@@ -1109,7 +1183,8 @@ def write_vtm(
         dims = list(tensor.dims) + [0] * (MAX_DIMS - len(tensor.dims))
         table += _TENSOR_STRUCT.pack(
             name_bytes, tensor.kind, len(tensor.dims), *dims,
-            tensor.offset, tensor.scale_offset, 0,
+            tensor.offset, tensor.scale_offset,
+            int(getattr(tensor, "flags", 0)),
         )
 
     with open(path, "wb") as handle:
@@ -1144,9 +1219,16 @@ def write_vtm(
 
 
 def _payload_extent(
-    data: bytes, start: int, kind: int, n_elements: int
+    data: bytes, start: int, kind: int, n_elements: int, flags: int = 0
 ) -> tuple[int, str | None]:
-    """Размер payload'а по заголовку TRT1 (для тритов) или по kind/dims."""
+    """Размер payload'а по заголовку TRT1 (для тритов) или по kind/dims.
+
+    У KV-кэша (flags & TFLAG_KV_CACHE) payload'а нет: 0 байт, читать нечего.
+    """
+    if flags & TFLAG_KV_CACHE:
+        if kind == KIND_TRITS:
+            raise ValueError("KV-кэш обязан быть fp-тензором, а запись говорит kind=0")
+        return 0, None
     if kind == KIND_TRITS:
         if start + TRT1_HEADER_SIZE > len(data):
             raise ValueError("TRT1-сегмент выходит за конец файла")
@@ -1245,7 +1327,7 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     ranges: list[tuple[int, int, str]] = []
     for index in range(n_tensors):
         entry_offset = HEADER_SIZE + TENSOR_ENTRY_SIZE * index
-        raw_name, kind, ndim, d0, d1, d2, d3, offset, scale_offset, _reserved = (
+        raw_name, kind, ndim, d0, d1, d2, d3, offset, scale_offset, tflags = (
             _TENSOR_STRUCT.unpack_from(data, entry_offset)
         )
         name_bytes = raw_name.split(b"\x00", 1)[0]
@@ -1262,11 +1344,31 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
         dims = tuple((d0, d1, d2, d3)[:ndim])
         if any(d == 0 for d in dims):
             raise ValueError(f"тензор {name!r}: нулевое измерение в {dims}")
+        if tflags & TFLAG_KV_CACHE:
+            # KV-кэш: payload'а в файле нет, offset/scale_offset — нули и
+            # адресами не являются. Буфер создаст исполнитель по dims.
+            if kind == KIND_TRITS:
+                raise ValueError(f"тензор {name!r}: KV-кэш обязан быть fp-тензором")
+            if scale_offset != 0:
+                raise ValueError(
+                    f"тензор {name!r}: у KV-кэша scale_offset={scale_offset}, ожидался 0"
+                )
+            tensor = Tensor(
+                name=name, kind=kind, dims=dims, offset=offset,
+                scale_offset=0, flags=tflags,
+            )
+            tensors.append(tensor)
+            continue
         if offset % ALIGNMENT:
             raise ValueError(f"тензор {name!r}: offset={offset} не выровнен на {ALIGNMENT}")
 
-        tensor = Tensor(name=name, kind=kind, dims=dims, offset=offset, scale_offset=scale_offset)
-        size, scale_dtype = _payload_extent(data, data_start + offset, kind, tensor.n_elements)
+        tensor = Tensor(
+            name=name, kind=kind, dims=dims, offset=offset,
+            scale_offset=scale_offset, flags=tflags,
+        )
+        size, scale_dtype = _payload_extent(
+            data, data_start + offset, kind, tensor.n_elements, tflags
+        )
         start = data_start + offset
         end = start + size
         if end > meta_end:
@@ -1825,6 +1927,16 @@ class _Interpreter:
             for index in (int(instr.dst), int(instr.b))
         }
         self.workspace: dict[int, list[float]] = {}
+        # KV-кэш из контейнера нового формата (TFLAG_KV_CACHE) данных не
+        # имеет: буфер создаётся здесь, нулями — ровно как кэш из старого
+        # контейнера, где в файле лежали нули. Так оба формата дают одно
+        # поведение (ATTN до первого KVW видит нули, а не «нет данных»).
+        # Берём все помеченные тензоры, а не только dst/b KVW: в C такой
+        # тензор тоже существует и читается как нули, даже если программа до
+        # него не пишет.
+        for index, tensor in enumerate(self.tensors):
+            if tensor.is_kv_cache:
+                self.workspace[index] = [0.0] * tensor.n_elements
 
     # -- доступ к значениям --------------------------------------------------
 
@@ -1872,7 +1984,7 @@ class _Interpreter:
         self.workspace = {
             index: values
             for index, values in self.workspace.items()
-            if index in self.cache_indices
+            if index in self.cache_indices or self.tensors[index].is_kv_cache
         }
 
     def run_step(self, state: _State) -> None:

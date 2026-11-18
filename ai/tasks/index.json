@@ -660,7 +660,7 @@
   {
     "id": "0101",
     "title": "KV-кэши вне контейнера: −112 МиБ на 1.5B",
-    "status": "in_progress",
+    "status": "done",
     "file": "0101-kv-lazy-alloc.md",
     "assignee": "agent:kv-lazy-alloc"
   },
@@ -709,7 +709,7 @@
   {
     "id": "0108",
     "title": "Сервер: лимиты запросов и мягкая деградация",
-    "status": "in_progress",
+    "status": "done",
     "file": "0108-server-limits.md",
     "assignee": "agent:server-limits"
   },
@@ -718,6 +718,13 @@
     "title": "Телеметрия: маркер локальной модели в Route и JSONL",
     "status": "pending",
     "file": "0109-telemetry-local.md",
+    "assignee": ""
+  },
+  {
+    "id": "0110",
+    "title": "KV-кэш: кэп на суммарный размер и явный отказ старым бинарям",
+    "status": "pending",
+    "file": "0110-kv-caps.md",
     "assignee": ""
   }
 ]

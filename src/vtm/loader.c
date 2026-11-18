@@ -352,6 +352,9 @@ static int tensor_arena_size(const vtm_tensor *t, size_t *out) {
 //   - всё, что интерпретатор может писать (writable: dst и V-кэш KVW);
 //   - fp16/bf16 — их всё равно нужно развернуть в fp32 (t->f32 — float*);
 //   - масштабы тритов в fp16: API отдаёт их как float*.
+// KV-кэш (flag VTM_TENSOR_FLAG_KV_CACHE) — отдельный случай: содержимого в
+// файле нет, поэтому копировать нечего; в арене под него выделяется буфер
+// n_elements float (арена выделена calloc'ом и стартует с нулей).
 typedef struct {
     size_t arena_size;  // байт в арене
     int    copy_data;   // fp32/fp16/bf16: копировать значения в арену
@@ -367,6 +370,15 @@ static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
     p->copy_data = 0;
     p->copy_words = 0;
     p->copy_scales = 0;
+
+    if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) {
+        // writable и can_reference тут ни при чём: файла нет, копировать
+        // нечего. Размер считается по dims, а не по payload'у; kind проверен
+        // при разборе записи таблицы.
+        if ((uint64_t)t->n_elements * 4u > (uint64_t)SIZE_MAX) return -1;
+        p->arena_size = (size_t)t->n_elements * 4u;
+        return 0;
+    }
 
     if (!can_reference || writable) {
         if (tensor_arena_size(t, &sz) != 0) return -1;
@@ -426,6 +438,13 @@ static const uint8_t *trit_scales_ptr(const vtm_tensor *t, const uint8_t *data) 
 // Для тритов слова идут первыми (выровнены на 64), затем масштабы.
 static void fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
                                 uint8_t *dst, const tensor_plan *p) {
+    if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) {
+        // Копировать нечего: буфер уже в арене и обнулён calloc'ом (см.
+        // выделение арены). Нули — это и есть «пустой кэш»: ровно то же
+        // состояние, что давал старый контейнер, где в файле лежали нули.
+        t->f32 = (float *)(void *)dst;
+        return;
+    }
     if (t->kind == VTM_TENSOR_TRIT) {
         uint32_t nb = t->n_blocks;
         uint32_t ns = t->n_scales;
@@ -1013,11 +1032,31 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         t->n_elements = (uint32_t)n_el;
         t->offset = rd32(e + 42u);
         t->scale_offset = rd32(e + 46u);
+        // Резерв таблицы (байты 50-51) — флаги записи; старые контейнеры
+        // присылают 0. Неизвестные биты игнорируются: резерв для того и есть.
+        t->flags = rd16(e + 50u);
         t->n_blocks = 0;
         t->n_scales = 0;
         t->scale_block = 0;
         t->scale_is_f32 = 0;
         t->layout = VTM_LAYOUT_TRT1;
+
+        // KV-кэш (VTM_TENSOR_FLAG_KV_CACHE): payload'а в файле нет — ни слов,
+        // ни масштабов. offset/scale_offset у такой записи нули и адресами не
+        // являются, поэтому проверки границ и TRT1 ниже не применяются:
+        // буфер создаётся в арене (plan_tensor/fill_tensor_planned). Старые
+        // контейнеры флаг не ставят и идут прежним путём, с данными из файла.
+        if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) {
+            if (t->kind == VTM_TENSOR_TRIT)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): KV-кэш обязан быть fp-тензором (kind %u)",
+                     i, t->name, (unsigned)t->kind);
+            if (t->scale_offset != 0)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): у KV-кэша scale_offset=%u, ожидался 0",
+                     i, t->name, t->scale_offset);
+            continue;
+        }
 
         if ((t->offset % VTM_DATA_ALIGN) != 0)
             FAIL(VTM_E_FORMAT, "тензор %u (%s): offset=%u не кратен %u",
@@ -1250,7 +1289,12 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
             uintptr_t base;
             if (total > SIZE_MAX - (VTM_ARENA_ALIGN - 1u))
                 FAIL(VTM_E_NOMEM, "арена: переполнение размера");
-            m->arena_raw = (uint8_t *)malloc(total + (VTM_ARENA_ALIGN - 1u));
+            // calloc, а не malloc: буферы KV-кэшей (VTM_TENSOR_FLAG_KV_CACHE)
+            // в файле не лежат и не заполняются — они обязаны стартовать с
+            // нулей, как кэш из старого контейнера. Большие calloc'и ядро
+            // отдаёт ленивыми нулевыми страницами, поэтому 112 МиБ кэша 1.5B
+            // не попадают в RSS, пока KVW не начнёт в них писать.
+            m->arena_raw = (uint8_t *)calloc(1, total + (VTM_ARENA_ALIGN - 1u));
             if (!m->arena_raw)
                 FAIL(VTM_E_NOMEM, "арена: не удалось выделить %zu байт",
                      total + (VTM_ARENA_ALIGN - 1u));
@@ -1378,6 +1422,9 @@ static void map_trim_copied(vtm_t *m) {
         const vtm_tensor *t = &m->tensors[i];
         uintptr_t begin, end, lo, hi;
         if (t->kind != VTM_TENSOR_F16 && t->kind != VTM_TENSOR_BF16) continue;
+        // KV-кэша в файле нет (offset == 0), его страницы в отображении не
+        // занимались — трогать их madvise'ом нельзя.
+        if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) continue;
         begin = base + (uintptr_t)m->data_start + (uintptr_t)t->offset;
         end = begin + (uintptr_t)t->n_elements * 2u;
         lo = begin & ~(uintptr_t)(page - 1u);

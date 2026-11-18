@@ -36,6 +36,11 @@ fp32-матрице) и `SAMP` + `HALT` добавляет `compile_model`.
   флаг `ROPE_INTERLEAVED` (0x02) — пары `(2i, 2i+1)`, иначе половинки;
 * `KVW`: `a` — K, `c` — V, `dst` — K-кэш `(ctx, kv_dim)`,
   `b` — V-кэш `(ctx, kv_dim)`; оба кэша не сбрасываются между проходами;
+* KV-кэши помечены `VTM_TENSOR_FLAG_KV_CACHE` (бит 0 поля по смещению 50 в
+  таблице тензоров) и в контейнер не пишутся (задача 0101): в файле остаётся
+  только запись таблицы, а буфер `ctx × kv_dim` создаёт загрузчик (C — в
+  арене, Python — списком нулей). Для 1.5B-раскладки это −112 МиБ файла;
+  старые контейнеры, где кэш лежал внутри, читаются как раньше;
 * `ATTN`: Q/out `(heads, q_len, head_dim)`, K/V — 2-D кэши, GQA через
   `group = n_heads / n_kv_heads`, `q_start = pos + imm`;
 * `CPY` копирует тензор целиком;
@@ -252,6 +257,16 @@ class Graph:
         """Рабочий fp32-тензор (активация), инициализированный нулями."""
         return self.add(vtm_ref.Tensor.f32(name, dims, [0.0] * vtm_ref.prod(dims)))
 
+    def kv_cache(self, name: str, dims: Sequence[int]) -> int:
+        """K/V-кэш внимания `(ctx, kv_dim)` — без содержимого в контейнере.
+
+        В файл попадает только запись таблицы (имя/kind/dims): кэш пуст на
+        старте, его заполняет KVW. Для 1.5B-раскладки это экономит 112 МиБ
+        (28 слоёв × ctx 2048 × kv_dim 256 × 2 × 4). Читатель (C и Python)
+        создаёт буфер по dims, поэтому исполнение не меняется.
+        """
+        return self.add(vtm_ref.Tensor.kv_cache(name, dims))
+
     def emit(
         self,
         op: vtm_ref.Op,
@@ -446,8 +461,8 @@ def compile_layer(
     g.emit(Op.ROPE, dst=q, a=q, b=cfg.n_heads, flags=rope_flags, imm=0)
     g.emit(Op.ROPE, dst=k, a=k, b=cfg.n_kv_heads, flags=rope_flags, imm=0)
 
-    k_cache = g.act(f"{prefix}.kcache", (ctx, cfg.kv_dim))
-    v_cache = g.act(f"{prefix}.vcache", (ctx, cfg.kv_dim))
+    k_cache = g.kv_cache(f"{prefix}.kcache", (ctx, cfg.kv_dim))
+    v_cache = g.kv_cache(f"{prefix}.vcache", (ctx, cfg.kv_dim))
     g.emit(Op.KVW, dst=k_cache, a=k, b=v_cache, c=v, imm=0)
 
     attn = g.act(f"{prefix}.attn", (cfg.n_heads, 1, cfg.head_dim))
@@ -1351,10 +1366,11 @@ def make_synthetic(seed: int = 1, size: int = 128, mode: str = "attn") -> vtm_re
 # ---------------------------------------------------------------------------
 
 #: Архитектуры, которые мы знаем по имени (значения из HF-конфигов).
-#: context_len — не max_position_embeddings модели, а длина KV-кэша, которую
-#: компилятор кладёт в контейнер: кэш занимает ctx × layers × kv_dim × 8 байт
-#: (K и V, fp32). 32768 превратили бы контейнер в ~3 ГиБ одних нулей, поэтому
-#: по умолчанию берём рабочую длину VTM, а не максимум Qwen.
+#: context_len — не max_position_embeddings модели, а длина KV-кэша: кэш
+#: занимает ctx × layers × kv_dim × 8 байт (K и V, fp32) в памяти. В контейнер
+#: он больше не пишется (задача 0101, VTM_TENSOR_FLAG_KV_CACHE), поэтому
+#: контейнер не растёт от ctx; но буфер в арене всё равно 112 МиБ на 1.5B, так
+#: что 32768 по-прежнему не берём — это рабочая длина VTM, а не максимум Qwen.
 _KNOWN_ARCH: dict[str, dict[str, Any]] = {
     "Qwen/Qwen2.5-1.5B-Instruct": {
         "hidden": 1536,
@@ -1518,7 +1534,7 @@ def _print_manifest(
     cache_bytes = cfg.n_layers * cfg.context_len * cfg.kv_dim * 2 * 4
     print(
         f"параметры: тритов {export.trit_params:,}, fp {export.fp_params:,}; "
-        f"KV-кэш {_human_bytes(cache_bytes)}"
+        f"KV-кэш {_human_bytes(cache_bytes)} в арене, в контейнере его нет"
     )
     if path:
         print(f"файл: {path} ({_human_bytes(os.path.getsize(path))})")
