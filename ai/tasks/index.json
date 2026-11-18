@@ -61,5 +61,12 @@
     "status": "done",
     "file": "0009-task-registry.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0010",
+    "title": "CI: тесты Python и C на каждый пуш",
+    "status": "in_progress",
+    "file": "0010-ci-pipeline.md",
+    "assignee": "agent:ci"
   }
 ]
