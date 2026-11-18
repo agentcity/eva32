@@ -471,7 +471,7 @@
   {
     "id": "0073",
     "title": "KV: окно контекста и сброс между запросами",
-    "status": "pending",
+    "status": "done",
     "file": "0073-kv-window-reset.md",
     "assignee": ""
   },
@@ -492,7 +492,7 @@
   {
     "id": "0076",
     "title": "ATTN: блочный attention с онлайн-softmax + окно контекста",
-    "status": "in_progress",
+    "status": "done",
     "file": "0076-vtm-attn-tiling.md",
     "assignee": "agent:vtm-attn-tiling"
   },
@@ -516,5 +516,12 @@
     "status": "in_progress",
     "file": "0079-vtm-kv-session.md",
     "assignee": "agent:vtm-kv-session"
+  },
+  {
+    "id": "0080",
+    "title": "Синхронизировать эталон: окно контекста и доки ATTN",
+    "status": "pending",
+    "file": "0080-ref-window.md",
+    "assignee": ""
   }
 ]

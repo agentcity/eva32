@@ -1787,6 +1787,339 @@ static void test_kvw_attn_cache(void) {
     model_free(&md);
 }
 
+// --- ATTN: блочный онлайн-softmax против наивного эталона (задача 0076) ----
+
+// Наивный ATTN, как до 0076: массив scores на весь видимый диапазон, max,
+// сумма exp, нормировка, накопление V — всё в double. В plain-раскладке
+// ключ j — строка j, в 2D-кэше — строка j % ctx (кольцо). lo/hi задают
+// видимый диапазон в глобальных позициях; causal-маска поверх: j > q_start+qi
+// скрыт. Нужен, чтобы сравнивать с ним блочный вариант при любых ctx.
+static void attn_reference(const float *q, const float *k, const float *v,
+                           float *out, int n_heads, int q_len, int head_dim,
+                           int n_kv_heads, int kv_len, int ctx, int plain,
+                           int q_start, int causal,
+                           const int *lo, const int *hi) {
+    int rep = n_heads / n_kv_heads;
+    int kv_dim = n_kv_heads * head_dim;
+    double scale = 1.0 / sqrt((double)head_dim);
+    int h, qi, j, d;
+
+    for (h = 0; h < n_heads; h++) {
+        int kvh = h / rep;
+        for (qi = 0; qi < q_len; qi++) {
+            const float *qrow = q + ((size_t)h * (size_t)q_len + (size_t)qi)
+                                * (size_t)head_dim;
+            float *orow = out + ((size_t)h * (size_t)q_len + (size_t)qi)
+                          * (size_t)head_dim;
+            int cnt = hi[qi] - lo[qi] + 1;
+            double *scores = (double *)xmalloc((size_t)cnt * sizeof(double));
+            double mx = -INFINITY, sum = 0.0;
+
+            for (j = lo[qi]; j <= hi[qi]; j++) {
+                int b = j - lo[qi];
+                const float *krow;
+                double dot = 0.0;
+                if (causal && j > q_start + qi) {
+                    scores[b] = -INFINITY;
+                    continue;
+                }
+                if (plain)
+                    krow = k + ((size_t)kvh * (size_t)kv_len + (size_t)j)
+                           * (size_t)head_dim;
+                else
+                    krow = k + (size_t)(j % ctx) * (size_t)kv_dim
+                           + (size_t)kvh * (size_t)head_dim;
+                for (d = 0; d < head_dim; d++)
+                    dot += (double)qrow[d] * (double)krow[d];
+                scores[b] = dot * scale;
+                if (scores[b] > mx) mx = scores[b];
+            }
+            if (mx == -INFINITY) {
+                memset(orow, 0, (size_t)head_dim * sizeof(float));
+                free(scores);
+                continue;
+            }
+            for (j = lo[qi]; j <= hi[qi]; j++) {
+                int b = j - lo[qi];
+                if (scores[b] == -INFINITY) continue;
+                sum += exp(scores[b] - mx);
+            }
+            if (!(sum > 0.0) || !isfinite(sum)) {
+                memset(orow, 0, (size_t)head_dim * sizeof(float));
+                free(scores);
+                continue;
+            }
+            for (d = 0; d < head_dim; d++) {
+                double acc = 0.0;
+                for (j = lo[qi]; j <= hi[qi]; j++) {
+                    int b = j - lo[qi];
+                    const float *vrow;
+                    double p;
+                    if (scores[b] == -INFINITY) continue;
+                    p = exp(scores[b] - mx) / sum;
+                    if (p == 0.0) continue;
+                    if (plain)
+                        vrow = v + ((size_t)kvh * (size_t)kv_len + (size_t)j)
+                               * (size_t)head_dim;
+                    else
+                        vrow = v + (size_t)(j % ctx) * (size_t)kv_dim
+                               + (size_t)kvh * (size_t)head_dim;
+                    acc += p * (double)vrow[d];
+                }
+                orow[d] = (float)acc;
+            }
+            free(scores);
+        }
+    }
+}
+
+static uint32_t g_attn_rng = 0x12345678u;
+
+static float attn_rand(void) {
+    g_attn_rng ^= g_attn_rng << 13;
+    g_attn_rng ^= g_attn_rng >> 17;
+    g_attn_rng ^= g_attn_rng << 5;
+    return (float)((double)(g_attn_rng & 0xFFFFu) / 32768.0 - 1.0);
+}
+
+typedef struct {
+    const char *name;
+    int heads, kv_heads, head_dim, q_len, kv_len, plain, causal, q_start;
+} attn_case;
+
+// Одна конфигурация: собираем контейнер, гоняем ATTN и сравниваем с наивным
+// эталоном. kv_len — длина 3D K/V (plain) или длина 2D-кэша (ctx).
+static void run_attn_case(const attn_case *c) {
+    model_t md;
+    uint32_t dq[3], dk[3], dv[3], dout[3];
+    float *qv, *kv, *vv, *ov, *expect;
+    uint8_t *img;
+    size_t size;
+    vtm_t *m;
+    int kv_dim = c->kv_heads * c->head_dim;
+    int nq = c->heads * c->q_len * c->head_dim;
+    int nk = c->plain ? c->kv_heads * c->kv_len * c->head_dim
+                      : c->kv_len * kv_dim;
+    int lo_buf[64], hi_buf[64];
+    int q_start = c->plain ? c->kv_len - c->q_len : c->q_start;
+    int key_count = c->plain ? c->kv_len : c->q_start + c->q_len;
+    int qi, i;
+    double maxdiff = 0.0;
+
+    qv = (float *)xmalloc((size_t)nq * sizeof(float));
+    kv = (float *)xmalloc((size_t)nk * sizeof(float));
+    vv = (float *)xmalloc((size_t)nk * sizeof(float));
+    ov = (float *)calloc((size_t)nq, sizeof(float));
+    expect = (float *)xmalloc((size_t)nq * sizeof(float));
+    if (!ov) { fprintf(stderr, "OOM\n"); exit(2); }
+    for (i = 0; i < nq; i++) qv[i] = attn_rand();
+    for (i = 0; i < nk; i++) kv[i] = attn_rand();
+    for (i = 0; i < nk; i++) vv[i] = attn_rand();
+
+    dq[0] = (uint32_t)c->heads; dq[1] = (uint32_t)c->q_len;
+    dq[2] = (uint32_t)c->head_dim;
+    if (c->plain) {
+        dk[0] = (uint32_t)c->kv_heads; dk[1] = (uint32_t)c->kv_len;
+        dk[2] = (uint32_t)c->head_dim;
+        dv[0] = dk[0]; dv[1] = dk[1]; dv[2] = dk[2];
+    } else {
+        dk[0] = (uint32_t)c->kv_len; dk[1] = (uint32_t)kv_dim; dk[2] = 0;
+        dv[0] = dk[0]; dv[1] = dk[1]; dv[2] = 0;
+    }
+    dout[0] = dq[0]; dout[1] = dq[1]; dout[2] = dq[2];
+
+    model_init(&md);
+    model_add_f32(&md, "Q", 3, dq, qv);
+    model_add_f32(&md, "K", c->plain ? 3 : 2, dk, kv);
+    model_add_f32(&md, "V", c->plain ? 3 : 2, dv, vv);
+    model_add_f32(&md, "O", 3, dout, ov);
+    model_inst(&md, VTM_OP_ATTN,
+               c->causal ? VTM_FLAG_CAUSAL : 0, 3, 0, 1, 2,
+               c->plain ? 0 : c->q_start);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+
+    for (qi = 0; qi < c->q_len; qi++) {
+        lo_buf[qi] = 0;
+        hi_buf[qi] = key_count - 1;
+    }
+    attn_reference(qv, kv, vv, expect, c->heads, c->q_len, c->head_dim,
+                   c->kv_heads, c->kv_len, c->kv_len, c->plain,
+                   q_start, c->causal, lo_buf, hi_buf);
+
+    m = load_ok(img, size);
+    CHECK(m != NULL);
+    if (m) {
+        float *got;
+        CHECK(run_ok(m));
+        got = vtm_tensor_by_name(m, "O")->f32;
+        for (i = 0; i < nq; i++) {
+            double diff = fabs((double)got[i] - (double)expect[i]);
+            if (diff > maxdiff) maxdiff = diff;
+            CHECK_NEAR(got[i], expect[i], 1e-5);
+        }
+        vtm_free(m);
+    }
+    printf("ATTN %-26s: max|Δ| = %.3g\n", c->name, maxdiff);
+
+    free(qv); free(kv); free(vv); free(ov); free(expect);
+    free(img);
+    model_free(&md);
+}
+
+static void test_attn_tiled_vs_reference(void) {
+    static const attn_case cases[] = {
+        // 3D без кэша: один блок, каузальная маска.
+        {"plain causal q4", 1, 1, 4, 4, 4, 1, 1, 0},
+        // 3D без кэша + GQA (4 головы / 2 kv), non-causal, q_len < kv_len.
+        {"plain gqa q3 noncausal", 4, 2, 8, 3, 8, 1, 0, 0},
+        // 2D-кэш: один блок (13 ключей), как прежний ATTN.
+        {"cache causal q1 ctx16", 4, 1, 8, 1, 16, 0, 1, 12},
+        // 2D-кэш: 128 ключей = два блока по 64.
+        {"cache causal q1 ctx128", 4, 2, 8, 1, 128, 0, 1, 127},
+        // 2D-кэш: 106 ключей, q_len 6, non-causal, два неполных блока.
+        {"cache noncausal q6 ctx128", 4, 2, 6, 6, 128, 0, 0, 100},
+    };
+    size_t i;
+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++)
+        run_attn_case(&cases[i]);
+}
+
+// --- ATTN: окно контекста и ротация K/V (задача 0076) ----------------------
+
+enum {
+    WIN_CTX = 8,
+    WIN_STEPS = 16,
+    WIN_H = 2,
+    WIN_KVD = 4
+};
+
+static float win_k(int pos, int d) {
+    return (float)(((pos * 7 + d * 3) % 11) - 5) / 5.0f;
+}
+static float win_v(int pos, int d) {
+    return (float)(((pos * 5 + d * 9) % 13) - 6) / 6.0f;
+}
+static float win_q(int h, int pos, int d) {
+    return (float)(((pos * 3 + h * 5 + d) % 9) - 4) / 4.0f;
+}
+
+// ROPE одной строки (half-раскладка, theta=10000 — дефолт без меты). Кэш
+// должен хранить поворот по ГЛОБАЛЬНОЙ позиции, а не по номеру слота.
+static void rope_ref_row(const float *in, float *out, int pos, int head_dim) {
+    int half = head_dim / 2, p;
+    for (p = 0; p < half; p++) {
+        double inv = pow(10000.0, -2.0 * (double)p / (double)head_dim);
+        double angle = (double)pos * inv;
+        double co = cos(angle), si = sin(angle);
+        out[p] = (float)((double)in[p] * co - (double)in[p + half] * si);
+        out[p + half] = (float)((double)in[p + half] * co
+                                + (double)in[p] * si);
+    }
+}
+
+// Прогон steps подряд: каждый шаг пишет K/V позиции pos через KVW (кольцо
+// win) и считает ATTN одним запросом. Результат сверяется с наивным эталоном
+// по последним win токенам — то есть проверяется и ротация, и то, что свежие
+// токены не теряются.
+static void run_window_case(int win, int steps) {
+    model_t md;
+    uint32_t dkc[2] = {WIN_CTX, WIN_KVD}, dvc[2] = {WIN_CTX, WIN_KVD};
+    uint32_t dq[3] = {WIN_H, 1, WIN_KVD}, dout[3] = {WIN_H, 1, WIN_KVD};
+    uint32_t dvec[1] = {WIN_KVD};
+    float zeros[WIN_CTX * WIN_KVD];
+    float k0[WIN_KVD], v0[WIN_KVD], q0[WIN_H * WIN_KVD];
+    float o0[WIN_H * WIN_KVD];
+    float *kcf, *vcf, *qf, *of;
+    float expect[WIN_H * WIN_KVD];
+    uint8_t *img;
+    size_t size;
+    vtm_t *m;
+    int pos, d, h, lo;
+    int lo_buf[1], hi_buf[1];
+    char meta[64];
+
+    memset(zeros, 0, sizeof zeros);
+    memset(o0, 0, sizeof o0);
+    memset(k0, 0, sizeof k0);
+    memset(v0, 0, sizeof v0);
+    memset(q0, 0, sizeof q0);
+    model_init(&md);
+    model_add_f32(&md, "Kc", 2, dkc, zeros);
+    model_add_f32(&md, "K", 1, dvec, k0);
+    model_add_f32(&md, "Vc", 2, dvc, zeros);
+    model_add_f32(&md, "V", 1, dvec, v0);
+    model_add_f32(&md, "Q", 3, dq, q0);
+    model_add_f32(&md, "O", 3, dout, o0);
+    if (win != WIN_CTX) {
+        snprintf(meta, sizeof meta, "{\"context_window\": %d}", win);
+        model_set_meta(&md, meta);
+    }
+    model_inst(&md, VTM_OP_ROPE, 0, 1, 1, 1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_KVW, 0, 0, 1, 2, 3, 0);
+    model_inst(&md, VTM_OP_ATTN, VTM_FLAG_CAUSAL, 5, 4, 0, 2, 0);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    CHECK(m != NULL);
+    if (!m) {
+        free(img);
+        model_free(&md);
+        return;
+    }
+    kcf = vtm_tensor_by_name(m, "Kc")->f32;
+    vcf = vtm_tensor_by_name(m, "Vc")->f32;
+    qf = vtm_tensor_by_name(m, "Q")->f32;
+    of = vtm_tensor_by_name(m, "O")->f32;
+
+    for (pos = 0; pos < steps; pos++) {
+        int slot = pos % win;
+        float knew[WIN_KVD], kexp[WIN_KVD];
+        for (d = 0; d < WIN_KVD; d++) {
+            knew[d] = win_k(pos, d);
+            vtm_tensor_by_name(m, "K")->f32[d] = knew[d];
+            vtm_tensor_by_name(m, "V")->f32[d] = win_v(pos, d);
+        }
+        // ROPE инструкции крутит K по глобальной позиции pos; в кэш должен
+        // попасть именно этот вектор, а не поворот по номеру слота.
+        rope_ref_row(knew, kexp, pos, WIN_KVD);
+        for (h = 0; h < WIN_H; h++)
+            for (d = 0; d < WIN_KVD; d++)
+                qf[h * WIN_KVD + d] = win_q(h, pos, d);
+
+        vtm_set_position(m, pos);
+        CHECK(run_ok(m));
+
+        // KVW положил K/V позиции pos именно в слот pos % win.
+        for (d = 0; d < WIN_KVD; d++)
+            CHECK_NEAR(kcf[slot * WIN_KVD + d], kexp[d], 1e-6);
+
+        // Эталон видит ровно последние win ключей (win=контекст кэша).
+        lo = pos - win + 1;
+        if (lo < 0) lo = 0;
+        lo_buf[0] = lo;
+        hi_buf[0] = pos;
+        attn_reference(qf, kcf, vcf, expect, WIN_H, 1, WIN_KVD, 1,
+                       WIN_CTX, win, 0, pos, 0, lo_buf, hi_buf);
+        for (h = 0; h < WIN_H; h++)
+            for (d = 0; d < WIN_KVD; d++)
+                CHECK_NEAR(of[h * WIN_KVD + d], expect[h * WIN_KVD + d], 1e-6);
+    }
+    printf("ATTN окно win=%d (%d шагов, 2×+): ok\n", win, steps);
+    vtm_free(m);
+    free(img);
+    model_free(&md);
+}
+
+static void test_attn_window_rotation(void) {
+    // win == длина кэша: ротация начинается на позиции ctx.
+    run_window_case(WIN_CTX, 2 * WIN_CTX);
+    // win < длины кэша: context_window из меты (кольцо меньшего размера).
+    run_window_case(4, 12);
+}
+
 // --- SAMP и f16/bf16 -------------------------------------------------------
 
 typedef struct {
@@ -3724,6 +4057,8 @@ int main(void) {
     test_attn_plain();
     test_attn_causal();
     test_kvw_attn_cache();
+    test_attn_tiled_vs_reference();
+    test_attn_window_rotation();
     test_samp();
     test_samp_strategies();
     test_f16_bf16();

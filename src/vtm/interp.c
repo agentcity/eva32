@@ -623,12 +623,37 @@ static vtm_status op_emb(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     return VTM_OK;
 }
 
+// --- окно KV-кэша ----------------------------------------------------------
+//
+// Эффективное окно attention — min(длина кэша, meta["context_window"]).
+// Ключ context_window читается лениво при первом KVW/ATTN и запоминается в
+// машине (m->ctx_window), чтобы не разбирать JSON в горячем цикле. Значение
+// битое/<=0/больше длины кэша — окно равно длине кэша (прежнее поведение).
+static uint32_t kv_window(vtm_t *m, uint32_t ctx) {
+    if (m->ctx_window == 0) {
+        double v = meta_number(m, "context_window", 0.0);
+        if (isfinite(v) && v >= 1.0 && v <= (double)INT_MAX)
+            m->ctx_window = (int)v;
+        else
+            m->ctx_window = -1;
+    }
+    if (m->ctx_window > 0 && (uint32_t)m->ctx_window < ctx)
+        return (uint32_t)m->ctx_window;
+    return ctx;
+}
+
 // --- KVW -------------------------------------------------------------------
 //
 // dst — K-кэш [ctx, kv_dim], a — K-вектор [kv_dim],
 // b   — V-кэш [ctx, kv_dim], c — V-вектор [kv_dim], imm — позиция.
 // Слой задаётся самими тензорами (у каждого слоя свой кэш), поэтому
 // отдельного поля layer нет.
+//
+// Кэш — кольцо (задача 0076): токен глобальной позиции p пишется в слот
+// p % win. Позиция >= win больше не ошибка — она затирает самый старый слот,
+// а ATTN читает последние win ключей в хронологическом порядке. ROPE
+// применяется к K/V до KVW по глобальной позиции, поэтому ротация его не
+// портит: повёрнутые векторы просто переезжают в другой слот.
 static vtm_status op_kvw(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     vtm_status st;
     const vtm_tensor *kc = need(m, in->dst, ins, "dst (K-кэш)", &st);
@@ -636,7 +661,8 @@ static vtm_status op_kvw(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     const vtm_tensor *vc;
     const vtm_tensor *vv;
     long long pos;
-    uint32_t ctx, kv_dim;
+    size_t slot;
+    uint32_t ctx, kv_dim, win;
 
     if (!kc) return st;
     kv = need(m, in->a, ins, "a (K)", &st);
@@ -658,13 +684,15 @@ static vtm_status op_kvw(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     if (kv->n_elements != kv_dim || vv->n_elements != kv_dim)
         return fail(m, ins, VTM_E_SHAPE,
                     "KVW: K/V должны быть длины %u", kv_dim);
+    win = kv_window(m, ctx);
     pos = (long long)m->position + (long long)in->imm;
-    if (pos < 0 || pos >= (long long)ctx)
+    if (pos < 0 || pos > (long long)INT_MAX)
         return fail(m, ins, VTM_E_BOUNDS,
-                    "KVW: позиция %lld вне ctx=%u", pos, ctx);
-    memmove(kc->f32 + (size_t)pos * kv_dim, kv->f32,
+                    "KVW: позиция %lld вне диапазона", pos);
+    slot = (size_t)(pos % (long long)win);
+    memmove(kc->f32 + slot * kv_dim, kv->f32,
             (size_t)kv_dim * sizeof(float));
-    memmove(vc->f32 + (size_t)pos * kv_dim, vv->f32,
+    memmove(vc->f32 + slot * kv_dim, vv->f32,
             (size_t)kv_dim * sizeof(float));
     return VTM_OK;
 }
@@ -678,7 +706,20 @@ static vtm_status op_kvw(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 //      imm — смещение начала запроса, q_start = m->position + imm,
 //      валидны ключи 0..q_start+q_len-1. GQA: голова h идёт в kv-голову
 //      h / (h / kv_h).
-// Масштаб — 1/sqrt(d); softmax считается в double с вычитанием максимума.
+//
+// Окно (задача 0076). 2D-кэш — кольцо: KVW кладёт токен глобальной позиции p
+// в слот p % win, а ATTN читает последние win ключей хронологически, начиная
+// с max(0, hi - win + 1) для каждого запроса. Поэтому q_start >= ctx — не
+// ошибка: диалог длиннее кэша продолжается, старейшие ключи вытесняются.
+// win = min(ctx, context_window); без ключа — ctx.
+//
+// Масштаб — 1/sqrt(d). Softmax — онлайн, блоками по ATTN_KEY_BLOCK ключей:
+// running max m, running sum l, накопитель acc[head_dim] в double. Память
+// O(head_dim + блок), а не O(ctx): массива scores на весь ключевой диапазон
+// нет. exp на ключ считается один раз; при росте максимума acc и l
+// домножаются на exp(m_old - m_new).
+#define ATTN_KEY_BLOCK 64
+
 static vtm_status op_attn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     vtm_status st;
     const vtm_tensor *q = need(m, in->a, ins, "a (Q)", &st);
@@ -686,9 +727,13 @@ static vtm_status op_attn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     const vtm_tensor *v;
     const vtm_tensor *out;
     int plain, n_heads, n_kv_heads, q_len, head_dim, kv_len, ctx;
-    int q_start, key_count, h, qi, j, d, rep, causal, kv_dim;
-    double scale;
-    double *scores = NULL;
+    int q_start, key_count, h, qi, b, d, dd, rep, causal, kv_dim;
+    int win, lo, hi, jb, n;
+    double scale, mrun, lrun;
+    double sbuf[ATTN_KEY_BLOCK];
+    double *scratch, *qv, *acc;
+    const float *kbase, *vbase;
+    size_t kstride, slot;
 
     if (!q) return st;
     k = need(m, in->b, ins, "b (K)", &st);
@@ -730,6 +775,7 @@ static vtm_status op_attn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         key_count = kv_len;
         kv_dim = n_kv_heads * head_dim;
         ctx = 0;
+        win = 0;
     } else if (k->ndim == 2 && v->ndim == 2) {
         plain = 0;
         ctx = (int)k->dims[0];
@@ -746,20 +792,23 @@ static vtm_status op_attn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         // Считаем в long long: malformed-контейнер с imm=INT_MAX раньше давал
         // signed overflow (q_start+q_len < 0), проверка "больше ctx" его пропускала,
         // и malloc получал отрицательную длину — SIGBUS. Фаззинг 0069 нашёл это.
+        // Проверка q_start > INT_MAX - q_len закрывает и переполнение, и
+        // заведомо битый imm; верхней границы "меньше ctx" больше нет — кэш
+        // стал кольцом (0076), длинный диалог законен.
         {
             long long qs = (long long)m->position + (long long)in->imm;
-            long long keys = qs + (long long)q_len;
+            long long keys;
 
-            if (qs < 0 || qs > (long long)INT_MAX)
+            if (qs < 0 || qs > (long long)INT_MAX - (long long)q_len)
                 return fail(m, ins, VTM_E_BOUNDS,
-                            "ATTN: q_start=%lld вне диапазона", qs);
-            if (keys > (long long)ctx)
-                return fail(m, ins, VTM_E_BOUNDS,
-                            "ATTN: q_start+q_len=%lld больше ctx=%d", keys, ctx);
+                            "ATTN: q_start=%lld вне диапазона (q_len=%d)",
+                            qs, q_len);
+            keys = qs + (long long)q_len;
             q_start = (int)qs;
             key_count = (int)keys;
         }
         kv_len = ctx;
+        win = (int)kv_window(m, (uint32_t)ctx);
     } else {
         return fail(m, ins, VTM_E_SHAPE,
                     "ATTN: K/V должны быть оба 3D (без кэша) или оба 2D (кэш)");
@@ -775,75 +824,126 @@ static vtm_status op_attn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 
     causal = (in->flags & VTM_FLAG_CAUSAL) != 0;
     scale = 1.0 / sqrt((double)head_dim);
-    scores = (double *)malloc((size_t)key_count * sizeof(double));
-    if (!scores) return fail(m, ins, VTM_E_NOMEM, "ATTN: нет памяти под scores");
+    // Один буфер на вызов: q-строка в double (переиспользуется для всех
+    // ключей) и накопитель выхода. Размер зависит от head_dim, не от ctx.
+    scratch = (double *)malloc(2u * (size_t)head_dim * sizeof(double));
+    if (!scratch)
+        return fail(m, ins, VTM_E_NOMEM, "ATTN: нет памяти под аккумулятор");
+    qv = scratch;
+    acc = scratch + (size_t)head_dim;
 
     for (h = 0; h < n_heads; h++) {
         int kvh = h / rep;
+
+        // База строк K/V своей kv-головы: при plain-раскладке строки лежат
+        // подряд, в 2D-кэше между ними kv_dim чисел.
+        if (plain) {
+            kbase = k->f32 + (size_t)kvh * (size_t)kv_len * (size_t)head_dim;
+            vbase = v->f32 + (size_t)kvh * (size_t)kv_len * (size_t)head_dim;
+            kstride = (size_t)head_dim;
+        } else {
+            kbase = k->f32 + (size_t)kvh * (size_t)head_dim;
+            vbase = v->f32 + (size_t)kvh * (size_t)head_dim;
+            kstride = (size_t)kv_dim;
+        }
+
         for (qi = 0; qi < q_len; qi++) {
             const float *qrow = q->f32
                 + ((size_t)h * (size_t)q_len + (size_t)qi) * (size_t)head_dim;
             float *orow = out->f32
                 + ((size_t)h * (size_t)q_len + (size_t)qi) * (size_t)head_dim;
-            double max = -INFINITY;
-            double sum = 0.0;
 
-            for (j = 0; j < key_count; j++) {
-                double dot = 0.0;
-                const float *krow;
-                if (causal && (long long)j > (long long)q_start + qi) {
-                    scores[j] = -INFINITY;
-                    continue;
-                }
-                if (plain) {
-                    krow = k->f32
-                        + (((size_t)kvh * (size_t)kv_len) + (size_t)j)
-                          * (size_t)head_dim;
-                } else {
-                    krow = k->f32 + (size_t)j * (size_t)kv_dim
-                         + (size_t)kvh * (size_t)head_dim;
-                }
-                for (d = 0; d < head_dim; d++)
-                    dot += (double)qrow[d] * (double)krow[d];
-                scores[j] = dot * scale;
-                if (scores[j] > max) max = scores[j];
+            for (d = 0; d < head_dim; d++) qv[d] = (double)qrow[d];
+
+            // Видимые ключи запроса qi: [lo, hi] в глобальных позициях.
+            // plain — прежние границы; 2D-кэш дополнительно обрезается
+            // окном win (causal-граница hi = q_start + qi).
+            if (plain) {
+                lo = 0;
+                hi = key_count - 1;
+                if (causal && q_start + qi < hi) hi = q_start + qi;
+            } else {
+                hi = causal ? q_start + qi : key_count - 1;
+                if (hi > key_count - 1) hi = key_count - 1;
+                lo = hi - win + 1;
+                if (lo < 0) lo = 0;
             }
-            if (max == -INFINITY) {
+            if (hi < lo) {
                 memset(orow, 0, (size_t)head_dim * sizeof(float));
                 continue;
             }
-            for (j = 0; j < key_count; j++) {
-                if (scores[j] == -INFINITY) continue;
-                sum += exp(scores[j] - max);
-            }
-            if (!(sum > 0.0) || !isfinite(sum)) {
-                memset(orow, 0, (size_t)head_dim * sizeof(float));
-                continue;
-            }
-            // Переиспользуем scores как вероятности, чтобы не считать exp дважды.
-            for (j = 0; j < key_count; j++)
-                scores[j] = (scores[j] == -INFINITY)
-                          ? 0.0 : exp(scores[j] - max) / sum;
-            for (d = 0; d < head_dim; d++) {
-                double acc = 0.0;
-                for (j = 0; j < key_count; j++) {
-                    const float *vrow;
-                    if (scores[j] == 0.0) continue;
-                    if (plain) {
-                        vrow = v->f32
-                            + (((size_t)kvh * (size_t)kv_len) + (size_t)j)
-                              * (size_t)head_dim;
-                    } else {
-                        vrow = v->f32 + (size_t)j * (size_t)kv_dim
-                             + (size_t)kvh * (size_t)head_dim;
+
+            for (d = 0; d < head_dim; d++) acc[d] = 0.0;
+            mrun = -INFINITY;
+            lrun = 0.0;
+            slot = plain ? 0u : (size_t)lo % (size_t)win;
+
+            jb = lo;
+            while (jb <= hi) {
+                size_t bslot = slot;
+                double bmax = -INFINITY;
+
+                n = hi - jb + 1;
+                if (n > ATTN_KEY_BLOCK) n = ATTN_KEY_BLOCK;
+
+                // 1) Оценки Q·Kᵀ/√d блока и его максимум. Четыре независимых
+                // аккумулятора — короче цепочка зависимостей. Порядок сложения
+                // double другой, чем у прежнего скаляра; разница ~1e-16.
+                for (b = 0; b < n; b++) {
+                    const float *krow = kbase
+                        + (size_t)(plain ? jb + b : (int)slot) * kstride;
+                    double dot, d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
+
+                    for (dd = 0; dd + 4 <= head_dim; dd += 4) {
+                        d0 += qv[dd] * (double)krow[dd];
+                        d1 += qv[dd + 1] * (double)krow[dd + 1];
+                        d2 += qv[dd + 2] * (double)krow[dd + 2];
+                        d3 += qv[dd + 3] * (double)krow[dd + 3];
                     }
-                    acc += scores[j] * (double)vrow[d];
+                    dot = (d0 + d1) + (d2 + d3);
+                    for (; dd < head_dim; dd++)
+                        dot += qv[dd] * (double)krow[dd];
+                    sbuf[b] = dot * scale;
+                    if (sbuf[b] > bmax) bmax = sbuf[b];
+                    if (!plain && ++slot == (size_t)win) slot = 0;
                 }
-                orow[d] = (float)acc;
+
+                // 2) Онлайн-softmax: новый максимум блока — тянем acc и l.
+                if (bmax > mrun) {
+                    double corr = (mrun == -INFINITY) ? 0.0 : exp(mrun - bmax);
+                    if (corr != 1.0) {
+                        for (d = 0; d < head_dim; d++) acc[d] *= corr;
+                        lrun *= corr;
+                    }
+                    mrun = bmax;
+                }
+
+                // 3) Веса блока и накопление V (снова с начала блока).
+                if (!plain) slot = bslot;
+                for (b = 0; b < n; b++) {
+                    double p = exp(sbuf[b] - mrun);
+                    const float *vrow = vbase
+                        + (size_t)(plain ? jb + b : (int)slot) * kstride;
+
+                    lrun += p;
+                    if (p != 0.0) {
+                        for (d = 0; d < head_dim; d++)
+                            acc[d] += p * (double)vrow[d];
+                    }
+                    if (!plain && ++slot == (size_t)win) slot = 0;
+                }
+
+                jb += n;
             }
+
+            if (!(lrun > 0.0) || !isfinite(lrun)) {
+                memset(orow, 0, (size_t)head_dim * sizeof(float));
+                continue;
+            }
+            for (d = 0; d < head_dim; d++) orow[d] = (float)(acc[d] / lrun);
         }
     }
-    free(scores);
+    free(scratch);
     return VTM_OK;
 }
 
