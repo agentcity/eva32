@@ -87,3 +87,49 @@ class TestMixture(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTranslationChecks(unittest.TestCase):
+    """Проверки перевода — без сети: учитель подменяется готовыми строками."""
+
+    def _check(self, q_en, a_en, q_ru, a_ru):
+        from tools.translate_pairs import _check
+        return _check(q_en, a_en, q_ru, a_ru)
+
+    def test_accepts_good_translation(self):
+        reason = self._check(
+            "Write a function that reverses a string.",
+            "```python\ndef rev(s):\n    return s[::-1]\n```\nThis works by slicing.",
+            "Напиши функцию, которая переворачивает строку.",
+            "```python\ndef rev(s):\n    return s[::-1]\n```\nЭто работает за счёт среза.",
+        )
+        self.assertIsNone(reason)
+
+    def test_rejects_untranslated_question(self):
+        reason = self._check("Write a function.", "Some text here.",
+                             "Write a function.", "Какой-то текст здесь, вполне русский.")
+        self.assertEqual(reason, "вопрос не переведён")
+
+    def test_rejects_lost_code_block(self):
+        reason = self._check(
+            "Write code.",
+            "```python\nprint(1)\n```\nExplanation.",
+            "Напиши код на Python, пожалуйста.",
+            "Вот объяснение без блока кода, но по-русски и достаточно длинное.",
+        )
+        self.assertIn(reason, {"потеряны блоки кода", "ответ не переведён"})
+
+    def test_rejects_chatty_answer(self):
+        reason = self._check(
+            "Write code.",
+            "Explanation of the code goes here in English.",
+            "Напиши код на Python.",
+            "Вот перевод: объяснение кода находится здесь и оно достаточно длинное, "
+            "чтобы пройти проверку на кириллицу.",
+        )
+        self.assertEqual(reason, "болтовня вокруг перевода")
+
+    def test_parse_format(self):
+        from tools.translate_pairs import _parse
+        got = _parse("ВОПРОС: Как дела?\n\nОТВЕТ: Хорошо.")
+        self.assertEqual(got, ("Как дела?", "Хорошо."))
