@@ -127,7 +127,7 @@ static uint32_t get_u32(const uint8_t *p) {
 typedef struct {
     char name[24];
     uint8_t kind, ndim;
-    uint16_t dims[4];
+    uint32_t dims[4];
     uint8_t *blob;
     size_t blob_len;
     uint8_t *blob2;
@@ -163,7 +163,7 @@ static size_t align32(size_t v) {
     return (v + 31u) & ~(size_t)31u;
 }
 
-static uint32_t dims_product(int ndim, const uint16_t *dims) {
+static uint32_t dims_product(int ndim, const uint32_t *dims) {
     uint32_t n = 1;
     int i;
     for (i = 0; i < ndim; i++) n *= dims[i];
@@ -171,7 +171,7 @@ static uint32_t dims_product(int ndim, const uint16_t *dims) {
 }
 
 static tensor_def *model_slot(model_t *m, const char *name, uint8_t kind,
-                              int ndim, const uint16_t *dims) {
+                              int ndim, const uint32_t *dims) {
     tensor_def *td;
     int i;
     if (m->n_tensors >= 32) {
@@ -188,7 +188,7 @@ static tensor_def *model_slot(model_t *m, const char *name, uint8_t kind,
 }
 
 static void model_add_f32(model_t *m, const char *name, int ndim,
-                          const uint16_t *dims, const float *vals) {
+                          const uint32_t *dims, const float *vals) {
     tensor_def *td = model_slot(m, name, VTM_TENSOR_F32, ndim, dims);
     buf_t b = {0};
     uint32_t i, n = dims_product(ndim, dims);
@@ -198,7 +198,7 @@ static void model_add_f32(model_t *m, const char *name, int ndim,
 }
 
 static void model_add_f16(model_t *m, const char *name, int ndim,
-                          const uint16_t *dims, const float *vals) {
+                          const uint32_t *dims, const float *vals) {
     tensor_def *td = model_slot(m, name, VTM_TENSOR_F16, ndim, dims);
     buf_t b = {0};
     uint32_t i, n = dims_product(ndim, dims);
@@ -208,7 +208,7 @@ static void model_add_f16(model_t *m, const char *name, int ndim,
 }
 
 static void model_add_bf16(model_t *m, const char *name, int ndim,
-                           const uint16_t *dims, const float *vals) {
+                           const uint32_t *dims, const float *vals) {
     tensor_def *td = model_slot(m, name, VTM_TENSOR_BF16, ndim, dims);
     buf_t b = {0};
     uint32_t i, n = dims_product(ndim, dims);
@@ -248,7 +248,7 @@ static void make_trt1(buf_t *seg, const int8_t *trits, uint32_t n_trits,
 }
 
 static void model_add_trit_scaled(model_t *m, const char *name, int ndim,
-                                  const uint16_t *dims, const int8_t *trits,
+                                  const uint32_t *dims, const int8_t *trits,
                                   const float *scales, int fp32_scale,
                                   int scale_block) {
     tensor_def *td = model_slot(m, name, VTM_TENSOR_TRIT, ndim, dims);
@@ -260,7 +260,7 @@ static void model_add_trit_scaled(model_t *m, const char *name, int ndim,
 }
 
 static void model_add_trit(model_t *m, const char *name, int ndim,
-                           const uint16_t *dims, const int8_t *trits,
+                           const uint32_t *dims, const int8_t *trits,
                            const float *scales, int fp32_scale) {
     // Тестовые 160-файлы помечаем флагом, чтобы неоднозначный n_scale
     // (например, 6 тритов) читался именно как 160.
@@ -272,7 +272,7 @@ static void model_add_trit(model_t *m, const char *name, int ndim,
 // Тот же тензор, но в «сырой» раскладке: слова в одном месте, масштабы
 // в другом (scale_offset), как допускает поле scale_offset в таблице.
 static void model_add_raw_trit(model_t *m, const char *name, int ndim,
-                               const uint16_t *dims, const int8_t *trits,
+                               const uint32_t *dims, const int8_t *trits,
                                const float *scales) {
     tensor_def *td = model_slot(m, name, VTM_TENSOR_TRIT, ndim, dims);
     uint32_t n = dims_product(ndim, dims);
@@ -324,7 +324,7 @@ static void model_free(model_t *m) {
 }
 
 static int model_build(model_t *m, uint8_t **out, size_t *out_size) {
-    size_t table_size = 32u + (size_t)m->n_tensors * 44u;
+    size_t table_size = 32u + (size_t)m->n_tensors * VTM_TENSOR_ENTRY_SIZE;
     size_t data_start = align32(table_size);
     size_t cursor = data_start;
     size_t meta_off = 0, program_off, total;
@@ -378,9 +378,10 @@ static int model_build(model_t *m, uint8_t **out, size_t *out_size) {
         memcpy(e, td->name, 24);
         e[24] = td->kind;
         e[25] = td->ndim;
-        for (d = 0; d < 4; d++) put_u16(e + 26u + (size_t)d * 2u, td->dims[d]);
-        put_u32(e + 34u, td->offset = offsets[i]);
-        put_u32(e + 38u, td->scale_offset = soffsets[i]);
+        for (d = 0; d < 4; d++)
+            put_u32(e + 26u + (size_t)d * 4u, td->dims[d]);
+        put_u32(e + 42u, td->offset = offsets[i]);
+        put_u32(e + 46u, td->scale_offset = soffsets[i]);
         memcpy(img + data_start + offsets[i], td->blob, td->blob_len);
         if (td->raw)
             memcpy(img + data_start + soffsets[i], td->blob2, td->blob2_len);
@@ -426,7 +427,7 @@ static int run_ok(vtm_t *m) {
 // освобождается здесь: загрузчик держит собственную копию JSON.
 static vtm_t *mini_with_meta(const char *meta) {
     model_t md;
-    uint16_t dy[1] = {1};
+    uint32_t dy[1] = {1};
     float yv[1] = {0.0f};
     uint8_t *img;
     size_t size;
@@ -529,9 +530,9 @@ static void test_trit_codec(void) {
 
 static void test_load_and_tmv(void) {
     model_t md;
-    uint16_t dw[2] = {2, 3};
-    uint16_t dx[1] = {3};
-    uint16_t dy[1] = {2};
+    uint32_t dw[2] = {2, 3};
+    uint32_t dx[1] = {3};
+    uint32_t dy[1] = {2};
     int8_t wt[6] = {1, 0, -1, -1, 1, 1};
     float scales[1] = {2.0f};
     float xv[3] = {2.0f, 3.0f, 4.0f};
@@ -621,9 +622,9 @@ static void test_load_and_tmv(void) {
 // поэтому загрузчик однозначно узнаёт 160 и проверяет смену масштаба.
 static void test_tmv_blocks(void) {
     model_t md;
-    uint16_t dw[2] = {1, 320};
-    uint16_t dx[1] = {320};
-    uint16_t dy[1] = {1};
+    uint32_t dw[2] = {1, 320};
+    uint32_t dx[1] = {320};
+    uint32_t dy[1] = {1};
     int8_t wt[320];
     float scales[2] = {0.5f, 2.0f};
     float xv[320], yv[1] = {0.0f};
@@ -672,9 +673,9 @@ static void test_tmv_blocks(void) {
 // строки, и слова: проверяем глобальный (row-major) индекс блока.
 static void test_tmv_scale128(void) {
     model_t md;
-    uint16_t dw[2] = {2, 150};
-    uint16_t dx[1] = {150};
-    uint16_t dy[1] = {2};
+    uint32_t dw[2] = {2, 150};
+    uint32_t dx[1] = {150};
+    uint32_t dy[1] = {2};
     int8_t wt[300];
     float scales[3] = {0.5f, 1.5f, 2.5f};
     float xv[150], yv[2] = {0.0f, 0.0f};
@@ -727,9 +728,9 @@ static void test_tmv_scale128(void) {
 
 static void test_raw_trit_layout(void) {
     model_t md;
-    uint16_t dw[2] = {1, 3};
-    uint16_t dx[1] = {3};
-    uint16_t dy[1] = {1};
+    uint32_t dw[2] = {1, 3};
+    uint32_t dx[1] = {3};
+    uint32_t dy[1] = {1};
     int8_t wt[3] = {1, -1, 0};
     float scales[1] = {3.0f};
     float xv[3] = {2.0f, 5.0f, 7.0f};
@@ -766,8 +767,8 @@ static void test_raw_trit_layout(void) {
 
 static void test_bad_files(void) {
     model_t md;
-    uint16_t dw[2] = {1, 1};
-    uint16_t dy[1] = {1};
+    uint32_t dw[2] = {1, 1};
+    uint32_t dy[1] = {1};
     int8_t wt[1] = {1};
     float scales[1] = {1.0f};
     float yv[1] = {0.0f};
@@ -783,7 +784,7 @@ static void test_bad_files(void) {
     model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
                VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
     model_build(&md, &img, &size);
-    data_start = align32(32u + (size_t)md.n_tensors * 44u);
+    data_start = align32(32u + (size_t)md.n_tensors * VTM_TENSOR_ENTRY_SIZE);
 
     // Обрезка: не должно быть падения, только NULL.
     m = vtm_load_mem(img, size - 1, &st, err, sizeof err);
@@ -810,9 +811,19 @@ static void test_bad_files(void) {
     {
         uint8_t *c = (uint8_t *)xmalloc(size);
         memcpy(c, img, size);
-        put_u16(c + 4, 2);
+        put_u16(c + 4, 99);
         m = vtm_load_mem(c, size, &st, err, sizeof err);
         CHECK(m == NULL && st == VTM_E_VERSION);
+        free(c);
+    }
+    // v0.1 отвергается с внятным сообщением (ADR 0011).
+    {
+        uint8_t *c = (uint8_t *)xmalloc(size);
+        memcpy(c, img, size);
+        put_u16(c + 4, VTM_FORMAT_VERSION_V01);
+        m = vtm_load_mem(c, size, &st, err, sizeof err);
+        CHECK(m == NULL && st == VTM_E_VERSION);
+        CHECK(strstr(err, "формат v0.1 не поддерживается") != NULL);
         free(c);
     }
     // Абсурдные n_tensors / n_instr.
@@ -832,7 +843,7 @@ static void test_bad_files(void) {
     {
         uint8_t *c = (uint8_t *)xmalloc(size);
         memcpy(c, img, size);
-        put_u32(c + 32u + 34u, 0xFFFFFFE0u);
+        put_u32(c + 32u + 42u, 0xFFFFFFE0u);
         m = vtm_load_mem(c, size, &st, err, sizeof err);
         CHECK(m == NULL);
         CHECK(st == VTM_E_BOUNDS || st == VTM_E_FORMAT);
@@ -877,8 +888,8 @@ static void test_bad_files(void) {
 
 static void test_file_load(void) {
     model_t md;
-    uint16_t dx[1] = {1};
-    uint16_t dy[1] = {1};
+    uint32_t dx[1] = {1};
+    uint32_t dy[1] = {1};
     float xv[1] = {7.0f};
     float yv[1] = {0.0f};
     uint8_t *img;
@@ -938,7 +949,7 @@ static void test_file_load(void) {
 
 static void test_rmsnorm(void) {
     model_t md;
-    uint16_t d[2] = {2};
+    uint32_t d[2] = {2};
     float xv[2] = {3.0f, 4.0f};
     float wv[2] = {1.0f, 2.0f};
     float yv[2] = {0.0f, 0.0f};
@@ -968,12 +979,12 @@ static void test_rmsnorm(void) {
 
 static void test_softmax(void) {
     model_t md;
-    uint16_t dx1[1] = {3};
-    uint16_t dy1[1] = {3};
+    uint32_t dx1[1] = {3};
+    uint32_t dy1[1] = {3};
     float x1[3] = {1.0f, 2.0f, 3.0f};
     float y1[3] = {0.0f, 0.0f, 0.0f};
-    uint16_t dx2[2] = {2, 3};
-    uint16_t dy2[2] = {2, 3};
+    uint32_t dx2[2] = {2, 3};
+    uint32_t dy2[2] = {2, 3};
     float x2[6] = {1.0f, 2.0f, 3.0f, 1.0f, 2.0f, 3.0f};
     float y2[6] = {0.0f};
     uint8_t *img;
@@ -1028,8 +1039,8 @@ static void test_softmax(void) {
 
 static void test_rope(void) {
     model_t md;
-    uint16_t dx[1] = {4};
-    uint16_t dy[1] = {4};
+    uint32_t dx[1] = {4};
+    uint32_t dy[1] = {4};
     float xv[4] = {1.0f, 2.0f, 3.0f, 4.0f};
     float y0[4] = {0.0f};
     float y1[4] = {0.0f};
@@ -1078,8 +1089,8 @@ static void test_rope(void) {
 // шаг нужен лишь затем, чтобы «логиты» были настоящими логитами (y·I).
 static int run_rope_meta(const char *meta, int pos, float *logits, int n) {
     model_t md;
-    uint16_t dx[1] = {8};
-    uint16_t di[2] = {8, 8};
+    uint32_t dx[1] = {8};
+    uint32_t di[2] = {8, 8};
     float xv[8] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
     float zero[8] = {0.0f};
     float ident[64];
@@ -1223,7 +1234,7 @@ static void test_meta_rope(void) {
     // Доступ к мете через API.
     {
         model_t md;
-        uint16_t dy[1] = {1};
+        uint32_t dy[1] = {1};
         float yv[1] = {0.0f};
         uint8_t *img;
         size_t size;
@@ -1257,10 +1268,10 @@ static void test_meta_rope(void) {
 // таблица как плотная матрица (TMV), в том числе в транспонированном виде.
 static void test_meta_fp16_emb_tied(void) {
     model_t md;
-    uint16_t de[2] = {3, 4};     // E: [vocab, hidden]
-    uint16_t det[2] = {4, 3};    // Et = Eᵀ: [hidden, vocab]
-    uint16_t dy[1] = {4};
-    uint16_t dl[1] = {3};
+    uint32_t de[2] = {3, 4};     // E: [vocab, hidden]
+    uint32_t det[2] = {4, 3};    // Et = Eᵀ: [hidden, vocab]
+    uint32_t dy[1] = {4};
+    uint32_t dl[1] = {3};
     float ev[12] = {0.5f, -1.0f, 2.0f, 3.5f,
                     1.5f, 0.1f, -2.0f, 0.75f,
                     -0.5f, 0.5f, 1.0f, -1.5f};
@@ -1377,7 +1388,7 @@ static void test_meta_broken(void) {
 
     for (c = 0; c < n_cases; c++) {
         model_t md;
-        uint16_t dy[1] = {1};
+        uint32_t dy[1] = {1};
         float yv[1] = {0.0f};
         uint8_t *img;
         size_t size;
@@ -1411,7 +1422,7 @@ static void test_meta_broken(void) {
     // врут — контейнер всё равно грузится.
     {
         model_t md;
-        uint16_t dy[1] = {1};
+        uint32_t dy[1] = {1};
         float yv[1] = {0.0f};
         uint8_t *img;
         uint8_t *copy;
@@ -1493,8 +1504,8 @@ static void test_meta_broken(void) {
 
 static void test_emb(void) {
     model_t md;
-    uint16_t de[2] = {2, 2};
-    uint16_t dy[1] = {2};
+    uint32_t de[2] = {2, 2};
+    uint32_t dy[1] = {2};
     float ev[4] = {1.0f, 2.0f, 3.0f, 4.0f};
     float yv[2] = {0.0f, 0.0f};
     uint8_t *img;
@@ -1547,9 +1558,9 @@ static void test_emb(void) {
 
 static void test_mm(void) {
     model_t md;
-    uint16_t da[2] = {2, 3};
-    uint16_t db[2] = {3, 2};
-    uint16_t dy[2] = {2, 2};
+    uint32_t da[2] = {2, 3};
+    uint32_t db[2] = {3, 2};
+    uint32_t dy[2] = {2, 2};
     float av[6] = {1, 2, 3, 4, 5, 6};
     float bv[6] = {1, 2, 3, 4, 5, 6};
     float yv[4] = {0};
@@ -1585,8 +1596,8 @@ static void test_mm(void) {
 
 static void test_elementwise(void) {
     model_t md;
-    uint16_t d2[1] = {2};
-    uint16_t d3[1] = {3};
+    uint32_t d2[1] = {2};
+    uint32_t d3[1] = {3};
     float av[2] = {1.0f, 2.0f};
     float bv[2] = {3.0f, 4.0f};
     float addv[2] = {0.0f, 0.0f};
@@ -1646,10 +1657,10 @@ static void test_elementwise(void) {
 
 static void test_attn_plain(void) {
     model_t md;
-    uint16_t dq[3] = {1, 1, 2};
-    uint16_t dk[3] = {1, 2, 2};
-    uint16_t dv[3] = {1, 2, 2};
-    uint16_t dout[3] = {1, 1, 2};
+    uint32_t dq[3] = {1, 1, 2};
+    uint32_t dk[3] = {1, 2, 2};
+    uint32_t dv[3] = {1, 2, 2};
+    uint32_t dout[3] = {1, 1, 2};
     float qv[2] = {1.0f, 0.0f};
     float kv[4] = {1.0f, 0.0f, 0.0f, 1.0f};
     float vv[4] = {1.0f, 2.0f, 3.0f, 4.0f};
@@ -1683,10 +1694,10 @@ static void test_attn_plain(void) {
 
 static void test_attn_causal(void) {
     model_t md;
-    uint16_t dq[3] = {1, 2, 2};
-    uint16_t dk[3] = {1, 3, 2};
-    uint16_t dv[3] = {1, 3, 2};
-    uint16_t dout[3] = {1, 2, 2};
+    uint32_t dq[3] = {1, 2, 2};
+    uint32_t dk[3] = {1, 3, 2};
+    uint32_t dv[3] = {1, 3, 2};
+    uint32_t dout[3] = {1, 2, 2};
     float qv[4] = {1.0f, 0.0f, 0.0f, 1.0f};
     float kv[6] = {1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
     float vv[6] = {1.0f, 0.0f, 0.0f, 1.0f, 10.0f, 10.0f};
@@ -1722,11 +1733,11 @@ static void test_attn_causal(void) {
 
 static void test_kvw_attn_cache(void) {
     model_t md;
-    uint16_t dkc[2] = {2, 2};
-    uint16_t dvc[2] = {2, 2};
-    uint16_t dq[3] = {1, 1, 2};
-    uint16_t dout[3] = {1, 1, 2};
-    uint16_t dvec[1] = {2};
+    uint32_t dkc[2] = {2, 2};
+    uint32_t dvc[2] = {2, 2};
+    uint32_t dq[3] = {1, 1, 2};
+    uint32_t dout[3] = {1, 1, 2};
+    uint32_t dvec[1] = {2};
     float k0[2] = {1.0f, 0.0f};
     float v0[2] = {1.0f, 2.0f};
     float k1[2] = {0.0f, 1.0f};
@@ -1791,8 +1802,8 @@ static int cb_capture(void *user, int token, int position) {
 
 static void test_samp(void) {
     model_t md;
-    uint16_t dlog[1] = {3};
-    uint16_t dto[1] = {1};
+    uint32_t dlog[1] = {3};
+    uint32_t dto[1] = {1};
     float logits[3] = {0.5f, 2.0f, 1.0f};
     float tok[1] = {-1.0f};
     uint8_t *img;
@@ -1850,7 +1861,7 @@ static void test_samp(void) {
 
 static void test_f16_bf16(void) {
     model_t md;
-    uint16_t d[1] = {2};
+    uint32_t d[1] = {2};
     float f16v[2] = {1.5f, -2.5f};
     float bf16v[2] = {3.5f, -4.5f};
     float f16y[2] = {0.0f, 0.0f};
@@ -1883,6 +1894,44 @@ static void test_f16_bf16(void) {
     model_free(&md);
 }
 
+// v0.2: словарь Qwen 151936 (> 65535) должен влезать и читаться (ADR 0011).
+static void test_large_dims_u32(void) {
+    model_t md;
+    uint8_t *img = NULL;
+    size_t size = 0;
+    uint32_t n = 151936u;
+    uint32_t dims[1];
+    float *vals;
+    uint32_t i;
+    vtm_t *m;
+    const vtm_tensor *t;
+
+    model_init(&md);
+    dims[0] = n;
+    vals = (float *)xmalloc(sizeof(float) * (size_t)n);
+    for (i = 0; i < n; i++) vals[i] = (float)(i % 7u) - 3.0f;
+    model_add_f32(&md, "embed", 1, dims, vals);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    CHECK(m != NULL);
+    if (m) {
+        t = vtm_tensor_by_name(m, "embed");
+        CHECK(t != NULL);
+        if (t) {
+            CHECK(t->ndim == 1);
+            CHECK(t->dims[0] == n);
+            CHECK(t->n_elements == n);
+            CHECK_NEAR(t->f32[151935], (float)(151935u % 7u) - 3.0f, 1e-6);
+        }
+        vtm_free(m);
+    }
+    free(vals);
+    free(img);
+    model_free(&md);
+}
+
 // --- main ------------------------------------------------------------------
 
 int main(void) {
@@ -1907,6 +1956,7 @@ int main(void) {
     test_kvw_attn_cache();
     test_samp();
     test_f16_bf16();
+    test_large_dims_u32();
 
     if (g_fail) {
         fprintf(stderr, "\nПРОВАЛЕНО проверок: %d\n", g_fail);

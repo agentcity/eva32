@@ -191,7 +191,7 @@ class TestContainerRoundTrip(_TmpCase):
 
         magic, version, flags, n_instr, n_tensors, n_program = struct.unpack("<4sHHIII", data[:20])
         self.assertEqual(magic, b"VTM1")
-        self.assertEqual(version, 1)
+        self.assertEqual(version, 2)
         self.assertIn(flags & vtm_ref.VFLAG_CAUSAL, (0, vtm_ref.VFLAG_CAUSAL))
         self.assertEqual(n_instr, len(program))
         self.assertEqual(n_tensors, len(tensors))
@@ -203,8 +203,8 @@ class TestContainerRoundTrip(_TmpCase):
         self.assertEqual(meta_len, len(vtm_ref._encode_meta(meta)))
         self.assertEqual(program_offset, vtm_ref.align_up(meta_offset + meta_len))
 
-        # data_start = align32(32 + 44*n), offset'ы тензоров от него и по 32.
-        table_end = 32 + 44 * n_tensors
+        # data_start = align32(32 + 52*n), offset'ы тензоров от него и по 32.
+        table_end = 32 + 52 * n_tensors
         data_start = vtm_ref.align_up(table_end)
         data_size = 0
         for tensor in tensors:
@@ -230,7 +230,7 @@ class TestContainerRoundTrip(_TmpCase):
         self.assertEqual(loaded.meta_len, 0)
         # заголовок + запись таблицы + выравнивание данных + 8 байт fp32 + программа
         self.assertEqual(
-            os.path.getsize(path), vtm_ref.align_up(32 + 44) + 32 + 16
+            os.path.getsize(path), vtm_ref.align_up(32 + 52) + 32 + 16
         )
 
     def test_execute_after_roundtrip_is_identical(self):
@@ -241,6 +241,58 @@ class TestContainerRoundTrip(_TmpCase):
         after = vtm_ref.execute(vtm_ref.read_vtm(path), [], 0)
         self.assertEqual(before.logits, after.logits)
         self.assertEqual(before.workspace, after.workspace)
+
+    def test_vocab_151936_roundtrip(self):
+        # Словарь Qwen: 151 936 > 65 535, в v0.1 такой тензор не влезал.
+        n = 151_936
+        values = [float(i % 7) - 3.0 for i in range(n)]
+        tensor = vtm_ref.Tensor.f32("embed", (n,), values)
+        program = [vtm_ref.Instr(vtm_ref.Op.HALT)]
+        path = self.path("vocab.vtm")
+        written = vtm_ref.write_vtm(path, [tensor], program, {})
+        self.assertEqual(os.path.getsize(path), written.estimated_file_size())
+
+        with open(path, "rb") as handle:
+            data = handle.read()
+        self.assertEqual(struct.unpack_from("<4sHHIII", data, 0)[1], 2)  # version
+        # Запись таблицы v0.2: dims u32 по смещению 26, offset — 42,
+        # scale_offset — 46; сама запись 52 байта.
+        self.assertEqual(struct.unpack_from("<I", data, 32 + 26)[0], n)
+        self.assertEqual(struct.unpack_from("<I", data, 32 + 42)[0], 0)
+        self.assertEqual(struct.unpack_from("<I", data, 32 + 46)[0], 0)
+        self.assertEqual(vtm_ref.align_up(32 + vtm_ref.TENSOR_ENTRY_SIZE), 96)
+
+        loaded = vtm_ref.read_vtm(path)
+        restored = loaded.tensors[0]
+        self.assertEqual(restored.dims, (n,))
+        self.assertEqual(restored.n_elements, n)
+        self.assertEqual(len(restored.data), n)
+        self.assertEqual(restored.dense(), values)
+        self.assertEqual(restored.dims, (151_936,))
+
+    def test_v01_file_is_rejected(self):
+        # Настоящая раскладка v0.1 здесь не нужна: version=1 отвергается
+        # до разбора таблицы, и сообщение должно быть внятным.
+        tensor = vtm_ref.Tensor.f32("x", (2,), [1.0, 2.0])
+        path = self.path("v02.vtm")
+        vtm_ref.write_vtm(path, [tensor], [vtm_ref.Instr(vtm_ref.Op.HALT)], {})
+        with open(path, "rb") as handle:
+            data = bytearray(handle.read())
+        data[4:6] = struct.pack("<H", 1)
+        legacy = self.path("v01.vtm")
+        with open(legacy, "wb") as handle:
+            handle.write(bytes(data))
+        with self.assertRaises(ValueError) as caught:
+            vtm_ref.read_vtm(legacy)
+        self.assertIn("формат v0.1 не поддерживается", str(caught.exception))
+
+    def test_entry_is_52_bytes_with_u32_dims(self):
+        self.assertEqual(vtm_ref.VTM_VERSION, 2)
+        self.assertEqual(vtm_ref.TENSOR_ENTRY_SIZE, 52)
+        self.assertEqual(vtm_ref._TENSOR_STRUCT.size, 52)
+        self.assertEqual(struct.calcsize("<24sBB4IIIH"), 52)
+        with self.assertRaises(ValueError):
+            vtm_ref.Tensor.f32("too_wide", (1 << 32,), [0.0])
 
 
 class TestInstructionEncoding(unittest.TestCase):
@@ -345,9 +397,9 @@ class TestCorruptFiles(_TmpCase):
             vtm_ref.read_vtm(path)
 
     def test_offset_out_of_bounds(self):
-        # offset — u32 по смещению 34 от начала записи таблицы.
+        # offset — u32 по смещению 42 от начала записи таблицы (v0.2).
         def mutate(data):
-            data[32 + 34:32 + 38] = struct.pack("<I", 0xFFFF00)
+            data[32 + 42:32 + 46] = struct.pack("<I", 0xFFFF00)
         path = self._patched(mutate, "offset.vtm")
         with self.assertRaises(ValueError):
             vtm_ref.read_vtm(path)
@@ -372,8 +424,8 @@ class TestCorruptFiles(_TmpCase):
         def mutate(data):
             # данные первого тензора начинаются с data_start + offset
             n_tensors = struct.unpack("<I", data[12:16])[0]
-            data_start = vtm_ref.align_up(32 + 44 * n_tensors)
-            offset = struct.unpack("<I", data[32 + 34:32 + 38])[0]
+            data_start = vtm_ref.align_up(32 + 52 * n_tensors)
+            offset = struct.unpack("<I", data[32 + 42:32 + 46])[0]
             data[data_start + offset: data_start + offset + 4] = b"XXXX"
         path = self._patched(mutate, "seg.vtm")
         with self.assertRaises(ValueError):

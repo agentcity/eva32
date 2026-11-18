@@ -1,4 +1,4 @@
-// VTM — виртуальная троичная машина, публичный API (v0.1).
+// VTM — виртуальная троичная машина, публичный API (v0.2).
 //
 // Единственный вход для хоста: vtm_load()/vtm_load_mem(), затем vtm_run().
 // Формат контейнера описан в docs/vtm.md; решения, которых в спеке не было,
@@ -18,9 +18,11 @@ extern "C" {
 #endif
 
 // --- размеры контейнера -----------------------------------------------------
-#define VTM_FORMAT_VERSION   1u
+// v0.2: dims — u32×4 (ADR 0011), запись тензора 52 байта вместо 44.
+#define VTM_FORMAT_VERSION   2u
+#define VTM_FORMAT_VERSION_V01 1u
 #define VTM_HEADER_SIZE      32u
-#define VTM_TENSOR_ENTRY_SIZE 44u
+#define VTM_TENSOR_ENTRY_SIZE 52u
 #define VTM_INSTR_SIZE       16u
 #define VTM_DATA_ALIGN       32u
 #define VTM_ARENA_ALIGN      64u
@@ -92,7 +94,7 @@ typedef struct {
     char name[24];          // NUL-терминированное имя из таблицы
     uint8_t kind;           // vtm_tensor_kind
     uint8_t ndim;           // 1..4
-    uint16_t dims[4];       // dims[0] — старшая ось, dims[ndim-1] — младшая
+    uint32_t dims[4];       // dims[0] — старшая ось, dims[ndim-1] — младшая
     uint32_t n_elements;    // произведение dims[0..ndim-1]
     uint32_t offset;        // от начала секции данных, кратен 32
     uint32_t scale_offset;  // VTM_NO_OFFSET для встроенного TRT1

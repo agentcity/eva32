@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VTM v0.1 — эталонная Python-реализация: контейнер, исполнитель, семантика.
+"""VTM v0.2 — эталонная Python-реализация: контейнер, исполнитель, семантика.
 
 Это **наша истина**. C-интерпретатор (`src/vtm/`) обязан воспроизводить
 поведение этого модуля; если результаты расходятся — прав Python, а не C.
@@ -22,20 +22,20 @@
  20  program_offset u32            4   абсолютное смещение программы в файле
  24  meta_offset u32               4   абсолютное смещение JSON-метаданных (0 = нет)
  28  meta_len u32                  4   длина JSON-метаданных в байтах (без padding)
-32                       таблица тензоров: n_tensors * 44 байта
+32                       таблица тензоров: n_tensors * 52 байта
   0  name[24]  UTF-8, NUL-дополнение
  24  kind u8                        0 триты (TRT1), 1 fp32, 2 fp16, 3 bf16
  25  ndim u8                        1..4
- 26  dims u16[4]                    недостающие измерения = 0
- 34  offset u32                     смещение ОТ НАЧАЛА СЕКЦИИ ДАННЫХ, кратно 32
- 38  scale_offset u32               0xFFFFFFFF (VTM_NO_OFFSET) — масштабы лежат
+ 26  dims u32[4]                    недостающие измерения = 0
+ 42  offset u32                     смещение ОТ НАЧАЛА СЕКЦИИ ДАННЫХ, кратно 32
+ 46  scale_offset u32               0xFFFFFFFF (VTM_NO_OFFSET) — масштабы лежат
                                     внутри TRT1-сегмента по offset; для fp — 0
                                     (читатель принимает и offset+18 как синоним)
- 42  reserved u16                   0
+ 50  reserved u16                   0
      (20 из 32 байт заголовка — это поля спеки; 12 байт «резерва» заняты
       program_offset/meta_offset/meta_len, что обратно совместимо: C может
       игнорировать эти три слова и читать программу с конца файла.)
-data_start = align32(32 + 44*n_tensors)
+data_start = align32(32 + 52*n_tensors)
 секция данных:      payload'ы тензоров подряд, каждый выровнен на 32 байта
 meta_start = data_start + data_size   (JSON, опционально, дополнен нулями до 32)
 program_offset = meta_start + align32(meta_len)  — программа идёт ПОСЛЕДНЕЙ
@@ -45,6 +45,11 @@ program_offset = meta_start + align32(meta_len)  — программа идёт
 Почему программа в конце: C-читатель, который ничего не знает про метаданные,
 всё равно может взять её как `file_size - n_instr*16`; `program_offset` из
 заголовка — тот же ответ.
+
+Версия 2 (ADR 0011): `dims` — `u32 × 4`, запись тензора 52 байта. Файлы v0.1
+(version=1, запись 44 байта) не читаются: `read_vtm` бросает `ValueError`
+«формат v0.1 не поддерживается» — ценных артефактов v0.1 нет, синтетика
+пересобирается за секунды.
 
 Тензор тритов (kind 0) — сегмент TRT1 (см. `docs/trit-format.md`):
 
@@ -216,18 +221,21 @@ except ImportError:  # pragma: no cover - запуск как `python3 tools/vtm
 # ---------------------------------------------------------------------------
 
 VTM_MAGIC = b"VTM1"
-VTM_VERSION = 1
+VTM_VERSION = 2
+VTM_VERSION_V01 = 1
 TRT1_MAGIC = b"TRT1"
 TRT1_VERSION = 1
 TRT1_HEADER_SIZE = 18
 
 HEADER_SIZE = 32
-TENSOR_ENTRY_SIZE = 44
+TENSOR_ENTRY_SIZE = 52
 INSTR_SIZE = 16
 ALIGNMENT = 32
 NAME_SIZE = 24
 MAX_DIMS = 4
 MAX_TENSORS = 0xFFFF
+#: Одно измерение тензора — u32; больше не влезает в запись таблицы.
+MAX_DIM_VALUE = 0xFFFFFFFF
 
 TRITS_PER_WORD = 20
 TRITS_PER_STORAGE_BLOCK = 160
@@ -285,14 +293,14 @@ OP_NAMES = {int(op): op.name for op in Op}
 
 _HEADER_STRUCT = struct.Struct("<4sHHIII")
 _RESERVED_STRUCT = struct.Struct("<III")
-_TENSOR_STRUCT = struct.Struct("<24sBB4HIIH")
+_TENSOR_STRUCT = struct.Struct("<24sBB4IIIH")
 _INSTR_STRUCT = struct.Struct("<BBHHHH2xi")
 _TRT1_STRUCT = struct.Struct("<4sBBQI")
 
 if _HEADER_STRUCT.size + _RESERVED_STRUCT.size != HEADER_SIZE:  # pragma: no cover
     raise RuntimeError("заголовок VTM должен быть 32 байта")
 if _TENSOR_STRUCT.size != TENSOR_ENTRY_SIZE:  # pragma: no cover
-    raise RuntimeError("запись таблицы тензоров должна быть 44 байта")
+    raise RuntimeError("запись таблицы тензоров должна быть 52 байта")
 if _INSTR_STRUCT.size != INSTR_SIZE:  # pragma: no cover
     raise RuntimeError("инструкция VTM должна быть 16 байт")
 if _TRT1_STRUCT.size != TRT1_HEADER_SIZE:  # pragma: no cover
@@ -399,6 +407,11 @@ class Tensor:
             raise ValueError(f"тензор {self.name!r}: ndim={len(self.dims)}, допустимо 1..{MAX_DIMS}")
         if any(d <= 0 for d in self.dims):
             raise ValueError(f"тензор {self.name!r}: размеры должны быть > 0, получено {self.dims}")
+        if any(d > MAX_DIM_VALUE for d in self.dims):
+            raise ValueError(
+                f"тензор {self.name!r}: размер {max(self.dims)} не влезает в u32 "
+                f"(максимум {MAX_DIM_VALUE})"
+            )
         name_bytes = self.name.encode("utf-8") if isinstance(self.name, str) else b""
         if not self.name or b"\0" in name_bytes:
             raise ValueError(f"тензор {self.name!r}: имя пустое или содержит NUL")
@@ -894,8 +907,8 @@ def write_vtm(
     file_size = program_offset + len(program_bytes)
     if file_size >= 2 ** 32:
         raise ValueError(
-            f"VTM v0.1 адресует файл 32-битными смещениями: {file_size} байт "
-            "не влезает, нужен формат v0.2 (u64)"
+            f"VTM адресует файл 32-битными смещениями: {file_size} байт "
+            "не влезает в контейнер"
         )
 
     flags = VFLAG_CAUSAL
@@ -990,6 +1003,11 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     magic, version, flags, n_instr, n_tensors, n_program = _HEADER_STRUCT.unpack_from(data, 0)
     if magic != VTM_MAGIC:
         raise ValueError(f"чужой magic контейнера: {magic!r}")
+    if version == VTM_VERSION_V01:
+        raise ValueError(
+            "формат v0.1 не поддерживается: пересоберите контейнер в v0.2 "
+            "(dims u32, запись тензора 52 байта)"
+        )
     if version != VTM_VERSION:
         raise ValueError(f"неизвестная версия контейнера: {version}")
     if n_tensors > MAX_TENSORS:

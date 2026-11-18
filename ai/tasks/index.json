@@ -198,7 +198,7 @@
   {
     "id": "0029",
     "title": "Компилятор: собрать полную модель в .vtm",
-    "status": "in_progress",
+    "status": "done",
     "file": "0029-vtm-compiler.md",
     "assignee": "agent:vtm-compiler"
   },
@@ -240,7 +240,7 @@
   {
     "id": "0035",
     "title": "Контейнер v0.2 — размерности u32",
-    "status": "in_progress",
+    "status": "done",
     "file": "0035-container-v02.md",
     "assignee": "agent:container-v02"
   },
@@ -278,5 +278,12 @@
     "status": "in_progress",
     "file": "0040-vtm-text.md",
     "assignee": "agent:vtm-text"
+  },
+  {
+    "id": "0041",
+    "title": "MM принимает размерность >65535",
+    "status": "done",
+    "file": "0041-mm-casts.md",
+    "assignee": "saron"
   }
 ]

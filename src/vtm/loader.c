@@ -1,5 +1,8 @@
-// Загрузчик .vtm: заголовок 32 байта, таблица тензоров по 44 байта,
+// Загрузчик .vtm: заголовок 32 байта, таблица тензоров по 52 байта,
 // секция данных с выравниванием на 32 и программа в конце файла.
+//
+// Формат v0.2 (ADR 0011): dims — u32×4. Файлы v0.1 отвергаются: ценных
+// артефактов v0.1 нет, синтетика пересобирается.
 //
 // Все проверки границ делаются до выделения памяти и до исполнения. Кривой
 // файл обязан вернуть NULL и внятную причину, а не уронить процесс.
@@ -610,6 +613,8 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
 
     if (memcmp(p, "VTM1", 4) != 0)
         FAIL(VTM_E_MAGIC, "нет магии VTM1");
+    if (rd16(p + 4) == VTM_FORMAT_VERSION_V01)
+        FAIL(VTM_E_VERSION, "формат v0.1 не поддерживается");
     if (rd16(p + 4) != VTM_FORMAT_VERSION)
         FAIL(VTM_E_VERSION, "версия контейнера %u, ожидали %u",
              (unsigned)rd16(p + 4), (unsigned)VTM_FORMAT_VERSION);
@@ -624,7 +629,8 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
              n_tensors, (unsigned)VTM_MAX_TENSORS);
     if ((uint64_t)n_tensors * VTM_TENSOR_ENTRY_SIZE > (uint64_t)(size - 32))
         FAIL(VTM_E_TRUNCATED,
-             "таблица тензоров (%u × 44) не влезает в файл", n_tensors);
+             "таблица тензоров (%u × %u) не влезает в файл", n_tensors,
+             (unsigned)VTM_TENSOR_ENTRY_SIZE);
     table_end = 32u + (size_t)n_tensors * VTM_TENSOR_ENTRY_SIZE;
     if (align_up(table_end, VTM_DATA_ALIGN, &data_start) != 0 || data_start > size)
         FAIL(VTM_E_TRUNCATED, "не удалось выровнять начало данных");
@@ -688,7 +694,7 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
                  i, t->name, (unsigned)t->ndim, (unsigned)VTM_MAX_DIMS);
 
         for (d = 0; d < VTM_MAX_DIMS; d++) {
-            uint16_t dim = rd16(e + 26u + (size_t)d * 2u);
+            uint32_t dim = rd32(e + 26u + (size_t)d * 4u);
             if (d < t->ndim) {
                 if (dim == 0)
                     FAIL(VTM_E_FORMAT,
@@ -704,8 +710,8 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
             }
         }
         t->n_elements = (uint32_t)n_el;
-        t->offset = rd32(e + 34u);
-        t->scale_offset = rd32(e + 38u);
+        t->offset = rd32(e + 42u);
+        t->scale_offset = rd32(e + 46u);
         t->n_blocks = 0;
         t->n_scales = 0;
         t->scale_block = 0;
