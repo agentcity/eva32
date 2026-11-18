@@ -5,7 +5,7 @@ title: Гибрид — eva-server
 created_at: 2026-11-18T04:40:00Z
 author: yuri
 assignee: agent:eva-server
-status: in_progress
+status: done
 scope:
   docs: false
   code: true
@@ -44,7 +44,18 @@ OpenAI-совместимый HTTP-сервер на stdlib: чтобы orioncod
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: `eva/server.py` (656 строк), `eva/__main__.py` (CLI), 34 теста.
+
+Проверено архитектором на живом процессе (не только в unittest):
+- `create_server(port=0)` → `/health` отвечает ok
+- `/v1/chat/completions` отдаёт тело OpenAI + поле `eva` с маршрутом и ценой
+- битый JSON → 400 с человеческим текстом, сервер жив
+- тесты поднимают реальный loopback-сервер, внешней сети нет
+
+Риски приняты: `stream=true` не поддержан (400 unsupported_stream) — нужен SSE
+отдельной задачей, если orioncode стримит; ошибки политики схлопываются в 500 без
+машинного кода (402/429) — доделаем при подключении к orioncode; сервер сам
+телеметрию не пишет, это делает роутер.
 
 ## Ссылки
 
