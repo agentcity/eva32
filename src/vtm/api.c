@@ -18,12 +18,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Внутренние функции kv_store.c (задача 0079). Не публичный API: объявлены
-// здесь, чтобы не заводить ещё один заголовок в зоне задачи.
+// Внутренние функции kv_store.c (задачи 0079, 0083). Не публичный API:
+// объявлены здесь, чтобы не заводить ещё один заголовок в зоне задачи.
 int vtm_session_save(const vtm_t *m, int32_t pending_token, const char *path,
                      char *err, size_t errcap);
 int vtm_session_load(vtm_t *m, int32_t *pending_token, const char *path,
                      char *err, size_t errcap);
+// Уложить каталог сессий в лимит: удалить самые старые по mtime, кроме
+// keep_path и незавершённых temp-файлов. Возврат — число удалённых файлов.
+int vtm_session_prune(const char *dir, uint64_t limit_bytes,
+                      const char *keep_path);
 
 struct vtm_api {
     vtm_t *m;                 // загруженная машина; владеет контекст
@@ -36,6 +40,10 @@ struct vtm_api {
     // Снимок обязан его запомнить, иначе продолжение потеряет один шаг.
     int32_t session_token;    // значим при session_token_valid
     int session_token_valid;  // 1 — session_token можно подать машине
+    // Лимит каталога сессий (задача 0083): sessions_limit == 0 или пустой
+    // sessions_dir — вытеснение выключено.
+    char sessions_dir[1024];
+    uint64_t sessions_limit;
     char error[256];          // последняя ошибка; "" — ошибки не было
 };
 
@@ -330,7 +338,15 @@ int vtm_api_generate(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
     return rc;
 }
 
-// --- сессии KV (задача 0079) ----------------------------------------------
+// --- сессии KV (задачи 0079, 0083) ----------------------------------------
+
+// Лимит каталога: вытеснить старые снимки, не трогая keep_path. Ошибки
+// вытеснения не поднимаются наружу: снимок уже записан/прочитан, а
+// предупреждение vtm_session_prune печатает в stderr сам.
+static void api_sessions_enforce(vtm_api_t *ctx, const char *keep_path) {
+    if (ctx->sessions_limit == 0 || ctx->sessions_dir[0] == '\0') return;
+    (void)vtm_session_prune(ctx->sessions_dir, ctx->sessions_limit, keep_path);
+}
 
 // Занять контекст на время операции: та же защита, что у generate(), без
 // гонки с параллельным generate() (вернём VTM_E_ARG, не трогая error).
@@ -360,6 +376,10 @@ int vtm_api_session_save(vtm_api_t *ctx, const char *path) {
             snprintf(ctx->error, sizeof ctx->error, "vtm_api_session_save: %s",
                      vtm_strerror((vtm_status)rc));
         }
+    } else {
+        // Снимок уже на диске: даже если вытеснение старых не удалось, save()
+        // успешен (ошибки prune — только предупреждения в stderr).
+        api_sessions_enforce(ctx, path);
     }
     atomic_store_explicit(&ctx->busy, 0, memory_order_release);
     return rc;
@@ -390,8 +410,36 @@ int vtm_api_session_load(vtm_api_t *ctx, const char *path) {
                      vtm_strerror((vtm_status)rc));
         }
     }
+    if (rc == VTM_OK) api_sessions_enforce(ctx, path);
     atomic_store_explicit(&ctx->busy, 0, memory_order_release);
     return rc;
+}
+
+int vtm_api_sessions_dir(vtm_api_t *ctx, const char *path) {
+    size_t n;
+
+    if (ctx == NULL) return VTM_E_ARG;
+    ctx->error[0] = '\0';
+    if (path == NULL || *path == '\0') {
+        ctx->sessions_dir[0] = '\0';
+        return VTM_OK;
+    }
+    n = strlen(path);
+    if (n >= sizeof ctx->sessions_dir) {
+        return api_fail(ctx, VTM_E_ARG,
+                        "vtm_api_sessions_dir: путь длиннее %u байт",
+                        (unsigned)(sizeof ctx->sessions_dir - 1u));
+    }
+    memcpy(ctx->sessions_dir, path, n + 1u);
+    return VTM_OK;
+}
+
+int vtm_api_sessions_limit(vtm_api_t *ctx, uint64_t bytes) {
+    if (ctx == NULL) return VTM_E_ARG;
+    ctx->error[0] = '\0';
+    // 0 — лимит снят; вытеснение не запускается до следующего save/load.
+    ctx->sessions_limit = bytes;
+    return VTM_OK;
 }
 
 int vtm_api_session_continue(vtm_api_t *ctx, vtm_api_token_cb cb, void *user) {

@@ -534,7 +534,7 @@
   {
     "id": "0083",
     "title": "Сессии: дедуплицировать SHA и добавить лимит с LRU",
-    "status": "in_progress",
+    "status": "done",
     "file": "0083-vtm-session-lru.md",
     "assignee": "agent:vtm-session-lru"
   },

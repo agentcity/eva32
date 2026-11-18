@@ -1,19 +1,26 @@
-// Тест KV-сессий (задача 0079): снимок после 3 токенов, загрузка в новую
-// машину, продолжение — совпадает с непрерывным прогоном; оборванный и
-// повреждённый файл дают ошибку без падения и не портят машину.
+// Тест KV-сессий (задачи 0079, 0083): снимок после 3 токенов, загрузка в
+// новую машину, продолжение — совпадает с непрерывным прогоном; оборванный и
+// повреждённый файл дают ошибку без падения и не портят машину. Отдельно —
+// совместимость хеша (trailer == стандартный SHA-256) и лимит каталога с
+// вытеснением старых сессий по mtime.
 //
 // Сборка (из корня репозитория):
 //   cc -std=c99 -O2 -I src/vtm -o /tmp/t tests/test_vtm_session.c \
 //      src/vtm/libvtm.a -lpthread
 // Модель по умолчанию — demo/model.vtm (аргументом можно задать другую).
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "api.h"
+#include "sha256.h"
 #include "vtm.h"
 
 #define N_PROMPT 3
@@ -82,6 +89,61 @@ static int write_file(const char *path, const unsigned char *buf, size_t n) {
     if (f == NULL) return -1;
     if (n != 0 && fwrite(buf, 1, n, f) != n) { fclose(f); return -1; }
     return fclose(f) == 0 ? 0 : -1;
+}
+
+// Суммарный размер обычных файлов каталога и их число. Temp-файлы записи
+// ("<сессия>.tmp.<pid>") не считаем: их не должно оставаться после save.
+static int dir_usage(const char *dir, int *count, unsigned long long *bytes) {
+    DIR *d = opendir(dir);
+    struct dirent *de;
+    int n = 0;
+    unsigned long long total = 0;
+
+    if (d == NULL) return -1;
+    while ((de = readdir(d)) != NULL) {
+        char path[512];
+        struct stat st;
+
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (strstr(de->d_name, ".tmp.") != NULL) continue;
+        snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        n++;
+        total += (unsigned long long)st.st_size;
+    }
+    (void)closedir(d);
+    *count = n;
+    *bytes = total;
+    return 0;
+}
+
+// Явный mtime: лимит вытесняет по времени изменения, а пять save подряд
+// укладываются в одну секунду.
+static void set_mtime(const char *path, long sec) {
+    struct timeval tv[2];
+
+    tv[0].tv_sec = sec;
+    tv[0].tv_usec = 0;
+    tv[1].tv_sec = sec;
+    tv[1].tv_usec = 0;
+    (void)utimes(path, tv);
+}
+
+static void clear_dir(const char *dir) {
+    DIR *d = opendir(dir);
+    struct dirent *de;
+
+    if (d == NULL) return;
+    while ((de = readdir(d)) != NULL) {
+        char path[512];
+
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+        (void)unlink(path);
+    }
+    (void)closedir(d);
 }
 
 static uint32_t le32(const unsigned char *p) {
@@ -166,12 +228,15 @@ int main(int argc, char **argv) {
         size_t size = 0;
         struct stat st;
         int fmt_ok = 0;
+        int hash_ok = 0;
         if (stat(sess, &st) == 0 && read_file(sess, &buf, &size) == 0
             && size > 64 + 36) {
             const uint32_t ctx_len = le32(buf + 16);
             const uint32_t kv_dim = le32(buf + 20);
             const uint32_t layers = le32(buf + 24);
             const uint64_t kv_bytes = le64(buf + 40);
+            vtm_sha256_ctx h;
+            uint8_t digest[32];
             fmt_ok = memcmp(buf, "VTMS", 4) == 0
                   && le32(buf + 4) == 1
                   && ctx_len == 8 && kv_dim == 32 && layers == 1
@@ -179,11 +244,20 @@ int main(int argc, char **argv) {
                   && (uint64_t)size
                      == (uint64_t)64 + kv_bytes + 36
                   && memcmp(buf + size - 36, "VTME", 4) == 0;
+            // Хеш сессии — обычный SHA-256 от заголовка и кадров. Так же
+            // считала локальная копия в kv_store.c до 0083, поэтому снимки
+            // 0079 читаются без миграции (см. также tests/vtm/test_sha256.c
+            // с векторами NIST).
+            vtm_sha256_init(&h);
+            vtm_sha256_update(&h, buf, size - 36);
+            vtm_sha256_final(&h, digest);
+            hash_ok = memcmp(buf + size - 36 + 4, digest, sizeof digest) == 0;
             printf("  формат: размер=%zu, ctx=%u, kv_dim=%u, слоёв=%u\n",
                    size, ctx_len, kv_dim, layers);
         }
         free(buf);
         check(fmt_ok, "заголовок VTMS v1, trailer VTME, размер сходится");
+        check(hash_ok, "trailer == стандартный sha256(заголовок+кадры)");
     }
 
     // 3. Загрузка в НОВУЮ машину и продолжение.
@@ -284,6 +358,131 @@ int main(int argc, char **argv) {
         check(rc == VTM_OK, "снимок до генерации загружен");
         rc = vtm_api_session_continue(ctx, bag_cb, &second);
         check(rc == VTM_E_ARG, "continue без pending -> VTM_E_ARG");
+    }
+
+    // 9. Лимит каталога сессий (0083): 5 снимков по ~2 КБ при лимите 5 КБ ->
+    //    остаются 2–3 самые новые, старые вытесняются по mtime; запись новой
+    //    не падает, а только что записанный файл не удаляется даже при лимите
+    //    меньше его размера.
+    {
+        char dir[512];
+        char paths[5][512];
+        char probe_path[512];
+        const uint64_t limit = 5u * 1024u;
+        unsigned long long bytes = 0;
+        long mtime_base = (long)time(NULL) - 3600;
+        int made_dir = 0;
+        int count = 0;
+        int exp_count = 1;
+        int exists[5];
+        int saves_ok = 0;
+        vtm_api_t *lru = NULL;
+
+        // mkdtemp в строгом POSIX C99 на macOS не объявлен, поэтому каталог
+        // создаём сами: имя уникально по pid + счётчику.
+        for (i = 0; i < 100 && !made_dir; i++) {
+            snprintf(dir, sizeof dir, "/tmp/vtm_session_lru_%ld_%zu",
+                     (long)getpid(), i);
+            if (mkdir(dir, 0700) == 0) made_dir = 1;
+            else if (errno != EEXIST) break;
+        }
+        check(made_dir, "временный каталог под лимит создан");
+        if (made_dir) {
+            lru = open_ctx(model, N_GEN);
+            check(lru != NULL, "контекст для проверки лимита открыт");
+        }
+
+        if (lru != NULL) {
+            check(vtm_api_sessions_dir(lru, dir) == VTM_OK,
+                  "sessions_dir -> VTM_OK");
+            check(vtm_api_sessions_limit(lru, limit) == VTM_OK,
+                  "sessions_limit 5 КБ -> VTM_OK");
+
+            // Пять снимков; mtime задаём явно, иначе все save попадают в одну
+            // секунду и «самый старый» не определить.
+            saves_ok = 1;
+            for (i = 0; i < 5; i++) {
+                snprintf(paths[i], sizeof paths[i], "%s/s%zu.vtms", dir, i);
+                if (vtm_api_session_save(lru, paths[i]) != VTM_OK) {
+                    saves_ok = 0;
+                    break;
+                }
+                set_mtime(paths[i], mtime_base + (long)i);
+            }
+            if (i < 5)
+                fprintf(stderr, "  save[%zu]: %s\n", i,
+                        vtm_api_last_error(lru));
+            check(saves_ok, "5 сохранений при лимите 5 КБ -> VTM_OK");
+        }
+
+        if (saves_ok) {
+            struct stat st;
+
+            // paths[0] уже вытеснен; размер берём у самой новой сессии.
+            if (stat(paths[4], &st) == 0 && st.st_size > 0) {
+                printf("  размер снимка: %lld байт, лимит: %llu байт\n",
+                       (long long)st.st_size, (unsigned long long)limit);
+                exp_count = (int)(limit / (uint64_t)st.st_size);
+            }
+            if (exp_count < 1) exp_count = 1;
+            if (exp_count > 5) exp_count = 5;
+
+            count = 0;
+            bytes = 0;
+            check(dir_usage(dir, &count, &bytes) == 0,
+                  "каталог сессий прочитан");
+            printf("  осталось сессий: %d, суммарно %llu байт "
+                   "(ожидалось %d..%d)\n", count, bytes, exp_count,
+                   exp_count + 1);
+            check(count >= exp_count && count <= exp_count + 1,
+                  "осталось 2–3 самые новые сессии");
+
+            for (i = 0; i < 5; i++)
+                exists[i] = access(paths[i], F_OK) == 0;
+            check(exists[4], "самая новая сессия на месте");
+            {
+                int newest_ok = 1;
+                for (i = 0; i < 5; i++)
+                    if (exists[i] != ((int)i >= 5 - count)) newest_ok = 0;
+                check(newest_ok, "уцелели именно самые новые (по mtime)");
+            }
+            check(count == 1 || bytes <= limit,
+                  "суммарный размер уложен в лимит");
+
+            // Только что записанный файл не вытесняется, даже если один
+            // больше лимита: иначе save() терял бы свой же результат.
+            snprintf(paths[0], sizeof paths[0], "%s/keep.vtms", dir);
+            check(vtm_api_sessions_limit(lru, 1) == VTM_OK,
+                  "лимит 1 байт принят");
+            rc = vtm_api_session_save(lru, paths[0]);
+            check(rc == VTM_OK, "save при лимите меньше снимка -> VTM_OK");
+            check(access(paths[0], F_OK) == 0,
+                  "только что записанный файл не вытеснен");
+            count = 0;
+            bytes = 0;
+            (void)dir_usage(dir, &count, &bytes);
+            check(count == 1, "осталась только свежая сессия");
+
+            // Ошибка вытеснения не фатальна: недоступный каталог -> save ОК
+            // (предупреждение уходит в stderr).
+            check(vtm_api_sessions_dir(lru, "/no/such/vtm_sessions") == VTM_OK,
+                  "несуществующий каталог лимита принят");
+            snprintf(probe_path, sizeof probe_path,
+                     "/tmp/vtm_session_%ld_probe.vtms", (long)getpid());
+            rc = vtm_api_session_save(lru, probe_path);
+            check(rc == VTM_OK,
+                  "save при недоступном каталоге лимита -> VTM_OK");
+            unlink(probe_path);
+
+            (void)vtm_api_sessions_limit(lru, 0);
+            (void)vtm_api_sessions_dir(lru, NULL);
+        }
+
+        if (lru != NULL) vtm_api_close(lru);
+        if (made_dir) {
+            clear_dir(dir);
+            (void)rmdir(dir);
+        }
     }
 
     vtm_api_close(ctx);
