@@ -1055,6 +1055,7 @@ class TestMainJson(unittest.TestCase):
         fake_path = write_tiny_model(os.path.join(self.tmp.name, "synth.vtm"), context=8,
                                      with_samp=True)
         args = [
+            "--vtm", vtm_stub_path(),
             "--synthetic-size", "64",
             "--contexts", "8", "--gen", "1", "--backends", "scalar",
             "--repeat", "1", "--no-breakdown", "--workdir", out_dir, "--json",
