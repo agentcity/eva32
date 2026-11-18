@@ -206,3 +206,175 @@ VTM_BACKEND=simd   ./bench_backend --logits ../../demo/model.vtm
 * `silu`, `mul`, `add`, `scal`, `softmax`, `emb`, `copy` оставлены
   скалярными (поля `NULL` в `vtm_backend_simd`): они не в счётном ядре, а
   лишний SIMD-путь — лишний риск расхождения.
+
+## Проверки: фаззинг и санитайзеры (задача 0069)
+
+Задача 0069 добавила инструменты проверки контейнера и отчёт по санитайзерам.
+Замеры 2026-11-18 на Apple M1 Pro (ARM64), macOS 25.2, Apple clang 17.0.0.
+Python-фаззер гонял текущую сборку `src/vtm/vtm`. Санитайзеры и
+`tests/vtm/fuzz_interp.c` собирались на снимке дерева: в `src/vtm`
+параллельно работали другие агенты, `main.c` в рабочей копии был незавершён,
+поэтому в снимок для CLI взят `main.c` из `HEAD`. Загрузчик/интерпретатор —
+из рабочего дерева; номера строк в отчётах UBSan — по снимку, для текущего
+дерева они сдвинуты (оговорено ниже).
+
+### Что фаззим
+
+`tools/fuzz_vtm.py` читает `demo/model.vtm` (118 784 байта: заголовок 32,
+таблица 29 × 52, данные 113 440, мета 3 409, программа 22 × 16), детерминированно
+(seed) выбирает 1–3 мутации и запускает
+
+```
+src/vtm/vtm run <мутация>.vtm --tokens 1 --max-new 1
+```
+
+с таймаутом 5 с. Мутируются все секции: заголовок (версия, флаги, счётчики,
+смещения), таблица тензоров (имя, `kind`, `ndim`, `dims`, `offset`,
+`scale_offset`), данные (включая заголовки TRT1 и масштабы: NaN/Inf/денормали),
+программа (`opcode`, `flags`, `dst/a/b/c`, `imm`: 0, ±1, 1000, INT_MAX,
+INT_MIN) и мета (JSON побайтово). Ловятся сигналы (`returncode < 0`), коды
+≥ 128, таймауты и (для санитайзерной сборки) строки ASan/UBSan. Найденное
+пишется в `fuzz-findings/`: мутированный `.vtm`, `.json` с абсолютными
+смещениями и sha256, stdout/stderr.
+
+`tests/vtm/fuzz_interp.c` — те же идеи в процессе: `vtm_load_mem()` +
+`vtm_run()` без запуска CLI; перед каждой загрузкой текущий случай пишется в
+`fuzz-findings/last_interp.vtm`. Это нужно, чтобы ASan/UBSan видели библиотеку
+целиком и чтобы 5000 мутаций занимали секунды. Сборка — вручную, Makefile не
+трогали:
+
+```
+cc -std=c99 -O1 -g -Wall -Wextra -Werror \
+   -fsanitize=address,undefined -fno-omit-frame-pointer \
+   -I src/vtm -I . -o fuzz_interp tests/vtm/fuzz_interp.c src/vtm/libvtm.a -lm
+```
+
+### 5000 мутаций
+
+```
+$ python3 tools/fuzz_vtm.py --iterations 5000 --seed 1
+...
+итог: 5000 итераций за 19.8 с (252.0 итер/с)
+  rc=0 (исполнилось): 2477, rc=1 (отвергнуто загрузчиком/рантаймом): 2523
+  сигналов: 0, таймаутов: 0, уникальных находок: 0
+```
+
+```
+$ ./fuzz_interp demo/model.vtm 5000 1
+итог: 5000 итераций за 1.56 с
+  загрузка: ok=2929, ошибок=2071; run: ok=2423, ошибок=506
+```
+
+Половина мутаций проходит загрузчик и доходит до `vtm_run`; на seed 1 — без
+падений. Дополнительные seed'ы Python-фаззера (2, 3, 4) тоже дали 0, seed 5
+нашёл падение (ниже). В процессе `fuzz_interp` seed 2 падает на итерации 4165
+(тот же дефект), seed'ы 3 и 5 — чисто. Артефакты:
+`fuzz-findings/seed1-5000/` — чистый прогон, `fuzz-findings/findings.json` —
+прогон seed 5 с находкой, `fuzz-findings/interp-seed2-crash.vtm` — случай из
+in-process фаззера.
+
+### Найдено: ATTN, `imm = INT_MAX`
+
+```
+$ python3 tools/fuzz_vtm.py --iterations 5000 --seed 5 --stop-on-finding
+  НАХОДКА finding-0001-SIGBUS-02524: signal rc=-10
+итог: 2524 итераций за 9.4 с (267.6 итер/с), сигналов: 1
+```
+
+Минимальная мутация — 4 байта в `demo/model.vtm`:
+
+| Смещение | Было | Стало | Поле |
+|---:|---|---|---|
+| 118572 | `00 00 00 00` | `ff ff ff 7f` | `instr[8].imm`, ATTN |
+
+`instr[8]` — `ATTN` с 2-D K/V-кэшем; `imm` = 2 147 483 647. В `op_attn`
+(2-D ветка):
+
+```c
+q_start = m->position + in->imm;     /* 0 + INT_MAX = INT_MAX */
+...
+key_count = q_start + q_len;         /* INT_MAX + 1 -> signed overflow */
+```
+
+Дальше `key_count` уходит в `malloc((size_t)key_count * sizeof(double))`.
+Нормальная сборка падает с **SIGBUS (exit 138)**; под ASan/UBSan:
+
+```
+interp.c:749:29: runtime error: signed integer overflow: 2147483647 + 1 ...
+ERROR: AddressSanitizer: requested allocation size 0xfffffffc00000000
+... exceeds maximum supported size ...
+```
+
+В снимке, на котором гонялись санитайзеры, та же строка имела номер 718
+(перед ней другой агент добавил `meta_number`). Воспроизведение:
+
+```
+$ ./src/vtm/vtm run fuzz-findings/minimal-ATTN-imm-INT_MAX.vtm \
+      --tokens 1 --max-new 1
+Bus error: 10                       # exit 138
+$ sha256sum fuzz-findings/minimal-ATTN-imm-INT_MAX.vtm
+08d0b55dbcd188d9d208e2e24d0e80828baf53a7e93a4115d31fd35393ebad70
+```
+
+Это дефект интерпретатора, а не фаззера: проверка `key_count > ctx` стоит
+после переполнения и отрицательный `key_count` её проходит. `src/vtm/interp.c`
+вне зоны 0069, поэтому исправление не делалось — задача с воспроизведением
+заводится архитектором. Закрывает случай проверка `q_start > ctx - q_len`
+до сложения (или арифметика в `long long`).
+
+### Санитайзеры
+
+Сборка — `-O1 -g -fsanitize=address,undefined`, без правки Makefile:
+
+```
+cd src/vtm
+make clean
+make test \
+  CFLAGS="-std=c99 -O1 -g -Wall -Wextra -Werror \
+          -fsanitize=address,undefined -fno-omit-frame-pointer" \
+  CXXFLAGS="-std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror \
+            -fsanitize=address,undefined -fno-omit-frame-pointer" \
+  LDFLAGS="-fsanitize=address,undefined"
+```
+
+`LDFLAGS` этот Makefile не использует (линковка `test_vtm` идёт через
+`$(CFLAGS)`, `vtm` — через `$(CXXFLAGS)`), поэтому санитайзерные флаги
+продублированы там. Цель `make sanitize` не добавлялась: `src/vtm/Makefile` —
+зона задачи 0067.
+
+| Прогон | Результат |
+|---|---|
+| `make test` (test_vtm + bench_backend --check), ASan+UBSan | все проверки ok; ASan — 0 отчётов; UBSan — 2 отчёта `backend_scalar.c:140/144` (mmap-тест) |
+| `vtm run demo/model.vtm --tokens 1 --max-new 1`, ASan+UBSan | exit 0; ASan — 0 отчётов; UBSan — 3 отчёта `backend_scalar.c:165/182/191` (misaligned TRT1) |
+| `./fuzz_interp demo/model.vtm 5000 1`, ASan+UBSan | 5000 за 2.62 с, stderr пуст |
+| `./fuzz_interp`, seed 2–8 (7 × 5000 = 35 000), ASan+UBSan | 2.7 с на 5000; в seed 2/4/6/8 — то же переполнение `interp.c`, в 3/5/7 — пусто; ASan-ошибок нет |
+| `tools/fuzz_vtm.py --iterations 2000 --seed 3`, ASan+UBSan, сборка с `-DVTM_UNALIGNED_LOADS=0` | 2000 за 134.3 с, 0 находок |
+| demo, сборка с `-DVTM_UNALIGNED_LOADS=0` | exit 0, stderr пуст |
+| `VTM_NO_MMAP=1 ./test_vtm`, сборка с `-DVTM_UNALIGNED_LOADS=0` | все тесты ok; в stderr только информационные строки `VTM_NO_MMAP=1` |
+
+Отчёты UBSan про `backend_scalar.c` — **известный** unaligned TRT1: слова и
+масштабы начинаются со смещения 18 (2 mod 4), это описано в задаче 0060.
+На x86-64/ARM64 такие загрузки работают, формально это UB.
+`-DVTM_UNALIGNED_LOADS=0` копирует такие тензоры в выровненную арену — тогда
+ASan+UBSan чисто. С этой опцией `./test_vtm` с включённым mmap даёт 2 FAIL в
+проверках `..._is_mapped`: тесты 0060 ждут отображения тритов и не учитывают
+strict-режим. Это пробел тестов, а не регрессия; `tests/vtm/test_vtm.c` —
+зона 0065/0068. Для CI без правок тестов годится `VTM_NO_MMAP=1`.
+
+### Что не проверено
+
+* Только `demo/model.vtm` (128 измерений, 29 тензоров, 22 инструкции).
+  Реальная 1.5B-модель и контейнеры с `kind 4`/fp16-эмбеддингами не фаззились.
+* Мутации равномерные, без coverage-guided (AFL/libFuzzer) и без
+  автоматической минимизации: падение найдено перебором seed'ов.
+* Лимит памяти не ставился: гигантские `dims`/`n_tensors` отсекает загрузчик,
+  но поведение при OOM отдельно не проверялось.
+* Таймаут 5 с; зависания дольше не отделялись от OOM.
+* Санитайзеры — Apple clang/ARM64, macOS. Windows, big-endian, gcc/MSVC,
+  32-битные ARM не проверялись; AVX2-ядра под фаззинг не попадали (по
+  умолчанию работает scalar-lut243).
+* Мета мутируется побайтово; глубокий фаззинг JSON-схемы и всех ключей
+  (`rope_theta`, `top_p`, `repetition_*`) не делался — проверялись только
+  загрузка и дефолты.
+* Гонки, многопоточность и усечение mmap-файла во время исполнения не
+  проверялись (риски 0060 про SIGBUS остаются).

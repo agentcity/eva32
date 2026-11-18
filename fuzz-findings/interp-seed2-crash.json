@@ -1,0 +1,8 @@
+{
+  "iteration": 4165,
+  "seed": 2,
+  "section": "program",
+  "mutations": [
+    {"offset": 118572, "size": 4, "old": "0x00000000", "new": "0x7fffffff", "label": "instr.imm"}
+  ]
+}

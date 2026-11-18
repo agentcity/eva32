@@ -5,7 +5,7 @@ title: Волна 4: фаззинг и санитайзеры в CI
 created_at: 2026-11-18T09:20:00Z
 author: yuri
 assignee: agent:vtm-fuzz
-status: in_progress
+status: done
 scope:
   docs: false
   code: true
@@ -47,4 +47,14 @@ scope:
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: `tools/fuzz_vtm.py` (мутации по секциям, 5000 итераций за 19,8 с,
+0 сигналов, 0 таймаутов), `tests/vtm/fuzz_interp.c` (in-process фаззер), раздел в
+docs/vtm-perf.md, артефакты в `fuzz-findings/`.
+
+**Найден настоящий дефект:** ATTN с 2-D K/V-кэшем и `imm=INT_MAX` — signed overflow
+`q_start+q_len`, отрицательный `key_count` проходил проверку «больше ctx», malloc
+получал отрицательную длину → **SIGBUS** (exit 138). Минимальный repro сохранён,
+sha256 08d0b55d…. Исправлено архитектором (задача 0075), регрессионный тест добавлен.
+
+Санитайзеры: ASan/UBSan прогоны чистые, кроме известного unaligned TRT1 из 0060
+(backend_scalar.c), который закрывается `-DVTM_UNALIGNED_LOADS=0`.

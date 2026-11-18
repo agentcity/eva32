@@ -1,0 +1,30 @@
+{
+  "iteration": 2524,
+  "seed": 5,
+  "kind": "signal",
+  "returncode": -10,
+  "signal": "SIGBUS",
+  "timed_out": false,
+  "elapsed_s": 0.004837,
+  "sha256": "dcd4ae17052e532f8fd0bc63c06a1673c8614bcbd6f5b5072f724e572851d6fd",
+  "file": "fuzz-findings/finding-0001-SIGBUS-02524.vtm",
+  "size": 118784,
+  "mutations": [
+    {
+      "section": "program",
+      "offset": 118572,
+      "size": 4,
+      "old": "00000000",
+      "new": "ffffff7f",
+      "label": "instr[8].imm"
+    },
+    {
+      "section": "data",
+      "offset": 20010,
+      "size": 1,
+      "old": "13",
+      "new": "04",
+      "label": "data.byte"
+    }
+  ]
+}
