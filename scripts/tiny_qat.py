@@ -22,7 +22,10 @@ C-интерпретатор ``src/vtm/vtm``, после чего сверяет
 * ``run``     — ``./src/vtm/vtm run runs/tiny/model.vtm --tokens ... --max-new 8``;
 * ``parity``  — логиты той же тернарной модели в HF против C-пробы на
   ``src/vtm/libvtm.a`` (CLI печатает только выбранный токен, не вектор).
-* ``all``     — всё подряд (по умолчанию).
+* ``logits``  — «учитель» без API: логиты текущего tiny-чекпоинта для
+  ``--logits-pairs`` пар в формате ``qat.kl``, HF-каталог учителя и два
+  конфига ``qat.train`` (с KL и без) — задача 0107.
+* ``all``     — всё подряд (по умолчанию), кроме ``logits``.
 
 Решения, которые стоит знать
 ============================
@@ -678,6 +681,313 @@ def stage_train(args: argparse.Namespace) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Стадия 1b: логиты учителя для KL-дистилляции (задача 0107)
+# ---------------------------------------------------------------------------
+
+
+def teacher_logits_rows(
+    sequence_logits: Sequence[Any], prompt_len: int, answer_len: int,
+) -> Sequence[Any]:
+    """Строки логитов учителя для токенов ответа: позиции ``P-1 … P+A-2``.
+
+    Логит на позиции ``i`` предсказывает метку ``i+1``, поэтому первый токен
+    ответа (метка ``P``) предсказывает логит ``P-1``. Ровно эту же позицию
+    берёт ученик (``student_logits[:, P-1]``), и ``qat.train._kl_sum``
+    отсчитывает ``start_in_logits = first - 1``. Сдвиг на один — молча
+    неверная дистилляция, поэтому сверка на старте: KL(ученик‖учитель) ≈ 0.
+
+    Чистая функция: работает и со списками (тесты без torch), и с тензорами;
+    тип среза сохраняется, поэтому вызывающий сам решает, нужен ли ``.tolist()``.
+    """
+    if prompt_len <= 0:
+        raise TinyError(f"пустой промпт ({prompt_len} токенов): логиты учителя не выровнять")
+    start = prompt_len - 1
+    stop = start + answer_len
+    if answer_len <= 0:
+        raise TinyError(f"пустой ответ ({answer_len} токенов)")
+    if stop > len(sequence_logits):
+        raise TinyError(
+            f"логитов {len(sequence_logits)}, а нужно {stop} "
+            f"(промпт {prompt_len} + ответ {answer_len})"
+        )
+    return sequence_logits[start:stop]
+
+
+def _kl_config(name_or_path: str, data_path: Path, *, kl: bool, steps: int,
+               batch_size: int, lr: float, max_seq_len: int,
+               min_answer_tokens: int, seed: int) -> dict[str, Any]:
+    """Конфиг ``qat.train`` для tiny-модели (тот же путь, что на аренде)."""
+    return {
+        "model": {
+            "name_or_path": name_or_path,
+            "revision": "tiny-qat-cpu",
+            "trust_remote_code": False,
+            "master_dtype": "fp32",
+            "attn_implementation": "eager",
+            "num_params": EXPECTED_PARAMS,
+            "hidden_size": HIDDEN_SIZE,
+            "intermediate_size": INTERMEDIATE_SIZE,
+            "num_hidden_layers": NUM_HIDDEN_LAYERS,
+            "vocab_size": VOCAB_SIZE,
+        },
+        "quant": {
+            "block_size": 128,
+            "scale_dtype": "float32",
+            # Эмбеддинги не квантуем: tiny-чекпоинт обучался с fp32-таблицей,
+            # иначе ученик стартует не с весов учителя и KL≈0 не проверить.
+            "quantize_embeddings": "none",
+        },
+        "data": {
+            "path": str(data_path),
+            "max_seq_len": max_seq_len,
+            "long_pairs": "truncate",
+            "max_samples": 0,
+            "min_answer_tokens": min_answer_tokens,
+            "use_teacher_logits": bool(kl),
+            "kl_temperature": 1.0,
+            "kl_weight": 0.5,
+            "kl_chunk_size": 64,
+        },
+        "train": {
+            "micro_batch_size": batch_size,
+            "grad_accum_steps": 1,
+            "max_steps": steps,
+            "lr": lr,
+            "min_lr_ratio": 1.0,
+            "warmup_steps": 0,
+            "weight_decay": 0.0,
+            "grad_clip": 1.0,
+            "amp_dtype": "none",
+            "grad_dtype": "fp32",
+            "gradient_checkpointing": False,
+            "optimizer": "adamw",
+            "log_every": 10,
+            "save_every": 1000,
+            "keep_last_checkpoints": 1,
+            "save_optimizer": False,
+            "device": "cpu",
+            "seed": seed,
+            "loss_chunk_size": 512,
+        },
+    }
+
+
+def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
+    """Записать конфиг: yaml, а без pyyaml — JSON (YAML его читает как есть)."""
+    try:
+        import yaml  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - pyyaml есть в .pylibs
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+        return
+    path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+                    encoding="utf-8")
+
+
+def _export_teacher_model(model: Any, tokenizer: Any, out_dir: Path) -> int:
+    """Каталог HF (fp32-мастер-веса + токенизатор) для ``qat.train``.
+
+    tiny-чекпоинт — это state_dict **параметризованной** модели
+    (``…parametrizations.weight.original``), а ``qat.train`` загружает обычный
+    HF-каталог и навешивает триты сам. Поэтому параметризацию снимаем в
+    мастер-веса (``leave_parametrized=False``): forward ученика на старте
+    совпадает с учителем, и KL≈0 — это проверка выравнивания, а не совпадения.
+    """
+    import torch
+    from torch.nn.utils.parametrize import remove_parametrizations
+
+    for _name, module in model.named_modules():
+        parametrizations = getattr(module, "parametrizations", None)
+        if parametrizations is not None and "weight" in parametrizations:
+            remove_parametrizations(module, "weight", leave_parametrized=False)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(str(out_dir), safe_serialization=False)
+    # eos=id 0 в фикстуре не помечен как special: без явного eos_token
+    # qat.train.load_tokenizer не найдёт eos и упадёт.
+    tokenizer.eos_token = tokenizer.convert_ids_to_tokens(EOS_ID)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.save_pretrained(str(out_dir))
+    return sum(int(t.numel()) for t in model.state_dict().values())  # с tied-дублем
+
+
+def stage_logits(args: argparse.Namespace) -> dict[str, Any]:
+    """Логиты «учителя» (текущий tiny-чекпоинт) + конфиги прогонов qat.train.
+
+    Без API и без сети: учитель — тот же tiny-чекпоинт, снятый после
+    ``train``. Пишет в ``--logits-out`` (по умолчанию ``runs/tiny_kl``):
+
+    * ``pairs_logits.jsonl`` — пары с полем ``logits`` в формате ``qat.kl``;
+    * ``teacher_model/`` — HF-каталог для ``qat.train`` (fp32-мастер-веса);
+    * ``config_kl.yaml`` / ``config_ce.yaml`` — два прогона, отличается только
+      ``data.use_teacher_logits``;
+    * ``logits_metrics.json`` — размеры, CE и само-дистилляция: KL на старте
+      (должна быть ~0, иначе разъехались позиции/промпт/токенизатор).
+    """
+    import torch  # noqa: PLC0415
+
+    from qat import checkpoint as checkpoint_mod  # noqa: PLC0415
+    from qat.data import PairDataset, load_pairs  # noqa: PLC0415
+    from qat.kl import (  # noqa: PLC0415
+        kl_div_sum_torch, read_logits_file, write_logits_file,
+    )
+    from qat.model import apply_ternary  # noqa: PLC0415
+
+    ckpt = checkpoint_mod.latest_checkpoint(args.out)
+    if ckpt is None:
+        raise TinyError(
+            f"нет чекпоинта в {Path(args.out) / 'checkpoints'}: сначала стадия train"
+        )
+    logits_out = Path(args.logits_out).expanduser()
+    if not logits_out.is_absolute():
+        logits_out = (ROOT / logits_out).resolve()
+    logits_out.mkdir(parents=True, exist_ok=True)
+
+    print(f"[tiny] учитель: {ckpt.relative_to(ROOT)}")
+    tokenizer = load_tokenizer()
+    rows = load_pairs(TRAIN_PATH, args.logits_pairs)
+    dataset = PairDataset(
+        rows, tokenizer,
+        max_seq_len=args.max_seq_len,
+        long_pairs="truncate",
+        min_answer_tokens=args.min_answer_tokens,
+        use_teacher_logits=False,
+        vocab_size=VOCAB_SIZE,
+    )
+    encoded: list[dict[str, Any]] = []
+    dropped = 0
+    for index in range(len(rows)):
+        sample = dataset.encode(index)
+        if sample is None:
+            dropped += 1
+            continue
+        encoded.append({"row": rows[index], "sample": sample})
+    if not encoded:
+        raise TinyError("ни одна пара не закодировалась: проверьте min_answer_tokens")
+    if dropped:
+        print(f"[tiny] ВНИМАНИЕ: {dropped} пар отброшено (не влезли/короткий ответ)")
+    print(f"[tiny] пар: {len(encoded)}, обрезка {args.max_seq_len}, "
+          f"токенов ответа в среднем "
+          f"{sum(len(e['sample']['labels']) - e['sample']['labels'].count(-100) for e in encoded) / len(encoded):.0f}")
+
+    device = torch.device("cpu")
+    teacher = build_model()
+    teacher.eval()
+    apply_ternary(teacher, quant_config(args.scale_dtype, "none"))
+    checkpoint_mod.restore_model(teacher, ckpt, device)
+
+    out_rows: list[dict[str, Any]] = []
+    answer_tokens = 0
+    with torch.no_grad():
+        for item in encoded:
+            sample = item["sample"]
+            input_ids = torch.tensor([sample["input_ids"]], dtype=torch.long, device=device)
+            prompt_len = next(i for i, value in enumerate(sample["labels"]) if value != -100)
+            answer_len = len(sample["labels"]) - prompt_len
+            logits = teacher(input_ids=input_ids, use_cache=False).logits[0]
+            teacher_rows = teacher_logits_rows(logits, prompt_len, answer_len)
+            out_rows.append({
+                "question": item["row"]["question"],
+                "answer": item["row"]["answer"],
+                "logits": teacher_rows.cpu().tolist(),
+            })
+            answer_tokens += answer_len
+
+    logits_path = logits_out / "pairs_logits.jsonl"
+    written = write_logits_file(logits_path, out_rows)
+    print(f"[tiny] логиты: {written} пар -> {logits_path.relative_to(ROOT)} "
+          f"({human_bytes(logits_path.stat().st_size)})")
+    # Читаем записанный файл тем же парсером, что и тесты: артефакт для аренды
+    # проверяется целиком по формату, а не «writer и reader когда-то сойдутся».
+    checked = read_logits_file(logits_path, vocab_size=VOCAB_SIZE, limit=3)
+    print(f"[tiny] файл читается: {len(checked)} строк примеров, "
+          f"{len(checked[0]['logits'])} x {len(checked[0]['logits'][0])} логитов")
+
+    teacher_dir = logits_out / "teacher_model"
+    params = _export_teacher_model(teacher, tokenizer, teacher_dir)
+    print(f"[tiny] учитель для qat.train: {teacher_dir.relative_to(ROOT)} "
+          f"(элементов в state_dict: {params})")
+
+    # --- сверка: ученик из HF-каталога на тех же весах vs файл логитов ------
+    from transformers import AutoModelForCausalLM  # noqa: PLC0415
+
+    student = AutoModelForCausalLM.from_pretrained(
+        str(teacher_dir), dtype=torch.float32, attn_implementation="eager",
+    )
+    student.eval()
+    apply_ternary(student, quant_config(args.scale_dtype, "none"))
+    check_count = min(4, len(encoded))
+    kl_total = 0.0
+    tokens = 0
+    max_delta = 0.0
+    ce_total = 0.0
+    with torch.no_grad():
+        for index in range(check_count):
+            sample = encoded[index]["sample"]
+            prompt_len = next(i for i, value in enumerate(sample["labels"]) if value != -100)
+            answer_len = len(sample["labels"]) - prompt_len
+            teacher_rows = torch.tensor(out_rows[index]["logits"], dtype=torch.float32)
+            input_ids = torch.tensor([sample["input_ids"]], dtype=torch.long, device=device)
+            labels = torch.tensor([sample["labels"]], dtype=torch.long, device=device)
+            logits = student(input_ids=input_ids, use_cache=False).logits[0]
+            student_rows = logits[prompt_len - 1:prompt_len - 1 + answer_len]
+            kl_total += float(kl_div_sum_torch(torch, student_rows, teacher_rows).item())
+            max_delta = max(max_delta, float(
+                (student_rows - teacher_rows).abs().max().item()))
+            # sr[t] предсказывает метку P+t, поэтому метке P+1 отвечает sr[1].
+            shift_logits = student_rows[1:]
+            shift_labels = labels[0, prompt_len + 1:]
+            ce_total += float(torch.nn.functional.cross_entropy(
+                shift_logits, shift_labels, reduction="sum",
+            ).item())
+            tokens += int(shift_labels.numel())
+    student_kl_per_token = kl_total / max(1, tokens)
+    print(f"[tiny] сверка выравнивания: KL(учитель‖ученик) = "
+          f"{student_kl_per_token:.3e} на токен, max|Δ| логитов = {max_delta:.3e}")
+    if student_kl_per_token > 1e-4:
+        raise TinyError(
+            f"KL на старте {student_kl_per_token:.3e} на токен: ученик и учитель "
+            f"не совпали — логиты учителя выровнены не на те позиции"
+        )
+
+    config_kl = logits_out / "config_kl.yaml"
+    config_ce = logits_out / "config_ce.yaml"
+    common = dict(
+        steps=args.kl_steps, batch_size=args.batch_size, lr=args.kl_lr,
+        max_seq_len=args.max_seq_len, min_answer_tokens=args.min_answer_tokens,
+        seed=args.seed,
+    )
+    _write_yaml(config_kl, _kl_config(str(teacher_dir), logits_path, kl=True, **common))
+    _write_yaml(config_ce, _kl_config(str(teacher_dir), logits_path, kl=False, **common))
+    print(f"[tiny] конфиги: {config_kl.relative_to(ROOT)}, {config_ce.relative_to(ROOT)}")
+
+    metrics = {
+        "stage": "logits",
+        "teacher_checkpoint": str(ckpt),
+        "pairs": written,
+        "answer_tokens": answer_tokens,
+        "vocab_size": VOCAB_SIZE,
+        "logits_bytes": logits_path.stat().st_size,
+        "logits_path": str(logits_path),
+        "logits_file_check": {
+            "rows": len(checked),
+            "width": len(checked[0]["logits"][0]),
+        },
+        "teacher_model": str(teacher_dir),
+        "configs": {"kl": str(config_kl), "ce": str(config_ce)},
+        # Позиционная сверка: KL(ученик‖учитель) на одинаковых весах.
+        "alignment": {
+            "pairs_checked": check_count,
+            "kl_per_token": student_kl_per_token,
+            "max_abs_logit_delta": max_delta,
+            "teacher_ce": ce_total / max(1, tokens),
+        },
+    }
+    write_json_atomic(logits_out / "logits_metrics.json", metrics)
+    print(f"[tiny] метрики: {(logits_out / 'logits_metrics.json').relative_to(ROOT)}")
+    return metrics
+
+
+# ---------------------------------------------------------------------------
 # Стадия 2: экспорт qat.export
 # ---------------------------------------------------------------------------
 
@@ -1024,6 +1334,9 @@ def stage_parity(args: argparse.Namespace) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+STAGES = ("all", "train", "logits", "export", "compile", "run", "parity")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python3 scripts/tiny_qat.py",
@@ -1036,10 +1349,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  python3 scripts/tiny_qat.py parity --skip-fp16\n"
         ),
     )
-    parser.add_argument("--stage", choices=("all", "train", "export", "compile", "run", "parity"),
-                        default=None, help="что делать (по умолчанию all)")
-    parser.add_argument("command", nargs="?", default=None,
-                        choices=("all", "train", "export", "compile", "run", "parity"),
+    parser.add_argument("--stage", choices=STAGES, default=None,
+                        help="что делать (по умолчанию all)")
+    parser.add_argument("command", nargs="?", default=None, choices=STAGES,
                         help="то же, что --stage (удобно: scripts/tiny_qat.py train)")
     parser.add_argument("--out", default=str(DEFAULT_OUT),
                         help=f"каталог артефактов (по умолчанию {DEFAULT_OUT})")
@@ -1076,6 +1388,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="порог max|Δ| C↔HF (1e-4)")
     parser.add_argument("--skip-fp16", action="store_true",
                         help="не собирать/сверять второй артефакт с fp16-масштабами")
+    parser.add_argument("--logits-out", default=str(ROOT / "runs" / "tiny_kl"),
+                        help="каталог пары «логиты + конфиги qat.train» (runs/tiny_kl)")
+    parser.add_argument("--logits-pairs", type=int, default=40,
+                        help="пар с логитами учителя (40)")
+    parser.add_argument("--kl-steps", type=int, default=150,
+                        help="шагов в сгенерированных конфигах KL/CE (150)")
+    parser.add_argument("--kl-lr", type=float, default=1e-3,
+                        help="lr в сгенерированных конфигах KL/CE (1e-3)")
     return parser
 
 
@@ -1096,6 +1416,10 @@ def _update_report(out_dir: Path, stage: str, metrics: dict[str, Any]) -> None:
         summary["val_loss_before"] = metrics.get("val_loss_before")
         summary["val_loss_after"] = metrics.get("val_loss_after")
         summary["steps"] = metrics.get("steps")
+    elif stage == "logits":
+        alignment = metrics.get("alignment") or {}
+        summary["kl_alignment"] = alignment.get("kl_per_token")
+        summary["kl_pairs"] = metrics.get("pairs")
     elif stage == "compile":
         summary["vtm_bytes"] = metrics.get("vtm_bytes")
     elif stage == "parity":
@@ -1122,6 +1446,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"\n=== tiny_qat: {stage} ===")
             if stage == "train":
                 metrics = stage_train(args)
+            elif stage == "logits":
+                metrics = stage_logits(args)
             elif stage == "export":
                 metrics = stage_export(args)
                 if not args.skip_fp16 and args.scale_dtype != "float16":
@@ -1215,6 +1541,11 @@ def _summary_text(out_dir: Path) -> str:
         lines.append(
             f"val loss: {summary['val_loss_before']:.4f} -> "
             f"{summary['val_loss_after']:.4f} за {summary.get('steps')} шагов"
+        )
+    if "kl_alignment" in summary:
+        lines.append(
+            f"логиты учителя: {summary.get('kl_pairs')} пар, "
+            f"KL на старте {summary['kl_alignment']:.3e} на токен"
         )
     if "vtm_bytes" in summary:
         lines.append(f".vtm: {human_bytes(summary['vtm_bytes'])}")

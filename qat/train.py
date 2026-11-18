@@ -283,9 +283,10 @@ def _kl_sum(
 
     logits — срез модели начиная с позиции ``logits_start``; teacher_logits[b]
     выровнены на токены ответа (первый supervised-токен). Считаем по кускам,
-    чтобы [длина ответа, словарь] не раздувал память.
+    чтобы [длина ответа, словарь] не раздувал память. Сама формула — в
+    ``qat.kl.kl_div_sum_torch`` (её же проверяет тест без torch на эталоне).
     """
-    import torch.nn.functional as F  # noqa: PLC0415
+    from .kl import kl_div_sum_torch  # noqa: PLC0415 - модуль без torch
 
     batch_size = logits.size(0)
     total = logits.new_zeros((), dtype=torch.float32)
@@ -308,14 +309,10 @@ def _kl_sum(
             )
         for start in range(0, count, chunk_size):
             stop = min(count, start + chunk_size)
-            student = logits[b, start_in_logits + start:start_in_logits + stop].float()
-            target = teacher[start:stop].to(device=logits.device, dtype=torch.float32)
-            total = total + F.kl_div(
-                F.log_softmax(student / temperature, dim=-1),
-                F.log_softmax(target / temperature, dim=-1),
-                log_target=True,
-                reduction="sum",
-            ) * (temperature ** 2)
+            student = logits[b, start_in_logits + start:start_in_logits + stop]
+            total = total + kl_div_sum_torch(
+                torch, student, teacher[start:stop], temperature,
+            )
     return total
 
 
@@ -713,6 +710,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ce_total = torch.zeros((), device=device)
             kl_total = torch.zeros((), device=device)
             loss_total = torch.zeros((), device=device)
+            kl_seconds = 0.0
             supervised_total = torch.zeros((), device=device, dtype=torch.long)
             compute_t0 = time.perf_counter()
             for batch, keep, logits_start, usable in prepared:
@@ -748,10 +746,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if cfg.data.use_teacher_logits:
                         if not batch.get("teacher_logits"):
                             raise RuntimeError("use_teacher_logits: в батче нет logits учителя")
+                        # Отдельный замер: сколько стоит KL сверх forward/backward —
+                        # это и есть оверхед дистилляции в отчёте и в плане аренды.
+                        kl_t0 = time.perf_counter()
                         kl_sum = _kl_sum(
                             torch, logits, labels, batch["teacher_logits"],
                             logits_start, cfg.data.kl_temperature, cfg.data.kl_chunk_size,
                         )
+                        kl_seconds += time.perf_counter() - kl_t0
                     loss = ce_sum / step_tokens
                     if kl_sum is not None:
                         loss = loss + cfg.data.kl_weight * kl_sum / step_tokens
@@ -831,8 +833,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
                 if kl_value is not None:
                     fields["kl"] = round(kl_value, 6)
+                    fields["kl_sec"] = round(kl_seconds, 4)
                 line = (f"[qat] шаг {step}/{max_steps}  loss={loss_value:.4f}  "
                         f"ce={ce_value:.4f}  lr={lr:.2e}  {tok_s:.0f} ток/с")
+                if kl_value is not None:
+                    line += f"  kl={kl_value:.4f} (kl {kl_seconds * 1000:.0f} мс)"
                 if gpu_alloc is not None:
                     line += f"  GPU {gpu_alloc:.1f}/{gpu_peak:.1f} ГиБ"
                 print(line)

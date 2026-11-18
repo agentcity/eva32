@@ -7,7 +7,7 @@
 Учим только на токенах ответа: вопрос и padding получают label = -100.
 Поле ``logits`` (или ``teacher_logits``) читается только при
 ``data.use_teacher_logits: true`` — это распределения учителя по токенам
-ответа для KL-лосса.
+ответа для KL-лосса. Формат строк и допуски — ``qat.kl`` (модуль без torch).
 
 Поток данных детерминирован и возобновляем: позиция задаётся числом
 обработанных примеров ``samples_seen``; порядок внутри эпохи — перестановка
@@ -23,6 +23,7 @@ from typing import Any, Sequence
 
 import torch
 
+from .kl import LogitsFormatError, parse_teacher_logits
 from .util import file_fingerprint
 
 
@@ -156,31 +157,33 @@ class PairDataset:
         return list(self.tokenizer(text, add_special_tokens=False).input_ids)
 
     def _teacher_logits(self, raw: Any, answer_len: int) -> torch.Tensor | None:
+        """Логиты учителя по токенам ответа → float16-тензор ``[A, vocab]``.
+
+        Формат и допуски — в ``qat.kl`` (там же опорный расчёт и парсер файла):
+        строка ``t`` обязана быть логитами позиции, предсказывающей ``t``-й
+        токен ответа (``P - 1 + t``). Проверка формы общая с тестами без torch,
+        а конвертация и проверка на NaN/inf — здесь, на тензоре.
+        """
         if raw is None:
             self.stats["dropped_no_logits"] += 1
             return None
-        if not isinstance(raw, list) or not raw:
-            self.stats["dropped_bad_logits"] += 1
-            return None
-        # Допускаем распределения на токены ответа, с eos или без него.
-        if not (max(0, answer_len - 1) <= len(raw) <= answer_len + 1):
-            self.stats["dropped_bad_logits"] += 1
-            return None
-        first = raw[0]
-        if not isinstance(first, list) or not first:
-            self.stats["dropped_bad_logits"] += 1
-            return None
-        if self.vocab_size is not None and len(first) != self.vocab_size:
-            raise DataError(
-                f"logits учителя имеют размер {len(first)}, а словарь ученика "
-                f"{self.vocab_size}: KL возможен только при общем токенизаторе"
-            )
         try:
-            tensor = torch.tensor(raw, dtype=torch.float16)
-        except (TypeError, ValueError) as exc:
+            rows = parse_teacher_logits(raw, answer_len, self.vocab_size)
+        except LogitsFormatError as exc:
+            raise DataError(str(exc)) from exc
+        if rows is None:
             self.stats["dropped_bad_logits"] += 1
             return None
-        if tensor.ndim != 2 or tensor.shape[1] != len(first):
+        try:
+            tensor = torch.tensor(rows, dtype=torch.float16)
+        except (TypeError, ValueError):
+            self.stats["dropped_bad_logits"] += 1
+            return None
+        if tensor.ndim != 2 or tensor.shape[1] != len(rows[0]):
+            self.stats["dropped_bad_logits"] += 1
+            return None
+        # NaN/inf в логитах учителя не ловятся формой, а обучение ими отравится.
+        if not bool(torch.isfinite(tensor).all()):
             self.stats["dropped_bad_logits"] += 1
             return None
         return tensor
@@ -191,7 +194,6 @@ class PairDataset:
         prompt_ids = self._prompt_ids(row["question"])
         answer_ids = list(self.tokenizer(row["answer"], add_special_tokens=False).input_ids)
         eos_id = self.tokenizer.eos_token_id
-        answer_tokens = len(answer_ids)
         if eos_id is not None and (not answer_ids or answer_ids[-1] != eos_id):
             answer_ids = answer_ids + [eos_id]
         if not answer_ids:
@@ -208,6 +210,12 @@ class PairDataset:
             if eos_id is not None:
                 answer_ids[-1] = eos_id
             self.stats["truncated_long"] += 1
+        # Длина считается по обрезанному ответу: логиты учителя снимаются с
+        # тех же токенов (см. scripts/tiny_qat.py logits). Раньше здесь стояла
+        # длина до обрезки, и на парах длиннее max_seq_len (15,6% датасета)
+        # любая строка логитов отбрасывалась как «не той длины» — KL-путь
+        # молча оставался без данных.
+        answer_tokens = len(answer_ids)
         labels = [-100] * len(prompt_ids) + answer_ids
         if sum(1 for x in labels if x != -100) < self.min_answer_tokens:
             self.stats["dropped_short"] += 1
