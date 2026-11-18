@@ -156,8 +156,29 @@
   {
     "id": "0023",
     "title": "Закрыть промахи классификатора из замера гибрида",
-    "status": "pending",
-    "file": "0023-classifier-gaps.md",
-    "assignee": ""
+    "status": "in_progress",
+    "file": "0023-eva-classifier-gaps.md",
+    "assignee": "agent:eva-classifier-gaps"
+  },
+  {
+    "id": "0024",
+    "title": "RAG: контекст каталога в промпт",
+    "status": "in_progress",
+    "file": "0024-eva-rag.md",
+    "assignee": "agent:eva-rag"
+  },
+  {
+    "id": "0025",
+    "title": "SSE-стриминг в сервере",
+    "status": "in_progress",
+    "file": "0025-eva-sse.md",
+    "assignee": "agent:eva-sse"
+  },
+  {
+    "id": "0026",
+    "title": "Подключение к orioncode",
+    "status": "in_progress",
+    "file": "0026-eva-integration.md",
+    "assignee": "agent:eva-integration"
   }
 ]
