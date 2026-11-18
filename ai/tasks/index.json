@@ -751,7 +751,7 @@
   {
     "id": "0114",
     "title": "CLI и C-ABI для батчевого prefill",
-    "status": "in_progress",
+    "status": "done",
     "file": "0114-prefill-cli.md",
     "assignee": "agent:prefill-cli"
   },
@@ -802,6 +802,13 @@
     "title": "TSan для пула потоков: безмьютексный горячий путь",
     "status": "pending",
     "file": "0121-tsan-pool.md",
+    "assignee": ""
+  },
+  {
+    "id": "0122",
+    "title": "Батчевые SIMD-ядра TMV/MM — цель ≤2x, не 10x",
+    "status": "pending",
+    "file": "0122-batched-simd.md",
     "assignee": ""
   }
 ]

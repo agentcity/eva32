@@ -29,6 +29,54 @@ int vtm_session_load(vtm_t *m, int32_t *pending_token, const char *path,
 int vtm_session_prune(const char *dir, uint64_t limit_bytes,
                       const char *keep_path);
 
+// --- батчевый prefill (задачи 0112, 0114) ----------------------------------
+//
+// vtm_run_batch() — публичный API ядра из задачи 0112 (объявляется в vtm.h).
+// Здесь он объявлен и определён слабо: пока 0112 не сдана, работает заглушка
+// «по токену» (ровно прежний цикл), а когда interp.c получит сильное
+// определение, линковщик возьмёт его вместо заглушки — правок в api.c не
+// нужно. Слабое определение, а не только слабое объявление, выбрано
+// осознанно: в Mach-O (macOS) неразрешённая слабая ссылка — ошибка линковки,
+// а слабое определение собирается и линкуется на всех платформах; сильное
+// определение из libvtm.a его перекрывает (проверено: nm показывает
+// external, вызов идёт в ядро).
+//
+// Контракт, на который рассчитан вызов (его и должен реализовать 0112):
+//   vtm_run_batch(m, ids, n) прогоняет ids[0..n) начиная с текущей позиции
+//   машины: токен k считается на позиции start + k, где start =
+//   vtm_position(m) до вызова; emit не вызывается (это prefill, а не
+//   генерация); на выходе состояние машины (K/V, счётчик, сэмплер) и
+//   vtm_position(m) == start + n - 1 — побитово как после n вызовов
+//   vtm_run() по одному токену. n == 0 — no-op, VTM_OK.
+//
+// Компилятор без weak-атрибута собирает заглушку как обычную функцию — батч
+// тогда просто не ускоряет. Другая сигнатура в 0112 — ошибка компиляции здесь
+// (а не молчаливая работа заглушки): это лучше, чем незаметно потерять батч.
+#if defined(__GNUC__) || defined(__clang__)
+#define VTM_WEAK __attribute__((weak))
+#else
+#define VTM_WEAK
+#endif
+
+vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n);
+VTM_WEAK
+vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
+    const int64_t start = (int64_t)vtm_position(m);
+    int i;
+
+    for (i = 0; i < n; i++) {
+        const int64_t pos = start + i;
+        vtm_status st;
+        if (pos > (int64_t)INT_MAX) return VTM_E_BOUNDS;
+        vtm_set_position(m, (int)pos);
+        vtm_set_token(m, (int)ids[i]);
+        st = vtm_run(m, NULL, NULL);
+        if (st != VTM_OK) return st;
+    }
+    if (n > 0) vtm_set_position(m, (int)(start + n - 1));
+    return VTM_OK;
+}
+
 struct vtm_api {
     vtm_t *m;                 // загруженная машина; владеет контекст
     atomic_int cancel;        // 1 — запрошена остановка (пишут другие потоки)
@@ -39,6 +87,9 @@ struct vtm_api {
     // Кэш префикса промпта между запросами (задача 0087): 0 — каждый
     // generate() начинает с vtm_reset(), 1 — префикс переиспользуется.
     int cache_prefix;
+    // Промпт пачками по prefill_batch токенов (задачи 0112, 0114). 0 — по
+    // токену, как раньше; действует только при cache_prefix == 0.
+    int prefill_batch;
     // 1 — следующий generate() обязан посчитать префикс заново, не доверяя
     // снимку ядра (ставится vtm_api_session_load(): состояние машины —
     // K/V и позиция — заменено данными с диска).
@@ -91,6 +142,7 @@ vtm_api_t *vtm_api_open(const char *path, const vtm_api_options *opts) {
     const vtm_backend *backend = NULL;
     uint32_t max_new = 0;
     uint32_t cache_prefix = 0;
+    uint32_t prefill_batch = 0;
     int32_t eos = -1;
     size_t i;
 
@@ -139,6 +191,15 @@ vtm_api_t *vtm_api_open(const char *path, const vtm_api_options *opts) {
             return NULL;
         }
         cache_prefix = opts->cache_prefix;
+        // prefill_batch (0114) — только размер пачки: 0 = прежний путь по
+        // токену, N больше длины промпта = одна пачка. Ограничение сверху —
+        // int: длина пачки уходит в vtm_run_batch() как int.
+        if (opts->prefill_batch > (uint32_t)INT_MAX) {
+            open_fail("vtm_api_open: opts->prefill_batch=%u больше %d",
+                      (unsigned)opts->prefill_batch, INT_MAX);
+            return NULL;
+        }
+        prefill_batch = opts->prefill_batch;
     }
 
     ctx = (vtm_api_t *)calloc(1, sizeof *ctx);
@@ -151,6 +212,7 @@ vtm_api_t *vtm_api_open(const char *path, const vtm_api_options *opts) {
     ctx->max_new_tokens = max_new;
     ctx->eos_token_id = eos;
     ctx->cache_prefix = (int)cache_prefix;
+    ctx->prefill_batch = (int)prefill_batch;
 
     ctx->m = vtm_load(path);
     if (ctx->m == NULL) {
@@ -272,31 +334,67 @@ static int api_run(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
     vtm_reset(m);
     ctx->session_token_valid = 0;
 
+    // Отрицательные id проверяются до прогона: пачка (vtm_run_batch) неделима
+    // и не даёт точки, где цикл поймал бы VTM_E_ARG на середине промпта.
     for (i = 0; i < n; i++) {
-        vtm_status st;
-        int id = (int)prompt_ids[i];
-
-        if (id < 0) {
+        if (prompt_ids[i] < 0) {
             return api_fail(ctx, VTM_E_ARG,
                             "vtm_api_generate: prompt_ids[%zu]=%d отрицателен",
-                            i, id);
+                            i, (int)prompt_ids[i]);
+        }
+    }
+
+    // Токены промпта, кроме последнего, только наполняют KV-кэш: SAMP на них
+    // (если программа его вызывает) исполняется, но токен хосту не отдаётся —
+    // ровно как в CLI. prefill_batch > 0 (0114) считает их пачками через
+    // vtm_run_batch(); последний токен всё равно идёт отдельным vtm_run() с
+    // колбэком, потому что emit нужен только на нём.
+    for (i = 0; i + 1 < n;) {
+        vtm_status st;
+
+        if (api_cancelled(ctx)) {
+            return api_stop(ctx, VTM_API_CANCELLED);
+        }
+        if (ctx->prefill_batch > 0) {
+            size_t len = (n - 1) - i;
+            if (len > (size_t)ctx->prefill_batch) {
+                len = (size_t)ctx->prefill_batch;
+            }
+            vtm_set_position(m, (int)i);
+            st = vtm_run_batch(m, prompt_ids + i, (int)len);
+            if (st != VTM_OK) {
+                return api_fail(ctx, (int)st,
+                                "vtm_api_generate: промпт[%zu..%zu): %s: %s",
+                                i, i + len, vtm_strerror(st),
+                                vtm_error_message(m));
+            }
+            i += len;
+        } else {
+            vtm_set_position(m, (int)i);
+            vtm_set_token(m, (int)prompt_ids[i]);
+            st = vtm_run(m, NULL, NULL);
+            if (st != VTM_OK) {
+                return api_fail(ctx, (int)st,
+                                "vtm_api_generate: промпт[%zu]: %s: %s", i,
+                                vtm_strerror(st), vtm_error_message(m));
+            }
+            i++;
         }
         if (api_cancelled(ctx)) {
             return api_stop(ctx, VTM_API_CANCELLED);
         }
-        vtm_set_position(m, (int)i);
-        vtm_set_token(m, id);
-        memset(&cap, 0, sizeof cap);
-        // Токены промпта, кроме последнего, только наполняют KV-кэш; SAMP на
-        // них (если программа его вызывает) исполняется, но токен хосту не
-        // отдаётся — ровно как в CLI.
-        st = vtm_run(m, (i + 1 == n) ? api_emit_cb : NULL, &cap);
+    }
+
+    // Последний токен промпта даёт первый токен ответа (и в режиме пачек).
+    memset(&cap, 0, sizeof cap);
+    vtm_set_position(m, (int)(n - 1));
+    vtm_set_token(m, (int)prompt_ids[n - 1]);
+    {
+        vtm_status st = vtm_run(m, api_emit_cb, &cap);
         if (st != VTM_OK) {
-            return api_fail(ctx, (int)st, "vtm_api_generate: промпт[%zu]: %s: %s",
-                            i, vtm_strerror(st), vtm_error_message(m));
-        }
-        if (api_cancelled(ctx)) {
-            return api_stop(ctx, VTM_API_CANCELLED);
+            return api_fail(ctx, (int)st,
+                            "vtm_api_generate: промпт[%zu]: %s: %s", n - 1,
+                            vtm_strerror(st), vtm_error_message(m));
         }
     }
 

@@ -352,6 +352,51 @@ int vtm_tok_stream_push(vtm_tok_stream *s, int32_t id, char **out_text,
 int vtm_tok_stream_finish(vtm_tok_stream *s, char **out_text, char *err,
                           size_t errlen);
 
+// --- батчевый prefill (задачи 0112, 0114) ----------------------------------
+//
+// vtm_run_batch() — публичный API ядра из задачи 0112 (объявляется в vtm.h).
+// Здесь он объявлен и определён слабо: пока ядра нет, работает заглушка «по
+// токену» (ровно прежний цикл CLI), а когда interp.c получит сильное
+// определение, линковщик возьмёт его вместо заглушки — main.c менять не надо.
+//
+// Слабое определение, а не только слабое объявление: в Mach-O (macOS)
+// неразрешённая слабая ссылка — ошибка линковки, а слабое определение
+// линкуется везде, и сильное определение из libvtm.a его перекрывает.
+//
+// Контракт (его должен реализовать 0112): vtm_run_batch(m, ids, n) прогоняет
+// ids[0..n) начиная с текущей позиции машины; токен k считается на позиции
+// start + k (start = vtm_position(m) до вызова); emit не вызывается; на
+// выходе состояние машины и vtm_position(m) == start + n - 1 побитово как
+// после n вызовов vtm_run() по одному. n == 0 — no-op, VTM_OK.
+//
+// Компилятор без weak-атрибута собирает заглушку как обычную функцию — батч
+// тогда просто не ускоряет. Другая сигнатура в 0112 — ошибка компиляции здесь
+// (а не молчаливая работа заглушки).
+#if defined(__GNUC__) || defined(__clang__)
+#define VTM_WEAK __attribute__((weak))
+#else
+#define VTM_WEAK
+#endif
+
+vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n);
+VTM_WEAK
+vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
+    const int64_t start = (int64_t)vtm_position(m);
+    int i;
+
+    for (i = 0; i < n; i++) {
+        const int64_t pos = start + i;
+        vtm_status st;
+        if (pos > (int64_t)INT_MAX) return VTM_E_BOUNDS;
+        vtm_set_position(m, (int)pos);
+        vtm_set_token(m, (int)ids[i]);
+        st = vtm_run(m, NULL, NULL);
+        if (st != VTM_OK) return st;
+    }
+    if (n > 0) vtm_set_position(m, (int)(start + n - 1));
+    return VTM_OK;
+}
+
 static void usage(FILE *out) {
     fprintf(out,
         "VTM — скалярный интерпретатор виртуальной троичной машины (v0.1)\n"
@@ -379,6 +424,9 @@ static void usage(FILE *out) {
         "      --trace-summary        сводка в stderr: по опкоду вызовы, время,\n"
         "                             доля; время — реальный замер (0082)\n"
         "      --max-tokens N         синоним --max-new.\n"
+        "      --prefill-batch N      считать промпт пачками по N токенов:\n"
+        "                             быстрее на длинном промпте, ответ тот же;\n"
+        "                             0 — по токену, как раньше (по умолчанию 0).\n"
         "      --stream               печатать ответ по мере генерации (stdout,\n"
         "                             без буферизации строки; только с --text).\n"
         "                             Декодер ждёт завершения UTF-8 символа и\n"
@@ -578,6 +626,47 @@ static void trace_print_summary(const trace_state *ts, double run_ms) {
 
 static int timeout_expired(double started, double timeout_sec) {
     return timeout_sec > 0.0 && monotonic_now() - started >= timeout_sec;
+}
+
+// Прогнать токены промпта [from, to) — пачками по batch через vtm_run_batch()
+// (задачи 0112, 0114) или по токену (batch == 0, прежний путь).
+//
+// emit здесь не нужен: эти токены только наполняют KV-кэш (последний токен
+// промпта прогоняется отдельно, на нём SAMP выбирает первый ответ).
+// Пачка неделима, поэтому таймаут проверяется между пачками (как у
+// vtm_run_cached() в C-ABI), а не между токенами. *timed_out = 1 — таймаут
+// сработал, прогон прекращён; возврат VTM_OK.
+// timeout_sec == 0 — таймаута нет (режим --max-new 0 его и раньше не смотрел).
+static vtm_status prompt_prefill(vtm_t *m, const int *tokens, int from, int to,
+                                 int batch, double t_start, double timeout_sec,
+                                 int *timed_out) {
+    int i = from;
+
+    while (i < to) {
+        vtm_status st;
+        int len = to - i;
+
+        if (timeout_expired(t_start, timeout_sec)) {
+            *timed_out = 1;
+            return VTM_OK;
+        }
+        if (batch > 0) {
+            if (len > batch) len = batch;
+            vtm_set_position(m, i);
+            // tokens — int: те же 32 бита и представление, что у int32_t
+            // (id токена). C-ABI ядра принимает int32_t.
+            st = vtm_run_batch(m, (const int32_t *)(const void *)(tokens + i),
+                               len);
+        } else {
+            len = 1;
+            vtm_set_position(m, i);
+            vtm_set_token(m, tokens[i]);
+            st = vtm_run(m, NULL, NULL);
+        }
+        if (st != VTM_OK) return st;
+        i += len;
+    }
+    return VTM_OK;
 }
 
 static int parse_int_list(const char *s, int **out, size_t *out_n) {
@@ -1016,6 +1105,8 @@ static int cmd_run(int argc, char **argv) {
     int chat = 0;
     int stream = 0;
     int max_new = 8;
+    // 0 — промпт по токену (как раньше), N — пачками по N (задачи 0112, 0114).
+    int prefill_batch = 0;
     int stats = 0;
     int trace_lines = 0;
     int trace_summary = 0;
@@ -1102,6 +1193,14 @@ static int cmd_run(int argc, char **argv) {
             if (++i >= argc || parse_int(argv[i], &max_new) != 0 ||
                 max_new < 0 || max_new > 1000000) {
                 fprintf(stderr, "vtm run: плохое значение --max-new/--max-tokens\n");
+                goto arg_error;
+            }
+        } else if (strcmp(argv[i], "--prefill-batch") == 0) {
+            if (++i >= argc || parse_int(argv[i], &prefill_batch) != 0 ||
+                prefill_batch < 0 || prefill_batch > 1000000) {
+                fprintf(stderr,
+                        "vtm run: --prefill-batch ожидает N >= 0 "
+                        "(0 — промпт по токену)\n");
                 goto arg_error;
             }
         } else if (strcmp(argv[i], "--backend") == 0) {
@@ -1264,6 +1363,8 @@ args_ok:
                 vtm_backend_name(m));
         if (system_s) fprintf(info, "система: %s\n", system_s);
         if (text_s) fprintf(info, "текст:   %s\n", text_s);
+        if (prefill_batch > 0)
+            fprintf(info, "prefill: пачками по %d токен(ов)\n", prefill_batch);
         if (prompt) {
             fprintf(info, "шаблон:\n%sконец шаблона\n", prompt);
             free(prompt);
@@ -1302,50 +1403,43 @@ args_ok:
     c0 = clock();
     t_start = monotonic_now();
     if (max_new == 0) {
-        for (i = 0; i < (int)n_tokens; i++) {
-            vtm_status st;
-            vtm_set_position(m, i);
-            vtm_set_token(m, tokens[i]);
-            st = vtm_run(m, NULL, NULL);
-            if (st != VTM_OK) {
-                fprintf(stderr, "vtm run: %s: %s\n", vtm_strerror(st),
-                        vtm_error_message(m));
-                vtm_tok_stream_close(tok_stream);
-                vtm_free(m);
-                free(tokens);
-                free(generated);
-                vtm_tok_close(tokenizer);
-                stop_texts_free(stops, n_stops);
-                stream_state_free(&ss);
-                return 1;
-            }
+        // Здесь таймаут, как и раньше, не проверяется (--timeout действует
+        // на генерацию): timeout_sec = 0.
+        vtm_status st = prompt_prefill(m, tokens, 0, (int)n_tokens,
+                                       prefill_batch, t_start, 0.0, &timed_out);
+        if (st != VTM_OK) {
+            fprintf(stderr, "vtm run: %s: %s\n", vtm_strerror(st),
+                    vtm_error_message(m));
+            vtm_tok_stream_close(tok_stream);
+            vtm_free(m);
+            free(tokens);
+            free(generated);
+            vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
+            stream_state_free(&ss);
+            return 1;
         }
     } else {
         vtm_status st;
         emit_state es;
         int last;
 
-        // Все токены промпта, кроме последнего, только наполняют KV-кэш.
-        for (i = 0; i + 1 < (int)n_tokens; i++) {
-            if (timeout_expired(t_start, timeout_sec)) {
-                timed_out = 1;
-                goto generation_done;
-            }
-            vtm_set_position(m, i);
-            vtm_set_token(m, tokens[i]);
-            st = vtm_run(m, NULL, NULL);
-            if (st != VTM_OK) {
-                fprintf(stderr, "vtm run: %s: %s\n", vtm_strerror(st),
-                        vtm_error_message(m));
-                vtm_tok_stream_close(tok_stream);
-                vtm_free(m);
-                free(tokens);
-                free(generated);
-                vtm_tok_close(tokenizer);
-                stop_texts_free(stops, n_stops);
-                stream_state_free(&ss);
-                return 1;
-            }
+        // Все токены промпта, кроме последнего, только наполняют KV-кэш:
+        // пачками по prefill_batch или по токену (prefill_batch == 0).
+        st = prompt_prefill(m, tokens, 0, (int)n_tokens - 1, prefill_batch,
+                            t_start, timeout_sec, &timed_out);
+        if (timed_out) goto generation_done;
+        if (st != VTM_OK) {
+            fprintf(stderr, "vtm run: %s: %s\n", vtm_strerror(st),
+                    vtm_error_message(m));
+            vtm_tok_stream_close(tok_stream);
+            vtm_free(m);
+            free(tokens);
+            free(generated);
+            vtm_tok_close(tokenizer);
+            stop_texts_free(stops, n_stops);
+            stream_state_free(&ss);
+            return 1;
         }
         if (timeout_expired(t_start, timeout_sec)) {
             timed_out = 1;
