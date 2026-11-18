@@ -213,7 +213,10 @@ def _iter_raw_jsonl(src: Source, limit: int) -> Iterator[dict[str, Any]]:
             question, answer = _clean(pair[0]), _clean(pair[1])
             if len(question) < 10 or len(answer) < 20:
                 continue
-            if _LINK.search(answer) or not quality.accept_pair(question, answer):
+            if _LINK.search(answer):
+                continue
+            question, answer = quality.soften_pair(question, answer)
+            if not quality.accept_pair(question, answer):
                 continue
             yield {
                 "question": question,
@@ -265,6 +268,8 @@ def iter_pairs(src: Source, limit: int) -> Iterator[dict[str, Any]]:
             continue
         if _LINK.search(answer):
             continue
+        # Мат не повод терять пару: заменяем литературными оборотами и проверяем снова.
+        question, answer = quality.soften_pair(question, answer)
         if not quality.accept_pair(question, answer):
             continue
         # Русскость проверяем по вопросу; ответ может быть кодом без кириллицы.

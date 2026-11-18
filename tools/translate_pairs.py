@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         if result is None:
             reason = "не разобран ответ учителя"
         else:
-            question_ru, answer_ru = result
+            question_ru, answer_ru = quality.soften_pair(*result)
             reason = _check(item["question"], item["answer"], question_ru, answer_ru)
         with lock:
             if reason:

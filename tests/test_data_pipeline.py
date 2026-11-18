@@ -133,3 +133,36 @@ class TestTranslationChecks(unittest.TestCase):
         from tools.translate_pairs import _parse
         got = _parse("ВОПРОС: Как дела?\n\nОТВЕТ: Хорошо.")
         self.assertEqual(got, ("Как дела?", "Хорошо."))
+
+
+class TestSoften(unittest.TestCase):
+    def test_no_profanity_no_change(self):
+        for text in [
+            "```python\ndef f(x):\n    if x:\n        return 1\n    return 0\n```",
+            "Обычный ответ  с  двумя  пробелами.",
+            "  отступ в начале и в конце  ",
+        ]:
+            with self.subTest(text=text[:25]):
+                self.assertEqual(quality.soften(text), text)
+
+    def test_softens_profanity(self):
+        cases = {
+            "Это блядская ситуация.": "Это неприемлемая ситуация.",
+            "Пиздец, всё упало.": "Неприятность, всё упало.",
+            "Это полная хуйня.": "Это полная ерунда.",
+            "Дерьмовый код.": "Негодный код.",
+        }
+        for src, want in cases.items():
+            with self.subTest(src=src):
+                self.assertEqual(quality.soften(src), want)
+
+    def test_softened_text_is_clean(self):
+        for src in ["Это блядская ситуация.", "Пиздец, всё упало.", "Сука, надоело."]:
+            with self.subTest(src=src):
+                self.assertTrue(quality.is_clean_language(quality.soften(src)))
+
+    def test_code_indentation_survives(self):
+        text = "Блядская ошибка:\n```python\nif x:\n    return 1\n```"
+        out = quality.soften(text)
+        self.assertIn("    return 1", out)
+        self.assertNotIn("бляд", out.lower())

@@ -43,6 +43,41 @@ RISKY_ADVICE = re.compile(
     re.I,
 )
 
+#: Мат → литературный оборот. Заменяем корень, сохраняя окончание: тогда
+#: «охуенная идея» → «прекрасная идея», а «дерьмовый код» → «негодный код».
+#: Порядок важен: длинные корни раньше коротких.
+PROFANITY_MAP: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bблядск", re.I), "неприемлем"),
+    (re.compile(r"\bбляд", re.I), "неприемлем"),
+    (re.compile(r"\bбля(?:т|дь)?\b", re.I), ""),
+    (re.compile(r"\bпиздец\b", re.I), "неприятность"),
+    (re.compile(r"\bпиздеца\b", re.I), "неприятности"),
+    (re.compile(r"\bпизд", re.I), "ерунд"),
+    (re.compile(r"\bхуйня\b", re.I), "ерунда"),
+    (re.compile(r"\bхуйни\b", re.I), "ерунды"),
+    (re.compile(r"\bхуйню\b", re.I), "ерунду"),
+    (re.compile(r"\bхуйнёй\b|\bхуйней\b", re.I), "ерундой"),
+    (re.compile(r"\bхуйн", re.I), "ерунд"),
+    (re.compile(r"\bхуйня\b", re.I), "ерунда"),
+    (re.compile(r"\bхуйни\b", re.I), "ерунды"),
+    (re.compile(r"\bхуйню\b", re.I), "ерунду"),
+    (re.compile(r"\bхуйнёй\b|\bхуйней\b", re.I), "ерундой"),
+    (re.compile(r"\bхуйн", re.I), "ерунд"),
+    (re.compile(r"\bху[йяёе]в?", re.I), "ерунд"),
+    (re.compile(r"\bохуенн|\bахуенн|\bохуит", re.I), "прекрасн"),
+    (re.compile(r"\bохуе|\bахуе", re.I), "удив"),
+    (re.compile(r"\bебат|\bёбат", re.I), "удивля"),
+    (re.compile(r"\bебал|\bёбал", re.I), "надоеда"),
+    (re.compile(r"\bебуч|\bёбуч", re.I), "неудачн"),
+    (re.compile(r"\bсука\b", re.I), "вот досада"),
+    (re.compile(r"\bмудак", re.I), "глупец"),
+    (re.compile(r"\bдерьмов", re.I), "негодн"),
+    (re.compile(r"\bдерьм(?:о|а|у|ом|е)\b", re.I), "нечто негодное"),
+    (re.compile(r"\bговн", re.I), "ерунд"),
+    (re.compile(r"\bжоп", re.I), "задн"),
+    (re.compile(r"\b(?:fuck|shit|bitch)\w*", re.I), "ерунда"),
+]
+
 MIN_CYR = 20
 
 
@@ -56,6 +91,37 @@ def is_neutral(text: str) -> bool:
 
 def is_clean_language(text: str) -> bool:
     return not PROFANITY.search(text)
+
+
+def soften(text: str) -> str:
+    """Заменить мат литературными оборотами, не трогая всё остальное.
+
+    Важно: если замен не было — текст возвращается **байт в байт**. Иначе чистка
+    нормализует код: схлопывает отступы, поднимает регистр первой буквы — и ломает
+    примеры программ. Этот баг уже испортил 2433 пары, поэтому правило жёсткое:
+    нет мата — нет изменений.
+    """
+    out = text
+    changed = False
+    for pattern, replacement in PROFANITY_MAP:
+        if not pattern.search(out):
+            continue
+        changed = True
+
+        def _sub(match: re.Match[str], repl: str = replacement) -> str:
+            if not repl:
+                return ""
+            return repl[:1].upper() + repl[1:] if match.group(0)[:1].isupper() else repl
+
+        out = pattern.sub(_sub, out)
+    if not changed:
+        return text
+    return out
+
+
+def soften_pair(question: str, answer: str) -> tuple[str, str]:
+    """Почистить оба поля от мата (для датасетов, где ругань — часть стиля)."""
+    return soften(question), soften(answer)
 
 
 def is_not_broken(text: str) -> bool:
