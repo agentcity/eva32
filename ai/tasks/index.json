@@ -404,5 +404,12 @@
     "status": "in_progress",
     "file": "0063-vtm-stream-cli.md",
     "assignee": "agent:vtm-stream-cli"
+  },
+  {
+    "id": "0064",
+    "title": "Атомарная запись с fsync",
+    "status": "done",
+    "file": "0064-atomic-writes.md",
+    "assignee": "saron"
   }
 ]

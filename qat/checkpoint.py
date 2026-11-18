@@ -71,6 +71,30 @@ def checkpoint_step(path: str | Path) -> int:
     return int(name[5:])
 
 
+def _fsync_tree(directory: Path) -> None:
+    """fsync всех файлов каталога и самого каталога (ADR 0008).
+
+    rename без fsync переносит только имя: содержимое может остаться в кэше ОС,
+    и после потери питания чекпоинт окажется пустым.
+    """
+    from .util import fsync_dir  # noqa: PLC0415
+
+    for entry in sorted(directory.rglob("*")):
+        if not entry.is_file():
+            continue
+        try:
+            fd = os.open(str(entry), os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    fsync_dir(directory)
+
+
 def save_checkpoint(
     run_dir: str | Path,
     *,
@@ -99,6 +123,7 @@ def save_checkpoint(
             state = dict(state)
             state["grad_scaler"] = scaler.state_dict()
         torch.save(state, tmp / "trainer_state.pt")
+        _fsync_tree(tmp)
         if final.exists():
             shutil.rmtree(final)
         os.replace(tmp, final)
