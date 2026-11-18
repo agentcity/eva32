@@ -34,6 +34,9 @@ from .config import (
     ConfigError,
     apply_overrides,
     config_to_dict,
+    estimate_memory,
+    format_memory_matrix,
+    format_memory_table,
     load_config,
     resolve_data_path,
 )
@@ -56,7 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "примеры:\n"
             "  python3 -m qat.train --dry-run\n"
-            "      3 шага на случайных данных: проверить, что всё стартует\n\n"
+            "      оценка памяти по компонентам; без torch — только она,\n"
+            "      с torch — ещё 3 шага на случайных данных\n\n"
             "  python3 -m qat.train --config qat/configs/qwen1.5b.yaml \\\n"
             "      --data distill/out/pairs.jsonl --out runs/pilot1\n"
             "      пилот целиком\n\n"
@@ -94,7 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="3 шага на случайных данных без датасета; проверить запуск и память",
+        help="оценка памяти по компонентам (без torch); с torch — ещё 3 шага "
+             "на случайных данных без датасета",
     )
     parser.add_argument(
         "--no-save", action="store_true",
@@ -129,9 +134,33 @@ def print_missing_dependencies(missing: Sequence[str]) -> None:
     print("На машине разработчика проверить код можно без GPU-стека:")
     print("    python3 -m unittest discover -s tests -v")
     print("    python3 -m qat.train --help")
+    print("    python3 -m qat.train --config qat/configs/qwen3b.yaml --dry-run")
+    print("        (только оценка памяти: torch не нужен)")
     print()
     print("Если torch уже стоит, но не тот: проверьте, что Python 3.10–3.12 "
           "и что установлен CUDA-вариант torch.")
+
+
+def print_memory_summary(cfg: Any) -> dict[str, Any]:
+    """Печать матрицы 1.5B/3B × мастер × оптимизатор и текущего конфига."""
+    print("[qat] оценка памяти до запуска (чистая арифметика по конфигу, "
+          "torch не нужен)")
+    print()
+    print(format_memory_matrix(cfg))
+    print()
+    current = estimate_memory(cfg)
+    print("[qat] текущий конфиг:")
+    print(format_memory_table(current))
+    if current["master_dtype"] == "bf16":
+        print()
+        print("[qat] ВНИМАНИЕ: bf16-мастер. Обновление меньше половины шага "
+              "bf16 округляется в ноль:")
+        print("       при lr 3e-5 и весах ~0.02 (полшага ≈ 6e-5) большая часть "
+              "весов может замереть.")
+        print("       Контролируйте loss на первых 100 шагах; если стоит — "
+              "fp32-мастер или больший lr.")
+    print()
+    return current
 
 
 # ---------------------------------------------------------------------------
@@ -300,11 +329,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    missing = missing_modules()
-    if missing:
-        print_missing_dependencies(missing)
-        return 2
-
+    # Конфиг читается до проверки зависимостей: --dry-run должен показывать
+    # оценку памяти даже там, где torch/transformers не установлены.
     try:
         cfg = load_config(args.config)
         cfg = apply_overrides(
@@ -315,6 +341,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"[qat] ошибка конфига: {exc}")
         return 2
+
+    if args.dry_run:
+        try:
+            print_memory_summary(cfg)
+        except ConfigError as exc:
+            print(f"[qat] ошибка оценки памяти: {exc}")
+            return 2
+
+    missing = missing_modules()
+    if args.dry_run:
+        # pyyaml для --dry-run не нужен: конфиг прочитает встроенный парсер.
+        missing = [module for module in missing if module != "pyyaml"]
+    if missing:
+        if args.dry_run:
+            print("[qat] GPU-стека нет: показана только оценка памяти, "
+                  "обучение не запускалось.")
+            print("[qat] не хватает для 3 шагов: " + ", ".join(missing)
+                  + " — поставьте qat/requirements-qat.txt на GPU-машине.")
+            return 0
+        print_missing_dependencies(missing)
+        return 2
+    if args.dry_run:
+        print("[qat] GPU-стек есть: после оценки памяти — 3 шага на случайных данных")
     if args.dry_run and args.max_steps is not None and args.max_steps != 3:
         print("[qat] --dry-run всегда делает 3 шага; --max-steps проигнорирован")
 
@@ -412,7 +461,8 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"{cfg.train.grad_accum_steps} = {cfg.train.micro_batch_size * cfg.train.grad_accum_steps} "
           f"последовательностей, длина {cfg.data.max_seq_len}")
     print(f"[qat] grad checkpointing: {'вкл' if cfg.train.gradient_checkpointing else 'выкл'}, "
-          f"amp: {cfg.train.amp_dtype}, мастер-веса: {cfg.model.torch_dtype}")
+          f"amp: {cfg.train.amp_dtype}, мастер-веса: {cfg.model.master_dtype} "
+          f"({cfg.model.torch_dtype}), градиенты: {cfg.train.grad_dtype}")
     if cfg.model.revision == "main":
         print("[qat] ВНИМАНИЕ: revision=main; на GPU-машине зафиксируйте commit в конфиге")
 
@@ -729,6 +779,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
+            # grad_dtype: после backward градиенты уже bf16 при bf16-мастере;
+            # при fp32-мастере их можно опустить до bf16 и сэкономить половину
+            # памяти до шага оптимизатора. Оценка памяти это учитывает.
+            target_grad_dtype = (
+                torch.bfloat16 if cfg.train.grad_dtype == "bf16" else torch.float32
+            )
+            for param in model.parameters():
+                if param.grad is not None and param.grad.dtype != target_grad_dtype:
+                    param.grad = param.grad.to(target_grad_dtype)
             if cfg.train.grad_clip > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), cfg.train.grad_clip

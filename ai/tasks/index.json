@@ -345,7 +345,7 @@
   {
     "id": "0047",
     "title": "3B на 24 ГБ: bf16-мастер и экономия памяти",
-    "status": "in_progress",
+    "status": "done",
     "file": "0047-qat-3b-24gb.md",
     "assignee": "agent:qat-3b-24gb"
   },

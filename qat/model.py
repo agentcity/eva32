@@ -4,9 +4,11 @@
 Эмбеддинги, lm_head, layernorm, bias и возможные роутеры остаются в fp32
 и обучаются как обычно.
 
-Мастер-веса держим в float32, а считаем в bf16 autocast: обновления при
-lr ~3e-5 в bf16 просто округляются до нуля, поэтому bf16-мастер для QAT
-не годится (см. docs/distillation.md).
+По умолчанию мастер-веса держим в float32, а считаем в bf16 autocast.
+Режим ``master_dtype: bf16`` (задача 0047) экономит память, но обновления
+при lr ~3e-5 меньше половины шага bf16 и округляются до нуля: это осознанный
+компромисс ради 24 ГиБ, риск и обход описан в docs/qat.md. bf16-мастер
+имеет смысл только с контролем loss на первых шагах.
 """
 from __future__ import annotations
 
@@ -18,7 +20,13 @@ import torch
 from torch import nn
 from torch.nn.utils.parametrize import register_parametrization
 
-from .config import Config, QuantConfig, TrainConfig
+from .config import (
+    MASTER_TO_TORCH,
+    Config,
+    QuantConfig,
+    TrainConfig,
+    resolve_master_dtype,
+)
 from .ternary import BLOCK_SIZE, ternary_weight_torch
 from .util import human_count
 
@@ -146,13 +154,15 @@ def load_tokenizer(cfg: Config) -> Any:
 
 
 def load_model(cfg: Config, device: torch.device) -> nn.Module:
-    """Загрузить CausalLM в fp32 и поставить на устройство."""
+    """Загрузить CausalLM в master_dtype (fp32 по умолчанию) на устройство."""
     from transformers import AutoModelForCausalLM  # noqa: PLC0415 - тяжёлый импорт
 
+    master = resolve_master_dtype(cfg.model)
     kwargs: dict[str, Any] = {
         "revision": cfg.model.revision,
         "trust_remote_code": cfg.model.trust_remote_code,
-        "torch_dtype": torch_dtype(cfg.model.torch_dtype),
+        # master_dtype — источник правды; torch_dtype в конфиге только синоним.
+        "torch_dtype": torch_dtype(MASTER_TO_TORCH[master]),
         "low_cpu_mem_usage": True,
     }
     if cfg.model.attn_implementation:
@@ -287,13 +297,27 @@ def build_optimizer(
                 import bitsandbytes as bnb  # noqa: PLC0415 - опциональная зависимость
 
                 optimizer = bnb.optim.Adam8bit(groups, **common)
-                print("[qat] оптимизатор: bitsandbytes Adam8bit (fp32-мастер, 8-бит состояния)")
+                print(f"[qat] оптимизатор: bitsandbytes Adam8bit "
+                      f"(мастер {resolve_master_dtype(cfg.model)}, 8-бит состояния)")
                 return optimizer, "adam8bit"
             except Exception as exc:  # noqa: BLE001 - bnb падает по-разному
                 print(f"[qat] ВНИМАНИЕ: bitsandbytes Adam8bit недоступен ({exc}); беру AdamW")
     optimizer = torch.optim.AdamW(groups, **common)
-    print("[qat] оптимизатор: torch.optim.AdamW (fp32-состояния, памяти нужно больше)")
+    print("[qat] оптимизатор: torch.optim.AdamW (состояния в dtype параметра; "
+          "--dry-run считает fp32-состояния как верхнюю оценку)")
     return optimizer, "adamw"
+
+
+def estimate_memory(cfg: Config) -> dict[str, Any]:
+    """Оценка памяти; реализация в config.py, чтобы работать без torch.
+
+    Обёртка нужна для вызовов ``from qat.model import estimate_memory``:
+    сам этот модуль импортирует torch, а ``qat.config.estimate_memory`` —
+    нет, и именно её использует ``--dry-run`` на машине разработчика.
+    """
+    from .config import estimate_memory as _estimate_memory  # noqa: PLC0415
+
+    return _estimate_memory(cfg)
 
 
 def lr_at(step: int, cfg: TrainConfig, max_steps: int | None = None) -> float:
