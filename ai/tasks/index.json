@@ -275,7 +275,7 @@
   {
     "id": "0040",
     "title": "ВТМ: текстовый прогон через токенизатор",
-    "status": "in_progress",
+    "status": "done",
     "file": "0040-vtm-text.md",
     "assignee": "agent:vtm-text"
   },

@@ -1,19 +1,208 @@
 // CLI VTM: run / inspect / bench.
 //
 //   vtm run model.vtm --tokens 1,2,3 --max-new 8
+//   vtm run model.vtm --text "вопрос" --tokenizer tokenizer.json --max-new 8
 //   vtm inspect model.vtm
 //   vtm bench [--rows 512 --cols 512 --iters 200]
 //
 // Без аргументов печатается справка и код возврата 2 (как принято для CLI).
+//
+// Сборка: CLI — C99 + libvtm.a, но режим --text линкуется с BPE-токенизатором.
+// tokenizer.hpp объявляет `namespace vtm`, а vtm.h — `struct vtm`; в одной
+// единице трансляции C++ они несовместимы. Поэтому Makefile собирает этот же
+// файл второй раз как C++17 с -DVTM_TOK_BRIDGE (tok_bridge.o) — получается
+// узкий C-ABI без vtm.h, а main.c остаётся обычным C99.
+
+#ifdef VTM_TOK_BRIDGE
+// ---------------------------------------------------------------------------
+// C++17-мост к tokenizer.hpp. Никакого vtm.h здесь нет.
+// ---------------------------------------------------------------------------
+#include "tokenizer.hpp"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <unistd.h>
+
+struct vtm_tok {
+    vtm::Tokenizer tok;
+};
+
+static void bridge_error(char *err, size_t errlen, const char *what) {
+    if (err == NULL || errlen == 0) return;
+    std::snprintf(err, errlen, "%s", what ? what : "неизвестная ошибка");
+}
+
+// Как vtm-tok: если путь не открылся относительно cwd, пробуем родителей cwd.
+static std::string resolve_path(const std::string &given) {
+    FILE *f = NULL;
+    if (given.empty()) return given;
+    f = std::fopen(given.c_str(), "rb");
+    if (f) {
+        std::fclose(f);
+        return given;
+    }
+    {
+        char cwd[4096];
+        if (!getcwd(cwd, sizeof cwd)) return given;
+        std::string dir = cwd;
+        for (;;) {
+            const std::string candidate = dir + "/" + given;
+            FILE *g = std::fopen(candidate.c_str(), "rb");
+            if (g) {
+                std::fclose(g);
+                return candidate;
+            }
+            if (dir == "/" || dir.empty()) break;
+            const std::size_t slash = dir.rfind('/');
+            if (slash == std::string::npos) break;
+            if (slash == 0) dir = "/";
+            else dir.resize(slash);
+        }
+    }
+    return given;
+}
+
+extern "C" {
+
+const char *vtm_tok_default_path(void) {
+    static std::string path;
+    try {
+        path = vtm::Tokenizer::default_path();
+    } catch (...) {
+        path.clear();
+    }
+    return path.c_str();
+}
+
+vtm_tok *vtm_tok_open(const char *given, char *err, size_t errlen) {
+    if (given == NULL || *given == '\0') {
+        bridge_error(err, errlen, "пустой путь к tokenizer.json");
+        return NULL;
+    }
+    try {
+        const std::string path = resolve_path(given);
+        vtm::Tokenizer loaded = vtm::Tokenizer::load(path);
+        vtm_tok *handle = new vtm_tok;
+        handle->tok = std::move(loaded);
+        return handle;
+    } catch (const std::exception &e) {
+        bridge_error(err, errlen, e.what());
+        return NULL;
+    } catch (...) {
+        bridge_error(err, errlen, "неизвестная ошибка загрузки tokenizer.json");
+        return NULL;
+    }
+}
+
+void vtm_tok_close(vtm_tok *handle) {
+    delete handle;
+}
+
+int vtm_tok_encode(vtm_tok *handle, const char *text, int32_t **out_ids,
+                   size_t *out_n, char *err, size_t errlen) {
+    if (out_ids != NULL) *out_ids = NULL;
+    if (out_n != NULL) *out_n = 0;
+    if (handle == NULL || out_ids == NULL || out_n == NULL) {
+        bridge_error(err, errlen, "мост токенизатора не инициализирован");
+        return -1;
+    }
+    try {
+        const std::vector<int32_t> ids = handle->tok.encode(text ? text : "");
+        if (ids.empty()) return 0;
+        int32_t *copy =
+            (int32_t *)std::malloc(ids.size() * sizeof(int32_t));
+        if (copy == NULL) {
+            bridge_error(err, errlen, "не хватило памяти под токены");
+            return -1;
+        }
+        std::memcpy(copy, ids.data(), ids.size() * sizeof(int32_t));
+        *out_ids = copy;
+        *out_n = ids.size();
+        return 0;
+    } catch (const std::exception &e) {
+        bridge_error(err, errlen, e.what());
+        return -1;
+    } catch (...) {
+        bridge_error(err, errlen, "неизвестная ошибка токенизации");
+        return -1;
+    }
+}
+
+int vtm_tok_decode(vtm_tok *handle, const int32_t *ids, size_t n,
+                   char **out_text, char *err, size_t errlen) {
+    if (out_text != NULL) *out_text = NULL;
+    if (handle == NULL || out_text == NULL || (ids == NULL && n != 0)) {
+        bridge_error(err, errlen, "мост токенизатора не инициализирован");
+        return -1;
+    }
+    try {
+        std::vector<int32_t> gen;
+        if (n != 0) gen.assign(ids, ids + n);
+        const std::string text = handle->tok.decode(gen);
+        char *copy = (char *)std::malloc(text.size() + 1);
+        if (copy == NULL) {
+            bridge_error(err, errlen, "не хватило памяти под текст ответа");
+            return -1;
+        }
+        std::memcpy(copy, text.c_str(), text.size() + 1);
+        *out_text = copy;
+        return 0;
+    } catch (const std::exception &e) {
+        bridge_error(err, errlen, e.what());
+        return -1;
+    } catch (...) {
+        bridge_error(err, errlen, "неизвестная ошибка детокенизации");
+        return -1;
+    }
+}
+
+void vtm_tok_free_ids(int32_t *ids) {
+    std::free(ids);
+}
+
+void vtm_tok_free_text(char *text) {
+    std::free(text);
+}
+
+} // extern "C"
+
+#else  // !VTM_TOK_BRIDGE
+// ---------------------------------------------------------------------------
+// CLI на C99: только libvtm.a и C-ABI моста токенизатора.
+// ---------------------------------------------------------------------------
 #include "vtm.h"
 
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+// C-ABI tok_bridge.o (реализация — в начале этого файла под VTM_TOK_BRIDGE).
+typedef struct vtm_tok vtm_tok;
+
+const char *vtm_tok_default_path(void);
+vtm_tok *vtm_tok_open(const char *given, char *err, size_t errlen);
+void vtm_tok_close(vtm_tok *handle);
+int vtm_tok_encode(vtm_tok *handle, const char *text, int32_t **out_ids,
+                   size_t *out_n, char *err, size_t errlen);
+int vtm_tok_decode(vtm_tok *handle, const int32_t *ids, size_t n,
+                   char **out_text, char *err, size_t errlen);
+void vtm_tok_free_ids(int32_t *ids);
+void vtm_tok_free_text(char *text);
 
 static void usage(FILE *out) {
     fprintf(out,
@@ -21,6 +210,12 @@ static void usage(FILE *out) {
         "\n"
         "  vtm run model.vtm --tokens 1,2,3 --max-new 8\n"
         "      прогнать программу по токенам и напечатать выбранные токены\n"
+        "      --backend lut|direct   вариант скалярного TMV (по умолчанию lut)\n"
+        "\n"
+        "  vtm run model.vtm --text \"вопрос\" [--tokenizer PATH] [--max-new 8]\n"
+        "      токенизировать текст (BPE), прогнать и напечатать ответ текстом\n"
+        "      --tokenizer PATH       tokenizer.json; иначе $VTM_TOKENIZER,\n"
+        "                             затем tests/vtm/fixtures/tokenizer.json\n"
         "      --backend lut|direct   вариант скалярного TMV (по умолчанию lut)\n"
         "\n"
         "  vtm inspect model.vtm\n"
@@ -31,7 +226,8 @@ static void usage(FILE *out) {
         "\n"
         "  vtm --help\n"
         "\n"
-        "Коды возврата: 0 — успех, 1 — ошибка выполнения, 2 — ошибка аргументов.\n");
+        "Коды возврата: 0 — успех, 1 — ошибка выполнения, 2 — ошибка аргументов\n"
+        "или токенизатора.\n");
 }
 
 static int parse_int(const char *s, int *out) {
@@ -136,12 +332,17 @@ static void print_tokens(const char *label, const int *v, size_t n) {
 static int cmd_run(int argc, char **argv) {
     const char *path = NULL;
     const char *tokens_s = NULL;
+    const char *text_s = NULL;
+    const char *tokenizer_s = NULL;
     const char *backend_name = "lut";
     int max_new = 8;
     int *tokens = NULL;
     size_t n_tokens = 0;
     int *generated = NULL;
     size_t n_generated = 0;
+    vtm_tok *tokenizer = NULL;
+    char *answer = NULL;
+    char tok_err[512];
     vtm_t *m;
     clock_t c0, c1;
     int i;
@@ -153,6 +354,18 @@ static int cmd_run(int argc, char **argv) {
                 return 2;
             }
             tokens_s = argv[i];
+        } else if (strcmp(argv[i], "--text") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "vtm run: --text без значения\n");
+                return 2;
+            }
+            text_s = argv[i];
+        } else if (strcmp(argv[i], "--tokenizer") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "vtm run: --tokenizer без значения\n");
+                return 2;
+            }
+            tokenizer_s = argv[i];
         } else if (strcmp(argv[i], "--max-new") == 0) {
             if (++i >= argc || parse_int(argv[i], &max_new) != 0 ||
                 max_new < 0 || max_new > 1000000) {
@@ -175,8 +388,16 @@ static int cmd_run(int argc, char **argv) {
             return 2;
         }
     }
-    if (!path || !tokens_s) {
-        fprintf(stderr, "vtm run: нужны model.vtm и --tokens\n");
+    if (!path || (!tokens_s && !text_s)) {
+        fprintf(stderr, "vtm run: нужны model.vtm и --tokens или --text\n");
+        return 2;
+    }
+    if (tokens_s && text_s) {
+        fprintf(stderr, "vtm run: --tokens и --text взаимоисключающие\n");
+        return 2;
+    }
+    if (tokenizer_s && !text_s) {
+        fprintf(stderr, "vtm run: --tokenizer имеет смысл только с --text\n");
         return 2;
     }
     if (strcmp(backend_name, "lut") != 0 &&
@@ -184,16 +405,67 @@ static int cmd_run(int argc, char **argv) {
         fprintf(stderr, "vtm run: --backend должен быть lut или direct\n");
         return 2;
     }
-    if (parse_int_list(tokens_s, &tokens, &n_tokens) != 0 ||
-        n_tokens > (size_t)INT_MAX) {
-        fprintf(stderr, "vtm run: --tokens ожидает список неотрицательных чисел\n");
-        return 2;
+    if (tokens_s) {
+        if (parse_int_list(tokens_s, &tokens, &n_tokens) != 0 ||
+            n_tokens > (size_t)INT_MAX) {
+            fprintf(stderr,
+                    "vtm run: --tokens ожидает список неотрицательных чисел\n");
+            return 2;
+        }
+    } else {
+        const char *tok_path = tokenizer_s ? tokenizer_s
+                                           : vtm_tok_default_path();
+        int32_t *ids = NULL;
+        size_t n_ids = 0;
+
+        if (!tok_path || !*tok_path) {
+            fprintf(stderr,
+                    "vtm run: не найден tokenizer.json: укажите "
+                    "--tokenizer PATH или $VTM_TOKENIZER\n");
+            return 2;
+        }
+        tokenizer = vtm_tok_open(tok_path, tok_err, sizeof tok_err);
+        if (!tokenizer) {
+            fprintf(stderr, "vtm run: токенизатор %s: %s\n", tok_path, tok_err);
+            return 2;
+        }
+        if (vtm_tok_encode(tokenizer, text_s, &ids, &n_ids, tok_err,
+                           sizeof tok_err) != 0) {
+            fprintf(stderr, "vtm run: токенизатор %s: %s\n", tok_path, tok_err);
+            vtm_tok_close(tokenizer);
+            return 2;
+        }
+        if (n_ids == 0) {
+            fprintf(stderr,
+                    "vtm run: --text \"%s\" дал пустой список токенов "
+                    "(проверьте tokenizer.json: %s)\n", text_s, tok_path);
+            vtm_tok_free_ids(ids);
+            vtm_tok_close(tokenizer);
+            return 2;
+        }
+        if (n_ids > (size_t)INT_MAX) {
+            fprintf(stderr, "vtm run: --text дал слишком много токенов\n");
+            vtm_tok_free_ids(ids);
+            vtm_tok_close(tokenizer);
+            return 2;
+        }
+        tokens = (int *)malloc(n_ids * sizeof(int));
+        if (!tokens) {
+            fprintf(stderr, "vtm run: не хватило памяти\n");
+            vtm_tok_free_ids(ids);
+            vtm_tok_close(tokenizer);
+            return 1;
+        }
+        for (i = 0; i < (int)n_ids; i++) tokens[i] = (int)ids[i];
+        n_tokens = n_ids;
+        vtm_tok_free_ids(ids);
     }
 
     m = vtm_load(path);
     if (!m) {
         fprintf(stderr, "vtm: %s\n", vtm_last_error());
         free(tokens);
+        vtm_tok_close(tokenizer);
         return 1;
     }
     vtm_set_backend(m, strcmp(backend_name, "direct") == 0
@@ -204,6 +476,7 @@ static int cmd_run(int argc, char **argv) {
     printf("тензоров: %u, инструкций: %u, бэкенд: %s\n",
            (unsigned)vtm_tensor_count(m), (unsigned)vtm_instr_count(m),
            vtm_backend_name(m));
+    if (text_s) printf("текст:   %s\n", text_s);
 
     if (max_new > 0) {
         generated = (int *)calloc((size_t)max_new, sizeof(int));
@@ -211,6 +484,7 @@ static int cmd_run(int argc, char **argv) {
             fprintf(stderr, "vtm run: не хватило памяти\n");
             vtm_free(m);
             free(tokens);
+            vtm_tok_close(tokenizer);
             return 1;
         }
     }
@@ -228,6 +502,7 @@ static int cmd_run(int argc, char **argv) {
                 vtm_free(m);
                 free(tokens);
                 free(generated);
+                vtm_tok_close(tokenizer);
                 return 1;
             }
         }
@@ -247,6 +522,7 @@ static int cmd_run(int argc, char **argv) {
                 vtm_free(m);
                 free(tokens);
                 free(generated);
+                vtm_tok_close(tokenizer);
                 return 1;
             }
         }
@@ -261,6 +537,7 @@ static int cmd_run(int argc, char **argv) {
             vtm_free(m);
             free(tokens);
             free(generated);
+            vtm_tok_close(tokenizer);
             return 1;
         }
         if (es.count > 1)
@@ -275,6 +552,7 @@ static int cmd_run(int argc, char **argv) {
             vtm_free(m);
             free(tokens);
             free(generated);
+            vtm_tok_close(tokenizer);
             return 1;
         }
 
@@ -290,6 +568,7 @@ static int cmd_run(int argc, char **argv) {
                 vtm_free(m);
                 free(tokens);
                 free(generated);
+                vtm_tok_close(tokenizer);
                 return 1;
             }
             if (!es.have) break;
@@ -302,6 +581,35 @@ static int cmd_run(int argc, char **argv) {
     }
     c1 = clock();
 
+    if (text_s) {
+        int32_t *gen_ids = NULL;
+        if (n_generated != 0) {
+            gen_ids = (int32_t *)malloc(n_generated * sizeof(int32_t));
+            if (!gen_ids) {
+                fprintf(stderr, "vtm run: не хватило памяти\n");
+                vtm_free(m);
+                free(tokens);
+                free(generated);
+                vtm_tok_close(tokenizer);
+                return 1;
+            }
+            for (i = 0; i < (int)n_generated; i++)
+                gen_ids[i] = (int32_t)generated[i];
+        }
+        if (vtm_tok_decode(tokenizer, gen_ids, n_generated, &answer, tok_err,
+                           sizeof tok_err) != 0) {
+            fprintf(stderr, "vtm run: не удалось декодировать вывод: %s\n",
+                    tok_err);
+            free(gen_ids);
+            vtm_free(m);
+            free(tokens);
+            free(generated);
+            vtm_tok_close(tokenizer);
+            return 1;
+        }
+        free(gen_ids);
+    }
+
     {
         double sec = (double)(c1 - c0) / (double)CLOCKS_PER_SEC;
         print_tokens("prompt: ", tokens, n_tokens);
@@ -309,6 +617,12 @@ static int cmd_run(int argc, char **argv) {
             print_tokens("вывод:  ", generated, n_generated);
         else
             printf("вывод:  (пусто)\n");
+        if (text_s) {
+            if (answer && *answer)
+                printf("ответ:   %s\n", answer);
+            else
+                printf("ответ:   (пусто)\n");
+        }
         printf("время: %.3f мс", sec * 1000.0);
         if (n_generated)
             printf(", %zu токен(ов), %.1f ток/с", n_generated,
@@ -319,6 +633,8 @@ static int cmd_run(int argc, char **argv) {
     vtm_free(m);
     free(tokens);
     free(generated);
+    vtm_tok_close(tokenizer);
+    vtm_tok_free_text(answer);
     return 0;
 }
 
@@ -532,3 +848,5 @@ int main(int argc, char **argv) {
     usage(stderr);
     return 2;
 }
+
+#endif // VTM_TOK_BRIDGE

@@ -1932,6 +1932,144 @@ static void test_large_dims_u32(void) {
     model_free(&md);
 }
 
+// --- CLI: текст -> токены -> модель -> текст --------------------------------
+//
+// Интеграционный тест: test_vtm.c — C и не линкуется с C++-токенизатором,
+// поэтому проверяем собранный CLI снаружи, как пользователь. Модель
+// синтетическая: logits[287], максимум на id 33; фикстура tokenizer.json
+// декодирует 33 как "!". Проверяем и старый путь --tokens, и ошибку без
+// tokenizer.json.
+
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int text_file_ok(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static const char *find_readable(const char *const *paths) {
+    int i;
+    for (i = 0; paths[i]; i++)
+        if (text_file_ok(paths[i])) return paths[i];
+    return NULL;
+}
+
+static int read_text_file(const char *path, char *buf, size_t cap) {
+    FILE *f = fopen(path, "rb");
+    size_t n;
+    if (!f) return -1;
+    n = fread(buf, 1, cap - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return 0;
+}
+
+static int cli_exit_code(int rc) {
+    if (rc == -1) return -1;
+    if (WIFEXITED(rc)) return WEXITSTATUS(rc);
+    return -1;
+}
+
+static void test_cli_text(void) {
+    static const char *const cli_paths[] = {
+        "./vtm", "src/vtm/vtm", "../../src/vtm/vtm", NULL
+    };
+    static const char *const tok_paths[] = {
+        "../../tests/vtm/fixtures/tokenizer.json",
+        "tests/vtm/fixtures/tokenizer.json",
+        "../tests/vtm/fixtures/tokenizer.json",
+        NULL
+    };
+    model_t md;
+    uint32_t dlog[1] = {287};
+    float *logits = (float *)xmalloc(287 * sizeof(float));
+    uint8_t *img;
+    size_t size;
+    char model_path[128], out_path[128], err_path[128], missing_path[128];
+    char cmd[2048], out[8192], err[8192];
+    const char *cli;
+    const char *fixture;
+    long stamp = (long)time(NULL);
+    FILE *f;
+    int rc;
+
+    out[0] = '\0';
+    err[0] = '\0';
+    memset(logits, 0, 287 * sizeof(float));
+    logits[33] = 10.0f;
+
+    model_init(&md);
+    model_add_f32(&md, "logits", 1, dlog, logits);
+    model_inst(&md, VTM_OP_SAMP, 0, VTM_NO_TENSOR, 0, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+    free(logits);
+
+    snprintf(model_path, sizeof model_path, "/tmp/vtm_cli_text_%ld.vtm", stamp);
+    snprintf(out_path, sizeof out_path, "/tmp/vtm_cli_text_%ld.out", stamp);
+    snprintf(err_path, sizeof err_path, "/tmp/vtm_cli_text_%ld.err", stamp);
+    snprintf(missing_path, sizeof missing_path,
+             "/tmp/vtm_cli_missing_%ld.json", stamp);
+    f = fopen(model_path, "wb");
+    CHECK(f != NULL);
+    if (!f) {
+        free(img);
+        model_free(&md);
+        return;
+    }
+    CHECK(fwrite(img, 1, size, f) == size);
+    fclose(f);
+
+    cli = find_readable(cli_paths);
+    fixture = find_readable(tok_paths);
+    CHECK(cli != NULL);
+    CHECK(fixture != NULL);
+    if (cli && fixture) {
+        // Текст -> токены -> модель -> текст: 33 декодируется как "!".
+        snprintf(cmd, sizeof cmd,
+                 "%s run %s --text hello --tokenizer %s --max-new 2 "
+                 "> %s 2> %s",
+                 cli, model_path, fixture, out_path, err_path);
+        rc = system(cmd);
+        CHECK(cli_exit_code(rc) == 0);
+        CHECK(read_text_file(out_path, out, sizeof out) == 0);
+        CHECK(strstr(out, "текст:   hello") != NULL);
+        CHECK(strstr(out, "prompt:") != NULL);
+        CHECK(strstr(out, "ответ:   !!") != NULL);
+
+        // Старый путь --tokens не сломан.
+        snprintf(cmd, sizeof cmd,
+                 "%s run %s --tokens 33 --max-new 1 > %s 2> %s",
+                 cli, model_path, out_path, err_path);
+        rc = system(cmd);
+        CHECK(cli_exit_code(rc) == 0);
+        CHECK(read_text_file(out_path, out, sizeof out) == 0);
+        CHECK(strstr(out, "prompt: 33") != NULL);
+        CHECK(strstr(out, "вывод:  33") != NULL);
+
+        // Нет tokenizer.json — понятная ошибка и код 2, не падение.
+        snprintf(cmd, sizeof cmd,
+                 "%s run %s --text hello --tokenizer %s > %s 2> %s",
+                 cli, model_path, missing_path, out_path, err_path);
+        rc = system(cmd);
+        CHECK(cli_exit_code(rc) == 2);
+        CHECK(read_text_file(err_path, err, sizeof err) == 0);
+        CHECK(strstr(err, "токенизатор") != NULL);
+    }
+
+    remove(model_path);
+    remove(out_path);
+    remove(err_path);
+    remove(missing_path);
+    free(img);
+    model_free(&md);
+}
+
 // --- main ------------------------------------------------------------------
 
 int main(void) {
@@ -1957,6 +2095,7 @@ int main(void) {
     test_samp();
     test_f16_bf16();
     test_large_dims_u32();
+    test_cli_text();
 
     if (g_fail) {
         fprintf(stderr, "\nПРОВАЛЕНО проверок: %d\n", g_fail);
