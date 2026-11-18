@@ -306,5 +306,26 @@
     "status": "pending",
     "file": "0044-kind4-int8.md",
     "assignee": ""
+  },
+  {
+    "id": "0050",
+    "title": "SIMD-бэкенд для тритовых ядер",
+    "status": "in_progress",
+    "file": "0050-vtm-simd.md",
+    "assignee": "agent:vtm-simd"
+  },
+  {
+    "id": "0051",
+    "title": "Сэмплинг: temperature, top-k, top-p, повтор",
+    "status": "in_progress",
+    "file": "0051-vtm-sampling.md",
+    "assignee": "agent:vtm-sampling"
+  },
+  {
+    "id": "0053",
+    "title": "Чат-шаблон Qwen в текстовом пути",
+    "status": "in_progress",
+    "file": "0053-vtm-chat.md",
+    "assignee": "agent:vtm-chat"
   }
 ]
