@@ -187,5 +187,47 @@
     "status": "pending",
     "file": "0027-trit-embeddings.md",
     "assignee": ""
+  },
+  {
+    "id": "0028",
+    "title": "ВТМ: полная модель в контейнере",
+    "status": "in_progress",
+    "file": "0028-vtm-full.md",
+    "assignee": "agent:vtm-full"
+  },
+  {
+    "id": "0029",
+    "title": "Компилятор: собрать полную модель в .vtm",
+    "status": "in_progress",
+    "file": "0029-vtm-compiler.md",
+    "assignee": "agent:vtm-compiler"
+  },
+  {
+    "id": "0030",
+    "title": "Сервер: токен, лимиты и защита от злоупотреблений",
+    "status": "in_progress",
+    "file": "0030-eva-auth.md",
+    "assignee": "agent:eva-auth"
+  },
+  {
+    "id": "0031",
+    "title": "Живой замер качества: гибрид против большой модели",
+    "status": "in_progress",
+    "file": "0031-eva-live-eval.md",
+    "assignee": "agent:eva-live-eval"
+  },
+  {
+    "id": "0032",
+    "title": "Голос: прототип ASR → eva → TTS",
+    "status": "in_progress",
+    "file": "0032-eva-voice.md",
+    "assignee": "agent:eva-voice"
+  },
+  {
+    "id": "0033",
+    "title": "Документация: свести состояние проекта",
+    "status": "in_progress",
+    "file": "0033-docs-sync.md",
+    "assignee": "agent:docs-sync"
   }
 ]
