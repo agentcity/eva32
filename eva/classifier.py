@@ -11,15 +11,23 @@
 2. приветствие/болтовня — малая модель;
 3. маркеры рассуждения (почему, объясни, сравни, напиши код, переведи, посчитай)
    и структурные задачи (код, математика, перевод, доказательство) — большая;
-4. факт из каталога (цена, часы, возврат, контакты) — скилл;
-5. сравнение (разница/отличается) — большая;
-6. вопрос «как»/«что такое» — большая;
-7. высокая доля латиницы — большая;
-8. длинный текст — большая;
-9. остальное — малая.
+4. творческие задачи (придумай, составь, спланируй) — большая: это порождение
+   текста, а не факт, поэтому проверяются до каталога;
+5. факт из каталога (цена, часы, возврат, контакты) — скилл;
+6. структурные признаки (sql, запрос, формул, таблиц, схем) — большая; идут
+   после каталога, чтобы «сколько запросов входит в тариф» осталось скиллом;
+7. вопрос на общие знания (столица, сколько будет, кто такой, в каком году,
+   переведи на) — большая: каталога и скилла там нет;
+8. сравнение (разница/отличается) — большая;
+9. вопрос «как»/«что такое» — большая;
+10. высокая доля латиницы — большая;
+11. длинный текст — большая;
+12. остальное — малая.
 
 Каталог проверяется после явных маркеров (просьба «посчитай» важнее упоминания
 цены) и до сравнения/«как» («разница в цене» ещё может быть ответом скилла).
+Признаки общих знаний тоже идут после каталога: «сколько стоит тариф» — это
+факт из каталога, а «сколько будет 15% от 800» — общие знания.
 
 Пороги не захардкожены в ``classify``: они берутся из ``cfg``. Ожидается либо
 объект ``eva.config.Config`` (у него есть свойство ``classifier``), либо словарь
@@ -30,6 +38,9 @@
 ``long_chars``           текст длиннее — маршрут ``big`` (по умолчанию 120)
 ``latin_ratio``          доля латиницы, выше которой — ``big`` (0.35)
 ``reason_markers``       маркеры рассуждения (список/кортеж/строка через запятую)
+``task_markers``         творческие задачи: придумай, составь, спланируй
+``structural_markers``   структурные признаки: sql, запрос, формул, таблиц, схем
+``knowledge_markers``    маркеры вопросов на общие знания (список/строка)
 ``latin_min_letters``    минимум букв, чтобы считать долю латиницы (12)
 ``letters_ratio_min``    минимум доли букв, иначе текст считается мусором (0.30)
 ``catalog_fact_to_skill````False`` отключает маршрут ``skill`` из классификатора
@@ -64,6 +75,9 @@ __all__ = [
     "classify",
     "DEFAULT_CLASSIFIER_THRESHOLDS",
     "DEFAULT_REASON_MARKERS",
+    "DEFAULT_TASK_MARKERS",
+    "DEFAULT_STRUCTURAL_MARKERS",
+    "DEFAULT_KNOWLEDGE_MARKERS",
     "SKILL",
     "SMALL",
     "BIG",
@@ -95,11 +109,50 @@ DEFAULT_REASON_MARKERS = (
     "что такое",
 )
 
+#: Творческие задачи по умолчанию. Малая модель здесь плоха: нужно породить
+#: текст (план, сценарий), а не вспомнить факт. Проверяются до каталога.
+DEFAULT_TASK_MARKERS = (
+    "придумай",
+    "придумайте",
+    "составь",
+    "составьте",
+    "спланируй",
+    "спланируйте",
+)
+
+#: Структурные признаки по умолчанию: SQL/запрос, формула, таблица, схема.
+#: Проверяются после каталога, чтобы «сколько запросов входит в тариф»
+#: оставалось фактом из каталога, а не уходило в big.
+DEFAULT_STRUCTURAL_MARKERS = (
+    "sql",
+    "запрос",
+    "формул",
+    "таблиц",
+    "схем",
+)
+
+#: Маркеры вопросов на общие знания по умолчанию. Скиллов и каталога там нет,
+#: поэтому отвечает большая модель. Проверяются после каталога: «сколько стоит
+#: тариф» — факт из каталога, «сколько будет 15% от 800» — общие знания.
+DEFAULT_KNOWLEDGE_MARKERS = (
+    "столиц",
+    "сколько будет",
+    "кто такой",
+    "кто такая",
+    "кто такие",
+    "в каком году",
+    "переведи на",
+    "переведите на",
+)
+
 #: Пороги по умолчанию. Любой ключ переопределяется через cfg.
 DEFAULT_CLASSIFIER_THRESHOLDS: dict[str, Any] = {
     "long_chars": 120,
     "latin_ratio": 0.35,
     "reason_markers": DEFAULT_REASON_MARKERS,
+    "task_markers": DEFAULT_TASK_MARKERS,
+    "structural_markers": DEFAULT_STRUCTURAL_MARKERS,
+    "knowledge_markers": DEFAULT_KNOWLEDGE_MARKERS,
     "latin_min_letters": 12,
     "letters_ratio_min": 0.30,
     "catalog_fact_to_skill": True,
@@ -145,7 +198,7 @@ _CATALOG_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"цен[аыуеой]"
             r"|стоимост\w*"
-            r"|сколько\s+стоит"
+            r"|сколько\s+(?:будет\s+)?стоит"
             r"|\bпрайс\w*"
             r"|\bтариф\w*"
             r"|\bprice\b|\bpricing\b|\bcost\b|\bhow\s+much\b",
@@ -281,10 +334,26 @@ def classify(text: str, cfg: Any = None) -> Route:
         confidence = 0.90 if len(labels) > 1 else 0.85
         return _route(BIG, "reasoning: " + ", ".join(labels[:3]), confidence)
 
+    task = _marker_hits(stripped, thresholds["task_markers"])
+    if task:
+        labels = [f"«{marker}»" for marker in task[:3]]
+        confidence = 0.90 if len(task) > 1 else 0.85
+        return _route(BIG, "task: " + ", ".join(labels), confidence)
+
     catalog = _catalog_hit(stripped)
     if catalog and thresholds["catalog_fact_to_skill"]:
         confidence = 0.90 if len(stripped) <= thresholds["long_chars"] else 0.75
         return _route(SKILL, "catalog_fact: " + catalog, confidence)
+
+    structural = _marker_hits(stripped, thresholds["structural_markers"])
+    if structural:
+        labels = [f"«{marker}»" for marker in structural[:3]]
+        return _route(BIG, "structural: " + ", ".join(labels), 0.80)
+
+    knowledge = _marker_hits(stripped, thresholds["knowledge_markers"])
+    if knowledge:
+        labels = [f"«{marker}»" for marker in knowledge[:3]]
+        return _route(BIG, "general_knowledge: " + ", ".join(labels), 0.75)
 
     comparison = _COMPARISON_RE.search(stripped)
     if comparison:
@@ -337,6 +406,25 @@ def load_thresholds(cfg: Any = None) -> dict[str, Any]:
     if markers is None:
         markers = _get(section, "classifier_reason_markers")
     thresholds["reason_markers"] = _normalize_markers(markers)
+
+    thresholds["task_markers"] = _markers_from(
+        section,
+        cfg,
+        ("task_markers", "classifier_task_markers"),
+        DEFAULT_TASK_MARKERS,
+    )
+    thresholds["structural_markers"] = _markers_from(
+        section,
+        cfg,
+        ("structural_markers", "classifier_structural_markers"),
+        DEFAULT_STRUCTURAL_MARKERS,
+    )
+    thresholds["knowledge_markers"] = _markers_from(
+        section,
+        cfg,
+        ("knowledge_markers", "general_knowledge_markers", "classifier_knowledge_markers"),
+        DEFAULT_KNOWLEDGE_MARKERS,
+    )
 
     return thresholds
 
@@ -394,23 +482,46 @@ def _as_float(value: Any, default: float) -> float:
     return number
 
 
-def _normalize_markers(value: Any) -> tuple[str, ...]:
+def _markers_from(
+    section: Any,
+    cfg: Any,
+    keys: tuple[str, ...],
+    default: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Взять список маркеров из секции конфига (или из ``cfg``) по первому ключу."""
+    for key in keys:
+        value = _get(section, key)
+        if value is None and section is not cfg:
+            value = _get(cfg, key)
+        if value is not None:
+            return _normalize_markers(value, default)
+    return default
+
+
+def _normalize_markers(
+    value: Any, default: tuple[str, ...] = DEFAULT_REASON_MARKERS
+) -> tuple[str, ...]:
     """Привести маркеры к кортежу строк; пустое значение — умолчания."""
     if value is None:
-        return DEFAULT_REASON_MARKERS
+        return default
     if isinstance(value, str):
         items = value.split(",")
     elif isinstance(value, (list, tuple, set, frozenset)):
         items = list(value)
     else:
-        return DEFAULT_REASON_MARKERS
+        return default
     cleaned = tuple(str(item).strip().lower() for item in items if str(item).strip())
-    return cleaned or DEFAULT_REASON_MARKERS
+    return cleaned or default
 
 
 def _reasoning_hits(text: str, thresholds: Mapping[str, Any]) -> list[str]:
+    return _marker_hits(text, thresholds["reason_markers"])
+
+
+def _marker_hits(text: str, markers: Any) -> list[str]:
+    """Маркеры из списка, которые встречаются в тексте (подстрока, без регистра)."""
     haystack = text.lower()
-    return [marker for marker in thresholds["reason_markers"] if marker and marker in haystack]
+    return [marker for marker in markers if marker and marker in haystack]
 
 
 def _catalog_hit(text: str) -> str | None:

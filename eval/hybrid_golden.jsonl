@@ -48,3 +48,13 @@
 {"question": "Придумай план запуска продукта за 30 дней.", "expect_route": "big", "expect_contains": []}
 {"question": "Напиши SQL-запрос: топ-10 клиентов по выручке.", "expect_route": "big", "expect_contains": []}
 {"question": "Какая столица Австралии?", "expect_route": "big", "expect_contains": []}
+{"question": "Составь план продвижения на месяц.", "expect_route": "big", "expect_contains": []}
+{"question": "Спланируй бюджет рекламной кампании на квартал.", "expect_route": "big", "expect_contains": []}
+{"question": "Напиши запрос: клиенты с активными подписками за последний месяц.", "expect_route": "big", "expect_contains": []}
+{"question": "Придумай слоган для тарифа «Старт».", "expect_route": "big", "expect_contains": []}
+{"question": "Сколько будет 15% от 800?", "expect_route": "big", "expect_contains": []}
+{"question": "Кто такой Алан Тьюринг?", "expect_route": "big", "expect_contains": []}
+{"question": "В каком году вышел Python 3.0?", "expect_route": "big", "expect_contains": []}
+{"question": "Какая столица Канады?", "expect_route": "big", "expect_contains": []}
+{"question": "Сколько будет стоить тариф «Старт» при оплате за год?", "expect_route": "skill", "expect_contains": ["990"]}
+{"question": "Какой телефон службы поддержки?", "expect_route": "skill", "expect_contains": ["+7"]}

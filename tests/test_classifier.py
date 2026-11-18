@@ -242,6 +242,135 @@ class TestThresholdsFromConfig(unittest.TestCase):
         self.assertTrue(route.reason.startswith("comparison"))
 
 
+class TestCreativeAndKnowledgeGaps(unittest.TestCase):
+    """Промахи из замера гибрида 0023: big→small на творчестве и общих знаниях."""
+
+    #: Творческие задачи: малая модель их не тянет, нужна большая.
+    CREATIVE = [
+        "Придумай план запуска продукта за 30 дней.",
+        "Составь план продвижения на месяц.",
+        "Спланируй бюджет рекламной кампании на квартал.",
+        "Придумай слоган для тарифа «Старт».",
+        "Составь таблицу сравнения тарифов.",
+    ]
+
+    #: Структурные признаки: SQL/запрос, формула, схема — тоже большая.
+    STRUCTURAL = [
+        "Напиши SQL-запрос: топ-10 клиентов по выручке.",
+        "Напиши запрос: клиенты с активными подписками за последний месяц.",
+        "Сделай формулу для расчёта скидки.",
+        "Нарисуй схему процесса согласования.",
+    ]
+
+    #: Вопросы на общие знания: каталога и скилла там нет — большая модель.
+    KNOWLEDGE = [
+        "Какая столица Австралии?",
+        "Сколько будет 15% от 800?",
+        "Кто такой Алан Тьюринг?",
+        "В каком году вышел Python 3.0?",
+        "Переведи на французский: добрый вечер.",
+    ]
+
+    def test_creative_tasks_are_big(self):
+        for text in self.CREATIVE:
+            with self.subTest(text=text):
+                route = classifier.classify(text, CFG)
+                self.assertEqual(
+                    route.kind,
+                    "big",
+                    msg=f"{text!r}: {route.kind} ({route.reason})",
+                )
+                self.assertTrue(
+                    route.reason.startswith(("task: ", "reasoning: ")),
+                    msg=route.reason,
+                )
+
+    def test_structural_tasks_are_big(self):
+        for text in self.STRUCTURAL:
+            with self.subTest(text=text):
+                route = classifier.classify(text, CFG)
+                self.assertEqual(
+                    route.kind,
+                    "big",
+                    msg=f"{text!r}: {route.kind} ({route.reason})",
+                )
+
+    def test_general_knowledge_is_big(self):
+        for text in self.KNOWLEDGE:
+            with self.subTest(text=text):
+                route = classifier.classify(text, CFG)
+                self.assertEqual(
+                    route.kind,
+                    "big",
+                    msg=f"{text!r}: {route.kind} ({route.reason})",
+                )
+
+    def test_catalog_still_wins_over_general_knowledge(self):
+        """«Сколько будет стоить тариф» — факт из каталога, а не общие знания."""
+        for text in (
+            "Сколько стоит тариф «Старт»?",
+            "Сколько будет стоить тариф «Старт» при оплате за год?",
+            "Сколько будет стоить доставка за МКАД?",
+            "Во сколько вы открываетесь в субботу?",
+            "Как вернуть деньги за подписку?",
+            "Дайте телефон поддержки",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(classifier.classify(text, CFG).kind, "skill")
+
+    def test_catalog_still_wins_over_structural_marker(self):
+        """«сколько запросов входит в тариф» — лимит из каталога, а не SQL-задача."""
+        text = "Сколько запросов входит в тариф «Старт»?"
+        self.assertEqual(classifier.classify(text, CFG).kind, "skill")
+
+    def test_task_markers_come_from_config(self):
+        text = "Придумай план запуска продукта"
+        self.assertEqual(classifier.classify(text, CFG).kind, "big")
+
+        custom = {"classifier": {"task_markers": ["набросай"]}}
+        self.assertEqual(classifier.classify(text, custom).kind, "small")
+        self.assertEqual(
+            classifier.classify("Набросай план запуска", custom).kind,
+            "big",
+        )
+
+    def test_structural_markers_come_from_config(self):
+        text = "Напиши SQL-запрос по клиентам"
+        self.assertEqual(classifier.classify(text, CFG).kind, "big")
+
+        custom = {"classifier": {"structural_markers": ["набросай"]}}
+        self.assertEqual(classifier.classify(text, custom).kind, "small")
+
+    def test_knowledge_markers_come_from_config(self):
+        text = "Какая столица Австралии?"
+        self.assertEqual(classifier.classify(text, CFG).kind, "big")
+
+        custom = {"classifier": {"knowledge_markers": ["былин"]}}
+        self.assertEqual(classifier.classify(text, custom).kind, "small")
+
+    def test_markers_accept_comma_separated_string(self):
+        custom = {"classifier": {"task_markers": "придумай, составь"}}
+        self.assertEqual(
+            classifier.classify("Составь план на неделю", custom).kind,
+            "big",
+        )
+
+    def test_reasons_have_distinct_prefixes(self):
+        """Причина маршрута остаётся читаемой: разные классы — разные префиксы."""
+        self.assertTrue(
+            classifier.classify("Придумай план запуска продукта", CFG).reason.startswith("task: ")
+        )
+        self.assertTrue(
+            classifier.classify("Напиши SQL-запрос по клиентам", CFG).reason.startswith("structural: ")
+        )
+        self.assertTrue(
+            classifier.classify("Какая столица Австралии?", CFG).reason.startswith("general_knowledge: ")
+        )
+        self.assertTrue(
+            classifier.classify("Объясни, почему небо голубое", CFG).reason.startswith("reasoning: ")
+        )
+
+
 class TestNoNetwork(unittest.TestCase):
     """Классификатор не имеет права ходить в сеть (правило 2 из docs/hybrid.md)."""
 

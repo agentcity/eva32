@@ -156,7 +156,7 @@
   {
     "id": "0023",
     "title": "Закрыть промахи классификатора из замера гибрида",
-    "status": "in_progress",
+    "status": "done",
     "file": "0023-eva-classifier-gaps.md",
     "assignee": "agent:eva-classifier-gaps"
   },
