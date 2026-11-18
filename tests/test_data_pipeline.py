@@ -166,3 +166,44 @@ class TestSoften(unittest.TestCase):
         out = quality.soften(text)
         self.assertIn("    return 1", out)
         self.assertNotIn("бляд", out.lower())
+
+
+class TestDelexicalization(unittest.TestCase):
+    """Реальные факты каталога не должны попадать в обучение."""
+
+    def _mapping(self):
+        import distill.delex as dl
+        return dl.build_mapping(dl.load_catalog())
+
+    def test_real_prices_replaced(self):
+        import distill.delex as dl
+        mapping = self._mapping()
+        rows = dl.load_catalog()
+        for item in rows:
+            if not item.get("price_rub"):
+                continue
+            fake = mapping.get(str(item["price_rub"]))
+            self.assertIsNotNone(fake)
+            self.assertNotEqual(fake, str(item["price_rub"]))
+
+    def test_real_names_replaced(self):
+        import distill.delex as dl
+        mapping = self._mapping()
+        for item in dl.load_catalog():
+            self.assertIn(f"«{item['name']}»", mapping)
+
+    def test_pair_text_has_no_real_facts(self):
+        import distill.delex as dl
+        mapping = self._mapping()
+        item = dl.load_catalog()[0]
+        text = f"Тариф «{item['name']}» — {item['price_rub']} ₽/мес [1]."
+        out = dl.apply(text, mapping)
+        self.assertNotIn(f"«{item['name']}»", out)
+        self.assertNotIn(str(item["price_rub"]), out)
+
+    def test_spaced_thousands_replaced(self):
+        import distill.delex as dl
+        mapping = self._mapping()
+        text = "Аудит сайта — 12 000 ₽ за один сайт."
+        out = dl.apply(text, mapping)
+        self.assertNotIn("12 000", out)

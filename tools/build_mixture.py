@@ -29,7 +29,10 @@ LAYERS: dict[str, tuple[float, list[str]]] = {
         "distill/pulled/magicoder_ru.jsonl",
     ]),
     "business": (0.30, [
-        "distill/out/business_pairs.jsonl",
+        # Делексикализованные пары: модель учит форму ответа по контексту, а не наши
+        # цены. Реальные пары (business_grounded.jsonl) идут в проверку RAG, не в веса.
+        "distill/out/business_script.jsonl",
+        "distill/out/business_grounded_delex.jsonl",
         "distill/out/pairs.jsonl",
     ]),
     "general": (0.20, [
