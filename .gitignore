@@ -267,3 +267,7 @@ src/vtm/test_vtm
 src/vtm/bench_backend
 src/vtm/test_sha256
 src/vtm/test_vtm_session
+
+# локальные python-пакеты (torch/transformers для CPU-обучения)
+.pylibs/
+runs/
