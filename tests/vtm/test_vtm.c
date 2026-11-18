@@ -4484,8 +4484,9 @@ static void test_cache_prefix(void) {
         vtm_cache_stats(mc, &h1, &m1);
         CHECK(m1 == m0 + 1 && h1 == h0);
         vtm_free(base2);
-        // Дальше снова скалярный LUT: с ним работает base.
-        vtm_set_backend(mc, &vtm_backend_scalar_lut);
+        // Обратно на бэкенд по умолчанию (тот же, что у base: NULL —
+        // vtm_backend_from_env(), а не конкретный скалярный).
+        vtm_set_backend(mc, NULL);
     }
 
     // (8) Чужой прогон, переписывающий позицию префикса (position = 0 без
@@ -4542,6 +4543,77 @@ static void test_cache_prefix(void) {
     if (!g_fail)
         printf("кэш префикса 0081: побитовое совпадение, попадания/промахи:"
                " ok\n");
+}
+
+// Кольцо KV меньше последовательности: K/V префикса уже нельзя восстановить
+// после записи за пределы окна, поэтому кэш обязан инвалидироваться, а прогон
+// с попаданием — оставаться правильным (ATTN читает только последние win
+// ключей, так что переиспользование слота само по себе ошибки не даёт).
+static void test_cache_prefix_ring(void) {
+    cache_cfg cfg;
+    int32_t prefix[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    int32_t ids[12];
+    cache_snap want, got;
+    vtm_t *base, *mc;
+    int i;
+
+    cfg.ctx = 8;          // окно меньше префикса (10) и последовательности (12)
+    cfg.hidden = 16;
+    cfg.vocab = 16;
+    cfg.inter = 32;
+    cfg.heads = 2;
+    cfg.head_dim = 8;
+    cfg.kv_heads = 1;
+
+    base = cache_model(&cfg);
+    mc = cache_model(&cfg);
+    CHECK(base != NULL && mc != NULL);
+    if (!base || !mc) {
+        vtm_free(base);
+        vtm_free(mc);
+        return;
+    }
+    for (i = 0; i < 10; i++) ids[i] = prefix[i];
+    ids[10] = 11;
+    ids[11] = 12;
+
+    // (1) Префикс длиннее окна: KV уже провернулся, но последние win ключей
+    // на месте — ближайшее попадание корректно, а первый же прогон за окно
+    // (позиция 10 >= win) кэш инвалидирует: слоты префикса переиспользованы.
+    CHECK(vtm_cache_prefix(mc, prefix, 10) == VTM_OK);
+    CHECK(vtm_cache_prefix_len(mc) == 10);
+    cache_run_plain(base, ids, 12);
+    cache_snap_take(base, &want, cfg.ctx);
+    CHECK(vtm_run_cached(mc, ids, 12) == VTM_OK);
+    cache_snap_take(mc, &got, cfg.ctx);
+    CHECK(cache_snap_equal(&want, &got));
+    CHECK(vtm_cache_prefix_len(mc) == 0);
+
+    // (2) Кольцо включается и на хите: префикс 6 + 4 новых токена при win=8.
+    // K/V всех win слотов после прогона одинаковы у обоих путей.
+    {
+        int32_t p6[6] = {5, 4, 3, 2, 1, 0};
+        int32_t seq[10];
+        int j;
+        for (j = 0; j < 6; j++) seq[j] = p6[j];
+        seq[6] = 13;
+        seq[7] = 14;
+        seq[8] = 15;
+        seq[9] = 3;
+        vtm_reset(base);
+        cache_run_plain(base, seq, 10);
+        cache_snap_take(base, &want, cfg.ctx);
+        CHECK(vtm_cache_prefix(mc, p6, 6) == VTM_OK);
+        CHECK(vtm_cache_prefix_len(mc) == 6);
+        CHECK(vtm_run_cached(mc, seq, 10) == VTM_OK);
+        cache_snap_take(mc, &got, cfg.ctx);
+        CHECK(cache_snap_equal(&want, &got));
+        CHECK(vtm_cache_prefix_len(mc) == 0);
+    }
+
+    vtm_free(mc);
+    vtm_free(base);
+    if (!g_fail) printf("кэш префикса 0081 (кольцо KV): ok\n");
 }
 
 // --- замер кэша префикса (задача 0081) ------------------------------------
@@ -4710,6 +4782,7 @@ int main(void) {
     test_samp_buffer_reuse();
     test_samp_stale_stamps();
     test_cache_prefix();
+    test_cache_prefix_ring();
     bench_cache_prefix();
     test_samp_bench_150k();
 
