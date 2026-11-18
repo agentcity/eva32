@@ -383,5 +383,26 @@
     "status": "done",
     "file": "0058-parity-real.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0059",
+    "title": "Сэмплинг по словарю 150k: буфер и частичный отбор",
+    "status": "in_progress",
+    "file": "0059-vtm-samp-perf.md",
+    "assignee": "agent:vtm-samp-perf"
+  },
+  {
+    "id": "0060",
+    "title": "Загрузка контейнера через mmap: память 2×→1×",
+    "status": "in_progress",
+    "file": "0060-vtm-mmap.md",
+    "assignee": "agent:vtm-mmap"
+  },
+  {
+    "id": "0063",
+    "title": "Стриминг из CLI и безопасный UTF-8",
+    "status": "in_progress",
+    "file": "0063-vtm-stream-cli.md",
+    "assignee": "agent:vtm-stream-cli"
   }
 ]
