@@ -37,7 +37,7 @@
   {
     "id": "0006",
     "title": "Сверка C-рантайма с Python-эталоном (parity)",
-    "status": "pending",
+    "status": "done",
     "file": "0006-vtm-parity.md",
     "assignee": "saron"
   },
@@ -184,7 +184,7 @@
   {
     "id": "0027",
     "title": "Эксперимент: эмбеддинги в тритах против int8",
-    "status": "in_progress",
+    "status": "done",
     "file": "0027-trit-embeddings.md",
     "assignee": ""
   },
@@ -415,7 +415,7 @@
   {
     "id": "0065",
     "title": "Волна 1: eps, окно контекста, сброс KV, трассировка",
-    "status": "blocked",
+    "status": "done",
     "file": "0065-vtm-core-correct.md",
     "assignee": "agent:vtm-core-correct"
   },
@@ -478,7 +478,7 @@
   {
     "id": "0074",
     "title": "Быстрая проверка целостности: SHA-NI или кеш по mtime",
-    "status": "pending",
+    "status": "done",
     "file": "0074-fast-integrity.md",
     "assignee": ""
   },
@@ -548,7 +548,7 @@
   {
     "id": "0085",
     "title": "status.md: привести к текущему состоянию проекта",
-    "status": "in_progress",
+    "status": "done",
     "file": "0085-vtm-status-doc.md",
     "assignee": "agent:vtm-status-doc"
   },
@@ -656,5 +656,61 @@
     "status": "done",
     "file": "0099-trit-embeddings.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0101",
+    "title": "KV-кэши вне контейнера: −112 МиБ на 1.5B",
+    "status": "in_progress",
+    "file": "0101-kv-lazy-alloc.md",
+    "assignee": "agent:kv-lazy-alloc"
+  },
+  {
+    "id": "0102",
+    "title": "CI: сборка, тесты, санитайзеры одной командой",
+    "status": "in_progress",
+    "file": "0102-ci-pipeline.md",
+    "assignee": "agent:ci-pipeline"
+  },
+  {
+    "id": "0103",
+    "title": "Синтетический контейнер 1.5B-формы: скорость и память без обучения",
+    "status": "in_progress",
+    "file": "0103-bench-shape.md",
+    "assignee": "agent:bench-shape"
+  },
+  {
+    "id": "0104",
+    "title": "eva: локальная ВТМ как «маленькая модель» в маршрутизаторе",
+    "status": "in_progress",
+    "file": "0104-eva-router-vtm.md",
+    "assignee": "agent:eva-router-vtm"
+  },
+  {
+    "id": "0105",
+    "title": "Golden set: классы новых скиллов и честная доля скиллов",
+    "status": "in_progress",
+    "file": "0105-golden-classes.md",
+    "assignee": "agent:golden-classes"
+  },
+  {
+    "id": "0106",
+    "title": "Документация под текущее состояние: fp32, тритовый эмбеддинг, политики",
+    "status": "in_progress",
+    "file": "0106-docs-current.md",
+    "assignee": "agent:docs-current"
+  },
+  {
+    "id": "0107",
+    "title": "KL-дистилляция от учителя: проверить путь на крошечной модели",
+    "status": "in_progress",
+    "file": "0107-kl-distill.md",
+    "assignee": "agent:kl-distill"
+  },
+  {
+    "id": "0108",
+    "title": "Сервер: лимиты запросов и мягкая деградация",
+    "status": "in_progress",
+    "file": "0108-server-limits.md",
+    "assignee": "agent:server-limits"
   }
 ]
