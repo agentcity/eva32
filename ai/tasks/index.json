@@ -37,7 +37,7 @@
   {
     "id": "0006",
     "title": "Сверка C-рантайма с Python-эталоном (parity)",
-    "status": "pending",
+    "status": "done",
     "file": "0006-vtm-parity.md",
     "assignee": "saron"
   },
@@ -89,5 +89,726 @@
     "status": "done",
     "file": "0013-adr-process.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0014",
+    "title": "Гибрид: eva-core-router",
+    "status": "done",
+    "file": "0014-eva-core-router.md",
+    "assignee": "agent:eva-core-router"
+  },
+  {
+    "id": "0015",
+    "title": "Гибрид: eva-skills",
+    "status": "done",
+    "file": "0015-eva-skills.md",
+    "assignee": "agent:eva-skills"
+  },
+  {
+    "id": "0016",
+    "title": "Гибрид: eva-clients",
+    "status": "done",
+    "file": "0016-eva-clients.md",
+    "assignee": "agent:eva-clients"
+  },
+  {
+    "id": "0017",
+    "title": "Гибрид: eva-server",
+    "status": "done",
+    "file": "0017-eva-server.md",
+    "assignee": "agent:eva-server"
+  },
+  {
+    "id": "0018",
+    "title": "Гибрид: eva-classifier",
+    "status": "done",
+    "file": "0018-eva-classifier.md",
+    "assignee": "agent:eva-classifier"
+  },
+  {
+    "id": "0019",
+    "title": "Гибрид: eva-eval",
+    "status": "done",
+    "file": "0019-eva-eval.md",
+    "assignee": "agent:eva-eval"
+  },
+  {
+    "id": "0020",
+    "title": "Гибрид: eva-docs",
+    "status": "done",
+    "file": "0020-eva-docs.md",
+    "assignee": "agent:eva-docs"
+  },
+  {
+    "id": "0021",
+    "title": "Гибрид: eva-telemetry",
+    "status": "done",
+    "file": "0021-eva-telemetry.md",
+    "assignee": "agent:eva-telemetry"
+  },
+  {
+    "id": "0022",
+    "title": "Голос как транспорт: ADR",
+    "status": "done",
+    "file": "0022-voice-adr.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0023",
+    "title": "Закрыть промахи классификатора из замера гибрида",
+    "status": "done",
+    "file": "0023-eva-classifier-gaps.md",
+    "assignee": "agent:eva-classifier-gaps"
+  },
+  {
+    "id": "0024",
+    "title": "RAG: контекст каталога в промпт",
+    "status": "done",
+    "file": "0024-eva-rag.md",
+    "assignee": "agent:eva-rag"
+  },
+  {
+    "id": "0025",
+    "title": "SSE-стриминг в сервере",
+    "status": "done",
+    "file": "0025-eva-sse.md",
+    "assignee": "agent:eva-sse"
+  },
+  {
+    "id": "0026",
+    "title": "Подключение к orioncode",
+    "status": "done",
+    "file": "0026-eva-integration.md",
+    "assignee": "agent:eva-integration"
+  },
+  {
+    "id": "0027",
+    "title": "Эксперимент: эмбеддинги в тритах против int8",
+    "status": "done",
+    "file": "0027-trit-embeddings.md",
+    "assignee": ""
+  },
+  {
+    "id": "0028",
+    "title": "ВТМ: полная модель в контейнере",
+    "status": "done",
+    "file": "0028-vtm-full.md",
+    "assignee": "agent:vtm-full"
+  },
+  {
+    "id": "0029",
+    "title": "Компилятор: собрать полную модель в .vtm",
+    "status": "done",
+    "file": "0029-vtm-compiler.md",
+    "assignee": "agent:vtm-compiler"
+  },
+  {
+    "id": "0030",
+    "title": "Сервер: токен, лимиты и защита от злоупотреблений",
+    "status": "done",
+    "file": "0030-eva-auth.md",
+    "assignee": "agent:eva-auth"
+  },
+  {
+    "id": "0031",
+    "title": "Живой замер качества: гибрид против большой модели",
+    "status": "done",
+    "file": "0031-eva-live-eval.md",
+    "assignee": "agent:eva-live-eval"
+  },
+  {
+    "id": "0032",
+    "title": "Голос: прототип ASR → eva → TTS",
+    "status": "done",
+    "file": "0032-eva-voice.md",
+    "assignee": "agent:eva-voice"
+  },
+  {
+    "id": "0033",
+    "title": "Документация: свести состояние проекта",
+    "status": "done",
+    "file": "0033-docs-sync.md",
+    "assignee": "agent:docs-sync"
+  },
+  {
+    "id": "0034",
+    "title": "Вход eva.cli",
+    "status": "done",
+    "file": "0034-eva-cli.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0035",
+    "title": "Контейнер v0.2 — размерности u32",
+    "status": "done",
+    "file": "0035-container-v02.md",
+    "assignee": "agent:container-v02"
+  },
+  {
+    "id": "0036",
+    "title": "Раннер эксперимента с эмбеддингами",
+    "status": "done",
+    "file": "0036-emb-experiment.md",
+    "assignee": "agent:emb-experiment"
+  },
+  {
+    "id": "0037",
+    "title": "Рунбук аренды GPU под эксперимент",
+    "status": "done",
+    "file": "0037-rental-runbook.md",
+    "assignee": "agent:rental-runbook"
+  },
+  {
+    "id": "0038",
+    "title": "Промпт: перевод по прямой просьбе",
+    "status": "done",
+    "file": "0038-prompt-translate.md",
+    "assignee": "agent:prompt-translate"
+  },
+  {
+    "id": "0039",
+    "title": "Голос: синтез по предложениям",
+    "status": "done",
+    "file": "0039-voice-stream.md",
+    "assignee": "agent:voice-stream"
+  },
+  {
+    "id": "0040",
+    "title": "ВТМ: текстовый прогон через токенизатор",
+    "status": "done",
+    "file": "0040-vtm-text.md",
+    "assignee": "agent:vtm-text"
+  },
+  {
+    "id": "0041",
+    "title": "MM принимает размерность >65535",
+    "status": "done",
+    "file": "0041-mm-casts.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0042",
+    "title": "Демонстрационная троичная модель",
+    "status": "done",
+    "file": "0042-demo-ternary.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0043",
+    "title": "Квантованные эмбеддинги сквозь путь",
+    "status": "done",
+    "file": "0043-trit-embeddings-e2e.md",
+    "assignee": "agent:trit-emb-e2e"
+  },
+  {
+    "id": "0044",
+    "title": "Kind 4 — int8-тензоры в контейнере",
+    "status": "pending",
+    "file": "0044-kind4-int8.md",
+    "assignee": ""
+  },
+  {
+    "id": "0050",
+    "title": "SIMD-бэкенд для тритовых ядер",
+    "status": "done",
+    "file": "0050-vtm-simd.md",
+    "assignee": "agent:vtm-simd"
+  },
+  {
+    "id": "0051",
+    "title": "Сэмплинг: temperature, top-k, top-p, повтор",
+    "status": "done",
+    "file": "0051-vtm-sampling.md",
+    "assignee": "agent:vtm-sampling"
+  },
+  {
+    "id": "0053",
+    "title": "Чат-шаблон Qwen в текстовом пути",
+    "status": "done",
+    "file": "0053-vtm-chat.md",
+    "assignee": "agent:vtm-chat"
+  },
+  {
+    "id": "0045",
+    "title": "Данные по программированию на русском",
+    "status": "done",
+    "file": "0045-code-data.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0046",
+    "title": "Замер качества обученной модели",
+    "status": "done",
+    "file": "0046-eval-torch.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0047",
+    "title": "3B на 24 ГБ: bf16-мастер и экономия памяти",
+    "status": "done",
+    "file": "0047-qat-3b-24gb.md",
+    "assignee": "agent:qat-3b-24gb"
+  },
+  {
+    "id": "0048",
+    "title": "Стриминг в роутере гибрида",
+    "status": "done",
+    "file": "0048-eva-stream-router.md",
+    "assignee": "agent:eva-stream-router"
+  },
+  {
+    "id": "0049",
+    "title": "Бенчмарк гибрида: латентность и цена",
+    "status": "done",
+    "file": "0049-eva-bench.md",
+    "assignee": "agent:eva-bench"
+  },
+  {
+    "id": "0056",
+    "title": "Проверка троичности весов",
+    "status": "done",
+    "file": "0056-check-ternary.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0057",
+    "title": "Абстракция хранения тритов: packed20 и native",
+    "status": "pending",
+    "file": "0057-trit-storage-abstraction.md",
+    "assignee": ""
+  },
+  {
+    "id": "0058",
+    "title": "Сверка настоящей Qwen с ВТМ",
+    "status": "done",
+    "file": "0058-parity-real.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0059",
+    "title": "Сэмплинг по словарю 150k: буфер и частичный отбор",
+    "status": "done",
+    "file": "0059-vtm-samp-perf.md",
+    "assignee": "agent:vtm-samp-perf"
+  },
+  {
+    "id": "0060",
+    "title": "Загрузка контейнера через mmap: память 2×→1×",
+    "status": "done",
+    "file": "0060-vtm-mmap.md",
+    "assignee": "agent:vtm-mmap"
+  },
+  {
+    "id": "0063",
+    "title": "Стриминг из CLI и безопасный UTF-8",
+    "status": "done",
+    "file": "0063-vtm-stream-cli.md",
+    "assignee": "agent:vtm-stream-cli"
+  },
+  {
+    "id": "0064",
+    "title": "Атомарная запись с fsync",
+    "status": "done",
+    "file": "0064-atomic-writes.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0065",
+    "title": "Волна 1: eps, окно контекста, сброс KV, трассировка",
+    "status": "done",
+    "file": "0065-vtm-core-correct.md",
+    "assignee": "agent:vtm-core-correct"
+  },
+  {
+    "id": "0066",
+    "title": "Волна 1: целостность контейнера (sha256)",
+    "status": "done",
+    "file": "0066-vtm-integrity.md",
+    "assignee": "agent:vtm-integrity"
+  },
+  {
+    "id": "0067",
+    "title": "Волна 1: C-ABI для сервера — колбэк и отмена",
+    "status": "done",
+    "file": "0067-vtm-c-api.md",
+    "assignee": "agent:vtm-c-api"
+  },
+  {
+    "id": "0068",
+    "title": "Волна 1: CLI — текстовые стопы, лимиты, таймаут",
+    "status": "done",
+    "file": "0068-vtm-cli-limits.md",
+    "assignee": "agent:vtm-cli-limits"
+  },
+  {
+    "id": "0069",
+    "title": "Волна 4: фаззинг и санитайзеры в CI",
+    "status": "done",
+    "file": "0069-vtm-fuzz.md",
+    "assignee": "agent:vtm-fuzz"
+  },
+  {
+    "id": "0070",
+    "title": "Волна 4: спецификация ВТМ к текущему состоянию",
+    "status": "done",
+    "file": "0070-vtm-docs.md",
+    "assignee": "agent:vtm-docs"
+  },
+  {
+    "id": "0071",
+    "title": "Волна 2: профиль полного прохода — где теряется время",
+    "status": "done",
+    "file": "0071-vtm-bench.md",
+    "assignee": "agent:vtm-bench"
+  },
+  {
+    "id": "0072",
+    "title": "Волна 4: случайный паритет C↔Python",
+    "status": "done",
+    "file": "0072-vtm-parity-random.md",
+    "assignee": "agent:vtm-parity-random"
+  },
+  {
+    "id": "0073",
+    "title": "KV: окно контекста и сброс между запросами",
+    "status": "done",
+    "file": "0073-kv-window-reset.md",
+    "assignee": ""
+  },
+  {
+    "id": "0074",
+    "title": "Быстрая проверка целостности: SHA-NI или кеш по mtime",
+    "status": "done",
+    "file": "0074-fast-integrity.md",
+    "assignee": ""
+  },
+  {
+    "id": "0075",
+    "title": "ATTN: переполнение q_start+q_len (SIGBUS)",
+    "status": "done",
+    "file": "0075-attn-overflow.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0076",
+    "title": "ATTN: блочный attention с онлайн-softmax + окно контекста",
+    "status": "done",
+    "file": "0076-vtm-attn-tiling.md",
+    "assignee": "agent:vtm-attn-tiling"
+  },
+  {
+    "id": "0077",
+    "title": "Многопоточность ядер: TMV/MM/RMSN по строкам",
+    "status": "done",
+    "file": "0077-vtm-threads.md",
+    "assignee": "agent:vtm-threads"
+  },
+  {
+    "id": "0078",
+    "title": "Быстрая проверка целостности: SHA-NI/ARMv8 + кеш",
+    "status": "done",
+    "file": "0078-vtm-sha-fast.md",
+    "assignee": "agent:vtm-sha-fast"
+  },
+  {
+    "id": "0079",
+    "title": "Сессии KV: снимок и восстановление по ADR 0008",
+    "status": "done",
+    "file": "0079-vtm-kv-session.md",
+    "assignee": "agent:vtm-kv-session"
+  },
+  {
+    "id": "0080",
+    "title": "Эталон догоняет окно контекста",
+    "status": "done",
+    "file": "0080-vtm-ref-window.md",
+    "assignee": "agent:vtm-ref-window"
+  },
+  {
+    "id": "0081",
+    "title": "Кэш промпта: не пересчитывать одинаковый префикс",
+    "status": "done",
+    "file": "0081-vtm-prompt-cache.md",
+    "assignee": "agent:vtm-prompt-cache"
+  },
+  {
+    "id": "0083",
+    "title": "Сессии: дедуплицировать SHA и добавить лимит с LRU",
+    "status": "done",
+    "file": "0083-vtm-session-lru.md",
+    "assignee": "agent:vtm-session-lru"
+  },
+  {
+    "id": "0084",
+    "title": "Портируемость: Windows и big-endian — честный отказ вместо тихой ошибки",
+    "status": "done",
+    "file": "0084-vtm-portability.md",
+    "assignee": "agent:vtm-portability"
+  },
+  {
+    "id": "0085",
+    "title": "status.md: привести к текущему состоянию проекта",
+    "status": "done",
+    "file": "0085-vtm-status-doc.md",
+    "assignee": "agent:vtm-status-doc"
+  },
+  {
+    "id": "0082",
+    "title": "Метрики по операциям вместо оценки (trace)",
+    "status": "done",
+    "file": "0082-vtm-metrics.md",
+    "assignee": ""
+  },
+  {
+    "id": "0086",
+    "title": "UBSan: misaligned load в ядрах (memcpy)",
+    "status": "done",
+    "file": "0086-unaligned-loads.md",
+    "assignee": ""
+  },
+  {
+    "id": "0087",
+    "title": "Кэш промпта в C-ABI: не сбрасывать между запросами",
+    "status": "done",
+    "file": "0087-api-cache.md",
+    "assignee": ""
+  },
+  {
+    "id": "0088",
+    "title": "Паритет SIMD: измерить и задокументировать расхождение",
+    "status": "done",
+    "file": "0088-simd-parity.md",
+    "assignee": ""
+  },
+  {
+    "id": "0089",
+    "title": "eva ↔ ВТМ: локальный бэкенд через C-ABI",
+    "status": "done",
+    "file": "0089-eva-vtm-backend.md",
+    "assignee": "agent:eva-vtm-backend"
+  },
+  {
+    "id": "0090",
+    "title": "eva: метрики и отмена запросов на сервере",
+    "status": "done",
+    "file": "0090-eva-server-metrics.md",
+    "assignee": "agent:eva-server-metrics"
+  },
+  {
+    "id": "0091",
+    "title": "Скиллы: расширить и измерить маршрутизацию",
+    "status": "done",
+    "file": "0091-eva-skills-expand.md",
+    "assignee": "agent:eva-skills-expand"
+  },
+  {
+    "id": "0092",
+    "title": "Данные: разбиение train/val и предтокенизация для QAT",
+    "status": "done",
+    "file": "0092-qat-data-prep.md",
+    "assignee": "agent:qat-data-prep"
+  },
+  {
+    "id": "0093",
+    "title": "Голос: адаптер TTS с фолбэком (Piper)",
+    "status": "done",
+    "file": "0093-eva-tts-piper.md",
+    "assignee": "agent:eva-tts-piper"
+  },
+  {
+    "id": "0094",
+    "title": "Рунбуки: аренда и гибрид под текущие числа",
+    "status": "done",
+    "file": "0094-runbooks-refresh.md",
+    "assignee": "agent:runbooks-refresh"
+  },
+  {
+    "id": "0095",
+    "title": "Крошечная модель: сквозная проверка цепочки на своём железе",
+    "status": "done",
+    "file": "0095-tiny-qat-cpu.md",
+    "assignee": "agent:tiny-qat-cpu"
+  },
+  {
+    "id": "0096",
+    "title": "eva: включить кэш префикса в Python-бэкенде",
+    "status": "done",
+    "file": "0096-eva-cache-flag.md",
+    "assignee": ""
+  },
+  {
+    "id": "0097",
+    "title": "Политика длинных пар, max_steps и порог разреженности",
+    "status": "done",
+    "file": "0097-training-policies.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0098",
+    "title": "Разреженность тритов: базовая линия инициализации вместо абсолютного порога",
+    "status": "done",
+    "file": "0098-sparsity-baseline.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0099",
+    "title": "Эмбеддинги в триты: конфиги, эталон и цена tied-выхода",
+    "status": "done",
+    "file": "0099-trit-embeddings.md",
+    "assignee": "saron"
+  },
+  {
+    "id": "0101",
+    "title": "KV-кэши вне контейнера: −112 МиБ на 1.5B",
+    "status": "done",
+    "file": "0101-kv-lazy-alloc.md",
+    "assignee": "agent:kv-lazy-alloc"
+  },
+  {
+    "id": "0102",
+    "title": "CI: сборка, тесты, санитайзеры одной командой",
+    "status": "done",
+    "file": "0102-ci-pipeline.md",
+    "assignee": "agent:ci-pipeline"
+  },
+  {
+    "id": "0103",
+    "title": "Синтетический контейнер 1.5B-формы: скорость и память без обучения",
+    "status": "done",
+    "file": "0103-bench-shape.md",
+    "assignee": "agent:bench-shape"
+  },
+  {
+    "id": "0104",
+    "title": "eva: локальная ВТМ как «маленькая модель» в маршрутизаторе",
+    "status": "done",
+    "file": "0104-eva-router-vtm.md",
+    "assignee": "agent:eva-router-vtm"
+  },
+  {
+    "id": "0105",
+    "title": "Golden set: классы новых скиллов и честная доля скиллов",
+    "status": "done",
+    "file": "0105-golden-classes.md",
+    "assignee": "agent:golden-classes"
+  },
+  {
+    "id": "0106",
+    "title": "Документация под текущее состояние: fp32, тритовый эмбеддинг, политики",
+    "status": "done",
+    "file": "0106-docs-current.md",
+    "assignee": "agent:docs-current"
+  },
+  {
+    "id": "0107",
+    "title": "KL-дистилляция от учителя: проверить путь на крошечной модели",
+    "status": "done",
+    "file": "0107-kl-distill.md",
+    "assignee": "agent:kl-distill"
+  },
+  {
+    "id": "0108",
+    "title": "Сервер: лимиты запросов и мягкая деградация",
+    "status": "done",
+    "file": "0108-server-limits.md",
+    "assignee": "agent:server-limits"
+  },
+  {
+    "id": "0109",
+    "title": "Телеметрия: маркер локальной модели в Route и JSONL",
+    "status": "pending",
+    "file": "0109-telemetry-local.md",
+    "assignee": ""
+  },
+  {
+    "id": "0110",
+    "title": "KV-кэш: кэп на суммарный размер и явный отказ старым бинарям",
+    "status": "pending",
+    "file": "0110-kv-caps.md",
+    "assignee": ""
+  },
+  {
+    "id": "0111",
+    "title": "Логиты учителя: top-k формат и потоковое чтение",
+    "status": "pending",
+    "file": "0111-topk-logits.md",
+    "assignee": ""
+  },
+  {
+    "id": "0112",
+    "title": "Батчевый prefill: промпт пачкой, а не по токену",
+    "status": "done",
+    "file": "0112-prefill-batch.md",
+    "assignee": "agent:prefill-batch"
+  },
+  {
+    "id": "0113",
+    "title": "Декод 10,8 ток/с: профиль и ускорение ядер",
+    "status": "done",
+    "file": "0113-decode-kernels.md",
+    "assignee": "agent:decode-kernels"
+  },
+  {
+    "id": "0114",
+    "title": "CLI и C-ABI для батчевого prefill",
+    "status": "done",
+    "file": "0114-prefill-cli.md",
+    "assignee": "agent:prefill-cli"
+  },
+  {
+    "id": "0115",
+    "title": "Сервер: TTFT и прогрев модели",
+    "status": "done",
+    "file": "0115-server-ttft.md",
+    "assignee": "agent:server-ttft"
+  },
+  {
+    "id": "0116",
+    "title": "Документация: prefill, скорость, форма 1.5B",
+    "status": "done",
+    "file": "0116-docs-prefill.md",
+    "assignee": "agent:docs-prefill"
+  },
+  {
+    "id": "0117",
+    "title": "CI: порог регрессии производительности",
+    "status": "done",
+    "file": "0117-ci-perf.md",
+    "assignee": "agent:ci-perf"
+  },
+  {
+    "id": "0118",
+    "title": "KV: кэп на суммарный размер и отказ старым бинарям",
+    "status": "done",
+    "file": "0118-kv-caps.md",
+    "assignee": "agent:kv-caps"
+  },
+  {
+    "id": "0119",
+    "title": "Промпт короче: 4,4 КБ — это 1000 токенов prefill",
+    "status": "done",
+    "file": "0119-prompt-shorten.md",
+    "assignee": "agent:prompt-shorten"
+  },
+  {
+    "id": "0120",
+    "title": "Роутер отдаёт границу prefill для метрик TTFT",
+    "status": "pending",
+    "file": "0120-router-prefill-ms.md",
+    "assignee": ""
+  },
+  {
+    "id": "0121",
+    "title": "TSan для пула потоков: безмьютексный горячий путь",
+    "status": "pending",
+    "file": "0121-tsan-pool.md",
+    "assignee": ""
+  },
+  {
+    "id": "0122",
+    "title": "Батчевые SIMD-ядра TMV/MM — цель ≤2x, не 10x",
+    "status": "pending",
+    "file": "0122-batched-simd.md",
+    "assignee": ""
   }
 ]

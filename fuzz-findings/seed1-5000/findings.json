@@ -1,0 +1,46 @@
+{
+  "summary": {
+    "model": "/Users/a/Documents/work/my/eva32/demo/model.vtm",
+    "model_sha256": "a5dfc48dda1a439a9cc34da66aff49c50c0d8c4ce5d75424e9817e399de982c8",
+    "vtm": "/Users/a/Documents/work/my/eva32/src/vtm/vtm",
+    "iterations": 5000,
+    "planned_iterations": 5000,
+    "stopped_early": false,
+    "seed": 1,
+    "timeout_s": 5.0,
+    "elapsed_s": 19.845,
+    "iterations_per_s": 252.0,
+    "ok": 2477,
+    "rejected": 2523,
+    "other": 0,
+    "signals": 0,
+    "timeouts": 0,
+    "sanitizer": 0,
+    "findings": 0,
+    "duplicates": 0,
+    "sections": {
+      "header": [
+        0,
+        32
+      ],
+      "table": [
+        32,
+        1540
+      ],
+      "data": [
+        1568,
+        115008
+      ],
+      "meta": [
+        115008,
+        118417
+      ],
+      "program": [
+        118432,
+        118784
+      ]
+    }
+  },
+  "findings": [],
+  "duplicates": 0
+}

@@ -1,8 +1,12 @@
 name: CI
 
-# Проверка на каждый пуш и pull request: Python-тесты (stdlib, без torch),
-# C-рантайм src/vtm (если каталог уже появился) и реестр задач.
-# Локальный аналог: make ci
+# Одна команда на всё: C-рантайм src/vtm, Python-набор, реестр задач,
+# документация VTM и проверка, что тесты не зависят от собранных артефактов.
+# Локальный аналог: `python3 tools/ci.py` (он же повторяет все шаги целиком).
+#
+# Матрица: ubuntu-latest — эталонный «чистый» Linux; macos-latest — машины
+# разработки. Системные TTS-бинарники (say, afplay, espeak) в тестах не
+# запускаются, отсутствие внешних команд тесты скипают, а не падают.
 
 on:
   push:
@@ -16,57 +20,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  python:
-    name: Python · unittest discover
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  ci:
+    name: CI · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # Зависимости не ставим: код обязан работать на стандартной библиотеке.
-      - name: Unit tests
-        run: python3 -m unittest discover -s tests -v
+      # Зависимости не ставим: C-часть собирается стандартным cc/c++,
+      # Python-часть обязана работать на стандартной библиотеке.
 
-  c:
-    name: C · src/vtm
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # C-рантайма может ещё не быть (задачи 0002/0003/0006 в работе):
-      # в этом случае джоба не падает, а честно пропускает тесты.
-      - name: Detect C runtime
-        id: vtm
-        run: |
-          if [ -d src/vtm ] && [ -f src/vtm/Makefile ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-            echo "src/vtm найден — запускаем C-тесты"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=C-тесты пропущены::Каталог src/vtm (или его Makefile) ещё отсутствует"
-          fi
-
-      - name: C tests
-        if: steps.vtm.outputs.present == 'true'
+      - name: C tests (make -C src/vtm test)
         working-directory: src/vtm
         run: make test
 
-  tasks:
-    name: Tasks · реестр и фронтматтер
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Python tests (unittest discover)
+        run: python3 -m unittest discover -s tests
 
-      # check_tasks.py — только stdlib; python3 есть на раннере.
-      - name: Validate task registry
+      - name: Task registry (tools/check_tasks.py)
         run: python3 tools/check_tasks.py
+
+      - name: VTM docs (tools/check_vtm_docs.py)
+        run: python3 tools/check_vtm_docs.py
+
+      # Всё то же одной командой плюс проверка «Python-набор проходит после
+      # make clean». Шаги выше дают точную локализацию падения, этот —
+      # повторяемость на чистом дереве.
+      - name: Full check (tools/ci.py)
+        run: python3 tools/ci.py

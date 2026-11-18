@@ -19,15 +19,36 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def fsync_dir(directory: str | Path) -> None:
+    """Сделать долговечной саму запись каталога (rename) — иначе обрыв её съест."""
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return  # платформа без открытия каталога — не повод падать
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def write_text_atomic(path: str | Path, text: str) -> None:
-    """Записать текст атомарно: сначала temp в том же каталоге, потом rename."""
+    """Записать текст атомарно: temp → fsync → rename → fsync каталога.
+
+    Без fsync rename атомарен только по имени: содержимое файла может не дойти до
+    диска, и после потери питания на месте останется пустой файл (ADR 0008).
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp_name, path)
+        fsync_dir(path.parent)
     except BaseException:
         try:
             os.unlink(tmp_name)

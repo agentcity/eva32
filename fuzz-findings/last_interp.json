@@ -1,0 +1,8 @@
+{
+  "iteration": 5000,
+  "seed": 1,
+  "section": "data",
+  "mutations": [
+    {"offset": 69408, "size": 1, "old": "0x00000054", "new": "0x000000fd", "label": "trt1.magic"}
+  ]
+}

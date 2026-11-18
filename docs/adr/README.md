@@ -10,6 +10,12 @@
 | [0006](0006-qat-method.md) | QAT: STE, absmax-блок 128, 8-bit Adam | accepted |
 | [0007](0007-task-workflow.md) | Задачи в `ai/tasks`, отчёт и приёмка | accepted |
 | [0008](0008-engineering-standards.md) | Инженерные стандарты: тесты, детерминизм, коммиты | accepted |
+| [0009](0009-hybrid-router.md) | Гибрид: скиллы, малая модель, большая модель | accepted |
+| [0010](0010-voice-pipeline.md) | Голос как транспорт: ASR → LLM → TTS | accepted |
+| [0011](0011-container-v02.md) | Контейнер `.vtm` v0.2: размерности u32 | accepted |
+| [0012](0012-trit-storage-vs-semantics.md) | Упаковка отделена от троичной семантики | accepted |
+| [0013](0013-3b-on-24gb.md) | 3B на 24 ГБ: bf16-мастер и условие контроля loss | accepted |
+| [0014](0014-pilot-data-domain.md) | Данные пилота: программирование на русском | accepted |
 
 ## Правила
 

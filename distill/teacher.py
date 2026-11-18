@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +39,17 @@ MOCK_ANSWERS = [
 ]
 
 
+def _retry_after(exc: urllib.error.HTTPError) -> float | None:
+    """Сколько секунд просит подождать сервер (Retry-After), если указал."""
+    value = exc.headers.get("Retry-After") if exc.headers else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
+
+
 class Teacher:
     def __init__(self, base: str | None = None, key: str | None = None,
                  model: str | None = None, mock: bool = False):
@@ -50,7 +63,9 @@ class Teacher:
         self.last_reasoning: str = ""
         # reasoning стоит 30-45% цены, а в обучение не идёт: по умолчанию выключен
         self.reasoning = os.environ.get("TEACHER_REASONING", "off").lower() == "on"
-        self.max_tokens = 900
+        self.max_tokens = 1800
+        self.retries = int(os.environ.get("TEACHER_RETRIES", "4"))
+        self.timeout_s = float(os.environ.get("TEACHER_TIMEOUT", "60"))
 
     @staticmethod
     def build_message(question: str, context: str | None = None) -> str:
@@ -80,15 +95,38 @@ class Teacher:
             "max_tokens": max_tokens or self.max_tokens,
         }
         if not self.reasoning:
-            payload["reasoning"] = {"exclude": True}
+            # exclude только ПРЯЧЕТ рассуждения, но модель всё равно думает и платит
+            # за токены. enabled=false отключает их совсем: замер на кодовых парах
+            # 0,104 -> 0,032 ₽ за пару при том же качестве ответа.
+            payload["reasoning"] = {"enabled": False}
         req = urllib.request.Request(
             self.base + "/v1/chat/completions",
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {self.key}"},
         )
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            data = json.load(resp)
+        # Один сетевой сбой не должен убивать прогон на тысячи запросов: повторяем
+        # с паузой (2, 4, 8 с), а на 429/5xx уважаем Retry-After. Ошибки 4xx кроме
+        # 429 не повторяем — это наша ошибка в запросе, а не сеть.
+        data = None
+        last_error: Exception | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                    data = json.load(resp)
+                break
+            except urllib.error.HTTPError as exc:  # noqa: PERF203
+                last_error = exc
+                if exc.code != 429 and 400 <= exc.code < 500:
+                    raise
+                wait = _retry_after(exc) or min(2 ** attempt, 30)
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_error = exc
+                wait = min(2 ** attempt, 30)
+            if attempt < self.retries:
+                time.sleep(wait)
+        if data is None:
+            raise last_error if last_error else RuntimeError("учитель: нет ответа")
         msg = data["choices"][0]["message"]
         self.last_usage = data.get("usage") or {}
         # reasoning-часть не идёт в обучение, но стоит токенов — считаем отдельно

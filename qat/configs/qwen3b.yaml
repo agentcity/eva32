@@ -1,0 +1,90 @@
+# QAT-конфиг EVA32 для Qwen2.5-3B-Instruct на одной RTX 4090 24 ГиБ.
+#
+# Отличие от qwen1.5b.yaml — режим памяти (задача 0047):
+#   * master_dtype: bf16  — мастер-веса в bf16, отдельной bf16-копии нет;
+#   * grad_dtype: bf16    — градиенты вдвое меньше fp32;
+#   * micro_batch_size: 2 — активации 3B на 24 ГиБ иначе не оставляют запаса.
+# Оценка до запуска (torch не нужен):
+#   python3 -m qat.train --config qat/configs/qwen3b.yaml --dry-run
+#
+# ВНИМАНИЕ: bf16-мастер — компромисс ради памяти. Обновление меньше половины
+# шага bf16 округляется в ноль; при lr 3e-5 и весах ~0.02 (полшага ≈ 6e-5)
+# часть весов может замереть. Смотрите loss первые 100 шагов; если стоит —
+# поднимите lr или вернитесь к fp32-мастеру с меньшим батчем/длиной.
+# Подробности и таблица — docs/qat.md, раздел «Память и OOM».
+
+model:
+  name_or_path: Qwen/Qwen2.5-3B-Instruct
+  # На аренде зафиксируйте commit, а не "main": иначе прогон не воспроизведётся.
+  revision: main
+  trust_remote_code: false
+  # fp32 | bf16. bf16 экономит ~5.75 ГиБ на 3B и убирает bf16-копию.
+  master_dtype: bf16
+  # sdpa — быстрее и экономнее по памяти, чем eager.
+  attn_implementation: sdpa
+  # Архитектура и размер — только для estimate_memory/--dry-run.
+  # Для локального пути к весам эти поля обязательны (пресета по имени нет).
+  num_params: 3085936640
+  hidden_size: 2048
+  intermediate_size: 11008
+  num_hidden_layers: 36
+  vocab_size: 151936
+
+quant:
+  # absmax по 128 элементам вдоль входной размерности (последней оси веса).
+  block_size: 128
+  # float32: fp16-масштабы дают max|Δ| ~1,7e-03 (4,3e-03 с тритовым эмбеддингом)
+  # и не проходят порог паритета 1e-4 (0095, 0099). Цена — ~2% размера.
+  scale_dtype: float32
+  target_suffixes: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  exclude_suffixes: [lm_head, embed_tokens, router, gate, norm]
+  # Эмбеддинги в триты (решение 0099): у 3B таблица — 0,29B параметров, в fp16 это
+  # ~580 МиБ против ~70 МиБ. При tied она же выходной слой — качество логитов
+  # проверить на eval; откат — вернуть none, это одно поле.
+  quantize_embeddings: trit
+
+data:
+  path: distill/out/pairs.jsonl
+  # Длина та же, что у 1.5B: качество ответов важнее экономии на длине.
+  max_seq_len: 2048
+  max_samples: 0
+  min_answer_tokens: 1
+  use_teacher_logits: false
+  kl_temperature: 1.0
+  kl_weight: 0.5
+  kl_chunk_size: 64
+
+train:
+  # Эффективный батч = 2 * 16 = 32 последовательности, как у 1.5B (4 * 8).
+  # Меньший micro_batch — главный рычаг, если оценка памяти врёт в опасную сторону.
+  micro_batch_size: 2
+  grad_accum_steps: 16
+  # 3 эпохи на 3607 парах при эффективном батче 32 (замер 0092);
+  # 2000 шагов = ~18 эпох, на таком объёме это переобучение.
+  max_steps: 350
+  # Тернарный QAT нестабилен: большой LR убивает модель за сотню шагов.
+  # Для bf16-мастера lr ниже ~1e-4 может не сдвинуть веса (см. шапку).
+  lr: 3.0e-5
+  min_lr_ratio: 0.1
+  warmup_steps: 50
+  weight_decay: 0.0
+  grad_clip: 1.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  seed: 42
+  amp_dtype: bfloat16
+  # Градиенты bf16: экономит ~5.75 ГиБ на 3B против fp32.
+  grad_dtype: bf16
+  # Для 3B обязательно: без checkpointing активации не влезают в 24 ГиБ.
+  gradient_checkpointing: true
+  # adam8bit — 2 байта состояния на параметр. adamw (fp32-состояния) на 3B
+  # не влезает даже с bf16-мастером; оставлен как аварийный вариант.
+  optimizer: adam8bit
+  log_every: 10
+  # Чекпоинт: bf16-веса + 8-бит оптимизатор, заметно меньше fp32-варианта.
+  save_every: 100
+  keep_last_checkpoints: 2
+  save_optimizer: true
+  device: auto
+  # CE режем мельче, чем у 1.5B: логиты 3B на 512 токенов заметно больше.
+  loss_chunk_size: 256

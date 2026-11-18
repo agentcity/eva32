@@ -141,7 +141,7 @@ celerybeat.pid
 # RabbitMQ
 mnesia/
 rabbitmq/
-rabbitmq-data/
+rabbitmq-data/*
 
 # ActiveMQ
 activemq-data/
@@ -224,7 +224,8 @@ __marimo__/
 
 # --- EVA32: бандл модели ---
 # Данные и модели
-data/
+data/*
+!data/catalog.json
 local_model/
 *.gguf
 *.safetensors
@@ -251,4 +252,23 @@ src/vtm/*.d
 src/vtm/vtm
 src/vtm/vtm-tok
 src/vtm/test_vtm
+src/vtm/bench_backend
 src/vtm/test_tokenizer
+
+# Логи гибрида (телеметрия)
+logs/
+
+# артефакты демо (генерируются scripts/demo_ternary_model.py)
+demo/
+
+# собранные бинарники тестов
+src/vtm/test_vtm_api
+src/vtm/test_vtm
+src/vtm/bench_backend
+src/vtm/test_sha256
+src/vtm/test_vtm_session
+
+# локальные python-пакеты (torch/transformers для CPU-обучения)
+.pylibs/
+runs/
+*.dSYM/

@@ -1,0 +1,23 @@
+{
+  "title": "ATTN: q_start + q_len signed overflow -> huge malloc -> SIGBUS",
+  "source": "demo/model.vtm",
+  "mutations": [
+    {
+      "offset": 118572,
+      "size": 4,
+      "old": "00000000",
+      "new": "ffffff7f",
+      "label": "instr[8].imm",
+      "opcode": "ATTN (0x0B)",
+      "value": 2147483647
+    }
+  ],
+  "sha256": "08d0b55dbcd188d9d208e2e24d0e80828baf53a7e93a4115d31fd35393ebad70",
+  "size": 118784,
+  "repro": "./src/vtm/vtm run fuzz-findings/minimal-ATTN-imm-INT_MAX.vtm --tokens 1 --max-new 1",
+  "observed": {
+    "normal_build": "exit 138 (SIGBUS)",
+    "asan_ubsan": "interp.c:749 signed integer overflow; ASan allocation-size-too-big",
+    "ubsan_snapshot_line": "interp.c:718 (снимок до правки meta_number)"
+  }
+}

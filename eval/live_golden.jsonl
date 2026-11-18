@@ -1,0 +1,20 @@
+{"id": "cat-01", "kind": "catalog", "question": "Сколько стоит тариф «Старт»?", "expect_route": "skill", "facts": ["990"]}
+{"id": "cat-02", "kind": "catalog", "question": "Сколько стоит тариф «Профи» в месяц?", "expect_route": "skill", "facts": ["2490"]}
+{"id": "cat-03", "kind": "catalog", "question": "Сколько стоит тариф «Бизнес»?", "expect_route": "skill", "facts": ["7900"]}
+{"id": "cat-04", "kind": "catalog", "question": "Сколько стоит услуга «Аудит сайта»?", "expect_route": "skill", "facts": ["12000"]}
+{"id": "cat-05", "kind": "catalog", "question": "Сколько стоит настройка CRM под ключ?", "expect_route": "skill", "facts": ["34000"]}
+{"id": "cat-06", "kind": "catalog", "question": "Сколько стоит доставка документов по Москве?", "expect_route": "skill", "facts": ["490"]}
+{"id": "cat-07", "kind": "catalog", "question": "Какие часы работы офиса?", "expect_route": "skill", "facts": ["9:00"]}
+{"id": "cat-08", "kind": "catalog", "question": "Какие часы работы у службы поддержки?", "expect_route": "skill", "facts": ["21:00"]}
+{"id": "cat-09", "kind": "catalog", "question": "Сколько дней даётся на возврат денег?", "expect_route": "skill", "facts": ["14"]}
+{"id": "cat-10", "kind": "catalog", "question": "Какой телефон службы поддержки?", "expect_route": "skill", "facts": ["120-32-32"]}
+{"id": "gen-01", "kind": "general", "question": "Почему небо голубое?", "expect_route": "big", "facts": ["рассе", "рэле"]}
+{"id": "gen-02", "kind": "general", "question": "Объясни, как работает HTTP.", "expect_route": "big", "facts": ["протокол"]}
+{"id": "gen-03", "kind": "general", "question": "Напиши код на Python для сортировки списка.", "expect_route": "big", "facts": ["sort"]}
+{"id": "gen-04", "kind": "general", "question": "Посчитай 17% от 4800.", "expect_route": "big", "facts": ["816"]}
+{"id": "gen-05", "kind": "general", "question": "Переведи на английский: «Добро пожаловать в наш сервис».", "expect_route": "big", "facts": ["welcome"]}
+{"id": "gen-06", "kind": "general", "question": "Почему моя программа на Python падает с IndexError?", "expect_route": "big", "facts": ["индекс", "границ", "предел", "длин"]}
+{"id": "gen-07", "kind": "general", "question": "Что такое транзакция в базах данных?", "expect_route": "big", "facts": ["атомарн", "неделим", "целостн", "acid"]}
+{"id": "gen-08", "kind": "general", "question": "Напиши код на SQL: топ-10 клиентов по выручке.", "expect_route": "big", "facts": ["orderby", "limit"]}
+{"id": "gen-09", "kind": "general", "question": "Когда вышел Python 3.0 и почему это было важно?", "expect_route": "big", "facts": ["2008"]}
+{"id": "gen-10", "kind": "general", "question": "Кто такой Алан Тьюринг и почему его считают отцом информатики?", "expect_route": "big", "facts": ["машин", "энигм", "enigma"]}

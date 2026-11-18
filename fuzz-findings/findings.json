@@ -1,0 +1,77 @@
+{
+  "summary": {
+    "model": "/Users/a/Documents/work/my/eva32/demo/model.vtm",
+    "model_sha256": "a5dfc48dda1a439a9cc34da66aff49c50c0d8c4ce5d75424e9817e399de982c8",
+    "vtm": "/Users/a/Documents/work/my/eva32/src/vtm/vtm",
+    "iterations": 2524,
+    "planned_iterations": 5000,
+    "stopped_early": true,
+    "seed": 5,
+    "timeout_s": 5.0,
+    "elapsed_s": 9.433,
+    "iterations_per_s": 267.6,
+    "ok": 1272,
+    "rejected": 1251,
+    "other": 0,
+    "signals": 1,
+    "timeouts": 0,
+    "sanitizer": 0,
+    "findings": 1,
+    "duplicates": 0,
+    "sections": {
+      "header": [
+        0,
+        32
+      ],
+      "table": [
+        32,
+        1540
+      ],
+      "data": [
+        1568,
+        115008
+      ],
+      "meta": [
+        115008,
+        118417
+      ],
+      "program": [
+        118432,
+        118784
+      ]
+    }
+  },
+  "findings": [
+    {
+      "iteration": 2524,
+      "seed": 5,
+      "kind": "signal",
+      "returncode": -10,
+      "signal": "SIGBUS",
+      "timed_out": false,
+      "elapsed_s": 0.004837,
+      "sha256": "dcd4ae17052e532f8fd0bc63c06a1673c8614bcbd6f5b5072f724e572851d6fd",
+      "file": "fuzz-findings/finding-0001-SIGBUS-02524.vtm",
+      "size": 118784,
+      "mutations": [
+        {
+          "section": "program",
+          "offset": 118572,
+          "size": 4,
+          "old": "00000000",
+          "new": "ffffff7f",
+          "label": "instr[8].imm"
+        },
+        {
+          "section": "data",
+          "offset": 20010,
+          "size": 1,
+          "old": "13",
+          "new": "04",
+          "label": "data.byte"
+        }
+      ]
+    }
+  ],
+  "duplicates": 0
+}

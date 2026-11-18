@@ -34,6 +34,9 @@ from .config import (
     ConfigError,
     apply_overrides,
     config_to_dict,
+    estimate_memory,
+    format_memory_matrix,
+    format_memory_table,
     load_config,
     resolve_data_path,
 )
@@ -56,7 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "примеры:\n"
             "  python3 -m qat.train --dry-run\n"
-            "      3 шага на случайных данных: проверить, что всё стартует\n\n"
+            "      оценка памяти по компонентам; без torch — только она,\n"
+            "      с torch — ещё 3 шага на случайных данных\n\n"
             "  python3 -m qat.train --config qat/configs/qwen1.5b.yaml \\\n"
             "      --data distill/out/pairs.jsonl --out runs/pilot1\n"
             "      пилот целиком\n\n"
@@ -94,7 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="3 шага на случайных данных без датасета; проверить запуск и память",
+        help="оценка памяти по компонентам (без torch); с torch — ещё 3 шага "
+             "на случайных данных без датасета",
     )
     parser.add_argument(
         "--no-save", action="store_true",
@@ -129,9 +134,33 @@ def print_missing_dependencies(missing: Sequence[str]) -> None:
     print("На машине разработчика проверить код можно без GPU-стека:")
     print("    python3 -m unittest discover -s tests -v")
     print("    python3 -m qat.train --help")
+    print("    python3 -m qat.train --config qat/configs/qwen3b.yaml --dry-run")
+    print("        (только оценка памяти: torch не нужен)")
     print()
     print("Если torch уже стоит, но не тот: проверьте, что Python 3.10–3.12 "
           "и что установлен CUDA-вариант torch.")
+
+
+def print_memory_summary(cfg: Any) -> dict[str, Any]:
+    """Печать матрицы 1.5B/3B × мастер × оптимизатор и текущего конфига."""
+    print("[qat] оценка памяти до запуска (чистая арифметика по конфигу, "
+          "torch не нужен)")
+    print()
+    print(format_memory_matrix(cfg))
+    print()
+    current = estimate_memory(cfg)
+    print("[qat] текущий конфиг:")
+    print(format_memory_table(current))
+    if current["master_dtype"] == "bf16":
+        print()
+        print("[qat] ВНИМАНИЕ: bf16-мастер. Обновление меньше половины шага "
+              "bf16 округляется в ноль:")
+        print("       при lr 3e-5 и весах ~0.02 (полшага ≈ 6e-5) большая часть "
+              "весов может замереть.")
+        print("       Контролируйте loss на первых 100 шагах; если стоит — "
+              "fp32-мастер или больший lr.")
+    print()
+    return current
 
 
 # ---------------------------------------------------------------------------
@@ -254,9 +283,10 @@ def _kl_sum(
 
     logits — срез модели начиная с позиции ``logits_start``; teacher_logits[b]
     выровнены на токены ответа (первый supervised-токен). Считаем по кускам,
-    чтобы [длина ответа, словарь] не раздувал память.
+    чтобы [длина ответа, словарь] не раздувал память. Сама формула — в
+    ``qat.kl.kl_div_sum_torch`` (её же проверяет тест без torch на эталоне).
     """
-    import torch.nn.functional as F  # noqa: PLC0415
+    from .kl import kl_div_sum_torch  # noqa: PLC0415 - модуль без torch
 
     batch_size = logits.size(0)
     total = logits.new_zeros((), dtype=torch.float32)
@@ -279,14 +309,10 @@ def _kl_sum(
             )
         for start in range(0, count, chunk_size):
             stop = min(count, start + chunk_size)
-            student = logits[b, start_in_logits + start:start_in_logits + stop].float()
-            target = teacher[start:stop].to(device=logits.device, dtype=torch.float32)
-            total = total + F.kl_div(
-                F.log_softmax(student / temperature, dim=-1),
-                F.log_softmax(target / temperature, dim=-1),
-                log_target=True,
-                reduction="sum",
-            ) * (temperature ** 2)
+            student = logits[b, start_in_logits + start:start_in_logits + stop]
+            total = total + kl_div_sum_torch(
+                torch, student, teacher[start:stop], temperature,
+            )
     return total
 
 
@@ -300,11 +326,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    missing = missing_modules()
-    if missing:
-        print_missing_dependencies(missing)
-        return 2
-
+    # Конфиг читается до проверки зависимостей: --dry-run должен показывать
+    # оценку памяти даже там, где torch/transformers не установлены.
     try:
         cfg = load_config(args.config)
         cfg = apply_overrides(
@@ -315,6 +338,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"[qat] ошибка конфига: {exc}")
         return 2
+
+    if args.dry_run:
+        try:
+            print_memory_summary(cfg)
+        except ConfigError as exc:
+            print(f"[qat] ошибка оценки памяти: {exc}")
+            return 2
+
+    missing = missing_modules()
+    if args.dry_run:
+        # pyyaml для --dry-run не нужен: конфиг прочитает встроенный парсер.
+        missing = [module for module in missing if module != "pyyaml"]
+    if missing:
+        if args.dry_run:
+            print("[qat] GPU-стека нет: показана только оценка памяти, "
+                  "обучение не запускалось.")
+            print("[qat] не хватает для 3 шагов: " + ", ".join(missing)
+                  + " — поставьте qat/requirements-qat.txt на GPU-машине.")
+            return 0
+        print_missing_dependencies(missing)
+        return 2
+    if args.dry_run:
+        print("[qat] GPU-стек есть: после оценки памяти — 3 шага на случайных данных")
     if args.dry_run and args.max_steps is not None and args.max_steps != 3:
         print("[qat] --dry-run всегда делает 3 шага; --max-steps проигнорирован")
 
@@ -335,7 +381,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         DataError, PairDataset, PairStream, RandomTokenStream, data_fingerprint, load_pairs,
     )
     from .model import (  # noqa: PLC0415
-        apply_ternary, build_optimizer, load_model, load_tokenizer, logits_keep_arg, lr_at,
+        apply_embedding_quant, apply_ternary, build_optimizer, load_model, load_tokenizer,
+        logits_keep_arg, lr_at,
         print_model_report, resolve_device,
     )
 
@@ -411,7 +458,8 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"{cfg.train.grad_accum_steps} = {cfg.train.micro_batch_size * cfg.train.grad_accum_steps} "
           f"последовательностей, длина {cfg.data.max_seq_len}")
     print(f"[qat] grad checkpointing: {'вкл' if cfg.train.gradient_checkpointing else 'выкл'}, "
-          f"amp: {cfg.train.amp_dtype}, мастер-веса: {cfg.model.torch_dtype}")
+          f"amp: {cfg.train.amp_dtype}, мастер-веса: {cfg.model.master_dtype} "
+          f"({cfg.model.torch_dtype}), градиенты: {cfg.train.grad_dtype}")
     if cfg.model.revision == "main":
         print("[qat] ВНИМАНИЕ: revision=main; на GPU-машине зафиксируйте commit в конфиге")
 
@@ -419,6 +467,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     tokenizer = load_tokenizer(cfg)
     model = load_model(cfg, device)
     ternary_report = apply_ternary(model, cfg.quant)
+    embeddings_report = apply_embedding_quant(model, cfg.quant)
+    if embeddings_report:
+        print(f"[qat] эмбеддинги: {embeddings_report['mode']}, "
+              f"блок {embeddings_report['block_size']} ({embeddings_report['name']})")
     counts = print_model_report(model, ternary_report, device)
     vocab_size = int(getattr(model.config, "vocab_size", len(tokenizer)))
 
@@ -488,6 +540,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rows,
                 tokenizer,
                 max_seq_len=cfg.data.max_seq_len,
+                long_pairs=cfg.data.long_pairs,
                 min_answer_tokens=cfg.data.min_answer_tokens,
                 use_teacher_logits=cfg.data.use_teacher_logits,
                 vocab_size=vocab_size,
@@ -657,6 +710,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ce_total = torch.zeros((), device=device)
             kl_total = torch.zeros((), device=device)
             loss_total = torch.zeros((), device=device)
+            kl_seconds = 0.0
             supervised_total = torch.zeros((), device=device, dtype=torch.long)
             compute_t0 = time.perf_counter()
             for batch, keep, logits_start, usable in prepared:
@@ -692,10 +746,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if cfg.data.use_teacher_logits:
                         if not batch.get("teacher_logits"):
                             raise RuntimeError("use_teacher_logits: в батче нет logits учителя")
+                        # Отдельный замер: сколько стоит KL сверх forward/backward —
+                        # это и есть оверхед дистилляции в отчёте и в плане аренды.
+                        kl_t0 = time.perf_counter()
                         kl_sum = _kl_sum(
                             torch, logits, labels, batch["teacher_logits"],
                             logits_start, cfg.data.kl_temperature, cfg.data.kl_chunk_size,
                         )
+                        kl_seconds += time.perf_counter() - kl_t0
                     loss = ce_sum / step_tokens
                     if kl_sum is not None:
                         loss = loss + cfg.data.kl_weight * kl_sum / step_tokens
@@ -724,6 +782,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
+            # grad_dtype: после backward градиенты уже bf16 при bf16-мастере;
+            # при fp32-мастере их можно опустить до bf16 и сэкономить половину
+            # памяти до шага оптимизатора. Оценка памяти это учитывает.
+            target_grad_dtype = (
+                torch.bfloat16 if cfg.train.grad_dtype == "bf16" else torch.float32
+            )
+            for param in model.parameters():
+                if param.grad is not None and param.grad.dtype != target_grad_dtype:
+                    param.grad = param.grad.to(target_grad_dtype)
             if cfg.train.grad_clip > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), cfg.train.grad_clip
@@ -766,8 +833,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
                 if kl_value is not None:
                     fields["kl"] = round(kl_value, 6)
+                    fields["kl_sec"] = round(kl_seconds, 4)
                 line = (f"[qat] шаг {step}/{max_steps}  loss={loss_value:.4f}  "
                         f"ce={ce_value:.4f}  lr={lr:.2e}  {tok_s:.0f} ток/с")
+                if kl_value is not None:
+                    line += f"  kl={kl_value:.4f} (kl {kl_seconds * 1000:.0f} мс)"
                 if gpu_alloc is not None:
                     line += f"  GPU {gpu_alloc:.1f}/{gpu_peak:.1f} ГиБ"
                 print(line)

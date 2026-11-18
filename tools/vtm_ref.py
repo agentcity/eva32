@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VTM v0.1 — эталонная Python-реализация: контейнер, исполнитель, семантика.
+"""VTM v0.2 — эталонная Python-реализация: контейнер, исполнитель, семантика.
 
 Это **наша истина**. C-интерпретатор (`src/vtm/`) обязан воспроизводить
 поведение этого модуля; если результаты расходятся — прав Python, а не C.
@@ -22,29 +22,57 @@
  20  program_offset u32            4   абсолютное смещение программы в файле
  24  meta_offset u32               4   абсолютное смещение JSON-метаданных (0 = нет)
  28  meta_len u32                  4   длина JSON-метаданных в байтах (без padding)
-32                       таблица тензоров: n_tensors * 44 байта
+32                       таблица тензоров: n_tensors * 52 байта
   0  name[24]  UTF-8, NUL-дополнение
  24  kind u8                        0 триты (TRT1), 1 fp32, 2 fp16, 3 bf16
  25  ndim u8                        1..4
- 26  dims u16[4]                    недостающие измерения = 0
- 34  offset u32                     смещение ОТ НАЧАЛА СЕКЦИИ ДАННЫХ, кратно 32
- 38  scale_offset u32               0xFFFFFFFF (VTM_NO_OFFSET) — масштабы лежат
+ 26  dims u32[4]                    недостающие измерения = 0
+ 42  offset u32                     смещение ОТ НАЧАЛА СЕКЦИИ ДАННЫХ, кратно 32
+                                    (у KV-кэша — не адрес: 0 или 0xFFFFFFFF
+                                     при флаге VFLAG_KV_OUT_OF_FILE)
+ 46  scale_offset u32               0xFFFFFFFF (VTM_NO_OFFSET) — масштабы лежат
                                     внутри TRT1-сегмента по offset; для fp — 0
                                     (читатель принимает и offset+18 как синоним)
- 42  reserved u16                   0
+ 50  flags/резерв u16              0 — обычный тензор; бит 0 — KV-кэш
+                                    (VTM_TENSOR_FLAG_KV_CACHE, payload'а нет)
      (20 из 32 байт заголовка — это поля спеки; 12 байт «резерва» заняты
       program_offset/meta_offset/meta_len, что обратно совместимо: C может
       игнорировать эти три слова и читать программу с конца файла.)
-data_start = align32(32 + 44*n_tensors)
+data_start = align32(32 + 52*n_tensors)
 секция данных:      payload'ы тензоров подряд, каждый выровнен на 32 байта
 meta_start = data_start + data_size   (JSON, опционально, дополнен нулями до 32)
 program_offset = meta_start + align32(meta_len)  — программа идёт ПОСЛЕДНЕЙ
 программа:          n_instr * 16 байт, файл заканчивается ровно на ней
 ```
 
+KV-кэши вне контейнера (задачи 0101, 0118). Поле по смещению 50 было резервом и
+всегда 0; младший бит занят ролью `KV_CACHE`. Такой тензор существует только
+в таблице (`name`/`kind`/`dims`), а его payload в секцию данных **не пишется**:
+`offset` — не адрес, `scale_offset = 0`. Кэш пуст на старте и заполняется KVW,
+поэтому хранить под него `ctx × kv_dim × 4` байт в файле незачем — для
+1.5B-раскладки (28 слоёв, ctx 2048, kv_dim 256) это 112 МиБ. Читатель создаёт
+буфер сам (Python — список нулей, C — буфер в арене); старые контейнеры
+присылают 0 в этом поле и читаются прежним путём, с содержимым из файла.
+Тензор с флагом обязан быть fp (kind 1..3); неизвестные биты читатель
+игнорирует.
+
+Новый вид контейнера (задача 0118) отмечается флагом заголовка
+`VFLAG_KV_OUT_OF_FILE` (0x0004) и `offset == KV_NO_OFFSET` (0xFFFFFFFF) у
+каждого KV-кэша. Старый загрузчик до 0101 этот бит игнорирует, зато проверяет
+выравнивание offset и отказывает с `VTM_E_FORMAT`, не читая данные: мусор в
+кэш вместо отказа — ровно тот риск, ради которого флаг введён. Контейнеры без
+флага (0101 и старше) по-прежнему несут `offset = 0` и читаются как раньше.
+Суммарный размер KV-кэшей ограничен `MAX_KV_BYTES` (512 МиБ): 192-байтный файл
+иначе просит `calloc` до 4 ГиБ (предел `VTM_MAX_ELEMENTS`).
+
 Почему программа в конце: C-читатель, который ничего не знает про метаданные,
 всё равно может взять её как `file_size - n_instr*16`; `program_offset` из
 заголовка — тот же ответ.
+
+Версия 2 (ADR 0011): `dims` — `u32 × 4`, запись тензора 52 байта. Файлы v0.1
+(version=1, запись 44 байта) не читаются: `read_vtm` бросает `ValueError`
+«формат v0.1 не поддерживается» — ценных артефактов v0.1 нет, синтетика
+пересобирается за секунды.
 
 Тензор тритов (kind 0) — сегмент TRT1 (см. `docs/trit-format.md`):
 
@@ -158,9 +186,13 @@ opcode u8 | flags u8 | dst u16 | a u16 | b u16 | c u16 | reserved u16 | imm i32
     `j <= q_start + qi`. Для одного токена (`q_len = 1`, `q_start = pos`)
     это всё `0..pos` — ровно декод.
 
-`SAMP` — выбрать токен из логитов `a`: `imm == 0` — жадный argmax (первый
-    максимум), `imm > 0` — температура `imm/1000` (расширение Python;
-    C v0.1 поддерживает только 0 и вернёт VTM_E_UNSUPPORTED). `dst`
+`SAMP` — выбрать токен из логитов `a`; `imm` — номер стратегии: 0 argmax
+    (первый максимум), 1 temperature, 2 top-k, 3 top-p; `imm` вне 0..3 —
+    `ValueError`. Параметры (temperature, top_k, top_p, repetition_penalty,
+    repetition_window, sample_seed) — из меты контейнера, штраф за повторы —
+    по окну последних токенов. ГПСЧ (xorshift64*, засев splitmix64) и порядок
+    вычислений совпадают с C побитово: при одном `seed` оба интерпретатора
+    дают ту же последовательность токенов (docs/vtm.md, «Сэмплинг»). `dst`
     (опционально) — тензор, куда пишется id как float; исполнитель помнит
     логиты в результате.
 
@@ -189,17 +221,19 @@ opcode u8 | flags u8 | dst u16 | a u16 | b u16 | c u16 | reserved u16 | imm i32
 * C v0.1 не читает метаданные: `rope_theta` (Qwen 1e6) и `rope_layout`
   он пока не знает — синтетика использует theta=10000/half, чтобы гейт
   проходил без этого;
-* в контейнере нет контрольной суммы: битые данные ловятся по magic, версии,
-  диапазонам и длинам, но не по содержимому;
+* контроль целостности — по желанию писателя (write_vtm(..., integrity=True)
+  или VTM_WRITE_HASH=1): sha256 секции данных и меты лежит в meta["integrity"];
+  старые контейнеры без блока читаются как раньше, VTM_SKIP_HASH=1 отключает
+  проверку;
 * тритовые тензоры ограничены 4 ГиБ смещениями u32; файл больше — ошибка.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
-import random
 import struct
 import sys
 from dataclasses import dataclass
@@ -216,18 +250,21 @@ except ImportError:  # pragma: no cover - запуск как `python3 tools/vtm
 # ---------------------------------------------------------------------------
 
 VTM_MAGIC = b"VTM1"
-VTM_VERSION = 1
+VTM_VERSION = 2
+VTM_VERSION_V01 = 1
 TRT1_MAGIC = b"TRT1"
 TRT1_VERSION = 1
 TRT1_HEADER_SIZE = 18
 
 HEADER_SIZE = 32
-TENSOR_ENTRY_SIZE = 44
+TENSOR_ENTRY_SIZE = 52
 INSTR_SIZE = 16
 ALIGNMENT = 32
 NAME_SIZE = 24
 MAX_DIMS = 4
 MAX_TENSORS = 0xFFFF
+#: Одно измерение тензора — u32; больше не влезает в запись таблицы.
+MAX_DIM_VALUE = 0xFFFFFFFF
 
 TRITS_PER_WORD = 20
 TRITS_PER_STORAGE_BLOCK = 160
@@ -248,10 +285,55 @@ KIND_NAMES = {
     KIND_BF16: "bf16",
 }
 
+#: Флаги записи таблицы тензоров (поле по смещению 50, бывший «резерв»).
+#: TFLAG_KV_CACHE — K/V-кэш внимания: содержимого в файле нет (offset=0),
+#: читатель создаёт буфер сам (см. докстроку модуля, «KV-кэши вне контейнера»).
+#: Как и в C (src/vtm/vtm.h), осмыслен только бит 0; остальные биты
+#: сохраняются, но поведение не меняют — контейнер будущей версии читается.
+TFLAG_KV_CACHE = 0x0001
+
+#: offset KV-кэша в контейнере с флагом VFLAG_KV_OUT_OF_FILE: payload'а нет,
+#: поэтому поле — не адрес («смещения нет», как NO_OFFSET у scale_offset).
+#: Старый загрузчик видит здесь невыровненное смещение и отказывает, не читая
+#: данные (задача 0118).
+KV_NO_OFFSET = 0xFFFFFFFF
+
+#: Кэп на суммарный размер KV-кэшей при загрузке (в C — VTM_MAX_KV_BYTES).
+#: 1.5B-раскладка (ctx 2048, kv_dim 256, 28 слоёв) — 112 МиБ, запас ×4,5
+#: (ctx 8192); 192-байтный файл не должен просить 4 ГиБ. Значения в двух
+#: загрузчиках обязаны совпадать: tools/vtm_ref.py — эталон для C.
+MAX_KV_BYTES = 512 << 20
+
 #: Флаги контейнера (заголовок).
 VFLAG_F32_SCALES = 0x0001  # масштабы тритов по умолчанию float32
 VFLAG_CAUSAL = 0x0002      # модель причинная (LM)
-VFLAG_KNOWN = VFLAG_F32_SCALES | VFLAG_CAUSAL
+#: KV-кэши (если есть) лежат вне файла: у их записей offset == KV_NO_OFFSET.
+#: Контейнер с этим флагом обязан нести хотя бы один KV-кэш; старые
+#: контейнеры присылают 0 и читаются прежним путём (задача 0118).
+VFLAG_KV_OUT_OF_FILE = 0x0004
+
+#: Стратегии SAMP (imm инструкции, задача 0051; см. docs/vtm.md).
+SAMP_ARGMAX = 0
+SAMP_TEMPERATURE = 1
+SAMP_TOPK = 2
+SAMP_TOPP = 3
+VFLAG_KNOWN = VFLAG_F32_SCALES | VFLAG_CAUSAL | VFLAG_KV_OUT_OF_FILE
+
+#: Предел int в C: позиция KVW/ATTN и context_window за него не выходят.
+INT_MAX = 2_147_483_647
+
+#: Контроль целостности (задача 0066). Блок лежит в мете под этим ключом:
+#: {"algo": "sha256", "data_sha256": "<hex>", "meta_sha256": "<hex>"}.
+#: data_sha256 — хеш секции данных; meta_sha256 — хеш JSON меты, в котором
+#: значение meta_sha256 заменено 64 символами '0' (иначе хеш невычислим).
+INTEGRITY_KEY = "integrity"
+INTEGRITY_ALGO = "sha256"
+INTEGRITY_DATA_FIELD = "data_sha256"
+INTEGRITY_META_FIELD = "meta_sha256"
+INTEGRITY_SKIP_ENV = "VTM_SKIP_HASH"
+#: Включить запись хеша в контейнер, не меняя вызовы write_vtm: полезно
+#: компилятору (tools/vtm_compile.py), который зовёт write_vtm без флага.
+INTEGRITY_WRITE_ENV = "VTM_WRITE_HASH"
 
 #: Флаги инструкции — локальны для opcode (как в C).
 IFLAG_CAUSAL = 0x01            # SM, ATTN
@@ -285,14 +367,14 @@ OP_NAMES = {int(op): op.name for op in Op}
 
 _HEADER_STRUCT = struct.Struct("<4sHHIII")
 _RESERVED_STRUCT = struct.Struct("<III")
-_TENSOR_STRUCT = struct.Struct("<24sBB4HIIH")
+_TENSOR_STRUCT = struct.Struct("<24sBB4IIIH")
 _INSTR_STRUCT = struct.Struct("<BBHHHH2xi")
 _TRT1_STRUCT = struct.Struct("<4sBBQI")
 
 if _HEADER_STRUCT.size + _RESERVED_STRUCT.size != HEADER_SIZE:  # pragma: no cover
     raise RuntimeError("заголовок VTM должен быть 32 байта")
 if _TENSOR_STRUCT.size != TENSOR_ENTRY_SIZE:  # pragma: no cover
-    raise RuntimeError("запись таблицы тензоров должна быть 44 байта")
+    raise RuntimeError("запись таблицы тензоров должна быть 52 байта")
 if _INSTR_STRUCT.size != INSTR_SIZE:  # pragma: no cover
     raise RuntimeError("инструкция VTM должна быть 16 байт")
 if _TRT1_STRUCT.size != TRT1_HEADER_SIZE:  # pragma: no cover
@@ -380,6 +462,10 @@ class Tensor:
     `data is None` / `trits is None` означает «тензор без полезной нагрузки»
     (каркас графа без весов): такой тензор нельзя записать в файл, но можно
     оценить по размеру.
+
+    Исключение — `flags & TFLAG_KV_CACHE` (K/V-кэш внимания, задача 0101):
+    данных у него нет и в файл они не пишутся, но это не каркас, а полноценный
+    тензор — читатель сам создаёт буфер нужного размера по `dims`.
     """
 
     name: str
@@ -392,6 +478,8 @@ class Tensor:
     block_size: int = SCALE_BLOCK
     offset: int = 0
     scale_offset: int = 0
+    #: Флаги записи таблицы (поле 50 в файле), см. TFLAG_KV_CACHE.
+    flags: int = 0
 
     def __post_init__(self) -> None:
         self.dims = tuple(int(d) for d in self.dims)
@@ -399,6 +487,11 @@ class Tensor:
             raise ValueError(f"тензор {self.name!r}: ndim={len(self.dims)}, допустимо 1..{MAX_DIMS}")
         if any(d <= 0 for d in self.dims):
             raise ValueError(f"тензор {self.name!r}: размеры должны быть > 0, получено {self.dims}")
+        if any(d > MAX_DIM_VALUE for d in self.dims):
+            raise ValueError(
+                f"тензор {self.name!r}: размер {max(self.dims)} не влезает в u32 "
+                f"(максимум {MAX_DIM_VALUE})"
+            )
         name_bytes = self.name.encode("utf-8") if isinstance(self.name, str) else b""
         if not self.name or b"\0" in name_bytes:
             raise ValueError(f"тензор {self.name!r}: имя пустое или содержит NUL")
@@ -410,6 +503,24 @@ class Tensor:
             raise ValueError(f"тензор {self.name!r}: неизвестный kind={self.kind}")
         if self.scale_dtype not in ("float32", "float16"):
             raise ValueError(f"тензор {self.name!r}: scale_dtype={self.scale_dtype!r}")
+        if not 0 <= int(self.flags) <= 0xFFFF:
+            raise ValueError(
+                f"тензор {self.name!r}: flags={self.flags}, а поле таблицы — u16"
+            )
+        if self.flags & TFLAG_KV_CACHE:
+            # Кэш существует только в таблице: содержимое не пишется и не
+            # читается (его создаёт исполнитель), поэтому данные запрещены —
+            # иначе легко решить, что они попадут в файл.
+            if self.kind == KIND_TRITS:
+                raise ValueError(
+                    f"тензор {self.name!r}: KV-кэш обязан быть fp-тензором (kind {self.kind})"
+                )
+            if self.data is not None or self.trits is not None or self.scales is not None:
+                raise ValueError(
+                    f"тензор {self.name!r}: у KV-кэша нет данных — буфер создаёт "
+                    "читатель (Tensor.kv_cache())"
+                )
+            return
         if self.kind == KIND_TRITS:
             if self.block_size != SCALE_BLOCK:
                 raise ValueError(
@@ -456,6 +567,21 @@ class Tensor:
     @property
     def kind_name(self) -> str:
         return KIND_NAMES[self.kind]
+
+    @property
+    def is_kv_cache(self) -> bool:
+        """1 — K/V-кэш: payload'а в файле нет, буфер создаёт читатель."""
+        return bool(getattr(self, "flags", 0) & TFLAG_KV_CACHE)
+
+    @classmethod
+    def kv_cache(cls, name: str, dims: Sequence[int]) -> "Tensor":
+        """K/V-кэш внимания `(ctx, kv_dim)`: в контейнере только запись таблицы.
+
+        Содержимое не пишется: кэш пуст на старте, его заполняет KVW. Загрузчик
+        (C — арена, Python — список нулей) создаёт буфер по `dims`, поэтому
+        тензор занимает `ctx × kv_dim × 4` байт только в памяти.
+        """
+        return cls(name=name, kind=KIND_F32, dims=tuple(dims), flags=TFLAG_KV_CACHE)
 
     @classmethod
     def f32(cls, name: str, dims: Sequence[int], values: Iterable[float]) -> "Tensor":
@@ -599,7 +725,13 @@ class Instr:
 
 
 def tensor_payload_size(tensor: Tensor) -> int:
-    """Размер payload'а тензора в байтах (без выравнивания)."""
+    """Размер payload'а тензора в байтах (без выравнивания).
+
+    У KV-кэша payload'а нет (TFLAG_KV_CACHE) — 0 байт: место под кэш
+    выделяется при загрузке, а не хранится в файле (задача 0101).
+    """
+    if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+        return 0
     if tensor.kind == KIND_TRITS:
         n_values = tensor.n_elements
         scale_bytes = 4 if tensor.scale_dtype == "float32" else 2
@@ -682,6 +814,9 @@ def decode_trit_segment(data: bytes) -> tuple[list[int], list[float], str]:
 
 def encode_tensor_payload(tensor: Tensor) -> bytes:
     """Payload тензора в том виде, в каком он лежит в секции данных."""
+    if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+        # KV-кэш в файл не пишется: тензор живёт только в таблице.
+        return b""
     if tensor.kind == KIND_TRITS:
         return encode_trit_segment(tensor)
     if tensor.data is None:
@@ -850,18 +985,160 @@ def _validate_names(tensors: Sequence[Tensor]) -> None:
             raise ValueError(f"повторяющееся имя тензора: {tensor.name!r}")
         seen.add(tensor.name)
 
+# ---------------------------------------------------------------------------
+# Контроль целостности (задача 0066)
+# ---------------------------------------------------------------------------
+
+
+def _is_sha256_hex(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(ch in "0123456789abcdef" for ch in value)
+    )
+
+
+def _integrity_requested(explicit: bool | None) -> bool:
+    """Записывать ли хеш: явный параметр, иначе VTM_WRITE_HASH=1."""
+    if explicit is not None:
+        return bool(explicit)
+    value = os.environ.get(INTEGRITY_WRITE_ENV, "")
+    return value not in ("", "0")
+
+
+def _json_string_value_offset(blob: bytes, name: str) -> int | None:
+    """Смещение значения "name": "<64 hex>" в сыром JSON или None.
+
+    Тот же поиск, что и в C-загрузчике: сырые байты, без разбора JSON, чтобы
+    испорченная мета не «теряла» блок целостности.
+    """
+    key = b'"' + name.encode("ascii") + b'"'
+    start = blob.find(key)
+    while start != -1:
+        i = start + len(key)
+        while i < len(blob) and blob[i:i + 1] in b" \t\r\n":
+            i += 1
+        if blob[i:i + 1] != b":":
+            start = blob.find(key, start + 1)
+            continue
+        i += 1
+        while i < len(blob) and blob[i:i + 1] in b" \t\r\n":
+            i += 1
+        if blob[i:i + 1] != b'"':
+            start = blob.find(key, start + 1)
+            continue
+        i += 1
+        value = blob[i:i + 64]
+        if len(value) == 64 and all(ch in b"0123456789abcdef" for ch in value):
+            if blob[i + 64:i + 65] == b'"':
+                return i
+        start = blob.find(key, start + 1)
+    return None
+
+
+def _json_object_key_present(blob: bytes, name: str) -> bool:
+    """Есть ли в сыром JSON ключ "name", значение которого — объект."""
+    key = b'"' + name.encode("ascii") + b'"'
+    start = blob.find(key)
+    while start != -1:
+        i = start + len(key)
+        while i < len(blob) and blob[i:i + 1] in b" \t\r\n":
+            i += 1
+        if blob[i:i + 1] == b":":
+            i += 1
+            while i < len(blob) and blob[i:i + 1] in b" \t\r\n":
+                i += 1
+            if blob[i:i + 1] == b"{":
+                return True
+        start = blob.find(key, start + 1)
+    return False
+
+
+def _hash_meta(meta_bytes: bytes, meta_value_offset: int) -> str:
+    """sha256(мета), где значение meta_sha256 заменено 64 символами '0'."""
+    zeroed = (
+        meta_bytes[:meta_value_offset]
+        + b"0" * 64
+        + meta_bytes[meta_value_offset + 64:]
+    )
+    return hashlib.sha256(zeroed).hexdigest()
+
+
+def _verify_integrity(meta_bytes: bytes, data: bytes) -> None:
+    """Сверить сырые поля integrity. Блока нет — старый контейнер.
+
+    Работаем по сырым байтам, а не по разобранному JSON: испорченная мета
+    может перестать парситься, но подмена обязана дать ошибку integrity,
+    а не «битый JSON».
+    """
+    data_pos = _json_string_value_offset(meta_bytes, INTEGRITY_DATA_FIELD)
+    meta_pos = _json_string_value_offset(meta_bytes, INTEGRITY_META_FIELD)
+    if data_pos is None and meta_pos is None:
+        if _json_object_key_present(meta_bytes, INTEGRITY_KEY):
+            raise ValueError(
+                "integrity: блок в мете есть, но data_sha256/meta_sha256 "
+                "в нём отсутствуют (блок повреждён)"
+            )
+        return
+    if data_pos is None or meta_pos is None:
+        raise ValueError(
+            "integrity: в мете нет пары data_sha256/meta_sha256 "
+            "(блок повреждён)"
+        )
+    expected_data = meta_bytes[data_pos:data_pos + 64].decode("ascii")
+    expected_meta = meta_bytes[meta_pos:meta_pos + 64].decode("ascii")
+
+    if os.environ.get(INTEGRITY_SKIP_ENV, "") not in ("", "0"):
+        print(
+            f"VTM: {INTEGRITY_SKIP_ENV}=1 — проверка sha256 контейнера "
+            "пропущена (данные не сверены)",
+            file=sys.stderr,
+        )
+        return
+
+    actual_data = hashlib.sha256(data).hexdigest()
+    if actual_data != expected_data:
+        raise ValueError(
+            "integrity: sha256 секции данных не совпал: "
+            f"в файле {actual_data[:16]}…, в мете {expected_data[:16]}…; "
+            f"контейнер повреждён ({INTEGRITY_SKIP_ENV}=1 — пропустить)"
+        )
+    actual_meta = _hash_meta(meta_bytes, meta_pos)
+    if actual_meta != expected_meta:
+        raise ValueError(
+            "integrity: sha256 метаданных не совпал: "
+            f"в файле {actual_meta[:16]}…, в мете {expected_meta[:16]}…; "
+            f"контейнер повреждён ({INTEGRITY_SKIP_ENV}=1 — пропустить)"
+        )
+
 
 def write_vtm(
     path: str | os.PathLike[str],
     tensors: Sequence[Tensor | dict[str, Any]],
     program: Sequence[Instr | tuple[Any, ...] | dict[str, Any]],
     meta: dict[str, Any] | None = None,
+    *,
+    integrity: bool | None = None,
 ) -> VTM:
     """Собрать контейнер `.vtm` строго по спеке и записать на диск.
 
     Возвращает собранный `VTM` (с проставленными offset'ами) — его можно
     сразу передать в `execute`. Порядок `tensors` = порядок таблицы, индексы
     в `program` ссылаются на него.
+
+    `integrity=True` кладёт в мету `meta["integrity"]` с sha256 секции данных
+    и самой меты (задача 0066). По умолчанию это делает `VTM_WRITE_HASH=1`,
+    чтобы компилятор мог включить защиту, не меняя вызов; без этой опции
+    файл без KV-кэшей пишется байт-в-байт как раньше (старые тесты и
+    контейнеры не ломаются). Загрузчик проверяет блок всегда, когда он есть;
+    `VTM_SKIP_HASH=1` отключает сверку.
+
+    Контейнер с KV-кэшами (TFLAG_KV_CACHE) получает флаг заголовка
+    `VFLAG_KV_OUT_OF_FILE` и offset `KV_NO_OFFSET` у кэшей (задача 0118):
+    старый загрузчик до 0101 видит невыровненный offset и отказывает, а не
+    читает мусор. Суммарный размер кэшей проверяется по `MAX_KV_BYTES` —
+    ровно так же, как это сделает загрузчик, чтобы не записать нечитаемый
+    файл.
     """
     tensor_list = [_as_tensor(item) for item in tensors]
     program_list = [_as_instr(item) for item in program]
@@ -871,36 +1148,81 @@ def write_vtm(
     if len(tensor_list) > MAX_TENSORS:
         raise ValueError(f"тензоров {len(tensor_list)}, максимум {MAX_TENSORS}")
 
+    kv_caches = [t for t in tensor_list if getattr(t, "flags", 0) & TFLAG_KV_CACHE]
+    kv_bytes = sum(t.n_elements * 4 for t in kv_caches)
+    if kv_bytes > MAX_KV_BYTES:
+        raise ValueError(
+            f"KV-кэши: суммарный размер {kv_bytes} байт больше предела "
+            f"{MAX_KV_BYTES} (MAX_KV_BYTES); уменьшите ctx или kv_dim"
+        )
+
     payloads = [encode_tensor_payload(tensor) for tensor in tensor_list]
+    write_integrity = _integrity_requested(integrity)
 
     n_tensors = len(tensor_list)
     table_end = HEADER_SIZE + TENSOR_ENTRY_SIZE * n_tensors
     data_start = align_up(table_end)
 
+    digest = hashlib.sha256() if write_integrity else None
+    has_kv = bool(kv_caches)
     data_size = 0
     for tensor, payload in zip(tensor_list, payloads):
+        if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+            # KV-кэш места в секции данных не занимает: payload'а нет, размер
+            # известен из dims. У контейнера нового вида offset — маркер
+            # KV_NO_OFFSET (не адрес): старый загрузчик до 0101 проверяет
+            # выравнивание offset и отказывает, не читая данные. Без флага
+            # (0101 и старше) сохраняем прежний offset=0 — совместимость.
+            tensor.offset = KV_NO_OFFSET if has_kv else 0
+            tensor.scale_offset = 0
+            continue
         tensor.offset = data_size
         tensor.scale_offset = NO_OFFSET if tensor.kind == KIND_TRITS else 0
         if tensor.offset % ALIGNMENT:
             raise RuntimeError(  # pragma: no cover - защита от ошибки в align_up
                 f"тензор {tensor.name!r}: offset не выровнен"
             )
-        data_size = align_up(data_size + len(payload))
+        start = data_size
+        data_size = align_up(start + len(payload))
+        if digest is not None:
+            # Секция данных целиком, включая выравнивающие нули: ровно эти
+            # байты C-загрузчик хеширует от data_start до meta_offset.
+            digest.update(payload)
+            digest.update(b"\x00" * (data_size - start - len(payload)))
+
+    if digest is not None:
+        block = {
+            "algo": INTEGRITY_ALGO,
+            "data_sha256": digest.hexdigest(),
+            # Плейсхолдер: сериализация с ним и есть вход для meta_sha256
+            # (в C/Python при проверке значение заменяется нулями).
+            INTEGRITY_META_FIELD: "0" * 64,
+        }
+        meta_dict.pop(INTEGRITY_KEY, None)
+        meta_dict[INTEGRITY_KEY] = block
 
     meta_bytes = _encode_meta(meta_dict) if meta_dict else b""
+    if digest is not None:
+        block[INTEGRITY_META_FIELD] = hashlib.sha256(meta_bytes).hexdigest()
+        meta_bytes = _encode_meta(meta_dict)
     meta_offset = data_start + data_size if meta_bytes else 0
     program_offset = data_start + data_size + align_up(len(meta_bytes))
     program_bytes = b"".join(instr.pack() for instr in program_list)
     file_size = program_offset + len(program_bytes)
     if file_size >= 2 ** 32:
         raise ValueError(
-            f"VTM v0.1 адресует файл 32-битными смещениями: {file_size} байт "
-            "не влезает, нужен формат v0.2 (u64)"
+            f"VTM адресует файл 32-битными смещениями: {file_size} байт "
+            "не влезает в контейнер"
         )
 
     flags = VFLAG_CAUSAL
     if all(t.kind != KIND_TRITS or t.scale_dtype == "float32" for t in tensor_list):
         flags |= VFLAG_F32_SCALES
+    if has_kv:
+        # Новый вид контейнера (0118): KV-кэши вне файла, их offset —
+        # KV_NO_OFFSET. Бита 0x0004 старый загрузчик не знает и игнорирует,
+        # отказ даёт offset (см. write_vtm).
+        flags |= VFLAG_KV_OUT_OF_FILE
 
     header = _HEADER_STRUCT.pack(
         VTM_MAGIC, VTM_VERSION, flags, len(program_list), n_tensors, len(program_bytes)
@@ -912,7 +1234,8 @@ def write_vtm(
         dims = list(tensor.dims) + [0] * (MAX_DIMS - len(tensor.dims))
         table += _TENSOR_STRUCT.pack(
             name_bytes, tensor.kind, len(tensor.dims), *dims,
-            tensor.offset, tensor.scale_offset, 0,
+            tensor.offset, tensor.scale_offset,
+            int(getattr(tensor, "flags", 0)),
         )
 
     with open(path, "wb") as handle:
@@ -947,9 +1270,16 @@ def write_vtm(
 
 
 def _payload_extent(
-    data: bytes, start: int, kind: int, n_elements: int
+    data: bytes, start: int, kind: int, n_elements: int, flags: int = 0
 ) -> tuple[int, str | None]:
-    """Размер payload'а по заголовку TRT1 (для тритов) или по kind/dims."""
+    """Размер payload'а по заголовку TRT1 (для тритов) или по kind/dims.
+
+    У KV-кэша (flags & TFLAG_KV_CACHE) payload'а нет: 0 байт, читать нечего.
+    """
+    if flags & TFLAG_KV_CACHE:
+        if kind == KIND_TRITS:
+            raise ValueError("KV-кэш обязан быть fp-тензором, а запись говорит kind=0")
+        return 0, None
     if kind == KIND_TRITS:
         if start + TRT1_HEADER_SIZE > len(data):
             raise ValueError("TRT1-сегмент выходит за конец файла")
@@ -990,8 +1320,17 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     magic, version, flags, n_instr, n_tensors, n_program = _HEADER_STRUCT.unpack_from(data, 0)
     if magic != VTM_MAGIC:
         raise ValueError(f"чужой magic контейнера: {magic!r}")
+    if version == VTM_VERSION_V01:
+        raise ValueError(
+            "формат v0.1 не поддерживается: пересоберите контейнер в v0.2 "
+            "(dims u32, запись тензора 52 байта)"
+        )
     if version != VTM_VERSION:
         raise ValueError(f"неизвестная версия контейнера: {version}")
+    # Задача 0118: флаг «KV-кэши вне файла». Старые контейнеры его не ставят
+    # и читаются прежним путём; контейнер с флагом обязан нести KV-кэши, а их
+    # offset — маркер KV_NO_OFFSET, а не адрес.
+    kv_flag = bool(flags & VFLAG_KV_OUT_OF_FILE)
     if n_tensors > MAX_TENSORS:
         raise ValueError(f"n_tensors={n_tensors} больше предела {MAX_TENSORS}")
 
@@ -1041,9 +1380,11 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     # --- таблица тензоров ---------------------------------------------------
     tensors: list[Tensor] = []
     ranges: list[tuple[int, int, str]] = []
+    kv_bytes = 0
+    has_kv = False
     for index in range(n_tensors):
         entry_offset = HEADER_SIZE + TENSOR_ENTRY_SIZE * index
-        raw_name, kind, ndim, d0, d1, d2, d3, offset, scale_offset, _reserved = (
+        raw_name, kind, ndim, d0, d1, d2, d3, offset, scale_offset, tflags = (
             _TENSOR_STRUCT.unpack_from(data, entry_offset)
         )
         name_bytes = raw_name.split(b"\x00", 1)[0]
@@ -1060,11 +1401,54 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
         dims = tuple((d0, d1, d2, d3)[:ndim])
         if any(d == 0 for d in dims):
             raise ValueError(f"тензор {name!r}: нулевое измерение в {dims}")
+        if tflags & TFLAG_KV_CACHE:
+            # KV-кэш: payload'а в файле нет, offset — не адрес. В контейнере
+            # нового вида (флаг VFLAG_KV_OUT_OF_FILE) это маркер
+            # KV_NO_OFFSET; старый загрузчик до 0101 на нём отказывает, а не
+            # читает данные по offset=0 как мусор. Контейнеры без флага
+            # (0101 и старше) по-прежнему несут offset=0.
+            if kind == KIND_TRITS:
+                raise ValueError(f"тензор {name!r}: KV-кэш обязан быть fp-тензором")
+            if scale_offset != 0:
+                raise ValueError(
+                    f"тензор {name!r}: у KV-кэша scale_offset={scale_offset}, ожидался 0"
+                )
+            if kv_flag:
+                if offset != KV_NO_OFFSET:
+                    raise ValueError(
+                        f"тензор {name!r}: KV-кэш с флагом KV_OUT_OF_FILE, "
+                        f"offset={offset}, ожидался 0x{KV_NO_OFFSET:08X} "
+                        "(payload'а в файле нет)"
+                    )
+            elif offset != 0:
+                raise ValueError(
+                    f"тензор {name!r}: KV-кэш без флага KV_OUT_OF_FILE, "
+                    f"offset={offset}, ожидался 0"
+                )
+            kv_bytes += prod(dims) * 4
+            if kv_bytes > MAX_KV_BYTES:
+                raise ValueError(
+                    f"KV-кэши: суммарный размер {kv_bytes} байт больше предела "
+                    f"{MAX_KV_BYTES} (MAX_KV_BYTES); тензор {name!r} — "
+                    f"{prod(dims)} элементов"
+                )
+            has_kv = True
+            tensor = Tensor(
+                name=name, kind=kind, dims=dims, offset=offset,
+                scale_offset=0, flags=tflags,
+            )
+            tensors.append(tensor)
+            continue
         if offset % ALIGNMENT:
             raise ValueError(f"тензор {name!r}: offset={offset} не выровнен на {ALIGNMENT}")
 
-        tensor = Tensor(name=name, kind=kind, dims=dims, offset=offset, scale_offset=scale_offset)
-        size, scale_dtype = _payload_extent(data, data_start + offset, kind, tensor.n_elements)
+        tensor = Tensor(
+            name=name, kind=kind, dims=dims, offset=offset,
+            scale_offset=scale_offset, flags=tflags,
+        )
+        size, scale_dtype = _payload_extent(
+            data, data_start + offset, kind, tensor.n_elements, tflags
+        )
         start = data_start + offset
         end = start + size
         if end > meta_end:
@@ -1085,6 +1469,14 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
         decode_tensor_values(tensor, data[start:end])
         ranges.append((start, end, name))
         tensors.append(tensor)
+
+    # Флаг обещает новый вид контейнера: в нём обязан быть хотя бы один
+    # KV-кэш. Обратное не требуется — старые контейнеры с кэшами внутри и
+    # 0101-контейнеры без флага читаются по-прежнему (задача 0118).
+    if kv_flag and not has_kv:
+        raise ValueError(
+            "флаг KV_OUT_OF_FILE поднят, но в таблице нет KV-кэшей"
+        )
 
     ranges.sort()
     for (prev_start, prev_end, prev_name), (next_start, _next_end, next_name) in zip(
@@ -1120,6 +1512,13 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     # --- метаданные ---------------------------------------------------------
     meta: dict[str, Any] = {}
     if meta_len:
+        # Контроль целостности (задача 0066): блок есть — сверяем всегда,
+        # кроме VTM_SKIP_HASH=1. Старые контейнеры без блока читаются как
+        # раньше.
+        _verify_integrity(
+            data[meta_offset:meta_offset + meta_len],
+            data[data_start:meta_offset],
+        )
         try:
             decoded_meta = json.loads(data[meta_offset:meta_offset + meta_len].decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1350,22 +1749,247 @@ def _argmax(values: Sequence[float]) -> int:
     return best
 
 
-def _sample_with_temperature(
-    logits: Sequence[float], temperature: float, seed: int
-) -> int:
-    if temperature <= 0:
-        return _argmax(logits)
-    rng = random.Random(int(seed))
-    peak = max(logits)
-    weights = [math.exp((value - peak) / temperature) for value in logits]
-    total = sum(weights)
-    threshold = rng.random() * total
-    cumulative = 0.0
-    for index, weight in enumerate(weights):
-        cumulative += weight
-        if cumulative >= threshold:
-            return index
-    return len(weights) - 1
+# --- SAMP: стратегии, параметры из меты и ГПСЧ -----------------------------
+#
+# Паритет с C (docs/vtm.md, «Сэмплинг»): imm — номер стратегии 0..3,
+# параметры — из меты, один сэмпл без перехода в argmax потребляет ровно одно
+# число xorshift64*. Всё считается в float (Python) над теми же значениями,
+# что C читает как f32, поэтому последовательности совпадают побитово.
+
+_SAMP_MASK64 = (1 << 64) - 1
+_SAMP_MAX_WINDOW = 256
+_SAMP_DEFAULTS = {
+    "temperature": 1.0,
+    "top_k": 0,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "repetition_window": 64,
+    "sample_seed": 0,
+    "has_seed": False,
+}
+
+
+def _samp_mix64(value: int) -> int:
+    """splitmix64 — только для засева xorshift64* (как в C)."""
+    value = (value + 0x9E3779B97F4A7C15) & _SAMP_MASK64
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _SAMP_MASK64
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _SAMP_MASK64
+    return value ^ (value >> 31)
+
+
+def _meta_number(meta: dict, key: str) -> float | None:
+    """Первое числовое значение ключа на минимальной глубине — как C-сканер.
+
+    C ищет ключ по тексту JSON на любом уровне вложенности и при нескольких
+    вхождениях берёт самое внешнее; здесь тот же порядок обхода. Числа из
+    `bool` не считаются числом (в C `true`/`false` не разбирает `strtod`).
+    """
+    found: list[tuple[int, float]] = []
+
+    def walk(value: object, depth: int) -> None:
+        if isinstance(value, dict):
+            for name, child in value.items():
+                if (
+                    name == key
+                    and isinstance(child, (int, float))
+                    and not isinstance(child, bool)
+                ):
+                    found.append((depth, float(child)))
+                walk(child, depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, depth + 1)
+
+    walk(meta, 0)
+    if not found:
+        return None
+    return min(found, key=lambda pair: pair[0])[1]
+
+
+#: Прежнее имя помощника: так его звал разбор SAMP (задача 0051).
+_samp_meta_number = _meta_number
+
+
+def _context_window(meta: dict) -> int:
+    """`meta["context_window"]` -> длина кольца или 0, если ключа нет/он битый.
+
+    Ровно как `kv_window()` в `src/vtm/interp.c`: берётся конечное число в
+    диапазоне `[1, INT_MAX]` и усекается к int; всё остальное (NaN, `0`,
+    отрицательное, строка, bool, слишком большое) — «ключа нет», окно равно
+    длине KV-кэша.
+    """
+    value = _meta_number(meta, "context_window")
+    if value is None or not math.isfinite(value):
+        return 0
+    if value < 1.0 or value > float(INT_MAX):
+        return 0
+    return int(value)
+
+
+def _samp_params(meta: dict) -> dict:
+    """Разбор и кламп параметров SAMP — ровно как samp_params_from_meta()."""
+    params = dict(_SAMP_DEFAULTS)
+    number = _meta_number
+
+    value = number(meta, "temperature")
+    if value is not None:
+        if math.isnan(value) or value < 0.0:
+            params["temperature"] = 0.0
+        elif value > 1e6:
+            params["temperature"] = 1e6
+        else:
+            params["temperature"] = value
+    value = number(meta, "top_k")
+    if value is not None:
+        if value <= 0.0:
+            params["top_k"] = 0
+        elif value > 1e9:
+            params["top_k"] = 1_000_000_000
+        else:
+            params["top_k"] = int(value)
+    value = number(meta, "top_p")
+    if value is not None:
+        if math.isnan(value):
+            params["top_p"] = _SAMP_DEFAULTS["top_p"]
+        elif value <= 0.0:
+            params["top_p"] = 0.0
+        elif value >= 1.0:
+            params["top_p"] = 1.0
+        else:
+            params["top_p"] = value
+    value = number(meta, "repetition_penalty")
+    if value is not None:
+        if math.isnan(value) or value <= 0.0:
+            params["repetition_penalty"] = _SAMP_DEFAULTS["repetition_penalty"]
+        elif value > 1e6:
+            params["repetition_penalty"] = 1e6
+        else:
+            params["repetition_penalty"] = value
+    value = number(meta, "repetition_window")
+    if value is not None:
+        if value <= 0.0:
+            params["repetition_window"] = 0
+        elif value > _SAMP_MAX_WINDOW:
+            params["repetition_window"] = _SAMP_MAX_WINDOW
+        else:
+            params["repetition_window"] = int(value)
+    value = number(meta, "sample_seed")
+    if (
+        value is not None
+        and math.isfinite(value)
+        and 0.0 <= value < 9007199254740992.0
+    ):
+        params["sample_seed"] = int(value)
+        params["has_seed"] = True
+    return params
+
+
+class _Sampler:
+    """Состояние SAMP машины: параметры, ГПСЧ и окно последних токенов."""
+
+    def __init__(self, meta: dict) -> None:
+        self.params = _samp_params(meta)
+        self.history: list[int] = []
+        seed = self.params["sample_seed"] ^ 0x9E3779B97F4A7C15
+        self.rng = _samp_mix64(seed)
+        if self.rng == 0:
+            self.rng = 0x2545F4914F6CDD1D
+
+    def _next(self) -> int:
+        value = self.rng
+        value ^= (value << 13) & _SAMP_MASK64
+        value ^= value >> 7
+        value ^= (value << 17) & _SAMP_MASK64
+        value &= _SAMP_MASK64
+        self.rng = value
+        return (value * 0x2545F4914F6CDD1D) & _SAMP_MASK64
+
+    def _uniform(self) -> float:
+        return (self._next() >> 11) * (1.0 / 9007199254740992.0)
+
+    def _penalty_active(self) -> bool:
+        params = self.params
+        return (
+            params["repetition_penalty"] != 1.0
+            and params["repetition_window"] > 0
+            and bool(self.history)
+        )
+
+    def _penalized(self, token: int, value: float) -> float:
+        if not self._penalty_active():
+            return value
+        window = self.history[-self.params["repetition_window"]:]
+        if token not in window:
+            return value
+        penalty = self.params["repetition_penalty"]
+        return value / penalty if value > 0.0 else value * penalty
+
+    def _greedy(self, logits: Sequence[float]) -> int:
+        best = 0
+        best_value = self._penalized(0, logits[0])
+        for index in range(1, len(logits)):
+            value = self._penalized(index, logits[index])
+            if value > best_value:
+                best = index
+                best_value = value
+        return best
+
+    def choose(self, logits: Sequence[float], strategy: int) -> int:
+        params = self.params
+        temperature = params["temperature"]
+        greedy = (
+            strategy == 0
+            or (strategy == 1 and temperature <= 0.0)
+            or (strategy == 2 and (temperature <= 0.0 or params["top_k"] == 1))
+            or (strategy == 3 and (temperature <= 0.0 or params["top_p"] <= 0.0))
+        )
+        if greedy:
+            token = self._greedy(logits)
+        else:
+            token = self._sample(logits, strategy)
+        self.history.append(token)
+        del self.history[:-_SAMP_MAX_WINDOW]
+        return token
+
+    def _sample(self, logits: Sequence[float], strategy: int) -> int:
+        params = self.params
+        values = [
+            -math.inf if math.isnan(float(value)) else self._penalized(index, float(value))
+            for index, value in enumerate(logits)
+        ]
+        order = sorted(range(len(values)), key=lambda index: (-values[index], index))
+        kept = len(order)
+        top = values[order[0]]
+        if not math.isfinite(top):
+            return order[0]
+        if strategy == 2 and 0 < params["top_k"] < kept:
+            kept = params["top_k"]
+        weights = [
+            math.exp((values[order[index]] - top) / params["temperature"])
+            for index in range(kept)
+        ]
+        total = sum(weights)
+        if strategy == 3 and params["top_p"] < 1.0 and total > 0.0:
+            need = params["top_p"] * total
+            upto = 0.0
+            for index in range(len(weights)):
+                upto += weights[index]
+                if upto >= need:
+                    kept = index + 1
+                    break
+            weights = weights[:kept]
+            total = sum(weights)
+        if total > 0.0 and math.isfinite(total):
+            threshold = self._uniform() * total
+            cumulative = 0.0
+            for index in range(kept):
+                cumulative += weights[index]
+                if cumulative >= threshold:
+                    return order[index]
+            return order[kept - 1]
+        return order[0]
+
+
 
 
 class _Interpreter:
@@ -1378,7 +2002,10 @@ class _Interpreter:
         self.meta = vtm.meta
         self.theta = float(self.meta.get("rope_theta", 10000.0))
         self.rope_layout = str(self.meta.get("rope_layout", "half"))
-        self.sample_seed = int(self.meta.get("sample_seed", 0))
+        #: Длина кольца KV-окна: `min(ctx, meta["context_window"])`, как в C.
+        #: 0 — ключа нет (или он битый), окно равно длине кэша.
+        self.context_window = _context_window(self.meta)
+        self.sampler = _Sampler(self.meta)
         #: индексы тензоров-кэшей KV: они не сбрасываются между проходами
         #: KVW пишет в dst (K-кэш) и b (V-кэш): их не сбрасываем между проходами.
         self.cache_indices = {
@@ -1388,6 +2015,16 @@ class _Interpreter:
             for index in (int(instr.dst), int(instr.b))
         }
         self.workspace: dict[int, list[float]] = {}
+        # KV-кэш из контейнера нового формата (TFLAG_KV_CACHE) данных не
+        # имеет: буфер создаётся здесь, нулями — ровно как кэш из старого
+        # контейнера, где в файле лежали нули. Так оба формата дают одно
+        # поведение (ATTN до первого KVW видит нули, а не «нет данных»).
+        # Берём все помеченные тензоры, а не только dst/b KVW: в C такой
+        # тензор тоже существует и читается как нули, даже если программа до
+        # него не пишет.
+        for index, tensor in enumerate(self.tensors):
+            if tensor.is_kv_cache:
+                self.workspace[index] = [0.0] * tensor.n_elements
 
     # -- доступ к значениям --------------------------------------------------
 
@@ -1422,6 +2059,12 @@ class _Interpreter:
             self.workspace[index] = [0.0] * self.tensors[index].n_elements
         return self.workspace[index]
 
+    def _window(self, ctx: int) -> int:
+        """Эффективное окно кольца: `min(ctx, context_window)` (C: kv_window)."""
+        if 0 < self.context_window < ctx:
+            return self.context_window
+        return ctx
+
     # -- проход --------------------------------------------------------------
 
     def begin_step(self) -> None:
@@ -1429,7 +2072,7 @@ class _Interpreter:
         self.workspace = {
             index: values
             for index, values in self.workspace.items()
-            if index in self.cache_indices
+            if index in self.cache_indices or self.tensors[index].is_kv_cache
         }
 
     def run_step(self, state: _State) -> None:
@@ -1550,8 +2193,8 @@ class _Interpreter:
                     f"{v_cache_tensor.dims}"
                 )
             pos = state.pos + int(instr.imm)
-            if not 0 <= pos < ctx:
-                raise ValueError(f"KVW: позиция {pos} вне кэша длины {ctx}")
+            if pos < 0 or pos > INT_MAX:
+                raise ValueError(f"KVW: позиция {pos} вне диапазона")
             k = self._read(int(instr.a))
             v = self._read(int(instr.c))
             if len(k) != kv_dim or len(v) != kv_dim:
@@ -1560,7 +2203,11 @@ class _Interpreter:
                 )
             k_cache = self._ensure_cache(int(instr.dst))
             v_cache = self._ensure_cache(int(instr.b))
-            base = pos * kv_dim
+            # Кольцо (задача 0076): токен глобальной позиции p живёт в слоте
+            # p % win, win = min(ctx, context_window). Позиция >= ctx — не
+            # ошибка: она затирает самый старый слот (C: op_kvw).
+            win = self._window(ctx)
+            base = (pos % win) * kv_dim
             k_cache[base:base + kv_dim] = [_f32(value) for value in k]
             v_cache[base:base + kv_dim] = [_f32(value) for value in v]
         elif op == Op.ATTN:
@@ -1593,16 +2240,18 @@ class _Interpreter:
                 )
             group = n_heads // n_kv_heads
             q_start = state.pos + int(instr.imm)
-            if q_start < 0:
-                raise ValueError(f"ATTN: q_start={q_start} отрицателен")
-            key_count = q_start + q_len
-            if key_count > ctx:
+            # Верхней границы «меньше ctx» больше нет: 2-D кэш стал кольцом
+            # (0076), длинный диалог законен. Осталась защита от битого imm —
+            # та же, что в C (`qs > INT_MAX - q_len`).
+            if q_start < 0 or q_start > INT_MAX - q_len:
                 raise ValueError(
-                    f"ATTN: ключей {key_count} больше длины кэша {ctx}"
+                    f"ATTN: q_start={q_start} вне диапазона (q_len={q_len})"
                 )
+            key_count = q_start + q_len
             k_cache = self.workspace.get(int(instr.b), [0.0] * (ctx * kv_dim))
             v_cache = self.workspace.get(int(instr.c), [0.0] * (ctx * kv_dim))
             causal = bool(instr.flags & IFLAG_CAUSAL)
+            win = self._window(ctx)
             scale = 1.0 / math.sqrt(head_dim)
             out = [0.0] * (n_heads * q_len * head_dim)
             for head in range(n_heads):
@@ -1610,51 +2259,59 @@ class _Interpreter:
                 for qi in range(q_len):
                     q_base = (head * q_len + qi) * head_dim
                     out_base = q_base
+                    # Видимые ключи запроса qi — [lo, hi] в глобальных
+                    # позициях. Кэш — кольцо: ATTN читает только последние
+                    # win ключей, слот глобальной позиции j — `j % win`
+                    # (хронологический обход, как в C), поэтому q_start >= ctx
+                    # не ошибка.
+                    hi = q_start + qi if causal else key_count - 1
+                    if hi > key_count - 1:
+                        hi = key_count - 1
+                    lo = hi - win + 1
+                    if lo < 0:
+                        lo = 0
+                    if hi < lo:
+                        continue
+                    scores: list[float] = []
                     peak = -math.inf
-                    scores = [None] * key_count
-                    for j in range(key_count):
-                        if causal and j > q_start + qi:
-                            continue
-                        base = j * kv_dim + kv_head * head_dim
+                    for j in range(lo, hi + 1):
+                        base = (j % win) * kv_dim + kv_head * head_dim
                         dot = 0.0
                         for d in range(head_dim):
                             dot += q[q_base + d] * k_cache[base + d]
                         value = dot * scale
-                        scores[j] = value
+                        scores.append(value)
                         if value > peak:
                             peak = value
                     if peak == -math.inf:
                         continue
-                    exps = [0.0] * key_count
+                    # Онлайн-softmax C копит p·V и делит на сумму в конце;
+                    # здесь тот же порядок, чтобы паритет не терял биты.
+                    acc = [0.0] * head_dim
                     total = 0.0
-                    for j, value in enumerate(scores):
-                        if value is None:
-                            continue
+                    for offset, value in enumerate(scores):
                         weight = math.exp(value - peak)
-                        exps[j] = weight
                         total += weight
+                        if weight == 0.0:
+                            continue
+                        base = ((lo + offset) % win) * kv_dim + kv_head * head_dim
+                        for d in range(head_dim):
+                            acc[d] += weight * v_cache[base + d]
                     if total <= 0.0 or not math.isfinite(total):
                         continue
                     for d in range(head_dim):
-                        acc = 0.0
-                        for j in range(key_count):
-                            if scores[j] is None:
-                                continue
-                            base = j * kv_dim + kv_head * head_dim
-                            acc += (exps[j] / total) * v_cache[base + d]
-                        out[out_base + d] = acc
+                        out[out_base + d] = acc[d] / total
             self._write(int(instr.dst), out)
         elif op == Op.SAMP:
             logits = self._read(int(instr.a))
             if not logits:
                 raise ValueError("SAMP: пустые логиты")
-            if instr.imm <= 0:
-                token = _argmax(logits)
-            else:
-                temperature = instr.imm / 1000.0
-                token = _sample_with_temperature(
-                    logits, temperature, self.sample_seed * 1_000_003 + state.pos
+            strategy = int(instr.imm)
+            if strategy < 0 or strategy > 3:
+                raise ValueError(
+                    f"SAMP: стратегия imm={strategy} не реализована (0..3)"
                 )
+            token = self.sampler.choose(logits, strategy)
             state.sampled = token
             state.logits = [float(value) for value in logits]
             self._write(int(instr.dst), [float(token)])
