@@ -450,7 +450,7 @@
   {
     "id": "0070",
     "title": "Волна 4: спецификация ВТМ к текущему состоянию",
-    "status": "in_progress",
+    "status": "done",
     "file": "0070-vtm-docs.md",
     "assignee": "agent:vtm-docs"
   },
