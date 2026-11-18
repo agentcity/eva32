@@ -165,6 +165,7 @@ def main() -> int:
         print(f"возобновление: уже готово {before - len(questions)}, осталось {len(questions)}")
 
     pairs, rejected = [], []
+    failed = 0  # вопросы, упавшие на сети/исключении
     tok_in = tok_out = 0
     cost_rub = 0.0
     workers = max(1, args.workers)
@@ -199,8 +200,21 @@ def main() -> int:
             },
         }
 
+    def safe_worker(item: dict) -> dict | None:
+        """Один сбой сети/DNS не должен убивать прогон на тысячи вопросов.
+
+        Учитель уже повторяет запросы, но при полном отказе DNS исключение вылетало
+        наружу и обрывало всю пачку (так потерялся прогон 25k сценарных пар на 17k).
+        """
+        try:
+            return worker(item)
+        except Exception as exc:  # noqa: BLE001 — причина попадает в отчёт
+            print(f"  пропуск вопроса ({type(exc).__name__}): {item['question'][:50]}",
+                  flush=True)
+            return None
+
     if workers == 1:
-        results_iter = map(worker, questions)
+        results_iter = filter(None, map(safe_worker, questions))
         for idx, result in enumerate(results_iter, 1):
             usage = result["usage"]
             tok_in += int(usage.get("prompt_tokens") or 0)
@@ -216,9 +230,12 @@ def main() -> int:
     else:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(worker, item) for item in questions]
+            futures = [pool.submit(safe_worker, item) for item in questions]
             for idx, fut in enumerate(as_completed(futures), 1):
                 result = fut.result()
+                if result is None:
+                    failed += 1
+                    continue
                 usage = result["usage"]
                 tok_in += int(usage.get("prompt_tokens") or 0)
                 tok_out += int(usage.get("completion_tokens") or 0)
@@ -252,6 +269,8 @@ def main() -> int:
     total = len(questions)
     print(f"вопросов: {total}")
     print(f"принято:  {len(pairs)}")
+    if failed:
+        print(f"пропущено (сеть/ошибка): {failed}")
     print(f"отброшено: {len(rejected)}  " + (", ".join(f"{k}={v}" for k, v in by_reason.items()) or ""))
     if tok_in or tok_out:
         print(f"токены: вход {tok_in}, выход {tok_out}")
