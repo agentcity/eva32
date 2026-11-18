@@ -359,7 +359,7 @@
   {
     "id": "0049",
     "title": "Бенчмарк гибрида: латентность и цена",
-    "status": "in_progress",
+    "status": "done",
     "file": "0049-eva-bench.md",
     "assignee": "agent:eva-bench"
   },
