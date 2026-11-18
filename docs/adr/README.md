@@ -14,6 +14,8 @@
 | [0010](0010-voice-pipeline.md) | Голос как транспорт: ASR → LLM → TTS | accepted |
 | [0011](0011-container-v02.md) | Контейнер `.vtm` v0.2: размерности u32 | accepted |
 | [0012](0012-trit-storage-vs-semantics.md) | Упаковка отделена от троичной семантики | accepted |
+| [0013](0013-3b-on-24gb.md) | 3B на 24 ГБ: bf16-мастер и условие контроля loss | accepted |
+| [0014](0014-pilot-data-domain.md) | Данные пилота: программирование на русском | accepted |
 
 ## Правила
 
