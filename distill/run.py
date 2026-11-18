@@ -46,6 +46,70 @@ def load_questions(path: str | None) -> list[dict]:
     return items
 
 
+def dedupe_file(path: str) -> None:
+    """Убрать дубли по вопросу, сохранив порядок; запись атомарная (ADR 0008)."""
+    seen: set[str] = set()
+    kept: list[str] = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            q = row.get("question")
+            if q in seen:
+                continue
+            seen.add(q)
+            kept.append(json.dumps(row, ensure_ascii=False))
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for line in kept:
+            fh.write(line + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    print(f"файл: {len(kept)} уникальных пар", flush=True)
+
+
+def _read_questions(path: str) -> tuple[set[str], int]:
+    """Прочитать готовые вопросы, отбросив оборванный хвост журнала.
+
+    Возвращает (множество вопросов, сколько строк пришлось отбросить).
+    """
+    done: set[str] = set()
+    bad = 0
+    with open(path, "rb") as fh:
+        for raw in fh:
+            try:
+                row = json.loads(raw.decode("utf-8"))
+                done.add(row["question"])
+            except (UnicodeDecodeError, json.JSONDecodeError, KeyError):
+                bad += 1
+    return done, bad
+
+
+def _truncate_to_last_good(path: str, bad_lines: int) -> None:
+    """Переписать файл, оставив только целые строки (хвост отбрасывается)."""
+    kept: list[bytes] = []
+    with open(path, "rb") as fh:
+        for raw in fh:
+            try:
+                json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            kept.append(raw if raw.endswith(b"\n") else raw + b"\n")
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.writelines(kept)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    print(f"журнал: {path} переписан ({len(kept)} строк, отброшено {bad_lines})", flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions", default=None, help="файл с вопросами (по одному в строке)")
@@ -89,12 +153,13 @@ def main() -> int:
         sink.flush()
 
     if args.resume and os.path.exists(args.out):
-        done = set()
-        with open(args.out, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    done.add(json.loads(line)["question"])
+        done, torn = _read_questions(args.out)
+        if torn:
+            # ADR 0008: журнал дописывания читается с обрезкой оборванного хвоста.
+            # Обрыв на середине строки (например, кончилось место) — не повод
+            # терять весь файл: отбрасываем хвост и продолжаем.
+            _truncate_to_last_good(args.out, torn)
+            print(f"журнал: отброшен оборванный хвост ({torn} строк)", flush=True)
         before = len(questions)
         questions = [q for q in questions if q["question"] not in done]
         print(f"возобновление: уже готово {before - len(questions)}, осталось {len(questions)}")
@@ -168,11 +233,16 @@ def main() -> int:
 
     if sink is not None:
         sink.close()
-    pairs = filters.dedupe(pairs)
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    with open(args.out, "w", encoding="utf-8") as fh:
-        for p in pairs:
-            fh.write(json.dumps(p, ensure_ascii=False) + "\n")
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    if args.incremental:
+        # Пары уже дописаны в файл (в том числе прошлыми запусками). Финальная
+        # запись из памяти стёрла бы их — дедуплицируем сам файл на месте.
+        dedupe_file(args.out)
+    else:
+        pairs = filters.dedupe(pairs)
+        with open(args.out, "w", encoding="utf-8") as fh:
+            for p in pairs:
+                fh.write(json.dumps(p, ensure_ascii=False) + "\n")
 
     by_reason: dict[str, int] = {}
     for r in rejected:
