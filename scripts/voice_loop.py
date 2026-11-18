@@ -17,11 +17,17 @@
   измерить и первый фрагмент синтеза, и реальный старт звука.
 * **Замеры.** ASR, маршрут, синтез TTS, первый фрагмент TTS, старт
   воспроизведения и итог до первого звука — в миллисекундах.
+* **Потоковая речь (по умолчанию).** Ответ режется на предложения; первое
+  синтезируется и сразу играет, остальные синтезируются параллельно, пока
+  звучит предыдущее. Задержка до первого звука считается по первому
+  предложению, а не по всему ответу. ``--no-stream`` возвращает старое
+  поведение (один WAV на весь ответ) — для сравнения.
 
 Примеры::
 
     python3 scripts/voice_loop.py --text "Сколько стоит тариф Старт"
     python3 scripts/voice_loop.py --text "Сколько стоит тариф Старт" --no-play
+    python3 scripts/voice_loop.py --text "Сколько стоит тариф Старт" --no-stream
     python3 scripts/voice_loop.py --text "..." --out /tmp/reply.wav
     python3 scripts/voice_loop.py --wav request.wav \
         --whisper-bin ./whisper.cpp/build/bin/whisper-cli \
@@ -42,7 +48,8 @@ import sys
 import tempfile
 import time
 import wave
-from dataclasses import asdict, dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -69,6 +76,14 @@ DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_TTS_TIMEOUT = 120.0
 DEFAULT_ASR_TIMEOUT = 180.0
 DEFAULT_PLAY_TIMEOUT = 180.0
+
+#: Сколько предложений синтезировать вперёд, пока звучит текущее. Два потока
+#: закрывают паузу, если первое предложение окажется совсем коротким.
+STREAM_WORKERS = 2
+
+#: Максимальная длина чанка, который уходит в один синтез. Длинное предложение
+#: без точек режется по пробелам/запятым, иначе потоковая речь теряет смысл.
+MAX_CHUNK_CHARS = 220
 
 #: say пишет WAV с выровненным 4-КиБ заголовком; всё, что больше, — аудиоданные.
 #: Порог нужен, чтобы «первый фрагмент» не оказывался моментом записи заголовка.
@@ -160,6 +175,39 @@ class PlayResult:
 
 
 @dataclass
+class ChunkTiming:
+    """Замеры одного чанка (предложения) в потоковой озвучке."""
+
+    index: int
+    text: str
+    chars: int
+    synth_ms: float | None = None
+    first_fragment_ms: float | None = None
+    synth_done_ms: float | None = None
+    wait_ms: float | None = None
+    play_start_ms: float | None = None
+    play_total_ms: float | None = None
+
+
+@dataclass
+class StreamResult:
+    """Итог потоковой озвучки: чанки, первый звук и суммарный синтез.
+
+    ``synth_total_ms`` — сумма синтеза всех чанков (работа, а не задержка):
+    чанк N+1 синтезируется, пока звучит чанк N. ``first_sound_ms`` — время от
+    начала потоковой озвучки до запуска afplay с первым предложением.
+    """
+
+    chunks: list[ChunkTiming]
+    parts: list[Path]
+    first_sound_ms: float | None
+    first_play_offset_ms: float | None
+    synth_total_ms: float
+    play_span_ms: float | None
+    wall_ms: float
+
+
+@dataclass
 class Timings:
     """Замеры этапов в миллисекундах."""
 
@@ -169,30 +217,52 @@ class Timings:
     tts_first_fragment_ms: float | None = None
     play_start_ms: float | None = None
     play_total_ms: float | None = None
+    stream: bool = False
+    chunks: int = 0
+    tts_total_synth_ms: float | None = None
+    chunk_stats: list[ChunkTiming] = field(default_factory=list)
 
     @property
     def first_sound_ms(self) -> float | None:
         """Время от старта конвейера до первого звука (файл уже синтезирован).
 
-        В текущем прототипе say сначала синтезирует весь ответ в WAV, поэтому
-        в путь до первого звука входит полный синтез. Для длинных ответов это
-        заметно; живой ``say`` без файла заговорил бы раньше (см.
-        ``live_estimate_ms``).
+        В непоточном режиме ``say`` сначала синтезирует весь ответ в WAV,
+        поэтому в путь до первого звука входит полный синтез. В потоковом
+        режиме ``tts_synth_ms`` — синтез только первого предложения, а
+        остальные синтезируются, пока звучит речь.
         """
         if self.play_start_ms is None or self.tts_synth_ms is None:
             return None
         return (self.asr_ms or 0.0) + self.route_ms + self.tts_synth_ms + self.play_start_ms
 
     @property
+    def first_sound_estimate_ms(self) -> float | None:
+        """Оценка до первого звука, когда воспроизведение отключено (``--no-play``).
+
+        В этой схеме afplay запускается, когда WAV уже синтезирован целиком,
+        поэтому оценка = ASR + маршрут + синтез того, что играем: всего ответа
+        в непоточном режиме и первого предложения в потоковом. Разница между
+        режимами — ровно выигрыш от потоковой речи.
+        """
+        synth = self.tts_synth_ms
+        if synth is None:
+            synth = self.tts_first_fragment_ms
+        if synth is None:
+            return None
+        return (self.asr_ms or 0.0) + self.route_ms + synth
+
+    @property
     def live_estimate_ms(self) -> float | None:
         """Ориентир для live say: ASR + маршрут + первый фрагмент синтеза."""
-        if self.tts_first_fragment_ms is None:
+        fragment = self.tts_first_fragment_ms
+        if fragment is None:
             return None
-        return (self.asr_ms or 0.0) + self.route_ms + self.tts_first_fragment_ms
+        return (self.asr_ms or 0.0) + self.route_ms + fragment
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["first_sound_ms"] = self.first_sound_ms
+        data["first_sound_estimate_ms"] = self.first_sound_estimate_ms
         data["live_estimate_ms"] = self.live_estimate_ms
         return data
 
@@ -278,6 +348,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="синтезировать WAV, но не воспроизводить (для тестов и замеров)",
     )
     parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help=(
+            "старое поведение: синтезировать весь ответ до воспроизведения; "
+            "по умолчанию речь идёт по предложениям (первое — сразу, остальные — параллельно)"
+        ),
+    )
+    parser.add_argument(
         "--asr-timeout",
         type=positive_float,
         default=DEFAULT_ASR_TIMEOUT,
@@ -358,6 +436,232 @@ def to_speech(text: str) -> str:
     speech = re.sub(r"\s+", " ", speech)
     speech = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", speech)
     return speech.strip()
+
+
+# --------------------------------------------------------------------------- #
+# разбиение ответа на предложения
+# --------------------------------------------------------------------------- #
+#: Символы, которые могут заканчивать предложение. Точка — с оговорками:
+#: она же стоит в числах (1.5), сокращениях (т.е.) и инициалах (А. С. Пушкин).
+_SENTENCE_END_CHARS = ".!?…"
+
+#: Парные кавычки: внутри них точка/многоточие не заканчивают предложение.
+_QUOTE_PAIRS = {"«": "»", "„": "“", "“": "”"}
+_OPEN_QUOTES = "".join(_QUOTE_PAIRS)
+_CLOSE_QUOTES = "".join(_QUOTE_PAIRS.values())
+
+#: Сокращения, точка которых не заканчивает предложение (в нижнем регистре).
+ABBREVIATIONS = frozenset(
+    """
+    т.е. т.д. т.п. т.к. т.н. др. г. гг. в. вв. руб. коп. млн. млрд. тыс.
+    стр. рис. табл. см. ср. напр. им. проф. акад. доц. п. пп. ул. д. кв.
+    обл. гор. ред. изд. прим. e.g. i.e. etc.
+    """.split()
+)
+
+#: После этих символов точку/многоточие нельзя считать концом предложения.
+_NO_SENTENCE_START = ",;:)]—–"
+
+
+def _last_token(text: str, end: int) -> str:
+    """Последнее слово перед позицией ``end`` (вместе с точками сокращений)."""
+    head = text[:end]
+    cut = max(head.rfind(" "), head.rfind("\t"), head.rfind("\n"))
+    return head[cut + 1 :]
+
+
+def _is_abbreviation(text: str, end: int) -> bool:
+    """Точка на позиции ``end - 1`` — часть сокращения, а не конец фразы.
+
+    Учитываются «т.е.», «др.», «т.д.», «г.» и т.п., а также инициалы
+    («А. С. Пушкин»): одиночная заглавная буква с точкой перед словом
+    с большой буквы.
+    """
+    token = _last_token(text, end)
+    if not token:
+        return False
+    if token.lower() in ABBREVIATIONS:
+        return True
+    if re.fullmatch(r"[А-ЯЁA-Z]\.", token):
+        following = text[end:].lstrip()
+        return bool(following) and following[0].isupper()
+    return False
+
+
+def _is_sentence_end(text: str, start: int, end: int, after: int) -> bool:
+    """Проверить, что терминаторы ``text[start:end]`` кончают предложение.
+
+    ``after`` — позиция сразу за терминаторами и закрывающими кавычками:
+    именно оттуда смотрим, начинается ли новое предложение.
+    """
+    run = text[start:end]
+    if run == ".":
+        before = text[start - 1] if start > 0 else ""
+        next_char = text[after] if after < len(text) else ""
+        if before.isdigit() and next_char.isdigit():
+            return False  # 1.5, 1.2.3 — точка внутри числа
+        if _is_abbreviation(text, end):
+            return False  # «т.е.», «др.», «А. С.»
+    following = text[after:].lstrip()
+    if not following:
+        return True
+    if following[0].islower():
+        return False  # продолжение фразы (в том числе после закрывающей кавычки)
+    if following[0] in _NO_SENTENCE_START:
+        return False
+    return True
+
+
+def _soft_break(text: str, max_chars: int) -> int:
+    """Позиция мягкого разрыва длинного предложения (не больше ``max_chars``).
+
+    Режем по пробелу вне кавычек; не рвём «2 490 ₽» (пробел внутри числа или
+    перед валютой) и не оставляем «₽/мес» в начале следующего чанка.
+    Если пробела вне кавычек нет, берём пробел внутри цитаты, чтобы чанк
+    не оказался гигантским; совсем без пробелов — жёсткий разрез.
+    """
+
+    def find(ignore_quotes: bool) -> int:
+        limit = min(len(text), max_chars)
+        depth = 0
+        best = -1
+        for index in range(limit):
+            char = text[index]
+            if char in _OPEN_QUOTES:
+                depth += 1
+                continue
+            if char in _CLOSE_QUOTES:
+                depth = max(0, depth - 1)
+                continue
+            if char != " " or (depth > 0 and not ignore_quotes):
+                continue
+            before = text[index - 1] if index > 0 else ""
+            after = text[index + 1] if index + 1 < len(text) else ""
+            if before.isdigit() and (after.isdigit() or after == "₽"):
+                continue  # пробел внутри числа или между числом и «₽»
+            tail = text[index + 1 :].lstrip()
+            if tail[:1] in ("₽", "%"):
+                continue
+            best = index + 1
+        return best
+
+    position = find(ignore_quotes=False)
+    if position > 0:
+        return position
+    position = find(ignore_quotes=True)
+    if position > 0:
+        return position
+    space = text.rfind(" ", 0, min(len(text), max_chars))
+    if space > 0:
+        return space + 1
+    return 0
+
+
+def _wrap_long(chunk: str, *, max_chars: int) -> list[str]:
+    """Порезать слишком длинное «предложение» на удобные для синтеза куски."""
+    if max_chars <= 0 or len(chunk) <= max_chars:
+        return [chunk]
+    parts: list[str] = []
+    rest = chunk
+    while len(rest) > max_chars:
+        cut = _soft_break(rest, max_chars)
+        if cut <= 0:
+            break
+        head = rest[:cut].strip()
+        if head:
+            parts.append(head)
+        rest = rest[cut:].strip()
+    if rest:
+        parts.append(rest)
+    return parts
+
+
+def _split_paragraph(paragraph: str, *, max_chars: int) -> list[str]:
+    text = paragraph.strip()
+    if not text:
+        return []
+    chunks: list[str] = []
+    start = 0
+    depth = 0
+    index = 0
+    length = len(text)
+
+    while index < length:
+        char = text[index]
+        if char in _OPEN_QUOTES:
+            depth += 1
+            index += 1
+            continue
+        if char in _CLOSE_QUOTES:
+            depth = max(0, depth - 1)
+            index += 1
+            continue
+        if char not in _SENTENCE_END_CHARS:
+            index += 1
+            continue
+
+        end = index
+        while end < length and text[end] in _SENTENCE_END_CHARS:
+            end += 1
+
+        stop = end
+        while stop < length and text[stop] in _CLOSE_QUOTES + ")":
+            stop += 1
+
+        # Внутри «ёлочек» режем, только если терминатор закрывает цитату:
+        # точка посреди цитаты («Всё хорошо. Завтра продолжим.») её не рвёт.
+        if depth > 0 and stop == end:
+            index = end
+            continue
+        if not _is_sentence_end(text, index, end, stop):
+            index = end
+            continue
+
+        chunk = text[start:stop].strip()
+        if chunk:
+            chunks.append(chunk)
+        for position in range(end, stop):
+            if text[position] in _CLOSE_QUOTES:
+                depth = max(0, depth - 1)
+        start = stop
+        index = stop
+
+    tail = text[start:].strip()
+    if tail:
+        chunks.append(tail)
+    return chunks
+
+
+def split_sentences(text: str, *, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
+    """Разбить ответ на предложения для потокового синтеза.
+
+    Правила:
+
+    * конец предложения — ``. ! ? …`` (в том числе ``...``), после которого
+      не идёт строчная буква, запятая, закрывающая скобка или тире;
+    * точка в числе (``1.5``), в сокращении (``т.е.``, ``др.``, ``г.``) и в
+      инициалах (``А. С.``) предложение не заканчивает;
+    * внутри «ёлочек» (и „лапок“) не режем, пока впереди есть закрывающая
+      кавычка — цитата остаётся целиком;
+    * «₽» и «₽/мес» остаются при своём числе: пробел внутри числа и перед
+      валютой не считается разрывом;
+    * предложение длиннее ``max_chars`` дорезается по пробелам (вне кавычек),
+      чтобы в синтез не уходил кусок на несколько абзацев.
+
+    Возвращает список непустых чанков в исходном порядке. Если пунктуации
+    нет, вернётся один чанк (или несколько — после дорезки по ``max_chars``).
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return []
+
+    chunks: list[str] = []
+    for paragraph in raw.splitlines():
+        if not paragraph.strip():
+            continue
+        for chunk in _split_paragraph(paragraph, max_chars=max_chars):
+            chunks.extend(_wrap_long(chunk, max_chars=max_chars))
+    return [chunk for chunk in chunks if chunk]
 
 
 # --------------------------------------------------------------------------- #
@@ -868,6 +1172,161 @@ def play_audio(path: Path, *, timeout: float = DEFAULT_PLAY_TIMEOUT) -> PlayResu
     return PlayResult(start_ms=start_ms, total_ms=total_ms)
 
 
+def concat_wavs(paths: Sequence[Path], out_path: Path) -> Path:
+    """Склеить части потоковой озвучки в один WAV для ``--out``.
+
+    Все части пишет один и тот же ``say`` с одинаковыми параметрами, поэтому
+    формат проверяется и должен совпасть; иначе — понятная ошибка.
+    """
+    parts = [Path(path) for path in paths]
+    if not parts:
+        raise TtsError("нечего объединять: нет частей WAV")
+
+    target = Path(out_path).expanduser()
+    if target.parent and not target.parent.exists():
+        raise TtsError(f"каталог для --out не существует: {target.parent}")
+
+    params: tuple[int, int, int] | None = None
+    try:
+        with wave.open(str(target), "wb") as destination:
+            for part in parts:
+                with wave.open(str(part), "rb") as source:
+                    current = (
+                        source.getnchannels(),
+                        source.getsampwidth(),
+                        source.getframerate(),
+                    )
+                    if params is None:
+                        params = current
+                        destination.setnchannels(current[0])
+                        destination.setsampwidth(current[1])
+                        destination.setframerate(current[2])
+                    elif current != params:
+                        raise TtsError(
+                            f"части WAV разного формата: {part} {current}, ожидалось {params}"
+                        )
+                    destination.writeframes(source.readframes(source.getnframes()))
+    except (wave.Error, EOFError, OSError) as exc:
+        raise TtsError(f"не удалось собрать {target} из частей: {exc}") from exc
+
+    return target
+
+
+def speak_stream(
+    sentences: Sequence[str],
+    out_dir: Path,
+    *,
+    voice: str = DEFAULT_VOICE,
+    say_bin: str | Path | None = None,
+    rate: int | None = None,
+    tts_timeout: float = DEFAULT_TTS_TIMEOUT,
+    play_timeout: float = DEFAULT_PLAY_TIMEOUT,
+    play: bool = True,
+    workers: int = STREAM_WORKERS,
+) -> StreamResult:
+    """Озвучить ответ по предложениям, не дожидаясь синтеза всего текста.
+
+    Первое предложение синтезируется синхронно и сразу отдаётся в ``afplay``.
+    Остальные синтезируются в пуле (``workers`` потоков), пока звучит
+    предыдущее; воспроизведение идёт строго по порядку. Если следующий чанк не
+    успел — речь делает паузу, и это видно в ``wait_ms``.
+
+    ``first_sound_ms`` — от старта этой функции до запуска afplay с первым
+    предложением; вызывающий код прибавляет к нему ASR и маршрут.
+    """
+    texts = [str(item).strip() for item in sentences]
+    texts = [item for item in texts if item]
+    if not texts:
+        raise TtsError("нечего синтезировать: список предложений пуст")
+
+    directory = Path(out_dir).expanduser()
+    if not directory.is_dir():
+        raise TtsError(f"каталог для частей WAV не существует: {directory}")
+
+    started = time.perf_counter()
+
+    def now_ms() -> float:
+        return (time.perf_counter() - started) * 1000.0
+
+    chunks = [
+        ChunkTiming(index=index, text=text, chars=len(text))
+        for index, text in enumerate(texts)
+    ]
+    parts = [directory / f"reply.part{index:02d}.wav" for index in range(len(texts))]
+
+    def synth_chunk(index: int) -> SynthesisResult:
+        return synthesize(
+            texts[index],
+            parts[index],
+            voice=voice,
+            say_bin=say_bin,
+            rate=rate,
+            timeout=tts_timeout,
+        )
+
+    first_sound_ms: float | None = None
+    first_play_offset_ms: float | None = None
+    play_span_ms: float | None = None
+    first_play_abs_ms: float | None = None
+    last_play_end_ms: float | None = None
+
+    # Первое предложение — синхронно: именно оно определяет первый звук.
+    first_result = synth_chunk(0)
+    first = chunks[0]
+    first.synth_ms = first_result.synth_ms
+    first.first_fragment_ms = first_result.first_fragment_ms
+    first.synth_done_ms = now_ms()
+
+    executor = ThreadPoolExecutor(max_workers=max(1, int(workers)))
+    try:
+        futures = {
+            index: executor.submit(synth_chunk, index) for index in range(1, len(texts))
+        }
+
+        if play:
+            before = time.perf_counter()
+            playback = play_audio(first_result.path, timeout=play_timeout)
+            first_play_offset_ms = playback.start_ms
+            first_play_abs_ms = (before - started) * 1000.0 + playback.start_ms
+            first_sound_ms = first_play_abs_ms
+            last_play_end_ms = first_play_abs_ms + (playback.total_ms - playback.start_ms)
+            first.play_start_ms = first_play_abs_ms
+            first.play_total_ms = playback.total_ms
+
+        for index in range(1, len(texts)):
+            wanted = time.perf_counter()
+            result = futures[index].result()
+            chunk = chunks[index]
+            chunk.synth_ms = result.synth_ms
+            chunk.first_fragment_ms = result.first_fragment_ms
+            chunk.synth_done_ms = now_ms()
+            # Пауза в речи: сколько ждали готовый чанк после конца предыдущего.
+            chunk.wait_ms = (time.perf_counter() - wanted) * 1000.0 if play else None
+
+            if play:
+                before = time.perf_counter()
+                playback = play_audio(result.path, timeout=play_timeout)
+                start_abs = (before - started) * 1000.0 + playback.start_ms
+                chunk.play_start_ms = start_abs
+                chunk.play_total_ms = playback.total_ms
+                last_play_end_ms = start_abs + (playback.total_ms - playback.start_ms)
+    finally:
+        executor.shutdown(wait=True)
+
+    if play and first_play_abs_ms is not None and last_play_end_ms is not None:
+        play_span_ms = last_play_end_ms - first_play_abs_ms
+
+    return StreamResult(
+        chunks=chunks,
+        parts=parts,
+        first_sound_ms=first_sound_ms,
+        first_play_offset_ms=first_play_offset_ms,
+        synth_total_ms=sum(chunk.synth_ms or 0.0 for chunk in chunks),
+        play_span_ms=play_span_ms,
+        wall_ms=now_ms(),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # вывод
 # --------------------------------------------------------------------------- #
@@ -896,7 +1355,15 @@ def format_timings(
     tts_note = ""
     if timings.tts_first_fragment_ms is not None:
         tts_note = f"  (первый фрагмент {timings.tts_first_fragment_ms:.1f})"
-    lines.append(f"  TTS, синтез WAV    {_ms(timings.tts_synth_ms)}{tts_note}")
+    if timings.stream:
+        lines.append(f"  TTS, 1-й чанк      {_ms(timings.tts_synth_ms)}{tts_note}")
+        lines.append(
+            f"  TTS, все чанки     {_ms(timings.tts_total_synth_ms)}"
+            "  (сумма синтеза; идёт во время речи)"
+        )
+        lines.append(f"  Чанков            {timings.chunks:8d}  (поток по предложениям)")
+    else:
+        lines.append(f"  TTS, синтез WAV    {_ms(timings.tts_synth_ms)}{tts_note}")
 
     if no_play:
         lines.append(f"  Воспроизведение    {_ms(None)}  (--no-play)")
@@ -909,6 +1376,17 @@ def format_timings(
     if first is None:
         reason = "воспроизведение отключено" if no_play else "звук не воспроизводился"
         lines.append(f"  До первого звука   {_ms(None)}  ({reason})")
+        estimate = timings.first_sound_estimate_ms
+        if estimate is not None:
+            lines.append(
+                f"  Оценка до звука    {_ms(estimate)}"
+                "  (ASR + маршрут + синтез того, что играем)"
+            )
+    elif timings.stream:
+        lines.append(
+            f"  До первого звука   {_ms(first)}"
+            "  (ASR + маршрут + синтез 1-го чанка + старт afplay)"
+        )
     else:
         lines.append(f"  До первого звука   {_ms(first)}  (ASR + маршрут + синтез + старт afplay)")
     live = timings.live_estimate_ms
@@ -927,6 +1405,7 @@ def _json_payload(
     audio_path: Path | None,
     audio_saved: bool,
     played: bool,
+    audio_parts: Sequence[Path] | None = None,
     error: str | None = None,
     stage: str | None = None,
 ) -> dict[str, Any]:
@@ -949,6 +1428,7 @@ def _json_payload(
             "path": str(audio_path) if audio_path else None,
             "saved": audio_saved,
             "played": played,
+            "parts": [str(part) for part in audio_parts] if audio_parts else [],
         },
     }
     if error is not None:
@@ -1075,30 +1555,69 @@ def run(args: argparse.Namespace, *, cfg: Any | None = None) -> int:
             print(f"Ответ: {route.answer_text}")
             print(f"Озвучка: {route.spoken_text}")
 
+        sentences = split_sentences(route.spoken_text)
+        if not sentences:
+            raise VoiceError("не удалось разбить ответ на предложения для озвучки")
+
         with tempfile.TemporaryDirectory(prefix="eva-voice-") as tmp:
+            work_dir = Path(tmp)
+            out_path: Path | None = None
             if args.out is not None:
                 out_path = Path(args.out).expanduser()
+                if out_path.parent and not out_path.parent.exists():
+                    raise TtsError(f"каталог для --out не существует: {out_path.parent}")
                 audio_saved = True
+
+            audio_parts: list[Path] = []
+
+            if args.no_stream:
+                # Старое поведение: один WAV на весь ответ, затем воспроизведение.
+                target = out_path if out_path is not None else work_dir / "reply.wav"
+                synthesis = synthesize(
+                    route.spoken_text,
+                    target,
+                    voice=args.voice,
+                    say_bin=args.say_bin,
+                    rate=args.rate,
+                    timeout=args.tts_timeout,
+                )
+                timings.tts_synth_ms = synthesis.synth_ms
+                timings.tts_first_fragment_ms = synthesis.first_fragment_ms
+                audio_path = synthesis.path
+
+                if not args.no_play:
+                    playback = play_audio(synthesis.path, timeout=args.play_timeout)
+                    timings.play_start_ms = playback.start_ms
+                    timings.play_total_ms = playback.total_ms
+                    played = True
             else:
-                out_path = Path(tmp) / "reply.wav"
+                # Поток: говорим первое предложение, остальные синтезируем рядом.
+                stream = speak_stream(
+                    sentences,
+                    work_dir,
+                    voice=args.voice,
+                    say_bin=args.say_bin,
+                    rate=args.rate,
+                    tts_timeout=args.tts_timeout,
+                    play_timeout=args.play_timeout,
+                    play=not args.no_play,
+                )
+                audio_parts = list(stream.parts)
+                first_chunk = stream.chunks[0]
+                timings.stream = True
+                timings.chunks = len(stream.chunks)
+                timings.chunk_stats = stream.chunks
+                timings.tts_synth_ms = first_chunk.synth_ms
+                timings.tts_first_fragment_ms = first_chunk.first_fragment_ms
+                timings.tts_total_synth_ms = stream.synth_total_ms
+                timings.play_start_ms = stream.first_play_offset_ms
+                timings.play_total_ms = stream.play_span_ms
+                played = not args.no_play
 
-            synthesis = synthesize(
-                route.spoken_text,
-                out_path,
-                voice=args.voice,
-                say_bin=args.say_bin,
-                rate=args.rate,
-                timeout=args.tts_timeout,
-            )
-            timings.tts_synth_ms = synthesis.synth_ms
-            timings.tts_first_fragment_ms = synthesis.first_fragment_ms
-            audio_path = synthesis.path
-
-            if not args.no_play:
-                playback = play_audio(synthesis.path, timeout=args.play_timeout)
-                timings.play_start_ms = playback.start_ms
-                timings.play_total_ms = playback.total_ms
-                played = True
+                if out_path is not None:
+                    audio_path = concat_wavs(stream.parts, out_path)
+                else:
+                    audio_path = stream.parts[0]
 
             if args.json:
                 print(
@@ -1112,6 +1631,7 @@ def run(args: argparse.Namespace, *, cfg: Any | None = None) -> int:
                             audio_path=audio_path,
                             audio_saved=audio_saved,
                             played=played,
+                            audio_parts=audio_parts,
                         ),
                         ensure_ascii=False,
                         indent=2,

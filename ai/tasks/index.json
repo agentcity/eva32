@@ -268,7 +268,7 @@
   {
     "id": "0039",
     "title": "Голос: синтез по предложениям",
-    "status": "in_progress",
+    "status": "done",
     "file": "0039-voice-stream.md",
     "assignee": "agent:voice-stream"
   },

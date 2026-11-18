@@ -18,6 +18,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import wave
 from contextlib import redirect_stderr, redirect_stdout
@@ -318,6 +320,373 @@ class TimingTests(unittest.TestCase):
         self.assertIn("ASR пропущен", text)
         self.assertIn("--no-play", text)
         self.assertIn("воспроизведение отключено", text)
+
+
+class SentenceSplitTests(unittest.TestCase):
+    """Разбиение ответа на предложения: пунктуация, «₽», кавычки, сокращения."""
+
+    def test_two_sentences(self):
+        chunks = voice_loop.split_sentences(
+            "Тариф «Старт» — 990 ₽/мес. Лимиты: до 3 сотрудников; 100 услуг."
+        )
+        self.assertEqual(
+            chunks,
+            ["Тариф «Старт» — 990 ₽/мес.", "Лимиты: до 3 сотрудников; 100 услуг."],
+        )
+
+    def test_ruble_numbers_stay_with_their_sentence(self):
+        chunks = voice_loop.split_sentences("Старт — 990 ₽. Профи — 2 490 ₽/мес.")
+        self.assertEqual(chunks, ["Старт — 990 ₽.", "Профи — 2 490 ₽/мес."])
+        self.assertTrue(all(len(chunk) > 3 for chunk in chunks))
+
+    def test_abbreviations_do_not_split(self):
+        chunks = voice_loop.split_sentences(
+            "Это долго, т.е. очень долго. Дальше — др. пункт."
+        )
+        self.assertEqual(chunks, ["Это долго, т.е. очень долго.", "Дальше — др. пункт."])
+        self.assertNotIn("т.е.", chunks[1])
+
+    def test_decimal_point_does_not_split(self):
+        chunks = voice_loop.split_sentences("Версия 1.5 вышла. Обновитесь.")
+        self.assertEqual(chunks, ["Версия 1.5 вышла.", "Обновитесь."])
+
+    def test_initials_do_not_split(self):
+        chunks = voice_loop.split_sentences("А. С. Пушкин написал. Это факт.")
+        self.assertEqual(chunks, ["А. С. Пушкин написал.", "Это факт."])
+
+    def test_ellipsis_splits(self):
+        chunks = voice_loop.split_sentences("Думал… Потом решил. И сделал!")
+        self.assertEqual(chunks, ["Думал…", "Потом решил.", "И сделал!"])
+
+    def test_three_dots_split(self):
+        chunks = voice_loop.split_sentences("Ну... Ладно.")
+        self.assertEqual(chunks, ["Ну...", "Ладно."])
+
+    def test_quote_sentence_is_not_torn(self):
+        # Точка внутри «ёлочек» не режет: цитата остаётся одним куском,
+        # а следующее за цитатой предложение — отдельный чанк.
+        chunks = voice_loop.split_sentences(
+            "Он сказал: «Всё хорошо. Завтра продолжим.» И ушёл."
+        )
+        self.assertEqual(
+            chunks,
+            ["Он сказал: «Всё хорошо. Завтра продолжим.»", "И ушёл."],
+        )
+
+    def test_quote_then_new_sentence_splits(self):
+        chunks = voice_loop.split_sentences("«Всё хорошо.» Он ушёл.")
+        self.assertEqual(chunks, ["«Всё хорошо.»", "Он ушёл."])
+
+    def test_ellipsis_inside_quote_is_not_torn(self):
+        chunks = voice_loop.split_sentences("Он сказал: «Ну…» и ушёл.")
+        self.assertEqual(chunks, ["Он сказал: «Ну…» и ушёл."])
+
+    def test_no_punctuation_is_one_chunk(self):
+        self.assertEqual(voice_loop.split_sentences("Привет"), ["Привет"])
+
+    def test_empty(self):
+        self.assertEqual(voice_loop.split_sentences(""), [])
+        self.assertEqual(voice_loop.split_sentences("   \n\t "), [])
+
+    def test_spoken_skill_answer_gives_three_chunks(self):
+        spoken = (
+            "Тариф «Старт» — 990 рублей в месяц. "
+            "Лимиты: до 3 сотрудников; 100 услуг в каталоге. "
+            "Заметки: дополнительный сотрудник — 290 рублей в месяц; "
+            "при оплате за год скидка 20%."
+        )
+        chunks = voice_loop.split_sentences(spoken)
+        self.assertEqual(len(chunks), 3)
+        self.assertTrue(chunks[0].startswith("Тариф «Старт»"))
+        self.assertTrue(chunks[2].endswith("20%."))
+        self.assertEqual(" ".join(chunks).split(), spoken.split())
+
+    def test_long_sentence_is_wrapped_without_losing_text(self):
+        text = "Слово " * 100
+        chunks = voice_loop.split_sentences(text, max_chars=120)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= 120 for chunk in chunks))
+        self.assertEqual(" ".join(chunks).split(), text.split())
+
+    def test_wrap_keeps_number_and_ruble_together(self):
+        # Пробел внутри «2 490 ₽» не должен стать разрывом чанка.
+        text = "Слово " * 36 + "2 490 ₽ и хвост."
+        chunks = voice_loop.split_sentences(text, max_chars=220)
+        self.assertTrue(any("2 490 ₽" in chunk for chunk in chunks), chunks)
+
+
+class StreamSpeakTests(unittest.TestCase):
+    """Потоковая озвучка: порядок чанков, параллельный синтез, первый звук."""
+
+    def _fake_synth(self, delay=0.0, return_ms=(40.0, 10.0)):
+        calls = []
+
+        def fake(text, out_path, **kwargs):
+            calls.append(text)
+            if delay:
+                time.sleep(delay)
+            Path(out_path).write_bytes(b"RIFF")
+            return voice_loop.SynthesisResult(
+                path=Path(out_path),
+                synth_ms=return_ms[0],
+                first_fragment_ms=return_ms[1],
+            )
+
+        return fake, calls
+
+    def test_order_and_overlap(self):
+        texts = ["Первое.", "Второе.", "Третье."]
+        synth_started = {text: threading.Event() for text in texts[1:]}
+        fake_synth, calls = self._fake_synth()
+        played = []
+        overlap = {}
+
+        def fake_synthesize(text, out_path, **kwargs):
+            if text in synth_started:
+                synth_started[text].set()
+            return fake_synth(text, out_path, **kwargs)
+
+        def fake_play(path, **kwargs):
+            name = Path(path).name
+            played.append(name)
+            if name.endswith("part00.wav"):
+                # Первое предложение уже звучит, а третье должно синтезироваться.
+                overlap["third_during_first_play"] = synth_started["Третье."].wait(2.0)
+            return voice_loop.PlayResult(start_ms=2.0, total_ms=5.0)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            voice_loop, "synthesize", side_effect=fake_synthesize
+        ), mock.patch.object(voice_loop, "play_audio", side_effect=fake_play):
+            stream = voice_loop.speak_stream(texts, Path(tmp), play=True)
+
+        self.assertEqual(
+            played, ["reply.part00.wav", "reply.part01.wav", "reply.part02.wav"]
+        )
+        self.assertEqual(calls, texts)
+        self.assertTrue(overlap["third_during_first_play"])
+        self.assertEqual(len(stream.chunks), 3)
+        self.assertIsNotNone(stream.first_sound_ms)
+        self.assertLess(stream.first_sound_ms, stream.synth_total_ms)
+        self.assertIsNone(stream.chunks[0].wait_ms)
+        self.assertAlmostEqual(stream.chunks[0].play_start_ms, stream.first_sound_ms)
+
+    def test_no_play_does_not_touch_player(self):
+        fake_synth, calls = self._fake_synth()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            voice_loop, "synthesize", side_effect=fake_synth
+        ), mock.patch.object(
+            voice_loop, "play_audio", side_effect=AssertionError("звук запрещён")
+        ):
+            stream = voice_loop.speak_stream(["Один.", "Два."], Path(tmp), play=False)
+        self.assertEqual(calls, ["Один.", "Два."])
+        self.assertIsNone(stream.first_sound_ms)
+        self.assertIsNone(stream.play_span_ms)
+        self.assertIsNotNone(stream.synth_total_ms)
+
+    def test_empty_sentences_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(voice_loop.TtsError):
+                voice_loop.speak_stream(["  ", ""], Path(tmp))
+
+    def test_missing_directory_rejected(self):
+        with self.assertRaises(voice_loop.TtsError):
+            voice_loop.speak_stream(["Привет."], Path("/nope/eva-voice"))
+
+    def test_concat_wavs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            frames = [100, 150, 200]
+            parts = []
+            for index, count in enumerate(frames):
+                path = Path(tmp) / f"part{index}.wav"
+                with wave.open(str(path), "wb") as audio:
+                    audio.setnchannels(1)
+                    audio.setsampwidth(2)
+                    audio.setframerate(16000)
+                    audio.writeframes(b"\x00\x00" * count)
+                parts.append(path)
+            target = Path(tmp) / "reply.wav"
+            result = voice_loop.concat_wavs(parts, target)
+            self.assertEqual(result, target)
+            with wave.open(str(target)) as audio:
+                self.assertEqual(audio.getnframes(), sum(frames))
+                self.assertEqual(audio.getframerate(), 16000)
+
+    def test_concat_rejects_different_formats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "a.wav"
+            second = Path(tmp) / "b.wav"
+            for path, rate in ((first, 16000), (second, 22050)):
+                with wave.open(str(path), "wb") as audio:
+                    audio.setnchannels(1)
+                    audio.setsampwidth(2)
+                    audio.setframerate(rate)
+                    audio.writeframes(b"\x00\x00" * 10)
+            with self.assertRaises(voice_loop.TtsError):
+                voice_loop.concat_wavs([first, second], Path(tmp) / "out.wav")
+
+
+class StreamRunTests(unittest.TestCase):
+    """run(): потоковый режим по умолчанию и --no-stream для сравнения."""
+
+    SPOKEN = "Первое предложение. Второе предложение. Третье предложение."
+
+    def _route(self):
+        return voice_loop.RouteResult(
+            question="Сколько стоит тариф Старт",
+            answer_text="Тариф «Старт» — 990 ₽/мес [1]. Лимиты. Заметки.",
+            spoken_text=self.SPOKEN,
+            route_kind="skill",
+            route_reason="skill: pricing",
+            skill="pricing",
+            latency_ms=1.5,
+            answered=True,
+        )
+
+    def _fake_synth(self, calls=None):
+        def fake(text, out_path, **kwargs):
+            if calls is not None:
+                calls.append(text)
+            path = Path(out_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(path), "wb") as audio:
+                audio.setnchannels(1)
+                audio.setsampwidth(2)
+                audio.setframerate(16000)
+                audio.writeframes(b"\x00\x00" * len(text))
+            return voice_loop.SynthesisResult(
+                path=path, synth_ms=8.0, first_fragment_ms=3.0
+            )
+
+        return fake
+
+    def test_stream_json_no_play(self):
+        args = voice_loop.parse_args(
+            ["--text", "Сколько стоит тариф Старт", "--json", "--no-play"]
+        )
+        out = io.StringIO()
+        with mock.patch.object(
+            voice_loop, "ask_hybrid", return_value=self._route()
+        ), mock.patch.object(
+            voice_loop, "synthesize", side_effect=self._fake_synth()
+        ), mock.patch.object(
+            voice_loop, "play_audio", side_effect=AssertionError("звук запрещён")
+        ), redirect_stdout(out):
+            code = voice_loop.run(args, cfg=object())
+
+        self.assertEqual(code, 0)
+        payload = json.loads(out.getvalue())
+        timings = payload["timings"]
+        self.assertTrue(timings["stream"])
+        self.assertEqual(timings["chunks"], 3)
+        self.assertEqual(len(timings["chunk_stats"]), 3)
+        self.assertEqual(timings["chunk_stats"][0]["chars"], len("Первое предложение."))
+        self.assertIsNone(timings["first_sound_ms"])
+        # --no-play: звук начнётся, когда WAV первого предложения готов.
+        self.assertAlmostEqual(timings["first_sound_estimate_ms"], 1.5 + 8.0)
+        self.assertAlmostEqual(timings["live_estimate_ms"], 1.5 + 3.0)
+        self.assertFalse(payload["audio"]["played"])
+        self.assertEqual(len(payload["audio"]["parts"]), 3)
+
+    def test_no_stream_synthesizes_whole_answer_once(self):
+        calls = []
+        args = voice_loop.parse_args(
+            ["--text", "Сколько стоит тариф Старт", "--json", "--no-play", "--no-stream"]
+        )
+        out = io.StringIO()
+        with mock.patch.object(
+            voice_loop, "ask_hybrid", return_value=self._route()
+        ), mock.patch.object(
+            voice_loop, "synthesize", side_effect=self._fake_synth(calls)
+        ), redirect_stdout(out):
+            code = voice_loop.run(args, cfg=object())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [self.SPOKEN])
+        timings = json.loads(out.getvalue())["timings"]
+        self.assertFalse(timings["stream"])
+        self.assertEqual(timings["chunks"], 0)
+        self.assertEqual(timings["chunk_stats"], [])
+        self.assertAlmostEqual(timings["tts_synth_ms"], 8.0)
+        self.assertIsNone(timings["first_sound_ms"])
+        self.assertAlmostEqual(timings["first_sound_estimate_ms"], 1.5 + 8.0)
+
+    def test_no_stream_flag_exists_in_human_mode(self):
+        args = voice_loop.parse_args(["--text", "привет", "--no-play", "--no-stream"])
+        self.assertTrue(args.no_stream)
+        self.assertFalse(voice_loop.parse_args(["--text", "привет"]).no_stream)
+
+    def test_stream_out_concatenates_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "reply.wav"
+            args = voice_loop.parse_args(
+                ["--text", "Сколько стоит тариф Старт", "--json", "--no-play", "--out", str(target)]
+            )
+            out = io.StringIO()
+            with mock.patch.object(
+                voice_loop, "ask_hybrid", return_value=self._route()
+            ), mock.patch.object(
+                voice_loop, "synthesize", side_effect=self._fake_synth()
+            ), redirect_stdout(out):
+                code = voice_loop.run(args, cfg=object())
+
+            self.assertEqual(code, 0)
+            payload = json.loads(out.getvalue())
+            self.assertTrue(payload["audio"]["saved"])
+            self.assertEqual(payload["audio"]["path"], str(target))
+            chunks = voice_loop.split_sentences(self.SPOKEN)
+            with wave.open(str(target)) as audio:
+                self.assertEqual(audio.getnframes(), sum(len(chunk) for chunk in chunks))
+
+    def test_stream_human_output_mentions_chunks(self):
+        args = voice_loop.parse_args(
+            ["--text", "Сколько стоит тариф Старт", "--no-play"]
+        )
+        out = io.StringIO()
+        with mock.patch.object(
+            voice_loop, "ask_hybrid", return_value=self._route()
+        ), mock.patch.object(
+            voice_loop, "synthesize", side_effect=self._fake_synth()
+        ), redirect_stdout(out):
+            code = voice_loop.run(args, cfg=object())
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("TTS, 1-й чанк", text)
+        self.assertIn("Чанков", text)
+        self.assertIn("(поток по предложениям)", text)
+        self.assertIn("Оценка до звука", text)
+        self.assertIn("Ориентир live say", text)
+
+    def test_no_stream_human_output_has_no_chunks(self):
+        args = voice_loop.parse_args(
+            ["--text", "Сколько стоит тариф Старт", "--no-play", "--no-stream"]
+        )
+        out = io.StringIO()
+        with mock.patch.object(
+            voice_loop, "ask_hybrid", return_value=self._route()
+        ), mock.patch.object(
+            voice_loop, "synthesize", side_effect=self._fake_synth()
+        ), redirect_stdout(out):
+            code = voice_loop.run(args, cfg=object())
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("TTS, синтез WAV", text)
+        self.assertNotIn("Чанков", text)
+
+
+class TimingEstimateTests(unittest.TestCase):
+    def test_first_sound_estimate_without_play(self):
+        timings = voice_loop.Timings(
+            asr_ms=120.0, route_ms=4.0, tts_synth_ms=500.0, tts_first_fragment_ms=430.0
+        )
+        self.assertIsNone(timings.first_sound_ms)
+        self.assertAlmostEqual(timings.first_sound_estimate_ms, 624.0)
+        self.assertAlmostEqual(timings.to_dict()["first_sound_estimate_ms"], 624.0)
+        # Ориентир live say — по первому фрагменту, он всегда меньше.
+        self.assertAlmostEqual(timings.live_estimate_ms, 554.0)
+
+    def test_estimate_falls_back_to_fragment(self):
+        timings = voice_loop.Timings(route_ms=5.0, tts_first_fragment_ms=300.0)
+        self.assertAlmostEqual(timings.first_sound_estimate_ms, 305.0)
 
 
 class RunWithoutSoundTests(unittest.TestCase):
