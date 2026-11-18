@@ -5,7 +5,7 @@ title: Сервер: лимиты запросов и мягкая деград�
 created_at: 2026-11-18T16:20:00Z
 author: yuri
 assignee: agent:server-limits
-status: in_progress
+status: done
 scope:
   docs: false
   code: true
@@ -48,4 +48,14 @@ scope:
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: 413 (`EVA_MAX_PROMPT_TOKENS`, проверка до моделей, работает и для stream),
+429 по маршруту с `Retry-After` и `X-RateLimit-*`, 503 при отказе всех источников,
+504 по `EVA_REQUEST_TIMEOUT` (до первого чанка — JSON, после — SSE-событие). Порядок
+деградации: big → локальная → скилл → 503 (`DegradationChain`, big не повторяется).
+Метрики: `limits.*`, `degraded`, `degradation`.
+
+Проверено: 29 тестов без сокета; полный набор 1532 OK.
+
+Риски: непотоковую генерацию нельзя прервать в Python (daemon-поток дорабатывает);
+на каждый запрос создаётся worker-поток; «по маршруту» = по HTTP-пути, не по виду
+big/small/skill; `EVA_REQUEST_TIMEOUT=60` может совпасть с `EVA_BIG_TIMEOUT`.
