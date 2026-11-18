@@ -214,6 +214,7 @@ void vtm_tok_free_text(char *text) {
 // CLI на C99: только libvtm.a и C-ABI моста токенизатора.
 // ---------------------------------------------------------------------------
 #include "vtm.h"
+#include "vtm_backend.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -247,7 +248,7 @@ static void usage(FILE *out) {
         "\n"
         "  vtm run model.vtm --tokens 1,2,3 --max-new 8\n"
         "      прогнать программу по токенам и напечатать выбранные токены\n"
-        "      --backend lut|direct   вариант скалярного TMV (по умолчанию lut)\n"
+        "      --backend auto|simd|scalar|lut|direct  бэкенд (по умолчанию VTM_BACKEND или lut)\n"
         "\n"
         "  vtm run model.vtm --text \"вопрос\" [--tokenizer PATH] [--max-new 8]\n"
         "      токенизировать текст (BPE), прогнать и напечатать ответ текстом\n"
@@ -256,7 +257,7 @@ static void usage(FILE *out) {
         "      --chat                 обернуть текст в чат-шаблон Qwen2.5\n"
         "                             (<|im_start|>system/user/assistant <|im_end|>)\n"
         "      --system \"...\"         системное сообщение; только вместе с --chat\n"
-        "      --backend lut|direct   вариант скалярного TMV (по умолчанию lut)\n"
+        "      --backend auto|simd|scalar|lut|direct  бэкенд (по умолчанию VTM_BACKEND или lut)\n"
         "\n"
         "  vtm inspect model.vtm\n"
         "      показать заголовок, тензоры и инструкции\n"
@@ -513,7 +514,7 @@ static int cmd_run(int argc, char **argv) {
     const char *text_s = NULL;
     const char *tokenizer_s = NULL;
     const char *system_s = NULL;
-    const char *backend_name = "lut";
+    const char *backend_name = NULL;  /* не задан — решает VTM_BACKEND/загрузчик */
     int chat = 0;
     int max_new = 8;
     int *tokens = NULL;
@@ -597,9 +598,9 @@ static int cmd_run(int argc, char **argv) {
         fprintf(stderr, "vtm run: --system имеет смысл только с --chat\n");
         return 2;
     }
-    if (strcmp(backend_name, "lut") != 0 &&
-        strcmp(backend_name, "direct") != 0) {
-        fprintf(stderr, "vtm run: --backend должен быть lut или direct\n");
+    if (backend_name && !vtm_backend_by_name(backend_name)) {
+        fprintf(stderr, "vtm run: --backend должен быть auto, simd, scalar, "
+                        "lut или direct\n");
         return 2;
     }
     if (tokens_s) {
@@ -678,9 +679,8 @@ static int cmd_run(int argc, char **argv) {
         vtm_tok_close(tokenizer);
         return 1;
     }
-    vtm_set_backend(m, strcmp(backend_name, "direct") == 0
-                           ? &vtm_backend_scalar_direct
-                           : &vtm_backend_scalar_lut);
+    if (backend_name)
+        vtm_set_backend(m, vtm_backend_by_name(backend_name));
 
     printf("модель: %s\n", path);
     printf("тензоров: %u, инструкций: %u, бэкенд: %s\n",

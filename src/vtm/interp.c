@@ -12,6 +12,7 @@
 //   MUL/ADD, несмотря на запись «c = a·b» в спеке, пишут в dst: буква c
 //   там означает результат, а не поле инструкции.
 #include "vtm_internal.h"
+#include "vtm_backend.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -214,6 +215,14 @@ static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 // Y = A·B. A может быть тритовой матрицей (tied lm_head: A = emb.w,
 // B = [hidden, 1]): триты расквантовываются при чтении (LUT243), копии
 // матрицы в fp32 не делаем — у словаря Qwen это 233 М элементов.
+// SIMD-ядра MM подключаются, только если выбран SIMD-бэкенд и он доступен:
+// результат тот же (порядок сложения иной, расхождение ~1e-7), но в 6–15 раз быстрее.
+static int simd_mm_enabled(const vtm_t *m) {
+    return m && m->backend && m->backend->name
+        && strncmp(m->backend->name, "simd", 4) == 0
+        && vtm_simd_available();
+}
+
 static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     vtm_status st;
     const vtm_tensor *a = need(m, in->a, ins, "a (A)", &st);
@@ -258,6 +267,10 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         return fail(m, ins, VTM_E_SHAPE, "MM: dst совпадает с входом");
 
     if (a_trit) {
+        if (simd_mm_enabled(m) &&
+            vtm_simd_mm_trit(y->f32, (const uint8_t *)a->words, a->scales,
+                             b->f32, mm, kk, nn, (int)a->scale_block) == 0)
+            return VTM_OK;
         lut243_init();
         for (r = 0; r < mm; r++) {
             for (c = 0; c < nn; c++) {
@@ -277,6 +290,10 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         }
         return VTM_OK;
     }
+
+    if (simd_mm_enabled(m) &&
+        vtm_simd_mm_f32(y->f32, a->f32, b->f32, mm, kk, nn) == 0)
+        return VTM_OK;
 
     for (r = 0; r < mm; r++) {
         for (c = 0; c < nn; c++) {

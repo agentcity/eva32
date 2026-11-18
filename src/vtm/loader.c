@@ -7,6 +7,7 @@
 // Все проверки границ делаются до выделения памяти и до исполнения. Кривой
 // файл обязан вернуть NULL и внятную причину, а не уронить процесс.
 #include "vtm_internal.h"
+#include "vtm_backend.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -599,7 +600,7 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
         set_global_error("не хватило памяти на vtm_t");
         return NULL;
     }
-    m->backend = &vtm_backend_scalar_lut;
+    m->backend = vtm_backend_from_env();
     m->input_token = -1;
     // Дефолты меты: без меты/с битой метой ROPE работает на 10000, как раньше.
     m->rope_theta = VTM_DEFAULT_ROPE_THETA;
@@ -1072,7 +1073,7 @@ const vtm_instr *vtm_instruction(const vtm_t *m, uint32_t index) {
 
 void vtm_set_backend(vtm_t *m, const vtm_backend *backend) {
     if (!m) return;
-    m->backend = backend ? backend : &vtm_backend_scalar_lut;
+    m->backend = backend ? backend : vtm_backend_from_env();
 }
 
 const char *vtm_backend_name(const vtm_t *m) {
