@@ -146,13 +146,6 @@ def _aliases(item: dict[str, Any]) -> list[str]:
     return [value for value in values if value.strip()]
 
 
-def _alias_token_set(item: dict[str, Any]) -> set[str]:
-    result: set[str] = set()
-    for alias in _aliases(item):
-        result.update(tokens(alias))
-    return result
-
-
 def _as_list(value: Any) -> list[str]:
     if value is None:
         return []

@@ -546,6 +546,7 @@ class TestContacts(SkillTest):
             "Покажи контакты",
             "Где находится офис?",
             "Как связаться с вами?",
+            "Как с вами связаться?",
         ):
             with self.subTest(question=question):
                 self.assertTrue(self.skill.match(question))
