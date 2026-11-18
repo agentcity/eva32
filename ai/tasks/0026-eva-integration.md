@@ -5,7 +5,7 @@ title: Подключение к orioncode
 created_at: 2026-11-18T05:00:00Z
 author: yuri
 assignee: agent:eva-integration
-status: in_progress
+status: done
 scope:
   docs: true
   code: true
@@ -44,7 +44,18 @@ scope:
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: `docs/integration-orioncode.md` (12 разделов), `scripts/integration_smoke.py`,
+блок `EVA_*` (18 переменных) в `.env.example`.
+
+Проверено архитектором на живом сервере: smoke прогнал 4/4 PASS —
+`/health` ok, `/v1/models` отдаёт eva-hybrid, чат вернул route=skill с ценой 0
+и ответом из каталога, стрим отдал `text/event-stream` и `[DONE]`. Exit 0.
+Недоступный сервер даёт 4 FAIL и exit 1 (проверено агентом на порту 1).
+
+Риски приняты: JSON-пример конфига orioncode — смысловой (их схемы в репозитории
+нет, имена полей могут отличаться); сервер без auth/TLS — только localhost или
+reverse proxy; `/health` не проверяет готовность моделей, поэтому smoke проверяет
+чат; телеметрия в HTTP пока не подключена — сервер сам `logs/eva.jsonl` не пишет.
 
 ## Ссылки
 

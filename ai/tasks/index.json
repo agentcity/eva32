@@ -177,7 +177,7 @@
   {
     "id": "0026",
     "title": "Подключение к orioncode",
-    "status": "in_progress",
+    "status": "done",
     "file": "0026-eva-integration.md",
     "assignee": "agent:eva-integration"
   }
