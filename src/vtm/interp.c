@@ -310,6 +310,35 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 
 // --- RMSN ------------------------------------------------------------------
 
+// Число из меты контейнера. Метa — плоский JSON, ключи наших настроек уникальны,
+// достаточно первого вхождения. Нужно, чтобы eps нормализации доходил точно:
+// imm инструкции хранит eps/1000, и Qwen-овский 1e-6 так округляется в ноль.
+static double meta_number(const vtm_t *m, const char *key, double fallback) {
+    const char *json = vtm_meta_json(m);
+    const char *hit;
+    char needle[64];
+    size_t klen = strlen(key);
+
+    if (!json || klen + 3u >= sizeof needle) return fallback;
+    needle[0] = '"';
+    memcpy(needle + 1, key, klen);
+    needle[klen + 1u] = '"';
+    needle[klen + 2u] = '\0';
+    hit = strstr(json, needle);
+    if (!hit) return fallback;
+    hit += klen + 2u;
+    while (*hit == ' ' || *hit == '\t' || *hit == '\n' || *hit == '\r') hit++;
+    if (*hit != ':') return fallback;
+    hit++;
+    while (*hit == ' ' || *hit == '\t' || *hit == '\n' || *hit == '\r') hit++;
+    {
+        char *end = NULL;
+        double value = strtod(hit, &end);
+        if (end == hit) return fallback;
+        return value;
+    }
+}
+
 static vtm_status op_rmsn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     vtm_status st;
     const vtm_tensor *x = need(m, in->a, ins, "a (x)", &st);
@@ -332,7 +361,9 @@ static vtm_status op_rmsn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     if (in->imm < 0)
         return fail(m, ins, VTM_E_ARG, "RMSN: eps не может быть отрицательным");
     n = (int)x->n_elements;
-    eps = (float)((double)in->imm / 1000.0);
+    // Приоритет у меты: компилятор кладёт туда точный eps (1e-6). imm/1000 —
+    // совместимость со старыми контейнерами, где 1e-6 округлялось в 0.
+    eps = (float)meta_number(m, "rms_norm_eps", (double)in->imm / 1000.0);
     fn = m->backend && m->backend->rmsnorm ? m->backend->rmsnorm
                                            : vtm_backend_scalar_lut.rmsnorm;
     if (!fn) return fail(m, ins, VTM_E_UNSUPPORTED, "нет ядра RMSN");

@@ -415,7 +415,7 @@
   {
     "id": "0065",
     "title": "Волна 1: eps, окно контекста, сброс KV, трассировка",
-    "status": "in_progress",
+    "status": "blocked",
     "file": "0065-vtm-core-correct.md",
     "assignee": "agent:vtm-core-correct"
   },
@@ -467,5 +467,12 @@
     "status": "in_progress",
     "file": "0072-vtm-parity-random.md",
     "assignee": "agent:vtm-parity-random"
+  },
+  {
+    "id": "0073",
+    "title": "KV: окно контекста и сброс между запросами",
+    "status": "pending",
+    "file": "0073-kv-window-reset.md",
+    "assignee": ""
   }
 ]
