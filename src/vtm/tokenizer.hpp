@@ -66,6 +66,15 @@ struct EncodeOptions {
     bool allow_special_tokens = true;
 };
 
+// Публичное описание added_tokens (порядок — как в tokenizer.json).
+// Нужно хосту, чтобы строить чат-шаблон из спецтокенов самого словаря,
+// а не из захардкоженных id: content, id и special берутся из файла.
+struct AddedTokenInfo {
+    std::string content;
+    int32_t id = -1;
+    bool special = false;
+};
+
 class Tokenizer {
 public:
     // Загрузить tokenizer.json с диска. Бросает TokenizerError.
@@ -90,6 +99,18 @@ public:
     const TokenizerInfo &info() const { return info_; }
     // Все токены по id (для отладки/CLI); added_tokens тоже входят.
     const std::vector<std::string> &id_to_token_table() const { return id_to_token_; }
+
+    // added_tokens в порядке tokenizer.json. Определён здесь inline, чтобы
+    // не менять tokenizer.cpp: чат-шаблону нужен content спецтокенов
+    // (<|im_start|> и т. п.) и их id из файла, а не из кода.
+    std::vector<AddedTokenInfo> added_tokens() const {
+        std::vector<AddedTokenInfo> out;
+        out.reserve(added_.size());
+        for (const AddedToken &t : added_) {
+            out.push_back(AddedTokenInfo{t.content, t.id, t.special});
+        }
+        return out;
+    }
 
 private:
     friend class TokenizerBuilder;

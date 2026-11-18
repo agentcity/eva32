@@ -189,6 +189,39 @@ typedef struct {
 Интерпретатор проверяет `NULL` и падает обратно на скалярный путь. Так SIMD
 подключается без изменения байткода.
 
+## CLI
+
+```
+vtm run model.vtm --tokens 1,2,3 --max-new 8
+vtm run model.vtm --text "вопрос" [--tokenizer tokenizer.json] [--max-new 8]
+vtm run model.vtm --text "вопрос" --chat [--system "..."]
+vtm inspect model.vtm
+vtm bench [--rows N --cols N --iters N]
+```
+
+`--text` кодирует промпт BPE-токенизатором (`tokenizer.json` формата
+HuggingFace: по умолчанию `$VTM_TOKENIZER`, затем
+`tests/vtm/fixtures/tokenizer.json`), прогоняет модель по одному токену и
+декодирует вывод обратно в UTF-8.
+
+`--chat` оборачивает текст в чат-шаблон Qwen2.5:
+
+```
+<|im_start|>system
+{system}<|im_end|>
+<|im_start|>user
+{text}<|im_end|>
+<|im_start|>assistant
+```
+
+Ход `system` появляется только при `--system "..."` — так же ведёт себя
+официальный шаблон Qwen, если системного сообщения нет. Токены
+`<|im_start|>`/`<|im_end|>` и их id берутся из `added_tokens`
+(`special == true`) того же `tokenizer.json`, в коде их нет: словарь с
+другими id даёт другие id в промпте, словарь без этих токенов — ошибку с
+кодом 2. Без `--chat` поведение прежнее: в токенизатор уходит ровно текст
+из `--text`, символ в символ.
+
 ## Порядок работ
 
 | Этап | Что | Готово, когда |

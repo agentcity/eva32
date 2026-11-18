@@ -165,6 +165,40 @@ int vtm_tok_decode(vtm_tok *handle, const int32_t *ids, size_t n,
     }
 }
 
+// added_tokens: чат-шаблон берёт из них content/id спецтокенов
+// (<|im_start|>, <|im_end|>), поэтому id в C-части не захардкожены.
+int vtm_tok_added_count(vtm_tok *handle) {
+    if (handle == NULL) return -1;
+    try {
+        return (int)handle->tok.added_tokens().size();
+    } catch (...) {
+        return -1;
+    }
+}
+
+// 1 — content выделен malloc (освобождать vtm_tok_free_text);
+// 0 — index за пределами; -1 — ошибка.
+int vtm_tok_added_at(vtm_tok *handle, int index, char **out_content,
+                     int32_t *out_id, int *out_special) {
+    if (out_content != NULL) *out_content = NULL;
+    if (handle == NULL || out_content == NULL || index < 0) return -1;
+    try {
+        const std::vector<vtm::AddedTokenInfo> all = handle->tok.added_tokens();
+        if ((std::size_t)index >= all.size()) return 0;
+        const vtm::AddedTokenInfo &t = all[(std::size_t)index];
+        char *copy = (char *)std::malloc(t.content.size() + 1);
+        if (copy == NULL) return -1;
+        std::memcpy(copy, t.content.data(), t.content.size());
+        copy[t.content.size()] = '\0';
+        *out_content = copy;
+        if (out_id != NULL) *out_id = t.id;
+        if (out_special != NULL) *out_special = t.special ? 1 : 0;
+        return 1;
+    } catch (...) {
+        return -1;
+    }
+}
+
 void vtm_tok_free_ids(int32_t *ids) {
     std::free(ids);
 }
@@ -201,6 +235,9 @@ int vtm_tok_encode(vtm_tok *handle, const char *text, int32_t **out_ids,
                    size_t *out_n, char *err, size_t errlen);
 int vtm_tok_decode(vtm_tok *handle, const int32_t *ids, size_t n,
                    char **out_text, char *err, size_t errlen);
+int vtm_tok_added_count(vtm_tok *handle);
+int vtm_tok_added_at(vtm_tok *handle, int index, char **out_content,
+                     int32_t *out_id, int *out_special);
 void vtm_tok_free_ids(int32_t *ids);
 void vtm_tok_free_text(char *text);
 
@@ -216,6 +253,9 @@ static void usage(FILE *out) {
         "      токенизировать текст (BPE), прогнать и напечатать ответ текстом\n"
         "      --tokenizer PATH       tokenizer.json; иначе $VTM_TOKENIZER,\n"
         "                             затем tests/vtm/fixtures/tokenizer.json\n"
+        "      --chat                 обернуть текст в чат-шаблон Qwen2.5\n"
+        "                             (<|im_start|>system/user/assistant <|im_end|>)\n"
+        "      --system \"...\"         системное сообщение; только вместе с --chat\n"
         "      --backend lut|direct   вариант скалярного TMV (по умолчанию lut)\n"
         "\n"
         "  vtm inspect model.vtm\n"
@@ -329,18 +369,159 @@ static void print_tokens(const char *label, const int *v, size_t n) {
     printf("\n");
 }
 
+// --- чат-шаблон Qwen2.5 ----------------------------------------------------
+//
+// Шаблон целиком:
+//
+//   <|im_start|>system\n{system}<|im_end|>\n
+//   <|im_start|>user\n{text}<|im_end|>\n
+//   <|im_start|>assistant\n
+//
+// Строки <|im_start|>/<|im_end|> не хардкодятся: они берутся из
+// added_tokens tokenizer.json (special == true, content содержит
+// "im_start"/"im_end"). Ход system добавляется только при --system — так же
+// ведёт себя официальный шаблон Qwen, если системного сообщения нет.
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+    int oom;
+} chat_buf;
+
+static void chat_buf_free(chat_buf *b) {
+    free(b->data);
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
+    b->oom = 0;
+}
+
+static int chat_buf_add_n(chat_buf *b, const char *s, size_t n) {
+    if (b->oom) return -1;
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 128;
+        char *p;
+        while (cap < b->len + n + 1) {
+            if (cap > (size_t)-1 / 2) {
+                b->oom = 1;
+                return -1;
+            }
+            cap *= 2;
+        }
+        p = (char *)realloc(b->data, cap);
+        if (!p) {
+            b->oom = 1;
+            return -1;
+        }
+        b->data = p;
+        b->cap = cap;
+    }
+    if (n != 0) memcpy(b->data + b->len, s, n);
+    b->len += n;
+    b->data[b->len] = '\0';
+    return 0;
+}
+
+static int chat_buf_add(chat_buf *b, const char *s) {
+    return chat_buf_add_n(b, s, strlen(s));
+}
+
+// Ищет special added_token, чей content содержит needle, и копирует content
+// в out. Так текст спецтокена приходит из tokenizer.json, а не из кода.
+static int chat_find_special(vtm_tok *tok, const char *needle, char *out,
+                             size_t cap, char *err, size_t errlen) {
+    int n, i;
+    if (tok == NULL) return -1;
+    n = vtm_tok_added_count(tok);
+    if (n < 0) {
+        snprintf(err, errlen, "не удалось прочитать added_tokens");
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        char *content = NULL;
+        int32_t id = -1;
+        int special = 0;
+        int rc = vtm_tok_added_at(tok, i, &content, &id, &special);
+        if (rc < 0) {
+            snprintf(err, errlen, "не удалось прочитать added_tokens[%d]", i);
+            return -1;
+        }
+        if (rc == 0 || !special || content == NULL) {
+            vtm_tok_free_text(content);
+            continue;
+        }
+        if (strstr(content, needle) == NULL) {
+            vtm_tok_free_text(content);
+            continue;
+        }
+        if (strlen(content) + 1 > cap) {
+            snprintf(err, errlen, "added_token \"%s\" не влез в буфер",
+                     content);
+            vtm_tok_free_text(content);
+            return -1;
+        }
+        memcpy(out, content, strlen(content) + 1);
+        vtm_tok_free_text(content);
+        return 0;
+    }
+    snprintf(err, errlen,
+             "в tokenizer.json нет special added_token с \"%s\" в content",
+             needle);
+    return -1;
+}
+
+// Собирает промпт. Возвращает 0 и malloc-строку в *out либо -1 с err.
+static int chat_build_prompt(vtm_tok *tok, const char *system_msg,
+                             const char *user_msg, char **out, char *err,
+                             size_t errlen) {
+    char start[128];
+    char end[128];
+    chat_buf b;
+
+    *out = NULL;
+    if (chat_find_special(tok, "im_start", start, sizeof start, err, errlen) != 0)
+        return -1;
+    if (chat_find_special(tok, "im_end", end, sizeof end, err, errlen) != 0)
+        return -1;
+
+    memset(&b, 0, sizeof b);
+    if (system_msg != NULL) {
+        if (chat_buf_add(&b, start) != 0 || chat_buf_add(&b, "system\n") != 0 ||
+            chat_buf_add(&b, system_msg) != 0 || chat_buf_add(&b, end) != 0 ||
+            chat_buf_add(&b, "\n") != 0)
+            goto oom;
+    }
+    if (chat_buf_add(&b, start) != 0 || chat_buf_add(&b, "user\n") != 0 ||
+        chat_buf_add(&b, user_msg) != 0 || chat_buf_add(&b, end) != 0 ||
+        chat_buf_add(&b, "\n") != 0 || chat_buf_add(&b, start) != 0 ||
+        chat_buf_add(&b, "assistant\n") != 0)
+        goto oom;
+
+    *out = b.data;
+    return 0;
+
+oom:
+    chat_buf_free(&b);
+    snprintf(err, errlen, "не хватило памяти под чат-шаблон");
+    return -1;
+}
+
 static int cmd_run(int argc, char **argv) {
     const char *path = NULL;
     const char *tokens_s = NULL;
     const char *text_s = NULL;
     const char *tokenizer_s = NULL;
+    const char *system_s = NULL;
     const char *backend_name = "lut";
+    int chat = 0;
     int max_new = 8;
     int *tokens = NULL;
     size_t n_tokens = 0;
     int *generated = NULL;
     size_t n_generated = 0;
     vtm_tok *tokenizer = NULL;
+    char *prompt = NULL;
     char *answer = NULL;
     char tok_err[512];
     vtm_t *m;
@@ -366,6 +547,14 @@ static int cmd_run(int argc, char **argv) {
                 return 2;
             }
             tokenizer_s = argv[i];
+        } else if (strcmp(argv[i], "--chat") == 0) {
+            chat = 1;
+        } else if (strcmp(argv[i], "--system") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "vtm run: --system без значения\n");
+                return 2;
+            }
+            system_s = argv[i];
         } else if (strcmp(argv[i], "--max-new") == 0) {
             if (++i >= argc || parse_int(argv[i], &max_new) != 0 ||
                 max_new < 0 || max_new > 1000000) {
@@ -400,6 +589,14 @@ static int cmd_run(int argc, char **argv) {
         fprintf(stderr, "vtm run: --tokenizer имеет смысл только с --text\n");
         return 2;
     }
+    if (chat && !text_s) {
+        fprintf(stderr, "vtm run: --chat имеет смысл только с --text\n");
+        return 2;
+    }
+    if (system_s && !chat) {
+        fprintf(stderr, "vtm run: --system имеет смысл только с --chat\n");
+        return 2;
+    }
     if (strcmp(backend_name, "lut") != 0 &&
         strcmp(backend_name, "direct") != 0) {
         fprintf(stderr, "vtm run: --backend должен быть lut или direct\n");
@@ -429,9 +626,18 @@ static int cmd_run(int argc, char **argv) {
             fprintf(stderr, "vtm run: токенизатор %s: %s\n", tok_path, tok_err);
             return 2;
         }
-        if (vtm_tok_encode(tokenizer, text_s, &ids, &n_ids, tok_err,
-                           sizeof tok_err) != 0) {
+        if (chat) {
+            if (chat_build_prompt(tokenizer, system_s, text_s, &prompt, tok_err,
+                                  sizeof tok_err) != 0) {
+                fprintf(stderr, "vtm run: чат-шаблон: %s\n", tok_err);
+                vtm_tok_close(tokenizer);
+                return 2;
+            }
+        }
+        if (vtm_tok_encode(tokenizer, prompt ? prompt : text_s, &ids, &n_ids,
+                           tok_err, sizeof tok_err) != 0) {
             fprintf(stderr, "vtm run: токенизатор %s: %s\n", tok_path, tok_err);
+            free(prompt);
             vtm_tok_close(tokenizer);
             return 2;
         }
@@ -439,12 +645,14 @@ static int cmd_run(int argc, char **argv) {
             fprintf(stderr,
                     "vtm run: --text \"%s\" дал пустой список токенов "
                     "(проверьте tokenizer.json: %s)\n", text_s, tok_path);
+            free(prompt);
             vtm_tok_free_ids(ids);
             vtm_tok_close(tokenizer);
             return 2;
         }
         if (n_ids > (size_t)INT_MAX) {
             fprintf(stderr, "vtm run: --text дал слишком много токенов\n");
+            free(prompt);
             vtm_tok_free_ids(ids);
             vtm_tok_close(tokenizer);
             return 2;
@@ -452,6 +660,7 @@ static int cmd_run(int argc, char **argv) {
         tokens = (int *)malloc(n_ids * sizeof(int));
         if (!tokens) {
             fprintf(stderr, "vtm run: не хватило памяти\n");
+            free(prompt);
             vtm_tok_free_ids(ids);
             vtm_tok_close(tokenizer);
             return 1;
@@ -464,6 +673,7 @@ static int cmd_run(int argc, char **argv) {
     m = vtm_load(path);
     if (!m) {
         fprintf(stderr, "vtm: %s\n", vtm_last_error());
+        free(prompt);
         free(tokens);
         vtm_tok_close(tokenizer);
         return 1;
@@ -476,7 +686,13 @@ static int cmd_run(int argc, char **argv) {
     printf("тензоров: %u, инструкций: %u, бэкенд: %s\n",
            (unsigned)vtm_tensor_count(m), (unsigned)vtm_instr_count(m),
            vtm_backend_name(m));
+    if (system_s) printf("система: %s\n", system_s);
     if (text_s) printf("текст:   %s\n", text_s);
+    if (prompt) {
+        printf("шаблон:\n%sконец шаблона\n", prompt);
+        free(prompt);
+        prompt = NULL;
+    }
 
     if (max_new > 0) {
         generated = (int *)calloc((size_t)max_new, sizeof(int));
