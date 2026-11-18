@@ -65,7 +65,7 @@
   {
     "id": "0010",
     "title": "CI: тесты Python и C на каждый пуш",
-    "status": "in_progress",
+    "status": "done",
     "file": "0010-ci-pipeline.md",
     "assignee": "agent:ci"
   },

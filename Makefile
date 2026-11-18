@@ -10,7 +10,7 @@ DEV_PORT   ?= 11434
 PROD_PORT  ?= 8000
 COMPOSE    := docker compose -f serving/compose.yaml
 
-.PHONY: help status bundle eval eval-dev dev-serve dev-stop dev pull-dev test distill distill-mock teacher-models compose-up compose-down compose-logs clean
+.PHONY: help status bundle eval eval-dev dev-serve dev-stop dev pull-dev test distill distill-mock teacher-models compose-up compose-down compose-logs clean ci
 
 help:  ## список команд
 	@echo "EVA32"
@@ -94,3 +94,22 @@ distill:  ## сбор пар у настоящего учителя (нужны 
 
 clean:  ## удалить локальные результаты eval и пары дистилляции
 	rm -rf eval/results distill/out
+
+# То же, что .github/workflows/ci.yml, но локально и без Docker.
+ci:  ## проверка как в CI: python-тесты, C-тесты, реестр задач
+	@echo "== python: unittest discover =="
+	@$(PY) -m unittest discover -s tests -v
+	@echo
+	@echo "== c: src/vtm =="
+	@if [ -d src/vtm ] && [ -f src/vtm/Makefile ]; then \
+	  $(MAKE) -C src/vtm test; \
+	elif [ -d src/vtm ]; then \
+	  echo "  src/vtm есть, но Makefile с целью test ещё нет — пропущено"; \
+	else \
+	  echo "  src/vtm отсутствует — C-тесты пропущены"; \
+	fi
+	@echo
+	@echo "== tasks: check_tasks =="
+	@$(PY) tools/check_tasks.py
+	@echo
+	@echo "== ci: OK =="

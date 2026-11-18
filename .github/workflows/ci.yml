@@ -1,0 +1,72 @@
+name: CI
+
+# Проверка на каждый пуш и pull request: Python-тесты (stdlib, без torch),
+# C-рантайм src/vtm (если каталог уже появился) и реестр задач.
+# Локальный аналог: make ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python · unittest discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Зависимости не ставим: код обязан работать на стандартной библиотеке.
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
+  c:
+    name: C · src/vtm
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # C-рантайма может ещё не быть (задачи 0002/0003/0006 в работе):
+      # в этом случае джоба не падает, а честно пропускает тесты.
+      - name: Detect C runtime
+        id: vtm
+        run: |
+          if [ -d src/vtm ] && [ -f src/vtm/Makefile ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "src/vtm найден — запускаем C-тесты"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=C-тесты пропущены::Каталог src/vtm (или его Makefile) ещё отсутствует"
+          fi
+
+      - name: C tests
+        if: steps.vtm.outputs.present == 'true'
+        working-directory: src/vtm
+        run: make test
+
+  tasks:
+    name: Tasks · реестр и фронтматтер
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # check_tasks.py — только stdlib; python3 есть на раннере.
+      - name: Validate task registry
+        run: python3 tools/check_tasks.py
