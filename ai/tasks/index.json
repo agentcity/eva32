@@ -747,5 +747,61 @@
     "status": "pending",
     "file": "0113-decode-speed.md",
     "assignee": ""
+  },
+  {
+    "id": "0112",
+    "title": "Батчевый prefill: промпт пачкой, а не по токену",
+    "status": "in_progress",
+    "file": "0112-prefill-batch.md",
+    "assignee": "agent:prefill-batch"
+  },
+  {
+    "id": "0113",
+    "title": "Декод 10,8 ток/с: профиль и ускорение ядер",
+    "status": "in_progress",
+    "file": "0113-decode-kernels.md",
+    "assignee": "agent:decode-kernels"
+  },
+  {
+    "id": "0114",
+    "title": "CLI и C-ABI для батчевого prefill",
+    "status": "in_progress",
+    "file": "0114-prefill-cli.md",
+    "assignee": "agent:prefill-cli"
+  },
+  {
+    "id": "0115",
+    "title": "Сервер: TTFT и прогрев модели",
+    "status": "in_progress",
+    "file": "0115-server-ttft.md",
+    "assignee": "agent:server-ttft"
+  },
+  {
+    "id": "0116",
+    "title": "Документация: prefill, скорость, форма 1.5B",
+    "status": "in_progress",
+    "file": "0116-docs-prefill.md",
+    "assignee": "agent:docs-prefill"
+  },
+  {
+    "id": "0117",
+    "title": "CI: порог регрессии производительности",
+    "status": "in_progress",
+    "file": "0117-ci-perf.md",
+    "assignee": "agent:ci-perf"
+  },
+  {
+    "id": "0118",
+    "title": "KV: кэп на суммарный размер и отказ старым бинарям",
+    "status": "in_progress",
+    "file": "0118-kv-caps.md",
+    "assignee": "agent:kv-caps"
+  },
+  {
+    "id": "0119",
+    "title": "Промпт короче: 4,4 КБ — это 1000 токенов prefill",
+    "status": "in_progress",
+    "file": "0119-prompt-shorten.md",
+    "assignee": "agent:prompt-shorten"
   }
 ]
