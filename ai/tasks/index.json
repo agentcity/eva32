@@ -541,7 +541,7 @@
   {
     "id": "0084",
     "title": "Портируемость: Windows и big-endian — честный отказ вместо тихой ошибки",
-    "status": "in_progress",
+    "status": "done",
     "file": "0084-vtm-portability.md",
     "assignee": "agent:vtm-portability"
   },
@@ -557,6 +557,13 @@
     "title": "Метрики по операциям вместо оценки (trace)",
     "status": "pending",
     "file": "0082-vtm-metrics.md",
+    "assignee": ""
+  },
+  {
+    "id": "0086",
+    "title": "UBSan: misaligned load в ядрах (memcpy)",
+    "status": "pending",
+    "file": "0086-unaligned-loads.md",
     "assignee": ""
   }
 ]

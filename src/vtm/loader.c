@@ -6,6 +6,11 @@
 //
 // Все проверки границ делаются до выделения памяти и до исполнения. Кривой
 // файл обязан вернуть NULL и внятную причину, а не уронить процесс.
+//
+// Платформа: нужен little-endian POSIX. Под Windows этот TU не собирается —
+// vtm.h даёт #error (см. «Портируемость» в docs/vtm.md), поэтому ветви
+// #if defined(_WIN32) ниже — черновик будущего порта, а не рабочий путь.
+// Big-endian проверяется один раз в load_core() (VTM_HOST_BIG_ENDIAN).
 #include "vtm_internal.h"
 #include "vtm_backend.h"
 #include "sha256.h"
@@ -118,6 +123,12 @@ const char *vtm_opcode_name(uint8_t opcode) {
 }
 
 // --- little-endian чтение --------------------------------------------------
+//
+// Все rd* предполагают little-endian хост: свопинга здесь нет намеренно.
+// Контейнер little-endian, и в mmap-режиме часть данных читается из файла
+// напрямую как uint32_t*/float*, так что свопинг в этих функциях всё равно не
+// спас бы — пришлось бы копировать всё в арену. Поэтому big-endian отсекается
+// один раз в load_core() (VTM_HOST_BIG_ENDIAN), до этих циклов.
 
 static uint16_t rd16(const uint8_t *p) {
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
@@ -807,6 +818,14 @@ static int meta_parse(const char *json, size_t len, meta_fields *out) {
 
 // --- загрузка из памяти ----------------------------------------------------
 
+// Текст отказа на big-endian. Один на оба входа (файл и память): причину
+// хочется видеть одинаковую и без «см. исходники». Держим короче 256 байт —
+// это ёмкость g_last_error и m->error (тест проверяет, что хвост не срезан).
+#define VTM_BIG_ENDIAN_MSG \
+    "big-endian хост не поддерживается: контейнер .vtm хранит u32/f32 в " \
+    "little-endian, свопинга нет; нужен little-endian хост — " \
+    "docs/vtm.md, «Портируемость»"
+
 // Общее ядро загрузки. can_reference == 1 — данные лежат в mmap-отображении,
 // которое живёт до vtm_free(): неизменяемые тензоры можно оставить там.
 // can_reference == 0 — буфер принадлежит вызывающему (vtm_load_mem) или это
@@ -848,6 +867,18 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         if (errbuf && errcap)
             snprintf(errbuf, errcap, "файл короче заголовка: %zu < %u байт",
                      size, (unsigned)VTM_HEADER_SIZE);
+        return NULL;
+    }
+
+    // Порядок байт — один раз на загрузку, до разбора и до выделения арены.
+    // VTM_HOST_BIG_ENDIAN — константа времени компиляции (vtm.h), поэтому в
+    // little-endian сборке эта ветвь стоит ноль: компилятор её выбрасывает.
+    // Проверять в циклах чтения (rd32/rd_f32, validate_words, раскладка
+    // тензоров) не нужно: на big-endian сюда дело не доходит.
+    if (VTM_HOST_BIG_ENDIAN) {
+        if (status) *status = VTM_E_UNSUPPORTED;
+        set_global_error("%s", VTM_BIG_ENDIAN_MSG);
+        if (errbuf && errcap) snprintf(errbuf, errcap, "%s", VTM_BIG_ENDIAN_MSG);
         return NULL;
     }
 
@@ -1375,13 +1406,10 @@ static vtm_t *load_mmap(const char *path) {
     char err[256];
     vtm_t *m;
 
-#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
-    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    // Контейнер little-endian; отображать fp32/триты как есть нельзя.
-    fprintf(stderr, "VTM: big-endian хост — mmap отключён, "
-                    "читаем файл в память\n");
-    return load_fread(path);
-#endif
+    // Big-endian здесь особого случая нет: файл отображается как обычно, а
+    // отказ выдаёт load_core() (VTM_BIG_ENDIAN_MSG, VTM_E_UNSUPPORTED) — одна
+    // проверка на оба входа, файл и память. Отображение при этом не отдаёт
+    // наружу ни одного float: загрузка обрывается до разбора тензоров.
 
     err[0] = '\0';
     fd = open(path, O_RDONLY);
@@ -1460,6 +1488,8 @@ vtm_t *vtm_load(const char *path) {
         return NULL;
     }
 #if defined(_WIN32)
+    // Недостижимо: под _WIN32 vtm.h даёт #error. Ветвь оставлена черновиком
+    // будущего порта (см. docs/vtm.md, «Портируемость»).
     // Windows: mmap нет — честно сообщаем и читаем файл в память, как раньше.
     fprintf(stderr, "VTM: mmap недоступен на Windows — читаем файл в память\n");
     return load_fread(path);

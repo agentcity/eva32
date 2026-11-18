@@ -30,6 +30,73 @@ static int g_fail;
     } \
 } while (0)
 
+// --- big-endian: контейнер не читается, загрузчик обязан отказать ----------
+//
+// Обычная сборка гоняет весь набор ниже. Сборка с -DVTM_HOST_BIG_ENDIAN=1
+// эмулирует BE-хост (docs/vtm.md, «Портируемость»): контейнер .vtm
+// little-endian, поэтому vtm_load_mem()/vtm_load() обязаны вернуть
+// VTM_E_UNSUPPORTED с внятным текстом, а не прочитать u32/f32 как мусор.
+// Проверка стоит один раз на загрузку, поэтому остальные тесты в BE-сборке
+// смысла не имеют: ни один контейнер не должен загрузиться.
+//
+//   make clean && make CPPFLAGS="-D_POSIX_C_SOURCE=200809L -DVTM_HOST_BIG_ENDIAN=1" test_vtm
+//   ./test_vtm
+#if VTM_HOST_BIG_ENDIAN
+
+// Минимальный корректный контейнер: заголовок 32 байта, ни тензоров, ни
+// программы. На little-endian он грузится (test_host_endian_guard), значит
+// отказ в BE-сборке — именно про хост, а не про кривой файл.
+static void minimal_header(uint8_t hdr[VTM_HEADER_SIZE]) {
+    memset(hdr, 0, VTM_HEADER_SIZE);
+    memcpy(hdr, "VTM1", 4);
+    hdr[4] = (uint8_t)(VTM_FORMAT_VERSION & 0xffu);   // версия u16, LE
+    hdr[5] = (uint8_t)(VTM_FORMAT_VERSION >> 8);
+}
+
+int main(void) {
+    uint8_t hdr[VTM_HEADER_SIZE];
+    vtm_status st = VTM_OK;
+    char err[256];
+    char path[64];
+    vtm_t *m;
+    FILE *f;
+
+    minimal_header(hdr);
+
+    err[0] = '\0';
+    m = vtm_load_mem(hdr, sizeof hdr, &st, err, sizeof err);
+    CHECK(m == NULL);
+    CHECK(st == VTM_E_UNSUPPORTED);
+    CHECK(strstr(err, "big-endian") != NULL);
+    CHECK(strstr(err, "Портируемость") != NULL);
+    CHECK(strstr(vtm_last_error(), "big-endian") != NULL);
+    if (m) vtm_free(m);
+
+    // Тот же отказ через файл: vtm_load() идёт через тот же load_core(), в
+    // том числе когда mmap-путь доступен.
+    snprintf(path, sizeof path, "/tmp/vtm_be_probe_%ld.vtm", (long)time(NULL));
+    f = fopen(path, "wb");
+    CHECK(f != NULL);
+    if (f) {
+        CHECK(fwrite(hdr, 1, sizeof hdr, f) == sizeof hdr);
+        fclose(f);
+        m = vtm_load(path);
+        CHECK(m == NULL);
+        CHECK(strstr(vtm_last_error(), "big-endian") != NULL);
+        if (m) vtm_free(m);
+        remove(path);
+    }
+
+    if (g_fail) {
+        fprintf(stderr, "\nПРОВАЛЕНО проверок: %d\n", g_fail);
+        return 1;
+    }
+    printf("big-endian: загрузчик отказал (VTM_E_UNSUPPORTED), все тесты VTM: ok\n");
+    return 0;
+}
+
+#else // !VTM_HOST_BIG_ENDIAN
+
 static void *xmalloc(size_t n) {
     void *p = malloc(n ? n : 1);
     if (!p) {
@@ -887,6 +954,33 @@ static void test_bad_files(void) {
 
     free(img);
     model_free(&md);
+}
+
+// Порядок байт: хост little-endian, как и контейнер, — обычная загрузка
+// проходит. Парный тест к BE-ветви в начале файла: там отказ, здесь успех на
+// том же минимальном заголовке, значит отказ был именно из-за хоста.
+static void test_host_endian_guard(void) {
+    uint8_t hdr[VTM_HEADER_SIZE];
+    vtm_status st = VTM_OK;
+    char err[256];
+    vtm_t *m;
+
+    CHECK(VTM_HOST_BIG_ENDIAN == 0);
+    memset(hdr, 0, sizeof hdr);
+    memcpy(hdr, "VTM1", 4);
+    hdr[4] = (uint8_t)(VTM_FORMAT_VERSION & 0xffu);
+    hdr[5] = (uint8_t)(VTM_FORMAT_VERSION >> 8);
+
+    err[0] = '\0';
+    m = vtm_load_mem(hdr, sizeof hdr, &st, err, sizeof err);
+    CHECK(m != NULL);
+    CHECK(st == VTM_OK);
+    CHECK(err[0] == '\0');
+    if (m) {
+        CHECK(vtm_tensor_count(m) == 0);
+        CHECK(vtm_instr_count(m) == 0);
+        vtm_free(m);
+    }
 }
 
 static void test_file_load(void) {
@@ -4035,6 +4129,543 @@ static void test_mmap_raw_trit(void) {
     model_free(&md);
 }
 
+// --- кэш префикса (задача 0081) --------------------------------------------
+//
+// Модель — один Qwen-подобный слой (как demo/model.vtm): EMB → RMSN → q/k/v →
+// ROPE → KVW → ATTN → o_proj → MLP → lm_head → SAMP. Размеры задаются
+// параметрами, чтобы тот же код собирал маленькую модель для теста и
+// 128-скрытую для замера.
+//
+// Проверяется поведение, а не реализация: после vtm_run_cached() машина
+// обязана быть ровно в том же состоянии, что после полного прогона тех же ids
+// по одному токену, — побитово (логиты, выбранный токен, K/V, позиция,
+// счётчик сгенерированных). Счётчики попаданий/промахов показывают, был ли
+// прогон полным; K/V сравниваются по строкам, которые прогон трогал (хвост
+// прошлого, более длинного запроса за пределами len не читается и не важен).
+
+enum {
+    CT_EMB, CT_X, CT_H1, CT_N1, CT_Q, CT_K, CT_V, CT_QW, CT_KW, CT_VW,
+    CT_KC, CT_VC, CT_ATTN, CT_O, CT_OW, CT_H2, CT_N2, CT_GATE, CT_UP,
+    CT_GW, CT_UW, CT_MUL, CT_DOWN, CT_DW, CT_NF, CT_HF, CT_LOGITS,
+    CT_LMW, CT_TOKEN
+};
+
+typedef struct {
+    int ctx;        // длина KV-кэша
+    int hidden;     // hidden_size
+    int vocab;      // словарь (эмбеддинги и lm_head)
+    int inter;      // промежуточный размер MLP
+    int heads;      // число голов Q
+    int head_dim;   // размер головы (heads*head_dim == hidden)
+    int kv_heads;   // GQA: kv_dim = kv_heads*head_dim
+} cache_cfg;
+
+static void cache_add_f32(model_t *md, const char *name, int ndim,
+                          const uint32_t *dims, float base, float amp) {
+    uint32_t n = dims_product(ndim, dims), i;
+    float *v = (float *)xmalloc((size_t)(n ? n : 1) * sizeof *v);
+    for (i = 0; i < n; i++) {
+        int d = (int)(((i * 2654435761u) >> 19) % 21u) - 10;
+        v[i] = base + amp * (float)d / 10.0f;
+    }
+    model_add_f32(md, name, ndim, dims, v);
+    free(v);
+}
+
+// Тритовая матрица [rows, cols] с блоком масштаба 128 (канон Python-эталона).
+static void cache_add_trit(model_t *md, const char *name, int rows, int cols) {
+    uint32_t dims[2] = {(uint32_t)rows, (uint32_t)cols};
+    uint32_t n = (uint32_t)rows * (uint32_t)cols;
+    uint32_t n_scales = (n + VTM_SCALE_BLOCK_128 - 1u) / VTM_SCALE_BLOCK_128;
+    int8_t *trits = (int8_t *)xmalloc((size_t)(n ? n : 1));
+    float *scales = (float *)xmalloc((size_t)(n_scales ? n_scales : 1)
+                                     * sizeof *scales);
+    uint32_t i;
+
+    for (i = 0; i < n; i++)
+        trits[i] = (int8_t)(int)(((i * 2654435761u) >> 9) % 3u) - 1;
+    for (i = 0; i < n_scales; i++) scales[i] = 0.05f;
+    model_add_trit_scaled(md, name, 2, dims, trits, scales, 1,
+                          (int)VTM_SCALE_BLOCK_128);
+    free(trits);
+    free(scales);
+}
+
+static vtm_t *cache_model(const cache_cfg *cfg) {
+    model_t md;
+    uint32_t d_emb[2], d_vec[1], d_kv[1], d_q[3], d_k[3], d_c[2], d_g[1];
+    uint32_t d_log[2], d_one[1];
+    int kv_dim = cfg->kv_heads * cfg->head_dim;
+    uint8_t *img;
+    size_t size;
+    char meta[192];
+    vtm_t *m;
+
+    d_emb[0] = (uint32_t)cfg->vocab;
+    d_emb[1] = (uint32_t)cfg->hidden;
+    d_vec[0] = (uint32_t)cfg->hidden;
+    d_kv[0] = (uint32_t)kv_dim;
+    d_q[0] = (uint32_t)cfg->heads;
+    d_q[1] = 1;
+    d_q[2] = (uint32_t)cfg->head_dim;
+    d_k[0] = (uint32_t)cfg->kv_heads;
+    d_k[1] = 1;
+    d_k[2] = (uint32_t)cfg->head_dim;
+    d_c[0] = (uint32_t)cfg->ctx;
+    d_c[1] = (uint32_t)kv_dim;
+    d_g[0] = (uint32_t)cfg->inter;
+    d_log[0] = (uint32_t)cfg->vocab;
+    d_log[1] = 1;
+    d_one[0] = 1;
+
+    model_init(&md);
+    cache_add_f32(&md, "emb.w", 2, d_emb, 0.0f, 0.05f);
+    cache_add_f32(&md, "x", 1, d_vec, 0.0f, 0.0f);
+    cache_add_f32(&md, "h1", 1, d_vec, 0.0f, 0.0f);
+    cache_add_f32(&md, "norm1.w", 1, d_vec, 1.0f, 0.02f);
+    cache_add_f32(&md, "q", 3, d_q, 0.0f, 0.0f);
+    cache_add_f32(&md, "k", 3, d_k, 0.0f, 0.0f);
+    cache_add_f32(&md, "v", 3, d_k, 0.0f, 0.0f);
+    cache_add_trit(&md, "q_proj.w", cfg->hidden, cfg->hidden);
+    cache_add_trit(&md, "k_proj.w", kv_dim, cfg->hidden);
+    cache_add_trit(&md, "v_proj.w", kv_dim, cfg->hidden);
+    cache_add_f32(&md, "kcache", 2, d_c, 0.0f, 0.0f);
+    cache_add_f32(&md, "vcache", 2, d_c, 0.0f, 0.0f);
+    cache_add_f32(&md, "attn", 3, d_q, 0.0f, 0.0f);
+    cache_add_f32(&md, "o", 1, d_vec, 0.0f, 0.0f);
+    cache_add_trit(&md, "o_proj.w", cfg->hidden, cfg->hidden);
+    cache_add_f32(&md, "h2", 1, d_vec, 0.0f, 0.0f);
+    cache_add_f32(&md, "norm2.w", 1, d_vec, 1.0f, 0.02f);
+    cache_add_f32(&md, "gate", 1, d_g, 0.0f, 0.0f);
+    cache_add_f32(&md, "up", 1, d_g, 0.0f, 0.0f);
+    cache_add_trit(&md, "gate_proj.w", cfg->inter, cfg->hidden);
+    cache_add_trit(&md, "up_proj.w", cfg->inter, cfg->hidden);
+    cache_add_f32(&md, "mul", 1, d_g, 0.0f, 0.0f);
+    cache_add_f32(&md, "down", 1, d_vec, 0.0f, 0.0f);
+    cache_add_trit(&md, "down_proj.w", cfg->hidden, cfg->inter);
+    cache_add_f32(&md, "final_norm.w", 1, d_vec, 1.0f, 0.02f);
+    cache_add_f32(&md, "hfinal", 1, d_vec, 0.0f, 0.0f);
+    cache_add_f32(&md, "logits", 2, d_log, 0.0f, 0.0f);
+    cache_add_trit(&md, "lm_head.w", cfg->vocab, cfg->hidden);
+    cache_add_f32(&md, "token", 1, d_one, 0.0f, 0.0f);
+
+    model_inst(&md, VTM_OP_EMB, VTM_FLAG_EMB_INPUT, CT_X, CT_EMB,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_RMSN, 0, CT_H1, CT_X, CT_N1,
+               VTM_NO_TENSOR, 1);
+    model_inst(&md, VTM_OP_TMV, 0, CT_Q, CT_QW, CT_H1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_TMV, 0, CT_K, CT_KW, CT_H1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_TMV, 0, CT_V, CT_VW, CT_H1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_ROPE, 0, CT_Q, CT_Q, (uint16_t)cfg->heads,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_ROPE, 0, CT_K, CT_K, (uint16_t)cfg->kv_heads,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_KVW, 0, CT_KC, CT_K, CT_VC, CT_V, 0);
+    model_inst(&md, VTM_OP_ATTN, VTM_FLAG_CAUSAL, CT_ATTN, CT_Q, CT_KC,
+               CT_VC, 0);
+    model_inst(&md, VTM_OP_TMV, 0, CT_O, CT_OW, CT_ATTN, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_ADD, 0, CT_X, CT_X, CT_O, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_RMSN, 0, CT_H2, CT_X, CT_N2, VTM_NO_TENSOR, 1);
+    model_inst(&md, VTM_OP_TMV, 0, CT_GATE, CT_GW, CT_H2, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_TMV, 0, CT_UP, CT_UW, CT_H2, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_SILU, 0, CT_GATE, CT_GATE, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_MUL, 0, CT_MUL, CT_GATE, CT_UP, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_TMV, 0, CT_DOWN, CT_DW, CT_MUL, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_ADD, 0, CT_X, CT_X, CT_DOWN, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_RMSN, 0, CT_HF, CT_X, CT_NF, VTM_NO_TENSOR, 1);
+    model_inst(&md, VTM_OP_TMV, 0, CT_LOGITS, CT_LMW, CT_HF,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_SAMP, 0, CT_TOKEN, CT_LOGITS, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_SAMP_TEMPERATURE);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+
+    // Недетерминированный argmax тут не годится: SAMP с температурой тянет
+    // ГПСЧ, и совпадение токена проверяет ещё и восстановление состояния
+    // сэмплера при попадании.
+    snprintf(meta, sizeof meta,
+             "{\"temperature\": 0.8, \"sample_seed\": 7,"
+             " \"rms_norm_eps\": 1e-06}");
+    model_set_meta(&md, meta);
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    free(img);
+    model_free(&md);
+    return m;
+}
+
+#define CACHE_SNAP_VOCAB 32
+#define CACHE_SNAP_CTX   64
+#define CACHE_SNAP_KV    32
+
+typedef struct {
+    float logits[CACHE_SNAP_VOCAB];
+    float token;
+    float kc[CACHE_SNAP_CTX * CACHE_SNAP_KV];
+    float vc[CACHE_SNAP_CTX * CACHE_SNAP_KV];
+    int   kvdim;
+    int   rows;
+    int   position;
+    int   generated;
+} cache_snap;
+
+static void cache_snap_take(vtm_t *m, cache_snap *s, int rows) {
+    const vtm_tensor *lg = vtm_tensor_by_name(m, "logits");
+    const vtm_tensor *tk = vtm_tensor_by_name(m, "token");
+    const vtm_tensor *kc = vtm_tensor_by_name(m, "kcache");
+    const vtm_tensor *vc = vtm_tensor_by_name(m, "vcache");
+    uint32_t n_logits, n_kv;
+
+    memset(s, 0, sizeof *s);
+    CHECK(lg && tk && kc && vc);
+    if (!lg || !tk || !kc || !vc) return;
+    CHECK(lg->n_elements <= CACHE_SNAP_VOCAB);
+    CHECK(kc->dims[1] <= CACHE_SNAP_KV && rows <= CACHE_SNAP_CTX);
+    if (lg->n_elements > CACHE_SNAP_VOCAB || kc->dims[1] > CACHE_SNAP_KV
+        || rows > CACHE_SNAP_CTX)
+        return;
+    s->kvdim = (int)kc->dims[1];
+    s->rows = rows;
+    s->position = vtm_position(m);
+    s->generated = vtm_generated(m);
+    n_logits = lg->n_elements;
+    n_kv = (uint32_t)rows * (uint32_t)s->kvdim;
+    memcpy(s->logits, lg->f32, (size_t)n_logits * sizeof(float));
+    s->token = tk->f32[0];
+    memcpy(s->kc, kc->f32, (size_t)n_kv * sizeof(float));
+    memcpy(s->vc, vc->f32, (size_t)n_kv * sizeof(float));
+}
+
+static int cache_snap_equal(const cache_snap *a, const cache_snap *b) {
+    size_t kv_bytes;
+
+    if (a->kvdim != b->kvdim || a->rows != b->rows) return 0;
+    if (a->position != b->position || a->generated != b->generated) return 0;
+    if (memcmp(a->logits, b->logits, sizeof a->logits) != 0) return 0;
+    if (memcmp(&a->token, &b->token, sizeof a->token) != 0) return 0;
+    kv_bytes = (size_t)a->rows * (size_t)a->kvdim * sizeof(float);
+    if (memcmp(a->kc, b->kc, kv_bytes) != 0) return 0;
+    if (memcmp(a->vc, b->vc, kv_bytes) != 0) return 0;
+    return 1;
+}
+
+// Полный прогон ids по одному токену — так это делает хост (CLI, api.c).
+static void cache_run_plain(vtm_t *m, const int32_t *ids, int n) {
+    int i;
+    for (i = 0; i < n; i++) {
+        vtm_set_token(m, ids[i]);
+        vtm_set_position(m, i);
+        CHECK(run_ok(m));
+    }
+}
+
+static void test_cache_prefix(void) {
+    cache_cfg cfg;
+    int32_t prefix[8] = {3, 1, 4, 1, 5, 9, 2, 6};
+    int32_t ids[16], ids2[16], other[16];
+    int i, n, n2;
+    uint64_t h0, m0, h1, m1;
+    cache_snap want, got;
+    vtm_t *base, *mc, *base2;
+
+    cfg.ctx = 32;
+    cfg.hidden = 16;
+    cfg.vocab = 16;
+    cfg.inter = 32;
+    cfg.heads = 2;
+    cfg.head_dim = 8;
+    cfg.kv_heads = 1;
+
+    base = cache_model(&cfg);
+    mc = cache_model(&cfg);
+    CHECK(base != NULL && mc != NULL);
+    if (!base || !mc) {
+        vtm_free(base);
+        vtm_free(mc);
+        return;
+    }
+
+    // (1) vtm_cache_prefix() сам по себе — ровно полный прогон префикса.
+    CHECK(vtm_cache_prefix(mc, prefix, 8) == VTM_OK);
+    CHECK(vtm_cache_prefix_len(mc) == 8);
+    cache_run_plain(base, prefix, 8);
+    cache_snap_take(base, &want, 8);
+    cache_snap_take(mc, &got, 8);
+    CHECK(cache_snap_equal(&want, &got));
+
+    // (2) Тот же префикс + новые токены: префикс пропущен, результат побитово
+    // тот же, что у полного прогона (логиты, токен, K/V, позиция, счётчик).
+    n = 11;
+    for (i = 0; i < 8; i++) ids[i] = prefix[i];
+    ids[8] = 7;
+    ids[9] = 0;
+    ids[10] = 13;
+    vtm_cache_stats(mc, &h0, &m0);
+    vtm_reset(base);
+    cache_run_plain(base, ids, n);
+    cache_snap_take(base, &want, n);
+    CHECK(vtm_run_cached(mc, ids, n) == VTM_OK);
+    cache_snap_take(mc, &got, n);
+    CHECK(cache_snap_equal(&want, &got));
+    vtm_cache_stats(mc, &h1, &m1);
+    CHECK(h1 == h0 + 1 && m1 == m0);        // префикс не пересчитывался
+    CHECK(vtm_cache_prefix_len(mc) == 8);   // кэш остался префиксом
+
+    // (3) Другой хвост при том же префиксе — снова попадание. Ровно этот
+    // случай и нужен: системный промпт один, вопрос каждый раз новый.
+    n2 = 10;
+    for (i = 0; i < 8; i++) ids2[i] = prefix[i];
+    ids2[8] = 12;
+    ids2[9] = 2;
+    vtm_reset(base);
+    cache_run_plain(base, ids2, n2);
+    cache_snap_take(base, &want, n2);
+    CHECK(vtm_run_cached(mc, ids2, n2) == VTM_OK);
+    cache_snap_take(mc, &got, n2);
+    CHECK(cache_snap_equal(&want, &got));
+    vtm_cache_stats(mc, &h1, &m1);
+    CHECK(h1 == h0 + 2 && m1 == m0);
+    CHECK(vtm_cache_prefix_len(mc) == 8);
+
+    // (4) Несовпадающий префикс той же длины — полный прогон, правильный
+    // результат и кэш на всю последовательность (следующий запрос с тем же
+    // промптом и другим продолжением уже попадёт).
+    for (i = 0; i < n; i++) other[i] = ids[i];
+    other[0] = 8;
+    vtm_reset(base);
+    cache_run_plain(base, other, n);
+    cache_snap_take(base, &want, n);
+    vtm_cache_stats(mc, &h0, &m0);
+    CHECK(vtm_run_cached(mc, other, n) == VTM_OK);
+    cache_snap_take(mc, &got, n);
+    CHECK(cache_snap_equal(&want, &got));
+    vtm_cache_stats(mc, &h1, &m1);
+    CHECK(m1 == m0 + 1 && h1 == h0);
+    CHECK(vtm_cache_prefix_len(mc) == n);
+
+    // (5) Та же последовательность ещё раз — попадание без единого прогона:
+    // пропуск n токенов не должен менять уже посчитанные тензоры.
+    cache_snap_take(mc, &want, n);
+    vtm_cache_stats(mc, &h0, &m0);
+    CHECK(vtm_run_cached(mc, other, n) == VTM_OK);
+    cache_snap_take(mc, &got, n);
+    CHECK(cache_snap_equal(&want, &got));
+    vtm_cache_stats(mc, &h1, &m1);
+    CHECK(h1 == h0 + 1 && m1 == m0);
+    CHECK(vtm_generated(mc) == n);
+
+    // (6) vtm_reset() кэш очищает: следующий вызов — полный прогон.
+    vtm_reset(mc);
+    CHECK(vtm_cache_prefix_len(mc) == 0);
+    vtm_cache_stats(mc, &h0, &m0);
+    CHECK(vtm_run_cached(mc, other, n) == VTM_OK);
+    cache_snap_take(mc, &got, n);
+    CHECK(cache_snap_equal(&want, &got));
+    vtm_cache_stats(mc, &h1, &m1);
+    CHECK(m1 == m0 + 1 && h1 == h0);
+
+    // (7) Смена бэкенда — другой численный путь, кэш негоден.
+    base2 = cache_model(&cfg);
+    CHECK(base2 != NULL);
+    if (base2) {
+        CHECK(vtm_cache_prefix(mc, prefix, 8) == VTM_OK);
+        CHECK(vtm_cache_prefix_len(mc) == 8);
+        vtm_set_backend(mc, &vtm_backend_scalar_direct);
+        vtm_set_backend(base2, &vtm_backend_scalar_direct);
+        CHECK(vtm_cache_prefix_len(mc) == 0);
+        vtm_reset(base2);
+        cache_run_plain(base2, ids, n);
+        cache_snap_take(base2, &want, n);
+        vtm_cache_stats(mc, &h0, &m0);
+        CHECK(vtm_run_cached(mc, ids, n) == VTM_OK);
+        cache_snap_take(mc, &got, n);
+        CHECK(cache_snap_equal(&want, &got));
+        vtm_cache_stats(mc, &h1, &m1);
+        CHECK(m1 == m0 + 1 && h1 == h0);
+        vtm_free(base2);
+        // Дальше снова скалярный LUT: с ним работает base.
+        vtm_set_backend(mc, &vtm_backend_scalar_lut);
+    }
+
+    // (8) Чужой прогон, переписывающий позицию префикса (position = 0 без
+    // reset), кэш инвалидирует: слоты префикса в KV заменены.
+    CHECK(vtm_cache_prefix(mc, prefix, 8) == VTM_OK);
+    CHECK(vtm_cache_prefix_len(mc) == 8);
+    vtm_set_token(mc, 15);
+    vtm_set_position(mc, 0);
+    CHECK(run_ok(mc));
+    CHECK(vtm_cache_prefix_len(mc) == 0);
+    vtm_reset(base);
+    cache_run_plain(base, ids, n);
+    cache_snap_take(base, &want, n);
+    vtm_cache_stats(mc, &h0, &m0);
+    CHECK(vtm_run_cached(mc, ids, n) == VTM_OK);
+    cache_snap_take(mc, &got, n);
+    CHECK(cache_snap_equal(&want, &got));
+    vtm_cache_stats(mc, &h1, &m1);
+    CHECK(m1 == m0 + 1 && h1 == h0);
+
+    // (9) Генерация через vtm_run() (позиции >= длины префикса) кэш не
+    // сбрасывает — так устроен реальный сервер: промпт посчитан, токены
+    // досочинены, следующий запрос с тем же системным промптом снова попадает
+    // в кэш, а снимок сэмплера восстанавливает историю после префикса.
+    CHECK(vtm_cache_prefix(mc, prefix, 8) == VTM_OK);
+    vtm_set_token(mc, 11);
+    vtm_set_position(mc, 8);
+    CHECK(run_ok(mc));
+    vtm_set_token(mc, 12);
+    vtm_set_position(mc, 9);
+    CHECK(run_ok(mc));
+    CHECK(vtm_cache_prefix_len(mc) == 8);
+    vtm_reset(base);
+    cache_run_plain(base, ids, n);
+    cache_snap_take(base, &want, n);
+    CHECK(vtm_run_cached(mc, ids, n) == VTM_OK);
+    cache_snap_take(mc, &got, n);
+    CHECK(cache_snap_equal(&want, &got));
+
+    // (10) Последовательность короче кэша — это не префикс, полный прогон.
+    CHECK(vtm_cache_prefix(mc, ids, n) == VTM_OK);   // кэш = 11 токенов
+    vtm_reset(base);
+    cache_run_plain(base, prefix, 8);
+    cache_snap_take(base, &want, 8);
+    vtm_cache_stats(mc, &h0, &m0);
+    CHECK(vtm_run_cached(mc, prefix, 8) == VTM_OK);
+    cache_snap_take(mc, &got, 8);
+    CHECK(cache_snap_equal(&want, &got));
+    vtm_cache_stats(mc, &h1, &m1);
+    CHECK(m1 == m0 + 1 && h1 == h0);
+
+    vtm_free(mc);
+    vtm_free(base);
+    if (!g_fail)
+        printf("кэш префикса 0081: побитовое совпадение, попадания/промахи:"
+               " ok\n");
+}
+
+// --- замер кэша префикса (задача 0081) ------------------------------------
+//
+// Сценарий из задачи: 128-токенный префикс + 16 новых токенов.
+// «До» — каждый запрос считает все 144 токена. «После» — префикс считается
+// один раз (vtm_cache_prefix), дальше каждый запрос пропускает его и считает
+// только 16 токенов. Печатаются мс/запрос и ускорение.
+//
+//   cd src/vtm && VTM_CACHE_BENCH=1 ./test_vtm
+//   VTM_CACHE_BENCH=1 VTM_CACHE_BENCH_MODEL=/tmp/eva/ctx256/model.vtm ./test_vtm
+//   VTM_CACHE_BENCH_ITERS=10 ...    (по умолчанию 5)
+//
+// Демо-контейнер имеет KV на 8 позиций; для 128+16 его надо расширить:
+//   python3 -c 'from tools import bench_vtm;
+//     print(bench_vtm.prepare_container("demo/model.vtm", 256, "/tmp/eva"))'
+// Без VTM_CACHE_BENCH_MODEL строится синтетическая модель той же формы
+// (hidden=128, 1 слой), чтобы замер воспроизводился без файлов. Токены
+// берутся < vocab, поэтому подходит и демо-словарь на 128.
+#define CACHE_BENCH_PREFIX 128
+#define CACHE_BENCH_FRESH  16
+#define CACHE_BENCH_TOTAL  (CACHE_BENCH_PREFIX + CACHE_BENCH_FRESH)
+
+static void bench_cache_prefix(void) {
+    const char *enable = getenv("VTM_CACHE_BENCH");
+    const char *path = getenv("VTM_CACHE_BENCH_MODEL");
+    const char *iters_env = getenv("VTM_CACHE_BENCH_ITERS");
+    int iters = iters_env ? atoi(iters_env) : 5;
+    int32_t ids[CACHE_BENCH_TOTAL];
+    vtm_t *plain, *cached;
+    const vtm_tensor *emb;
+    int i, it, vocab = 128;
+    double t0, full_ms = 0.0, cached_ms = 0.0, prime_ms = 0.0;
+    uint64_t hits = 0, misses = 0;
+
+    if (!enable) return;
+    if (iters < 1) iters = 1;
+    if (iters > 100) iters = 100;
+
+    if (path) {
+        plain = vtm_load(path);
+        cached = vtm_load(path);
+        CHECK(plain != NULL && cached != NULL);
+        if (!plain || !cached) {
+            vtm_free(plain);
+            vtm_free(cached);
+            return;
+        }
+    } else {
+        cache_cfg cfg;
+        cfg.ctx = 256;
+        cfg.hidden = 128;
+        cfg.vocab = 128;
+        cfg.inter = 256;
+        cfg.heads = 4;
+        cfg.head_dim = 32;
+        cfg.kv_heads = 1;
+        plain = cache_model(&cfg);
+        cached = cache_model(&cfg);
+    }
+    emb = vtm_tensor_by_name(plain, "emb.w");
+    if (emb && emb->ndim >= 1 && emb->dims[0] > 0)
+        vocab = (int)emb->dims[0];
+    for (i = 0; i < CACHE_BENCH_TOTAL; i++)
+        ids[i] = (int32_t)((i * 37u + 11u) % (uint32_t)vocab);
+
+    // Прогрев префикса — разовая плата; её показываем отдельно.
+    t0 = bench_now();
+    CHECK(vtm_cache_prefix(cached, ids, CACHE_BENCH_PREFIX) == VTM_OK);
+    prime_ms = (bench_now() - t0) * 1000.0;
+
+    for (it = 0; it < iters; it++) {
+        // Разные хвосты у одного префикса — как разные вопросы при одном
+        // системном промпте.
+        ids[CACHE_BENCH_TOTAL - 1] = (int32_t)((it * 13 + 5) % vocab);
+        vtm_reset(plain);
+        t0 = bench_now();
+        for (i = 0; i < CACHE_BENCH_TOTAL; i++) {
+            vtm_set_token(plain, ids[i]);
+            vtm_set_position(plain, i);
+            CHECK(run_ok(plain));
+        }
+        full_ms += bench_now() - t0;
+        t0 = bench_now();
+        CHECK(vtm_run_cached(cached, ids, CACHE_BENCH_TOTAL) == VTM_OK);
+        cached_ms += bench_now() - t0;
+        {
+            const vtm_tensor *a = vtm_tensor_by_name(plain, "logits");
+            const vtm_tensor *b = vtm_tensor_by_name(cached, "logits");
+            CHECK(a && b && a->n_elements == b->n_elements
+                  && memcmp(a->f32, b->f32,
+                            (size_t)a->n_elements * sizeof(float)) == 0);
+        }
+    }
+    full_ms = full_ms * 1000.0 / (double)iters;
+    cached_ms = cached_ms * 1000.0 / (double)iters;
+    vtm_cache_stats(cached, &hits, &misses);
+
+    printf("кэш префикса 0081: %s, префикс %d + %d, запросов %d\n",
+           path ? path : "синтетика (1 слой, hidden=128)",
+           CACHE_BENCH_PREFIX, CACHE_BENCH_FRESH, iters);
+    printf("  до:      %8.3f мс/запрос (полный прогон %d токенов)\n",
+           full_ms, CACHE_BENCH_TOTAL);
+    printf("  прогрев: %8.3f мс (один раз, %d токенов)\n",
+           prime_ms, CACHE_BENCH_PREFIX);
+    printf("  после:   %8.3f мс/запрос (пропуск префикса, %d токенов)\n",
+           cached_ms, CACHE_BENCH_FRESH);
+    if (cached_ms > 0.0) {
+        printf("  ускорение: %.2f× без прогрева; с прогревом на %d запросов"
+               " — %.2f×\n",
+               full_ms / cached_ms, iters,
+               (double)iters * full_ms
+                   / (prime_ms + (double)iters * cached_ms));
+    }
+    printf("  попаданий %llu, промахов %llu; логиты совпали побитово\n",
+           (unsigned long long)hits, (unsigned long long)misses);
+    if (hits != (uint64_t)iters)
+        printf("  внимание: попаданий %llu из %d — KV-кэш короче"
+               " последовательности или кэш сбрасывается\n",
+               (unsigned long long)hits, iters);
+    vtm_free(cached);
+    vtm_free(plain);
+}
+
 // --- main ------------------------------------------------------------------
 
 int main(void) {
@@ -4044,6 +4675,7 @@ int main(void) {
     test_tmv_scale128();
     test_raw_trit_layout();
     test_bad_files();
+    test_host_endian_guard();
     test_file_load();
     test_rmsnorm();
     test_softmax();
@@ -4077,6 +4709,8 @@ int main(void) {
     test_samp_partial_select();
     test_samp_buffer_reuse();
     test_samp_stale_stamps();
+    test_cache_prefix();
+    bench_cache_prefix();
     test_samp_bench_150k();
 
     if (g_fail) {
@@ -4086,3 +4720,5 @@ int main(void) {
     printf("все тесты VTM: ok\n");
     return 0;
 }
+
+#endif // !VTM_HOST_BIG_ENDIAN
