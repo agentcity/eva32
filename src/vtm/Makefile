@@ -101,8 +101,16 @@ $(TEST_SESSION_BIN): $(TEST_SESSION_SRC) $(LIB)
 # bench_backend --threads — тест «результат не зависит от 1/2/4/8 потоков»
 # (задача 0077), с малым числом итераций: печатает и время, но проверяет
 # только расхождение.
+# Интеграционные тесты ходят в demo/model.vtm, а он генерируется и в git не лежит.
+# Правило делает сборку модели зависимостью теста: чистый клон больше не падает.
+DEMO_MODEL = ../../demo/model.vtm
+
+$(DEMO_MODEL):
+	mkdir -p ../../demo
+	python3 ../../scripts/demo_ternary_model.py --out ../../demo
+
 test: $(TEST_BIN) $(TEST_API_BIN) $(TEST_SESSION_BIN) $(TEST_SHA_BIN) $(BIN) \
-	$(BENCH_BIN)
+	$(BENCH_BIN) $(DEMO_MODEL)
 	./$(TEST_BIN)
 	./$(TEST_API_BIN)
 	./$(TEST_SESSION_BIN)
