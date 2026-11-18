@@ -576,7 +576,7 @@
   {
     "id": "0088",
     "title": "Паритет SIMD: измерить и задокументировать расхождение",
-    "status": "in_progress",
+    "status": "done",
     "file": "0088-simd-parity.md",
     "assignee": ""
   },

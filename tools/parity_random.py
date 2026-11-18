@@ -51,6 +51,21 @@ Python-эталон читает с диска только 128. Поэтому 
 (`vtm_ref.read_vtm`), сравнение идёт с моделью в памяти. Это осознанно:
 канон Python — 128, а 160 — расширение C.
 
+Бэкенды: scalar против SIMD
+===========================
+
+Порог `max|Δ| < 1e-5` имеет смысл только для скалярного бэкенда: там
+расхождение ровно 0. SIMD-ядра (NEON/AVX2) переупорядочивают сложения, и
+логиты расходятся на ~1e-5…1e-4, поэтому проба по умолчанию гоняет
+`VTM_BACKEND=scalar` (переопределяется `VTM_PARITY_BACKEND` или флагом
+`--backend`).
+
+Режим `--compare-backends` прогоняет тот же контейнер вторым бэкендом
+(`--compare-backend`, по умолчанию `auto`, то есть SIMD) и сравнивает
+логиты/argmax: смена argmax между бэкендами — ошибка, а не допуск, и валит
+прогон. Развёрнутое измерение распределения `max|Δ|` и запаса по отрыву
+top-1/top-2 — `tools/parity_simd.py` (числа и вердикт: docs/quantization.md).
+
 Токены
 ======
 
@@ -65,12 +80,15 @@ Python-эталон читает с диска только 128. Поэтому 
     python3 tools/parity_random.py --count 10 --seed 7
     python3 tools/parity_random.py --json
     python3 tools/parity_random.py --seed 0 --only 12  # воспроизвести одну
+    python3 tools/parity_random.py --backend auto      # замерить SIMD-расхождение
+    python3 tools/parity_random.py --compare-backends  # scalar vs auto, argmax
 
 Коды возврата
 =============
 
 * 0 — все конфигурации в пороге, argmax и CLI совпали;
-* 1 — есть расхождения/ошибки прогона (конфигурация печатается);
+* 1 — есть расхождения/ошибки прогона (конфигурация печатается), в том
+  числе смена argmax между бэкендами в режиме `--compare-backends`;
 * 2 — нет C-рантайма, библиотеки или компилятора (сначала `make -C src/vtm`).
 """
 from __future__ import annotations
@@ -104,6 +122,9 @@ TOOL_NAME = "parity_random"
 DEFAULT_COUNT = 50
 DEFAULT_SEED = 0
 DEFAULT_TOLERANCE = 1e-5
+#: Бэкенд-кандидат в режиме --compare-backends: auto — это SIMD там, где он
+#: собран и поддержан CPU, и скаляр иначе (см. vtm_backend_from_env).
+DEFAULT_COMPARE_BACKEND = "auto"
 DEFAULT_WORKDIR = ROOT / "data" / "parity_random"
 
 #: Сколько токенов прогоняется на конфигурацию (позиции 0..n-1).
@@ -583,6 +604,95 @@ def compare_logits(
     )
 
 
+@dataclass
+class BackendComparison:
+    """Один и тот же контейнер, два бэкенда: расхождение логитов и argmax.
+
+    `top1_margin` — отрыв лидера от второго кандидата в логитах baseline
+    (`l[top1] - l[top2]`). Смена argmax при `max|Δ| = d` возможна, только
+    если отрыв не больше примерно `2d`: тогда ответ модели действительно
+    «на грани», и смена токена — не ошибка бэкенда, а честная ничья.
+    """
+
+    baseline: str
+    candidate: str
+    max_abs_delta: float
+    argmax_baseline: int
+    argmax_candidate: int
+    top1_margin: float
+    delta_at_baseline_argmax: float
+    delta_at_candidate_argmax: float
+
+    @property
+    def argmax_match(self) -> bool:
+        return self.argmax_baseline == self.argmax_candidate
+
+    @property
+    def margin_to_delta(self) -> float:
+        """Во сколько раз отрыв больше расхождения (чем больше, тем спокойнее)."""
+        if self.max_abs_delta <= 0.0:
+            return math.inf if self.top1_margin > 0.0 else 0.0
+        return self.top1_margin / self.max_abs_delta
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "baseline": self.baseline,
+            "candidate": self.candidate,
+            "max_abs_delta": _json_float(self.max_abs_delta),
+            "argmax_baseline": self.argmax_baseline,
+            "argmax_candidate": self.argmax_candidate,
+            "argmax_match": self.argmax_match,
+            "top1_margin": _json_float(self.top1_margin),
+            "delta_at_baseline_argmax": _json_float(
+                self.delta_at_baseline_argmax
+            ),
+            "delta_at_candidate_argmax": _json_float(
+                self.delta_at_candidate_argmax
+            ),
+            "margin_to_delta": _json_float(self.margin_to_delta),
+        }
+
+
+def top1_margin(values: Sequence[float]) -> float:
+    """`l[top1] - l[top2]` (>= 0); для одного элемента — 0."""
+    if len(values) < 2:
+        return 0.0
+    first, second = sorted((float(v) for v in values), reverse=True)[:2]
+    return first - second
+
+
+def compare_backend_logits(
+    baseline_logits: Sequence[float],
+    candidate_logits: Sequence[float],
+    *,
+    baseline: str = "scalar",
+    candidate: str = "auto",
+) -> BackendComparison:
+    """Сверить логиты двух бэкендов: max|Δ|, argmax, отрыв top-1/top-2."""
+    if len(baseline_logits) != len(candidate_logits):
+        raise ValueError(
+            "размеры логитов не совпали: "
+            f"{baseline} {len(baseline_logits)}, {candidate} "
+            f"{len(candidate_logits)}"
+        )
+    if not baseline_logits:
+        raise ValueError("пустые логиты")
+    base = [float(v) for v in baseline_logits]
+    cand = [float(v) for v in candidate_logits]
+    base_argmax = parity_real.argmax(base)
+    cand_argmax = parity_real.argmax(cand)
+    return BackendComparison(
+        baseline=str(baseline),
+        candidate=str(candidate),
+        max_abs_delta=max(abs(a - b) for a, b in zip(base, cand)),
+        argmax_baseline=base_argmax,
+        argmax_candidate=cand_argmax,
+        top1_margin=top1_margin(base),
+        delta_at_baseline_argmax=abs(base[base_argmax] - cand[base_argmax]),
+        delta_at_candidate_argmax=abs(base[cand_argmax] - cand[cand_argmax]),
+    )
+
+
 def _json_float(value: float) -> Any:
     return value if math.isfinite(value) else str(value)
 
@@ -653,7 +763,14 @@ def run_command(
     cwd: Path = ROOT,
     timeout: float | None = None,
     quiet: bool = False,
+    backend: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Запустить команду с `VTM_BACKEND`.
+
+    `backend=None` — бэкенд из `VTM_PARITY_BACKEND` (по умолчанию scalar);
+    иначе указанный (`auto`/`simd`/`scalar`/`direct`). Так один и тот же
+    контейнер можно прогнать двумя бэкендами и сравнить числа.
+    """
     if not quiet:
         print(
             f"[{TOOL_NAME}] $ " + shlex.join([str(part) for part in cmd]),
@@ -662,7 +779,7 @@ def run_command(
         )
     try:
         env = os.environ.copy()
-        env["VTM_BACKEND"] = PARITY_BACKEND
+        env["VTM_BACKEND"] = PARITY_BACKEND if backend is None else str(backend)
         return subprocess.run(
             [str(part) for part in cmd],
             cwd=str(cwd),
@@ -813,13 +930,61 @@ int main(int argc, char **argv) {
 PROBE_NAME = "parity_random_probe"
 
 
-def probe_compile_command(env: Environment, workdir: Path) -> list[str]:
+#: Маркеры инструментированной библиотеки и флаги, которые нужны пробе,
+#: чтобы скомпоноваться с ней. Штатная сборка `make -C src/vtm` их не
+#: содержит; сборка под ASan/UBSan (разбор находок санитайзеров) содержит
+#: ссылки на рантайм, и без тех же флагов линковка даёт «symbol(s) not
+#: found: ___asan_*». Проверяются оба префикса: macOS (`___asan_`) и
+#: ELF (`__asan_`).
+SANITIZER_MARKERS = (
+    (b"__asan_", "-fsanitize=address"),
+    (b"__ubsan_", "-fsanitize=undefined"),
+)
+
+
+def sanitizer_flags(lib: str | os.PathLike[str]) -> list[str]:
+    """Флаги `-fsanitize=...`, с которыми собрана `libvtm.a` (пусто — штатная).
+
+    Смотрим строки символов в архиве, без вызова `nm`: если объекты
+    инструментированы, в таблице имён есть `__asan_*`/`__ubsan_*`. Это
+    дешевле и не зависит от наличия binutils.
+    """
+    try:
+        data = Path(lib).read_bytes()
+    except OSError:
+        return []
+    if b"!<arch>" not in data:  # не ar-архив — нечего определять
+        return []
+    flags: list[str] = []
+    for marker, flag in SANITIZER_MARKERS:
+        if marker in data and flag not in flags:
+            flags.append(flag)
+    return flags
+
+
+def probe_compile_command(
+    env: Environment,
+    workdir: Path,
+    *,
+    extra_flags: Sequence[str] | None = None,
+) -> list[str]:
+    """Команда сборки C-пробы.
+
+    `extra_flags=None` — определить санитайзеры по `libvtm.a`
+    (`sanitizer_flags`); пустой список — не добавлять ничего.
+    """
+    flags = (
+        list(sanitizer_flags(env.vtm_lib))
+        if extra_flags is None
+        else [str(flag) for flag in extra_flags]
+    )
     return [
         env.cc or "cc",
         "-std=c99",
         "-O2",
         "-Wall",
         "-Wextra",
+        *flags,
         "-I",
         str(env.include_dir),
         "-o",
@@ -849,10 +1014,16 @@ def ensure_probe(workdir: Path, env: Environment) -> Path:
 
 
 def run_probe(
-    binary: Path, container: Path, tokens: Sequence[int]
+    binary: Path,
+    container: Path,
+    tokens: Sequence[int],
+    *,
+    backend: str | None = None,
 ) -> parity_real.ProbeResult:
     token_text = ",".join(str(int(token)) for token in tokens)
-    proc = run_command([str(binary), str(container), token_text], quiet=True)
+    proc = run_command(
+        [str(binary), str(container), token_text], quiet=True, backend=backend
+    )
     if proc.returncode != 0:
         raise ParityRandomError(
             f"C-проба не отработала (код {proc.returncode}):\n"
@@ -861,7 +1032,13 @@ def run_probe(
     return parity_real.parse_probe_output(proc.stdout)
 
 
-def run_cli(vtm_bin: Path, container: Path, tokens: Sequence[int]) -> dict[str, Any]:
+def run_cli(
+    vtm_bin: Path,
+    container: Path,
+    tokens: Sequence[int],
+    *,
+    backend: str | None = None,
+) -> dict[str, Any]:
     """Штатный `vtm run --max-new 1`: проверяем, что CLI даёт тот же argmax."""
     token_text = ",".join(str(int(token)) for token in tokens)
     cmd = [
@@ -873,7 +1050,7 @@ def run_cli(vtm_bin: Path, container: Path, tokens: Sequence[int]) -> dict[str, 
         "--max-new",
         "1",
     ]
-    proc = run_command(cmd, quiet=True)
+    proc = run_command(cmd, quiet=True, backend=backend)
     if proc.returncode != 0:
         raise ParityRandomError(
             f"vtm run завершился кодом {proc.returncode}:\n{_tail(proc.stderr)}\n"
@@ -908,6 +1085,8 @@ class ConfigResult:
     elapsed_ms: float = 0.0
     vtm_bytes: int | None = None
     tolerance: float = DEFAULT_TOLERANCE
+    #: Сверка бэкендов (--compare-backends); None — режим выключен.
+    backend: BackendComparison | None = None
 
     @property
     def passed(self) -> bool:
@@ -917,6 +1096,9 @@ class ConfigResult:
             and self.within_tolerance
             and self.cli_match
             and not self.meta_problems
+            # Смена argmax между бэкендами — не допуск, а ошибка: ответ
+            # модели не должен зависеть от выбора ядер.
+            and (self.backend is None or self.backend.argmax_match)
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -936,6 +1118,7 @@ class ConfigResult:
             "elapsed_ms": round(self.elapsed_ms, 1),
             "vtm_bytes": self.vtm_bytes,
             "tolerance": self.tolerance,
+            "backend": None if self.backend is None else self.backend.to_dict(),
             "passed": self.passed,
         }
 
@@ -956,6 +1139,14 @@ class ConfigResult:
             reasons.append(
                 f"CLI argmax {self.cli_argmax} != Python {self.argmax_reference}"
             )
+        if self.backend is not None and not self.backend.argmax_match:
+            reasons.append(
+                f"argmax сменился между бэкендами: "
+                f"{self.backend.baseline} {self.backend.argmax_baseline} -> "
+                f"{self.backend.candidate} {self.backend.argmax_candidate} "
+                f"(max|Δ| = {_fmt_delta(self.backend.max_abs_delta)}, "
+                f"отрыв top1-top2 = {_fmt_delta(self.backend.top1_margin)})"
+            )
         reasons.extend(self.meta_problems)
         return reasons
 
@@ -968,8 +1159,16 @@ def check_config(
     env: Environment,
     tolerance: float = DEFAULT_TOLERANCE,
     keep: bool = False,
+    compare_backends: bool = False,
+    candidate_backend: str = DEFAULT_COMPARE_BACKEND,
+    baseline_backend: str | None = None,
 ) -> ConfigResult:
-    """Полный цикл для одной конфигурации: контейнер -> Python -> C -> CLI."""
+    """Полный цикл для одной конфигурации: контейнер -> Python -> C -> CLI.
+
+    `compare_backends=True` — дополнительно прогнать тот же контейнер
+    бэкендом `candidate_backend` (по умолчанию `auto`, то есть SIMD) и
+    сравнить логиты/argmax с baseline-бэкендом (`VTM_PARITY_BACKEND`).
+    """
     started = time.perf_counter()
     result = ConfigResult(config=config, tolerance=float(tolerance))
     container = workdir / f"model_{config.index:03d}.vtm"
@@ -981,7 +1180,9 @@ def check_config(
         reference = vtm_ref.execute(vtm, list(config.tokens), 0)
         if reference.logits is None:  # pragma: no cover - защита от графа
             raise ParityRandomError("Python-эталон не дал логитов")
-        probe_result = run_probe(probe, container, config.tokens)
+        probe_result = run_probe(
+            probe, container, config.tokens, backend=baseline_backend
+        )
         comparison = compare_logits(reference.logits, probe_result.logits, tolerance)
         result.max_abs_delta = comparison.max_abs_delta
         result.argmax_reference = comparison.argmax_reference
@@ -998,7 +1199,23 @@ def check_config(
             len(reference.logits),
         )
 
-        cli = run_cli(env.vtm_bin, container, config.tokens)
+        if compare_backends:
+            # Тот же контейнер, другой бэкенд: SIMD переупорядочивает
+            # сложения, поэтому max|Δ| тут не проверяется на 1e-5 — значение
+            # имеет только argmax (ответ модели).
+            candidate = run_probe(
+                probe, container, config.tokens, backend=candidate_backend
+            )
+            result.backend = compare_backend_logits(
+                probe_result.logits,
+                candidate.logits,
+                baseline=baseline_backend or PARITY_BACKEND,
+                candidate=candidate_backend,
+            )
+
+        cli = run_cli(
+            env.vtm_bin, container, config.tokens, backend=baseline_backend
+        )
         result.cli_argmax = int(cli["argmax"])
         result.cli_match = result.cli_argmax == comparison.argmax_reference
     except Exception as exc:  # noqa: BLE001 - отчёт должен пережить любую ошибку
@@ -1034,6 +1251,15 @@ def summarize(
         if item.error is None and not item.within_tolerance
     ]
     failed = [item for item in results if not item.passed]
+    checked = [item for item in results if item.backend is not None]
+    backend_switches = [
+        item for item in checked if not item.backend.argmax_match
+    ]
+    backend_worst = max(
+        checked,
+        key=lambda item: item.backend.max_abs_delta,
+        default=None,
+    )
     summary = {
         "tool": TOOL_NAME,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1050,6 +1276,24 @@ def summarize(
         "worst": None if worst is None else _result_brief(worst),
         "failures": [_result_brief(item) for item in failed],
         "configs": [_result_record(item) for item in results],
+        "backend_compare": {
+            "enabled": bool(checked),
+            "checked": len(checked),
+            "baseline": (
+                checked[0].backend.baseline if checked else PARITY_BACKEND
+            ),
+            "candidate": (
+                checked[0].backend.candidate
+                if checked
+                else DEFAULT_COMPARE_BACKEND
+            ),
+            "argmax_switches": len(backend_switches),
+            "switches": [_result_brief(item) for item in backend_switches],
+            "worst": (
+                None if backend_worst is None else _result_brief(backend_worst)
+            ),
+            "ok": not backend_switches,
+        },
         "ok": not failed,
     }
     return summary
@@ -1072,6 +1316,7 @@ def _result_brief(result: ConfigResult) -> dict[str, Any]:
         "cli_match": result.cli_match,
         "meta_problems": list(result.meta_problems),
         "error": result.error,
+        "backend": None if result.backend is None else result.backend.to_dict(),
         "passed": result.passed,
         "reasons": result.failure_reasons(),
         "config": result.config.to_dict(),
@@ -1094,6 +1339,7 @@ def _result_record(result: ConfigResult) -> dict[str, Any]:
         "error": result.error,
         "elapsed_ms": round(result.elapsed_ms, 1),
         "vtm_bytes": result.vtm_bytes,
+        "backend": None if result.backend is None else result.backend.to_dict(),
         "passed": result.passed,
     }
 
@@ -1190,6 +1436,42 @@ def format_report(summary: dict[str, Any], *, verbose_configs: bool = True) -> s
                 f"python3 tools/parity_random.py --seed {config['seed']} "
                 f"--only {config['index']}"
             )
+    backend = summary.get("backend_compare") or {}
+    if backend.get("enabled"):
+        lines.append("")
+        lines.append("=== сверка бэкендов (--compare-backends) ===")
+        lines.append(
+            f"baseline: {backend['baseline']}, кандидат: {backend['candidate']}, "
+            f"конфигураций: {backend['checked']}"
+        )
+        lines.append(f"смен argmax: {backend['argmax_switches']}")
+        worst = backend.get("worst")
+        if worst is None:
+            lines.append("худшее расхождение: нет данных")
+        else:
+            backend_worst = worst["backend"]
+            lines.append(
+                f"худшее max|Δ| между бэкендами: "
+                f"{_fmt_delta(_delta_from_json(backend_worst['max_abs_delta']))} "
+                f"(индекс {worst['index']})"
+            )
+            lines.append(
+                f"  отрыв top1-top2 там: "
+                f"{_fmt_delta(_delta_from_json(backend_worst['top1_margin']))}, "
+                f"во сколько раз больше Δ: "
+                f"{_fmt_delta(_delta_from_json(backend_worst['margin_to_delta']))}"
+            )
+        for record in backend["switches"]:
+            record_backend = record["backend"]
+            config = record["config"]
+            lines.append(
+                f"  СМЕНА argmax idx={config['index']}: "
+                f"{record_backend['argmax_baseline']} -> "
+                f"{record_backend['argmax_candidate']}, "
+                f"max|Δ| = {_fmt_delta(_delta_from_json(record_backend['max_abs_delta']))}, "
+                f"отрыв top1-top2 = "
+                f"{_fmt_delta(_delta_from_json(record_backend['top1_margin']))}"
+            )
     lines.append("вердикт: " + ("PASS" if summary["ok"] else "FAIL"))
     return "\n".join(lines)
 
@@ -1247,6 +1529,32 @@ def parse_only(text: str) -> list[int]:
     return indices
 
 
+#: Имена бэкендов, которые понимает vtm_backend_by_name (src/vtm).
+BACKEND_NAMES = (
+    "auto",
+    "simd",
+    "scalar",
+    "lut",
+    "direct",
+    "neon",
+    "avx2",
+    "simd-neon",
+    "simd-avx2",
+    "scalar-lut243",
+    "scalar-direct",
+)
+
+
+def parse_backend(text: str) -> str:
+    """Имя бэкенда для --backend/--compare-backend (проверяется до прогона)."""
+    value = str(text).strip()
+    if value not in BACKEND_NAMES:
+        raise argparse.ArgumentTypeError(
+            f"неизвестный бэкенд {text!r}: допустимо {', '.join(BACKEND_NAMES)}"
+        )
+    return value
+
+
 def _positive_int(text: str) -> int:
     try:
         value = int(text)
@@ -1290,7 +1598,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  python3 tools/parity_random.py\n"
             "  python3 tools/parity_random.py --count 10 --seed 7\n"
             "  python3 tools/parity_random.py --json\n"
-            "  python3 tools/parity_random.py --seed 0 --only 12\n\n"
+            "  python3 tools/parity_random.py --seed 0 --only 12\n"
+            "  python3 tools/parity_random.py --backend auto\n"
+            "  python3 tools/parity_random.py --compare-backends\n\n"
             "Конфигурация зависит только от (seed, index): любую можно "
             "воспроизвести через --only.\n"
         ),
@@ -1323,6 +1633,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep", action="store_true",
         help="не удалять контейнеры успешных прогонов",
     )
+    parser.add_argument(
+        "--backend", type=parse_backend, default=None,
+        metavar="ИМЯ",
+        help=(
+            "бэкенд baseline-прогона: auto|simd|scalar|lut|direct "
+            f"(по умолчанию VTM_PARITY_BACKEND, сейчас {PARITY_BACKEND})"
+        ),
+    )
+    parser.add_argument(
+        "--compare-backends", action="store_true",
+        help=(
+            "дополнительно прогнать тот же контейнер бэкендом --compare-backend "
+            "и сравнить логиты/argmax (режим сравнения бэкендов)"
+        ),
+    )
+    parser.add_argument(
+        "--compare-backend", type=parse_backend,
+        default=DEFAULT_COMPARE_BACKEND, metavar="ИМЯ",
+        help=(
+            "бэкенд-кандидат для --compare-backends "
+            f"(по умолчанию {DEFAULT_COMPARE_BACKEND}: SIMD, где он есть)"
+        ),
+    )
     return parser
 
 
@@ -1348,9 +1681,15 @@ def run(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).expanduser().resolve()
     workdir.mkdir(parents=True, exist_ok=True)
 
+    baseline_backend = args.backend or PARITY_BACKEND
+    compare = bool(getattr(args, "compare_backends", False))
     print(
         f"[{TOOL_NAME}] seed={args.seed}, конфигураций: {len(indices)}, "
-        f"порог: {args.tolerance:g}, workdir: {workdir}",
+        f"порог: {args.tolerance:g}, бэкенд: {baseline_backend}"
+        + (
+            f" vs {args.compare_backend}" if compare else ""
+        )
+        + f", workdir: {workdir}",
         file=sys.stderr,
         flush=True,
     )
@@ -1373,6 +1712,9 @@ def run(args: argparse.Namespace) -> int:
             env=env,
             tolerance=args.tolerance,
             keep=bool(args.keep),
+            compare_backends=compare,
+            candidate_backend=args.compare_backend,
+            baseline_backend=baseline_backend,
         )
         results.append(result)
         status = "ok  " if result.passed else "FAIL"
@@ -1399,6 +1741,7 @@ def run(args: argparse.Namespace) -> int:
         workdir=workdir,
     )
     summary["total_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    summary["backend_compare"]["baseline"] = baseline_backend
 
     if args.json:
         print(format_json(summary))
