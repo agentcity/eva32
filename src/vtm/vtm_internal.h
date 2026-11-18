@@ -36,11 +36,35 @@ struct vtm {
     uint32_t        vocab_size;      // 0 = не задан
     int             tied_embeddings; // 0/1
     char           *meta_json;       // копия JSON (NUL-терминированная) или NULL
+
+    // --- SAMP (задача 0051): параметры и состояние сэмплера ---------------
+    //
+    // Живут в машине, а не в статике interp.c: иначе новая машина, получившая
+    // адрес освобождённой, унаследовала бы чужое окно повторов. calloc в
+    // vtm_load_mem() обнуляет поля; параметры разбираются лениво, на первом
+    // SAMP (samp_ready), потому что vtm_reset()/vtm_free() здесь не наши
+    // файлы — сброс окна замечается по счётчику generated.
+    int             samp_ready;          // параметры разобраны, ГПСЧ засеян
+    uint64_t        samp_rng;            // состояние xorshift64*
+    uint64_t        samp_seed;           // эффективное зерно (мета или 0)
+    double          samp_temperature;    // <= 0 — жадно
+    int             samp_top_k;          // <= 0 — не отсекать
+    double          samp_top_p;          // >= 1 — не отсекать
+    double          samp_repetition_penalty;
+    int             samp_repetition_window;
+    int             samp_prev_generated; // vtm_generated() на прошлом SAMP
+    int             samp_hist_len;       // элементов в кольце 0..MAX
+    int             samp_hist_head;      // куда писать следующий
+    int             samp_hist[VTM_MAX_REPETITION_WINDOW];
 };
 
 // Записать ошибку в машину и в глобальный буфер vtm_last_error().
 void vtm_set_error(vtm_t *m, vtm_status st, const char *fmt, ...);
 
 const char *vtm_op_name(uint8_t opcode);
+
+// Сбросить состояние сэмплера SAMP (окно повторов и ГПСЧ). Предназначено
+// для vtm_reset(); без вызова сброс всё равно распознаётся по vtm_generated().
+void vtm_samp_reset(vtm_t *m);
 
 #endif // VTM_INTERNAL_H

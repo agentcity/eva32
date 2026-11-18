@@ -12,14 +12,26 @@ LDLIBS   ?= -lm
 
 LIB      = libvtm.a
 BIN      = vtm
-SRC      = trit.c loader.c interp.c backend_scalar.c
+# SIMD-ядра: backend_neon.c собирается всегда (на ARM — NEON, иначе только
+# диспетчер с откатом на scalar). AVX2-ядра — отдельный TU с -mavx2, только
+# на x86-64; WITH_AVX2=1 можно задать руками при кросс-сборке.
+SRC      = trit.c loader.c interp.c backend_scalar.c backend_neon.c
+UNAME_M := $(shell uname -m)
+WITH_AVX2 ?= $(if $(filter x86_64 amd64,$(UNAME_M)),1,0)
+ifeq ($(WITH_AVX2),1)
+SRC     += backend_avx2.c
+else
+CPPFLAGS += -DVTM_NO_AVX2   # backend_neon.c не будет ссылаться на AVX2-ядра
+endif
 OBJ      = $(SRC:.c=.o)
 TOK_OBJ  = tokenizer.o
 BRIDGE   = tok_bridge.o
 TEST_SRC = ../../tests/vtm/test_vtm.c
 TEST_BIN = test_vtm
+BENCH_SRC = ../../tests/vtm/bench_backend.c
+BENCH_BIN = bench_backend
 
-.PHONY: all test test-all bench clean
+.PHONY: all test test-all bench bench-backend clean
 
 all: $(BIN)
 
@@ -29,7 +41,7 @@ $(BIN): main.o $(LIB) $(BRIDGE) $(TOK_OBJ)
 $(LIB): $(OBJ)
 	$(AR) rcs $@ $(OBJ)
 
-%.o: %.c vtm.h vtm_internal.h
+%.o: %.c vtm.h vtm_internal.h vtm_backend.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -c -o $@ $<
 
 # Тот же main.c, но как C++17: C-ABI моста к tokenizer.hpp (см. main.c).
@@ -43,9 +55,19 @@ $(TOK_OBJ): tokenizer.cpp tokenizer.hpp
 $(TEST_BIN): $(TEST_SRC) $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -I../.. -o $@ $(TEST_SRC) $(LIB) $(LDLIBS)
 
+# Бенчмарк/проверка SIMD (tests/vtm/bench_backend.c). Собирается тем же CC,
+# что и библиотека, поэтому видит тот же SIMD.
+$(BENCH_BIN): $(BENCH_SRC) $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -I../.. -o $@ $(BENCH_SRC) $(LIB) $(LDLIBS)
+
+# backend_avx2.c собирается без -mavx2: AVX2/FMA включены атрибутами только
+# на функциях-ядрах, чтобы детект CPUID не исполнял AVX2-инструкции.
+
 # $(BIN) нужен интеграционному тесту CLI (текст -> токены -> ответ).
-test: $(TEST_BIN) $(BIN)
+# bench_backend --check — тест «simd == scalar» (1e-5) на наборе форм.
+test: $(TEST_BIN) $(BIN) $(BENCH_BIN)
 	./$(TEST_BIN)
+	./$(BENCH_BIN) --check
 
 # Сборка токенизатора живёт отдельно (Makefile.tok), цели объединяются здесь:
 # общего Makefile у трёх параллельных задач быть не могло.
@@ -55,5 +77,9 @@ test-all: test
 bench: $(BIN)
 	./$(BIN) bench --rows 512 --cols 512 --iters 200
 
+# GFLOP/s: scalar-lut243 / scalar-direct / SIMD + MM + RMSN.
+bench-backend: $(BENCH_BIN)
+	./$(BENCH_BIN)
+
 clean:
-	rm -f $(OBJ) main.o $(BRIDGE) $(LIB) $(BIN) $(TEST_BIN)
+	rm -f $(OBJ) main.o $(BRIDGE) $(LIB) $(BIN) $(TEST_BIN) $(BENCH_BIN)

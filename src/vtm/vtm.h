@@ -151,6 +151,41 @@ typedef enum {
     VTM_OP_HALT  = 0x0F
 } vtm_opcode;
 
+// --- SAMP: стратегии и параметры ------------------------------------------
+//
+// imm инструкции SAMP — номер стратегии:
+//   0 — argmax (жадно; поведение v0.1 не изменилось);
+//   1 — temperature: p = softmax(logits / temperature);
+//   2 — top-k: температура, затем k старших логитов (top_k <= 0 — не отсекать);
+//   3 — top-p: температура, затем минимальное ядро с суммой вероятностей
+//       >= top_p (top_p >= 1 — не отсекать, top_p <= 0 — жадно).
+// imm вне 0..3 — VTM_E_UNSUPPORTED: старый Python-эталон трактовал imm > 0 как
+// temperature = imm/1000, C-интерпретатор эту конвенцию не наследует (задача
+// 0051), поэтому байткод с такими imm надо перекомпилировать.
+//
+// Параметры читаются из JSON-меты контейнера; ключ ищется на любом уровне
+// вложенности (как rope_theta), при отсутствии/порче — дефолт:
+//   temperature        double, 1.0;  0 и меньше — жадно (детерминизм);
+//   top_k              int,    0;    не отсекать (стратегия 2);
+//   top_p              double, 1.0;  не отсекать (стратегия 3);
+//   repetition_penalty double, 1.0;  1.0 — штраф выключен;
+//   repetition_window  int,    64;   окно последних токенов, 0 — выключить,
+//                                    максимум VTM_MAX_REPETITION_WINDOW;
+//   sample_seed        int,    0;    зерно ГПСЧ (детерминизм/воспроизводимость).
+// Штраф за повторы действует во всех стратегиях и применяется до температуры:
+// для каждого токена окна, встретившегося среди последних repetition_window
+// сгенерированных токенов, логит > 0 делится на penalty, иначе умножается.
+#define VTM_SAMP_ARGMAX      0
+#define VTM_SAMP_TEMPERATURE 1
+#define VTM_SAMP_TOPK        2
+#define VTM_SAMP_TOPP        3
+
+#define VTM_DEFAULT_TEMPERATURE        1.0
+#define VTM_DEFAULT_TOP_P              1.0
+#define VTM_DEFAULT_REPETITION_PENALTY 1.0
+#define VTM_DEFAULT_REPETITION_WINDOW  64
+#define VTM_MAX_REPETITION_WINDOW      256
+
 // Флаги локальны для opcode (один и тот же бит значит разное).
 #define VTM_FLAG_CAUSAL          0x01u  // SM, ATTN
 #define VTM_FLAG_INPLACE         0x02u  // подсказка: dst может совпадать с a
@@ -199,6 +234,23 @@ extern const vtm_backend vtm_backend_scalar_direct;
 
 // --- машина ----------------------------------------------------------------
 typedef struct vtm vtm_t;
+
+// Эффективные параметры SAMP из меты контейнера (для отладки, тестов и
+// логов хоста). Заполняется vtm_sampling_params(); при отсутствии меты —
+// дефолты VTM_DEFAULT_*. Разбор — линейный проход по JSON, не для горячего
+// цикла; сам интерпретатор держит разобранные параметры в машине.
+typedef struct {
+    double   temperature;
+    int      top_k;
+    double   top_p;
+    double   repetition_penalty;
+    int      repetition_window;   // 0 — штраф выключен
+    uint64_t sample_seed;
+    int      has_seed;            // 1 — sample_seed задан в мете
+} vtm_sampling;
+
+// 1 — мета есть и разобрана; 0 — меты нет, поля заполнены дефолтами.
+int vtm_sampling_params(const vtm_t *m, vtm_sampling *out);
 
 // Callback получает выбранный SAMP токен и позицию (m->position).
 // Возврат != 0 — вежливая остановка прогона (vtm_run вернёт VTM_OK).

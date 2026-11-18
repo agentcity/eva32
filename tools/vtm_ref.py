@@ -163,9 +163,13 @@ opcode u8 | flags u8 | dst u16 | a u16 | b u16 | c u16 | reserved u16 | imm i32
     `j <= q_start + qi`. Для одного токена (`q_len = 1`, `q_start = pos`)
     это всё `0..pos` — ровно декод.
 
-`SAMP` — выбрать токен из логитов `a`: `imm == 0` — жадный argmax (первый
-    максимум), `imm > 0` — температура `imm/1000` (расширение Python;
-    C v0.1 поддерживает только 0 и вернёт VTM_E_UNSUPPORTED). `dst`
+`SAMP` — выбрать токен из логитов `a`; `imm` — номер стратегии: 0 argmax
+    (первый максимум), 1 temperature, 2 top-k, 3 top-p; `imm` вне 0..3 —
+    `ValueError`. Параметры (temperature, top_k, top_p, repetition_penalty,
+    repetition_window, sample_seed) — из меты контейнера, штраф за повторы —
+    по окну последних токенов. ГПСЧ (xorshift64*, засев splitmix64) и порядок
+    вычислений совпадают с C побитово: при одном `seed` оба интерпретатора
+    дают ту же последовательность токенов (docs/vtm.md, «Сэмплинг»). `dst`
     (опционально) — тензор, куда пишется id как float; исполнитель помнит
     логиты в результате.
 
@@ -204,7 +208,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import random
 import struct
 import sys
 from dataclasses import dataclass
@@ -259,6 +262,12 @@ KIND_NAMES = {
 #: Флаги контейнера (заголовок).
 VFLAG_F32_SCALES = 0x0001  # масштабы тритов по умолчанию float32
 VFLAG_CAUSAL = 0x0002      # модель причинная (LM)
+
+#: Стратегии SAMP (imm инструкции, задача 0051; см. docs/vtm.md).
+SAMP_ARGMAX = 0
+SAMP_TEMPERATURE = 1
+SAMP_TOPK = 2
+SAMP_TOPP = 3
 VFLAG_KNOWN = VFLAG_F32_SCALES | VFLAG_CAUSAL
 
 #: Флаги инструкции — локальны для opcode (как в C).
@@ -1368,22 +1377,226 @@ def _argmax(values: Sequence[float]) -> int:
     return best
 
 
-def _sample_with_temperature(
-    logits: Sequence[float], temperature: float, seed: int
-) -> int:
-    if temperature <= 0:
-        return _argmax(logits)
-    rng = random.Random(int(seed))
-    peak = max(logits)
-    weights = [math.exp((value - peak) / temperature) for value in logits]
-    total = sum(weights)
-    threshold = rng.random() * total
-    cumulative = 0.0
-    for index, weight in enumerate(weights):
-        cumulative += weight
-        if cumulative >= threshold:
-            return index
-    return len(weights) - 1
+# --- SAMP: стратегии, параметры из меты и ГПСЧ -----------------------------
+#
+# Паритет с C (docs/vtm.md, «Сэмплинг»): imm — номер стратегии 0..3,
+# параметры — из меты, один сэмпл без перехода в argmax потребляет ровно одно
+# число xorshift64*. Всё считается в float (Python) над теми же значениями,
+# что C читает как f32, поэтому последовательности совпадают побитово.
+
+_SAMP_MASK64 = (1 << 64) - 1
+_SAMP_MAX_WINDOW = 256
+_SAMP_DEFAULTS = {
+    "temperature": 1.0,
+    "top_k": 0,
+    "top_p": 1.0,
+    "repetition_penalty": 1.0,
+    "repetition_window": 64,
+    "sample_seed": 0,
+    "has_seed": False,
+}
+
+
+def _samp_mix64(value: int) -> int:
+    """splitmix64 — только для засева xorshift64* (как в C)."""
+    value = (value + 0x9E3779B97F4A7C15) & _SAMP_MASK64
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _SAMP_MASK64
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _SAMP_MASK64
+    return value ^ (value >> 31)
+
+
+def _samp_meta_number(meta: dict, key: str) -> float | None:
+    """Первое числовое значение ключа на минимальной глубине — как C-сканер.
+
+    C ищет ключ по тексту JSON на любом уровне вложенности и при нескольких
+    вхождениях берёт самое внешнее; здесь тот же порядок обхода.
+    """
+    found: list[tuple[int, float]] = []
+
+    def walk(value: object, depth: int) -> None:
+        if isinstance(value, dict):
+            for name, child in value.items():
+                if (
+                    name == key
+                    and isinstance(child, (int, float))
+                    and not isinstance(child, bool)
+                ):
+                    found.append((depth, float(child)))
+                walk(child, depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, depth + 1)
+
+    walk(meta, 0)
+    if not found:
+        return None
+    return min(found, key=lambda pair: pair[0])[1]
+
+
+def _samp_params(meta: dict) -> dict:
+    """Разбор и кламп параметров SAMP — ровно как samp_params_from_meta()."""
+    params = dict(_SAMP_DEFAULTS)
+    number = _samp_meta_number
+
+    value = number(meta, "temperature")
+    if value is not None:
+        if math.isnan(value) or value < 0.0:
+            params["temperature"] = 0.0
+        elif value > 1e6:
+            params["temperature"] = 1e6
+        else:
+            params["temperature"] = value
+    value = number(meta, "top_k")
+    if value is not None:
+        if value <= 0.0:
+            params["top_k"] = 0
+        elif value > 1e9:
+            params["top_k"] = 1_000_000_000
+        else:
+            params["top_k"] = int(value)
+    value = number(meta, "top_p")
+    if value is not None:
+        if math.isnan(value):
+            params["top_p"] = _SAMP_DEFAULTS["top_p"]
+        elif value <= 0.0:
+            params["top_p"] = 0.0
+        elif value >= 1.0:
+            params["top_p"] = 1.0
+        else:
+            params["top_p"] = value
+    value = number(meta, "repetition_penalty")
+    if value is not None:
+        if math.isnan(value) or value <= 0.0:
+            params["repetition_penalty"] = _SAMP_DEFAULTS["repetition_penalty"]
+        elif value > 1e6:
+            params["repetition_penalty"] = 1e6
+        else:
+            params["repetition_penalty"] = value
+    value = number(meta, "repetition_window")
+    if value is not None:
+        if value <= 0.0:
+            params["repetition_window"] = 0
+        elif value > _SAMP_MAX_WINDOW:
+            params["repetition_window"] = _SAMP_MAX_WINDOW
+        else:
+            params["repetition_window"] = int(value)
+    value = number(meta, "sample_seed")
+    if (
+        value is not None
+        and math.isfinite(value)
+        and 0.0 <= value < 9007199254740992.0
+    ):
+        params["sample_seed"] = int(value)
+        params["has_seed"] = True
+    return params
+
+
+class _Sampler:
+    """Состояние SAMP машины: параметры, ГПСЧ и окно последних токенов."""
+
+    def __init__(self, meta: dict) -> None:
+        self.params = _samp_params(meta)
+        self.history: list[int] = []
+        seed = self.params["sample_seed"] ^ 0x9E3779B97F4A7C15
+        self.rng = _samp_mix64(seed)
+        if self.rng == 0:
+            self.rng = 0x2545F4914F6CDD1D
+
+    def _next(self) -> int:
+        value = self.rng
+        value ^= (value << 13) & _SAMP_MASK64
+        value ^= value >> 7
+        value ^= (value << 17) & _SAMP_MASK64
+        value &= _SAMP_MASK64
+        self.rng = value
+        return (value * 0x2545F4914F6CDD1D) & _SAMP_MASK64
+
+    def _uniform(self) -> float:
+        return (self._next() >> 11) * (1.0 / 9007199254740992.0)
+
+    def _penalty_active(self) -> bool:
+        params = self.params
+        return (
+            params["repetition_penalty"] != 1.0
+            and params["repetition_window"] > 0
+            and bool(self.history)
+        )
+
+    def _penalized(self, token: int, value: float) -> float:
+        if not self._penalty_active():
+            return value
+        window = self.history[-self.params["repetition_window"]:]
+        if token not in window:
+            return value
+        penalty = self.params["repetition_penalty"]
+        return value / penalty if value > 0.0 else value * penalty
+
+    def _greedy(self, logits: Sequence[float]) -> int:
+        best = 0
+        best_value = self._penalized(0, logits[0])
+        for index in range(1, len(logits)):
+            value = self._penalized(index, logits[index])
+            if value > best_value:
+                best = index
+                best_value = value
+        return best
+
+    def choose(self, logits: Sequence[float], strategy: int) -> int:
+        params = self.params
+        temperature = params["temperature"]
+        greedy = (
+            strategy == 0
+            or (strategy == 1 and temperature <= 0.0)
+            or (strategy == 2 and (temperature <= 0.0 or params["top_k"] == 1))
+            or (strategy == 3 and (temperature <= 0.0 or params["top_p"] <= 0.0))
+        )
+        if greedy:
+            token = self._greedy(logits)
+        else:
+            token = self._sample(logits, strategy)
+        self.history.append(token)
+        del self.history[:-_SAMP_MAX_WINDOW]
+        return token
+
+    def _sample(self, logits: Sequence[float], strategy: int) -> int:
+        params = self.params
+        values = [
+            -math.inf if math.isnan(float(value)) else self._penalized(index, float(value))
+            for index, value in enumerate(logits)
+        ]
+        order = sorted(range(len(values)), key=lambda index: (-values[index], index))
+        kept = len(order)
+        top = values[order[0]]
+        if not math.isfinite(top):
+            return order[0]
+        if strategy == 2 and 0 < params["top_k"] < kept:
+            kept = params["top_k"]
+        weights = [
+            math.exp((values[order[index]] - top) / params["temperature"])
+            for index in range(kept)
+        ]
+        total = sum(weights)
+        if strategy == 3 and params["top_p"] < 1.0 and total > 0.0:
+            need = params["top_p"] * total
+            upto = 0.0
+            for index in range(len(weights)):
+                upto += weights[index]
+                if upto >= need:
+                    kept = index + 1
+                    break
+            weights = weights[:kept]
+            total = sum(weights)
+        if total > 0.0 and math.isfinite(total):
+            threshold = self._uniform() * total
+            cumulative = 0.0
+            for index in range(kept):
+                cumulative += weights[index]
+                if cumulative >= threshold:
+                    return order[index]
+            return order[kept - 1]
+        return order[0]
+
+
 
 
 class _Interpreter:
@@ -1396,7 +1609,7 @@ class _Interpreter:
         self.meta = vtm.meta
         self.theta = float(self.meta.get("rope_theta", 10000.0))
         self.rope_layout = str(self.meta.get("rope_layout", "half"))
-        self.sample_seed = int(self.meta.get("sample_seed", 0))
+        self.sampler = _Sampler(self.meta)
         #: индексы тензоров-кэшей KV: они не сбрасываются между проходами
         #: KVW пишет в dst (K-кэш) и b (V-кэш): их не сбрасываем между проходами.
         self.cache_indices = {
@@ -1666,13 +1879,12 @@ class _Interpreter:
             logits = self._read(int(instr.a))
             if not logits:
                 raise ValueError("SAMP: пустые логиты")
-            if instr.imm <= 0:
-                token = _argmax(logits)
-            else:
-                temperature = instr.imm / 1000.0
-                token = _sample_with_temperature(
-                    logits, temperature, self.sample_seed * 1_000_003 + state.pos
+            strategy = int(instr.imm)
+            if strategy < 0 or strategy > 3:
+                raise ValueError(
+                    f"SAMP: стратегия imm={strategy} не реализована (0..3)"
                 )
+            token = self.sampler.choose(logits, strategy)
             state.sampled = token
             state.logits = [float(value) for value in logits]
             self._write(int(instr.dst), [float(token)])

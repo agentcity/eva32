@@ -1842,10 +1842,11 @@ static void test_samp(void) {
     model_free(&md);
 
     // Неизвестный режим SAMP — внятная ошибка, не падение.
+    // imm 0..3 заняты стратегиями (задача 0051), 4 — ещё не реализована.
     model_init(&md);
     model_add_f32(&md, "logits", 1, dlog, logits);
     model_add_f32(&md, "token", 1, dto, tok);
-    model_inst(&md, VTM_OP_SAMP, 0, 1, 0, VTM_NO_TENSOR, VTM_NO_TENSOR, 1);
+    model_inst(&md, VTM_OP_SAMP, 0, 1, 0, VTM_NO_TENSOR, VTM_NO_TENSOR, 4);
     model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
                VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
     model_build(&md, &img, &size);
@@ -1857,6 +1858,385 @@ static void test_samp(void) {
     }
     free(img);
     model_free(&md);
+}
+
+// --- SAMP: стратегии, параметры из меты, воспроизводимость -----------------
+
+// Контейнер «logits -> SAMP(strategy) -> HALT»; dst-тензор "token" уже есть.
+static vtm_t *samp_container(const float *logits, uint32_t n, const char *meta,
+                             int strategy) {
+    model_t md;
+    uint32_t dlog[1];
+    uint32_t dtok[1] = {1};
+    float tokv[1] = {-1.0f};
+    uint8_t *img;
+    size_t size;
+    vtm_t *m;
+
+    model_init(&md);
+    dlog[0] = n;
+    model_add_f32(&md, "logits", 1, dlog, logits);
+    model_add_f32(&md, "token", 1, dtok, tokv);
+    model_inst(&md, VTM_OP_SAMP, 0, 1, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               strategy);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    if (meta) model_set_meta(&md, meta);
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    free(img);
+    model_free(&md);
+    return m;
+}
+
+// Следующий выбранный токен (один прогон программы).
+static int samp_next(vtm_t *m) {
+    run_ok(m);
+    return (int)vtm_tensor_by_name(m, "token")->f32[0];
+}
+
+// K прогонов подряд: стратегия + окно/ГПСЧ машины работают как в генерации.
+static void samp_seq(vtm_t *m, int *out, int k) {
+    int i;
+    for (i = 0; i < k; i++) out[i] = samp_next(m);
+}
+
+// Гистограмма токенов за k прогонов; counts — массив длины n.
+static void samp_counts(vtm_t *m, int *counts, uint32_t n, int k) {
+    int i;
+    memset(counts, 0, (size_t)n * sizeof(int));
+    for (i = 0; i < k; i++) {
+        uint32_t token = (uint32_t)samp_next(m);
+        CHECK(token < n);
+        if (token < n) counts[token]++;
+    }
+}
+
+static void test_samp_strategies(void) {
+    // (1) argmax детерминирован: 3 прогона и 3 отдельные загрузки — токен 1.
+    {
+        float logits[3] = {0.5f, 2.0f, 1.0f};
+        int got[3], i;
+        vtm_t *m = samp_container(logits, 3, NULL, VTM_SAMP_ARGMAX);
+        CHECK(m != NULL);
+        if (m) {
+            samp_seq(m, got, 3);
+            CHECK(got[0] == 1 && got[1] == 1 && got[2] == 1);
+            vtm_free(m);
+        }
+        for (i = 0; i < 3; i++) {
+            m = samp_container(logits, 3, NULL, VTM_SAMP_ARGMAX);
+            CHECK(m != NULL);
+            if (!m) break;
+            CHECK(samp_next(m) == 1);
+            vtm_free(m);
+        }
+    }
+
+    // (2) temperature 0 == argmax: и явный 0, и отрицательная температура.
+    {
+        float logits[3] = {0.5f, 2.0f, 1.0f};
+        static const char *const metas[] = {
+            "{\"temperature\": 0.0}",
+            "{\"temperature\": 0}",
+            "{\"temperature\": -2.0}"
+        };
+        size_t i;
+        for (i = 0; i < sizeof metas / sizeof metas[0]; i++) {
+            int got[3];
+            vtm_t *m = samp_container(logits, 3, metas[i],
+                                      VTM_SAMP_TEMPERATURE);
+            CHECK(m != NULL);
+            if (!m) continue;
+            samp_seq(m, got, 3);
+            CHECK(got[0] == 1 && got[1] == 1 && got[2] == 1);
+            vtm_free(m);
+        }
+    }
+
+    // (3) top-k 1 == argmax: и при temperature 0, и при ненулевой.
+    {
+        float logits[3] = {0.5f, 2.0f, 1.0f};
+        static const char *const metas[] = {
+            "{\"top_k\": 1}",
+            "{\"top_k\": 1, \"temperature\": 0.7}",
+            "{\"top_k\": 1, \"temperature\": 2.0, \"top_p\": 0.3}"
+        };
+        size_t i;
+        for (i = 0; i < sizeof metas / sizeof metas[0]; i++) {
+            int got[3];
+            vtm_t *m = samp_container(logits, 3, metas[i], VTM_SAMP_TOPK);
+            CHECK(m != NULL);
+            if (!m) continue;
+            samp_seq(m, got, 3);
+            CHECK(got[0] == 1 && got[1] == 1 && got[2] == 1);
+            vtm_free(m);
+        }
+    }
+
+    // (4) top-p 1.0 ничего не отсекает: последовательность побитово равна
+    // стратегии temperature при том же seed (тот же ГПСЧ, тот же один draw).
+    {
+        float logits[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        const char *meta = "{\"temperature\": 1.0, \"top_p\": 1.0,"
+                           " \"sample_seed\": 2024}";
+        int temp[64], topp[64];
+        vtm_t *m1 = samp_container(logits, 5, meta, VTM_SAMP_TEMPERATURE);
+        vtm_t *m3 = samp_container(logits, 5, meta, VTM_SAMP_TOPP);
+        CHECK(m1 != NULL && m3 != NULL);
+        if (m1 && m3) {
+            samp_seq(m1, temp, 64);
+            samp_seq(m3, topp, 64);
+            CHECK(memcmp(temp, topp, sizeof temp) == 0);
+        }
+        vtm_free(m1);
+        vtm_free(m3);
+    }
+
+    // (5) top-p граница: 4 равных логита, p = 0.5 -> ядро ровно из двух,
+    // p = 0.6 -> из трёх; токены вне ядра не выбираются.
+    {
+        float logits[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        int counts[4];
+        vtm_t *m = samp_container(logits, 4,
+                                  "{\"top_p\": 0.5, \"sample_seed\": 5}",
+                                  VTM_SAMP_TOPP);
+        CHECK(m != NULL);
+        if (m) {
+            samp_counts(m, counts, 4, 400);
+            CHECK(counts[0] > 0 && counts[1] > 0);
+            CHECK(counts[2] == 0 && counts[3] == 0);
+            vtm_free(m);
+        }
+        m = samp_container(logits, 4,
+                           "{\"top_p\": 0.6, \"sample_seed\": 5}",
+                           VTM_SAMP_TOPP);
+        CHECK(m != NULL);
+        if (m) {
+            samp_counts(m, counts, 4, 400);
+            CHECK(counts[0] > 0 && counts[1] > 0 && counts[2] > 0);
+            CHECK(counts[3] == 0);
+            vtm_free(m);
+        }
+        // top_p <= 0 — детерминированный argmax (токен 0 при равных логитах).
+        m = samp_container(logits, 4, "{\"top_p\": 0.0}", VTM_SAMP_TOPP);
+        CHECK(m != NULL);
+        if (m) {
+            int got[3];
+            samp_seq(m, got, 3);
+            CHECK(got[0] == 0 && got[1] == 0 && got[2] == 0);
+            vtm_free(m);
+        }
+    }
+
+    // (6) temperature: распределение. logits {0, ln2} -> p = (1/3, 2/3).
+    {
+        float logits[2] = {0.0f, 0.6931472f};
+        int counts[2];
+        vtm_t *m = samp_container(logits, 2,
+                                  "{\"temperature\": 1.0, \"sample_seed\": 1}",
+                                  VTM_SAMP_TEMPERATURE);
+        CHECK(m != NULL);
+        if (m) {
+            samp_counts(m, counts, 2, 3000);
+            CHECK(counts[0] + counts[1] == 3000);
+            CHECK(counts[1] > 1800 && counts[1] < 2200);   // ~2000 = 2/3
+            vtm_free(m);
+        }
+        // T = 0.5: exp(ln2/0.5) = 4 -> p = (0.2, 0.8).
+        m = samp_container(logits, 2,
+                           "{\"temperature\": 0.5, \"sample_seed\": 1}",
+                           VTM_SAMP_TEMPERATURE);
+        CHECK(m != NULL);
+        if (m) {
+            samp_counts(m, counts, 2, 3000);
+            CHECK(counts[1] > 2200 && counts[1] < 2600);   // ~2400 = 0.8
+            vtm_free(m);
+        }
+    }
+
+    // (7) top-k: 5 равных логитов, k = 2 -> ровно два токена, примерно поровну.
+    {
+        float logits[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        int counts[5];
+        vtm_t *m = samp_container(logits, 5,
+                                  "{\"top_k\": 2, \"sample_seed\": 3}",
+                                  VTM_SAMP_TOPK);
+        CHECK(m != NULL);
+        if (m) {
+            samp_counts(m, counts, 5, 2000);
+            CHECK(counts[0] > 0 && counts[1] > 0);
+            CHECK(counts[2] == 0 && counts[3] == 0 && counts[4] == 0);
+            CHECK(counts[0] > 800 && counts[0] < 1200);    // ~1000
+            vtm_free(m);
+        }
+        // Без top_k (0) стратегия 2 — просто температура: выбираются все 5.
+        m = samp_container(logits, 5,
+                           "{\"top_k\": 0, \"sample_seed\": 3}",
+                           VTM_SAMP_TOPK);
+        CHECK(m != NULL);
+        if (m) {
+            samp_counts(m, counts, 5, 400);
+            CHECK(counts[0] > 0 && counts[4] > 0);
+            vtm_free(m);
+        }
+    }
+
+    // (8) штраф за повторы ломает зацикленный пример: без штрафа argmax
+    // всегда выбирает токен 2, со штрафом 1.5 следующий выбор — токен 0.
+    {
+        float logits[4] = {0.9f, 0.0f, 1.0f, 0.0f};
+        int got[3];
+        vtm_t *m = samp_container(logits, 4, NULL, VTM_SAMP_ARGMAX);
+        CHECK(m != NULL);
+        if (m) {
+            samp_seq(m, got, 3);
+            CHECK(got[0] == 2 && got[1] == 2 && got[2] == 2);
+            vtm_free(m);
+        }
+        m = samp_container(logits, 4,
+                           "{\"repetition_penalty\": 1.5,"
+                           " \"repetition_window\": 8}",
+                           VTM_SAMP_ARGMAX);
+        CHECK(m != NULL);
+        if (m) {
+            samp_seq(m, got, 3);
+            CHECK(got[0] == 2);
+            CHECK(got[1] == 0);          // 1.0 / 1.5 = 0.667 < 0.9
+            CHECK(!(got[0] == 2 && got[1] == 2 && got[2] == 2));
+            vtm_free(m);
+        }
+        // Штраф только по окну: window = 0 — выключен, поведение как без него.
+        m = samp_container(logits, 4,
+                           "{\"repetition_penalty\": 3.0,"
+                           " \"repetition_window\": 0}",
+                           VTM_SAMP_ARGMAX);
+        CHECK(m != NULL);
+        if (m) {
+            samp_seq(m, got, 3);
+            CHECK(got[0] == 2 && got[1] == 2 && got[2] == 2);
+            vtm_free(m);
+        }
+    }
+
+    // (8b) окно ровно N токенов: при penalty 2.0 и логитах {0.5, 0.9, 1.0, 0}
+    // window = 1 штрафует только последний токен ([2,1,2]), window = 2 —
+    // последние два и перевес уходит токену 0 ([2,1,0]).
+    {
+        float logits[4] = {0.5f, 0.9f, 1.0f, 0.0f};
+        int got1[3], got2[3];
+        vtm_t *m = samp_container(logits, 4,
+                                  "{\"repetition_penalty\": 2.0,"
+                                  " \"repetition_window\": 1}",
+                                  VTM_SAMP_ARGMAX);
+        CHECK(m != NULL);
+        if (m) {
+            samp_seq(m, got1, 3);
+            CHECK(got1[0] == 2 && got1[1] == 1 && got1[2] == 2);
+            vtm_free(m);
+        }
+        m = samp_container(logits, 4,
+                           "{\"repetition_penalty\": 2.0,"
+                           " \"repetition_window\": 2}",
+                           VTM_SAMP_ARGMAX);
+        CHECK(m != NULL);
+        if (m) {
+            samp_seq(m, got2, 3);
+            CHECK(got2[0] == 2 && got2[1] == 1 && got2[2] == 0);
+            vtm_free(m);
+        }
+    }
+
+    // (9) воспроизводимость: vtm_reset() повторяет последовательность, две
+    // независимые машины с тем же seed — тоже (ГПСЧ не зависит от адреса).
+    {
+        float logits[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        const char *meta = "{\"temperature\": 1.0, \"sample_seed\": 7}";
+        int first[20], again[20], other[20], diff[20];
+        vtm_t *m = samp_container(logits, 5, meta, VTM_SAMP_TEMPERATURE);
+        vtm_t *m2 = samp_container(logits, 5, meta, VTM_SAMP_TEMPERATURE);
+        vtm_t *m3 = samp_container(logits, 5,
+                                   "{\"temperature\": 1.0,"
+                                   " \"sample_seed\": 8}",
+                                   VTM_SAMP_TEMPERATURE);
+        CHECK(m != NULL && m2 != NULL && m3 != NULL);
+        if (m && m2 && m3) {
+            samp_seq(m, first, 20);
+            samp_seq(m2, other, 20);
+            samp_seq(m3, diff, 20);
+            CHECK(memcmp(first, other, sizeof first) == 0);
+            CHECK(memcmp(first, diff, sizeof first) != 0);
+            vtm_reset(m);
+            samp_seq(m, again, 20);
+            CHECK(memcmp(first, again, sizeof first) == 0);
+        }
+        vtm_free(m);
+        vtm_free(m2);
+        vtm_free(m3);
+    }
+
+    // (10) параметры из меты: доступ через vtm_sampling_params(), вложенный
+    // ключ не перебивает верхний.
+    {
+        vtm_sampling sp;
+        vtm_t *m = mini_with_meta("{\"temperature\": 0.25, \"top_k\": 7,"
+                                  " \"top_p\": 0.9,"
+                                  " \"repetition_penalty\": 1.3,"
+                                  " \"repetition_window\": 12,"
+                                  " \"sample_seed\": 42,"
+                                  " \"model\": {\"temperature\": 0.5}}");
+        CHECK(m != NULL);
+        if (m) {
+            memset(&sp, 0, sizeof sp);
+            CHECK(vtm_sampling_params(m, &sp) == 1);
+            CHECK_NEAR(sp.temperature, 0.25, 1e-12);
+            CHECK(sp.top_k == 7);
+            CHECK_NEAR(sp.top_p, 0.9, 1e-12);
+            CHECK_NEAR(sp.repetition_penalty, 1.3, 1e-12);
+            CHECK(sp.repetition_window == 12);
+            CHECK(sp.sample_seed == 42);
+            CHECK(sp.has_seed == 1);
+            vtm_free(m);
+        }
+        // Меты нет — дефолты vtm.h.
+        m = mini_with_meta(NULL);
+        CHECK(m != NULL);
+        if (m) {
+            memset(&sp, 0xFF, sizeof sp);
+            CHECK(vtm_sampling_params(m, &sp) == 0);
+            CHECK_NEAR(sp.temperature, VTM_DEFAULT_TEMPERATURE, 1e-12);
+            CHECK(sp.top_k == 0);
+            CHECK_NEAR(sp.top_p, VTM_DEFAULT_TOP_P, 1e-12);
+            CHECK_NEAR(sp.repetition_penalty,
+                       VTM_DEFAULT_REPETITION_PENALTY, 1e-12);
+            CHECK(sp.repetition_window == VTM_DEFAULT_REPETITION_WINDOW);
+            CHECK(sp.sample_seed == 0);
+            CHECK(sp.has_seed == 0);
+            vtm_free(m);
+        }
+        // Битая мета — тоже дефолты, без падения.
+        m = mini_with_meta("{\"temperature\": ");
+        CHECK(m != NULL);
+        if (m) {
+            memset(&sp, 0, sizeof sp);
+            CHECK(vtm_sampling_params(m, &sp) == 0);
+            CHECK_NEAR(sp.temperature, VTM_DEFAULT_TEMPERATURE, 1e-12);
+            vtm_free(m);
+        }
+    }
+
+    // (11) стратегия вне 0..3 — VTM_E_UNSUPPORTED, машина не портится.
+    {
+        float logits[3] = {0.5f, 2.0f, 1.0f};
+        vtm_t *m = samp_container(logits, 3, NULL, 9);
+        CHECK(m != NULL);
+        if (m) {
+            CHECK(vtm_run(m, NULL, NULL) == VTM_E_UNSUPPORTED);
+            CHECK(strstr(vtm_error_message(m), "SAMP") != NULL);
+            CHECK(vtm_generated(m) == 0);
+            vtm_free(m);
+        }
+    }
 }
 
 static void test_f16_bf16(void) {
@@ -2070,6 +2450,119 @@ static void test_cli_text(void) {
     model_free(&md);
 }
 
+// Чат-шаблон Qwen2.5: --chat --system должен дать ровно эталонную строку,
+// а без --chat вывод прежний (сырой текст). Спецтокены <|im_start|>/<|im_end|>
+// приходят из added_tokens фикстуры (id 500/501), не из кода.
+static void test_cli_chat(void) {
+    static const char *const cli_paths[] = {
+        "./vtm", "src/vtm/vtm", "../../src/vtm/vtm", NULL
+    };
+    static const char *const tok_paths[] = {
+        "../../tests/vtm/fixtures/tokenizer.json",
+        "tests/vtm/fixtures/tokenizer.json",
+        "../tests/vtm/fixtures/tokenizer.json",
+        NULL
+    };
+    // Эталон: <|im_start|>system\n{system}<|im_end|>\n
+    //         <|im_start|>user\n{text}<|im_end|>\n
+    //         <|im_start|>assistant\n
+    static const char expected[] =
+        "шаблон:\n"
+        "<|im_start|>system\n"
+        "Ты ассистент<|im_end|>\n"
+        "<|im_start|>user\n"
+        "hello<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        "конец шаблона\n";
+    model_t md;
+    uint32_t dlog[1] = {287};
+    float *logits = (float *)xmalloc(287 * sizeof(float));
+    uint8_t *img;
+    size_t size;
+    char model_path[128], out_path[128], err_path[128];
+    char cmd[2048], out[8192], err[8192];
+    const char *cli;
+    const char *fixture;
+    long stamp = (long)time(NULL);
+    FILE *f;
+    int rc;
+
+    out[0] = '\0';
+    err[0] = '\0';
+    memset(logits, 0, 287 * sizeof(float));
+    logits[33] = 10.0f;
+
+    model_init(&md);
+    model_add_f32(&md, "logits", 1, dlog, logits);
+    model_inst(&md, VTM_OP_SAMP, 0, VTM_NO_TENSOR, 0, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+    free(logits);
+
+    snprintf(model_path, sizeof model_path, "/tmp/vtm_cli_chat_%ld.vtm", stamp);
+    snprintf(out_path, sizeof out_path, "/tmp/vtm_cli_chat_%ld.out", stamp);
+    snprintf(err_path, sizeof err_path, "/tmp/vtm_cli_chat_%ld.err", stamp);
+    f = fopen(model_path, "wb");
+    CHECK(f != NULL);
+    if (!f) {
+        free(img);
+        model_free(&md);
+        return;
+    }
+    CHECK(fwrite(img, 1, size, f) == size);
+    fclose(f);
+
+    cli = find_readable(cli_paths);
+    fixture = find_readable(tok_paths);
+    CHECK(cli != NULL);
+    CHECK(fixture != NULL);
+    if (cli && fixture) {
+        // --chat --system: точное совпадение с эталонным шаблоном.
+        snprintf(cmd, sizeof cmd,
+                 "%s run %s --text hello --tokenizer %s --chat "
+                 "--system \"Ты ассистент\" --max-new 1 > %s 2> %s",
+                 cli, model_path, fixture, out_path, err_path);
+        rc = system(cmd);
+        CHECK(cli_exit_code(rc) == 0);
+        CHECK(read_text_file(out_path, out, sizeof out) == 0);
+        CHECK(strstr(out, expected) != NULL);
+        // Промпт реально закодирован спецтокенами из added_tokens:
+        // 500 = <|im_start|>, 501 = <|im_end|>, 259 = "hello".
+        CHECK(strstr(out, "prompt: 500 115 121 115 116 101 109 10") != NULL);
+        CHECK(strstr(out, "259 501 10 500 97 115 115 105 115 116 97 110 116")
+              != NULL);
+
+        // Без --chat — прежнее поведение: сырой текст, без шаблона.
+        snprintf(cmd, sizeof cmd,
+                 "%s run %s --text hello --tokenizer %s --max-new 1 "
+                 "> %s 2> %s",
+                 cli, model_path, fixture, out_path, err_path);
+        rc = system(cmd);
+        CHECK(cli_exit_code(rc) == 0);
+        CHECK(read_text_file(out_path, out, sizeof out) == 0);
+        CHECK(strstr(out, "шаблон:") == NULL);
+        CHECK(strstr(out, "prompt: 259") != NULL);
+        CHECK(strstr(out, "текст:   hello") != NULL);
+
+        // --system без --chat — ошибка аргументов, код 2.
+        snprintf(cmd, sizeof cmd,
+                 "%s run %s --text hello --system \"x\" > %s 2> %s",
+                 cli, model_path, out_path, err_path);
+        rc = system(cmd);
+        CHECK(cli_exit_code(rc) == 2);
+        CHECK(read_text_file(err_path, err, sizeof err) == 0);
+        CHECK(strstr(err, "--system") != NULL);
+    }
+
+    remove(model_path);
+    remove(out_path);
+    remove(err_path);
+    free(img);
+    model_free(&md);
+}
+
 // --- main ------------------------------------------------------------------
 
 int main(void) {
@@ -2093,9 +2586,11 @@ int main(void) {
     test_attn_causal();
     test_kvw_attn_cache();
     test_samp();
+    test_samp_strategies();
     test_f16_bf16();
     test_large_dims_u32();
     test_cli_text();
+    test_cli_chat();
 
     if (g_fail) {
         fprintf(stderr, "\nПРОВАЛЕНО проверок: %d\n", g_fail);

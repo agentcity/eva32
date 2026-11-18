@@ -310,14 +310,14 @@
   {
     "id": "0050",
     "title": "SIMD-бэкенд для тритовых ядер",
-    "status": "in_progress",
+    "status": "done",
     "file": "0050-vtm-simd.md",
     "assignee": "agent:vtm-simd"
   },
   {
     "id": "0051",
     "title": "Сэмплинг: temperature, top-k, top-p, повтор",
-    "status": "in_progress",
+    "status": "done",
     "file": "0051-vtm-sampling.md",
     "assignee": "agent:vtm-sampling"
   },

@@ -793,39 +793,349 @@ static vtm_status op_attn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 
 // --- SAMP ------------------------------------------------------------------
 //
-// v0.1: imm == 0 — жадный argmax (первый максимум; NaN пропускаются,
-// если все NaN — токен 0). imm != 0 — зарезервировано под температуру/
-// top-k, пока VTM_E_UNSUPPORTED. dst (если задан) — тензор fp32, куда
-// кладётся id как float; callback получает id и позицию.
-static vtm_status op_samp(vtm_t *m, uint32_t ins, const vtm_instr *in,
-                          vtm_emit_fn emit, void *user, int *stop) {
-    vtm_status st;
-    const vtm_tensor *logits = need(m, in->a, ins, "a (logits)", &st);
-    const vtm_tensor *tok = NULL;
-    uint32_t n, j;
-    int best_i = 0;
-    float best;
-    int token;
+// imm — номер стратегии (см. vtm.h):
+//   0 VTM_SAMP_ARGMAX      — жадный argmax, ровно как в v0.1;
+//   1 VTM_SAMP_TEMPERATURE — p = softmax(logits / temperature);
+//   2 VTM_SAMP_TOPK        — температура, затем top_k старших;
+//   3 VTM_SAMP_TOPP        — температура, затем ядро с суммой >= top_p.
+// imm вне 0..3 — VTM_E_UNSUPPORTED (конвенция «imm/1000 = температура» из
+// старого Python-эталона не поддерживается, см. docs/vtm.md).
+//
+// Параметры — из меты контейнера: temperature, top_k, top_p,
+// repetition_penalty, repetition_window, sample_seed (vtm.h). Штраф за
+// повторы действует во всех стратегиях и применяется до температуры: если
+// токен встретился среди последних repetition_window сгенерированных, его
+// логит делится на penalty (>0) или умножается на неё (<=0); повтор внутри
+// окна штрафуется один раз — как в CTRL.
+//
+// ГПСЧ — xorshift64* с засевом splitmix64. Алгоритм зафиксирован в
+// docs/vtm.md и повторён в tools/vtm_ref.py побитово: один сэмпл без
+// перехода в argmax потребляет ровно одно 64-битное число, поэтому C и
+// Python при одном seed дают одну и ту же последовательность токенов.
+// Всё, от чего зависит выбор, считается в double — как в Python-эталоне.
 
-    *stop = 0;
-    if (!logits) return st;
-    if ((st = req_f32(m, logits, ins, "a (logits)")) != VTM_OK) return st;
-    if (in->imm != 0)
-        return fail(m, ins, VTM_E_UNSUPPORTED,
-                    "SAMP: режим imm=%d не реализован (v0.1: 0 = argmax)",
-                    in->imm);
-    n = logits->n_elements;
-    if (n == 0)
-        return fail(m, ins, VTM_E_SHAPE, "SAMP: пустые логиты");
-    best = logits->f32[0];
+// Эффективный argmax: первый максимум, NaN не побеждает (v0.1).
+// При включённом штрафе — по логитам, уже умноженным на штраф.
+typedef struct {
+    double   value;     // логит после штрафа
+    uint32_t index;     // токен
+} samp_cand;
+
+static int samp_cand_cmp(const void *pa, const void *pb) {
+    const samp_cand *a = (const samp_cand *)pa;
+    const samp_cand *b = (const samp_cand *)pb;
+    if (a->value > b->value) return -1;
+    if (a->value < b->value) return 1;
+    if (a->index < b->index) return -1;
+    if (a->index > b->index) return 1;
+    return 0;
+}
+
+// splitmix64 — только для засева xorshift64*.
+static uint64_t samp_mix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+static uint64_t samp_rng_next(vtm_t *m) {
+    uint64_t x = m->samp_rng;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    m->samp_rng = x;
+    return x * 0x2545F4914F6CDD1Dull;
+}
+
+// Равномерное [0,1): 53 старших бита (как double(random())).
+static double samp_uniform(vtm_t *m) {
+    return (double)(samp_rng_next(m) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+// --- параметры из меты -----------------------------------------------------
+//
+// Свой маленький сканер, а не загрузчик: loader.c вне зоны задачи, а мета —
+// тот же JSON, что уже лежит в машине. Ключ ищется на любом уровне
+// вложенности, при нескольких вхождениях побеждает минимальная глубина
+// (как у rope_theta в загрузчике). Числа читает strtod; мусор — дефолт.
+
+static size_t samp_skip_ws(const char *s, size_t i, size_t n) {
+    while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n'
+                     || s[i] == '\r'))
+        i++;
+    return i;
+}
+
+static int samp_meta_number(const char *json, const char *key, double *out) {
+    size_t n, i = 0, klen = strlen(key);
+    int depth = 0, best_depth = 0, found = 0;
+    double best = 0.0;
+
+    if (!json || !json[0]) return 0;
+    n = strlen(json);
+    while (i < n) {
+        char c = json[i];
+        if (c == '"') {
+            size_t start = i + 1;
+            int esc = 0, closed = 0;
+            i = start;
+            while (i < n) {
+                if (esc) { esc = 0; i++; continue; }
+                if (json[i] == '\\') { esc = 1; i++; continue; }
+                if (json[i] == '"') { closed = 1; break; }
+                i++;
+            }
+            if (closed && i - start == klen
+                && memcmp(json + start, key, klen) == 0) {
+                size_t j = samp_skip_ws(json, i + 1, n);
+                if (j < n && json[j] == ':') {
+                    char *end = NULL;
+                    double v;
+                    j = samp_skip_ws(json, j + 1, n);
+                    v = strtod(json + j, &end);
+                    if (end && end != json + j
+                        && (!found || depth < best_depth)) {
+                        best = v;
+                        best_depth = depth;
+                        found = 1;
+                    }
+                }
+            }
+            i = closed ? i + 1 : n;
+            continue;
+        }
+        if (c == '{' || c == '[') depth++;
+        else if ((c == '}' || c == ']') && depth > 0) depth--;
+        i++;
+    }
+    if (found && out) *out = best;
+    return found;
+}
+
+static void samp_params_from_meta(const vtm_t *m, vtm_sampling *p) {
+    const char *json = vtm_meta_json(m);
+    double v;
+
+    p->temperature = VTM_DEFAULT_TEMPERATURE;
+    p->top_k = 0;
+    p->top_p = VTM_DEFAULT_TOP_P;
+    p->repetition_penalty = VTM_DEFAULT_REPETITION_PENALTY;
+    p->repetition_window = VTM_DEFAULT_REPETITION_WINDOW;
+    p->sample_seed = 0;
+    p->has_seed = 0;
+
+    if (samp_meta_number(json, "temperature", &v)) {
+        if (isnan(v) || v < 0.0) p->temperature = 0.0;   // мусор/минус — жадно
+        else if (v > 1e6) p->temperature = 1e6;
+        else p->temperature = v;
+    }
+    if (samp_meta_number(json, "top_k", &v)) {
+        if (!(v > 0.0)) p->top_k = 0;
+        else if (v > 1e9) p->top_k = 1000000000;
+        else p->top_k = (int)v;
+    }
+    if (samp_meta_number(json, "top_p", &v)) {
+        if (isnan(v)) p->top_p = VTM_DEFAULT_TOP_P;
+        else if (v <= 0.0) p->top_p = 0.0;
+        else if (v >= 1.0) p->top_p = 1.0;
+        else p->top_p = v;
+    }
+    if (samp_meta_number(json, "repetition_penalty", &v)) {
+        if (isnan(v) || v <= 0.0)
+            p->repetition_penalty = VTM_DEFAULT_REPETITION_PENALTY;
+        else if (v > 1e6) p->repetition_penalty = 1e6;
+        else p->repetition_penalty = v;
+    }
+    if (samp_meta_number(json, "repetition_window", &v)) {
+        if (!(v > 0.0)) p->repetition_window = 0;
+        else if (v > (double)VTM_MAX_REPETITION_WINDOW)
+            p->repetition_window = VTM_MAX_REPETITION_WINDOW;
+        else p->repetition_window = (int)v;
+    }
+    if (samp_meta_number(json, "sample_seed", &v) && isfinite(v)
+        && v >= 0.0 && v < 9007199254740992.0) {
+        p->sample_seed = (uint64_t)v;
+        p->has_seed = 1;
+    }
+}
+
+int vtm_sampling_params(const vtm_t *m, vtm_sampling *out) {
+    vtm_sampling p;
+    if (!m) return 0;
+    samp_params_from_meta(m, &p);
+    if (out) *out = p;
+    return vtm_meta_present(m) ? 1 : 0;
+}
+
+// --- состояние сэмплера ----------------------------------------------------
+
+static void samp_state_seed(vtm_t *m) {
+    m->samp_rng = samp_mix64(m->samp_seed ^ 0x9E3779B97F4A7C15ull);
+    if (m->samp_rng == 0) m->samp_rng = 0x2545F4914F6CDD1Dull;
+    m->samp_hist_len = 0;
+    m->samp_hist_head = 0;
+}
+
+// Явный сброс состояния SAMP; вызывать из vtm_reset() (loader.c).
+// Пока загрузчик этого не делает, op_samp() замечает сброс сам — по
+// счётчику vtm_generated(), поэтому поведение одинаково в обоих случаях.
+void vtm_samp_reset(vtm_t *m) {
+    if (!m) return;
+    m->samp_prev_generated = 0;
+    if (m->samp_ready) samp_state_seed(m);
+}
+
+// Вызывается в начале каждого SAMP: ленивая инициализация параметров и
+// распознавание vtm_reset() по счётчику сгенерированных токенов.
+static void samp_state_begin(vtm_t *m) {
+    vtm_sampling p;
+
+    if (m->samp_ready) {
+        if (m->samp_prev_generated > m->generated) samp_state_seed(m);
+        return;
+    }
+    samp_params_from_meta(m, &p);
+    m->samp_temperature = p.temperature;
+    m->samp_top_k = p.top_k;
+    m->samp_top_p = p.top_p;
+    m->samp_repetition_penalty = p.repetition_penalty;
+    m->samp_repetition_window = p.repetition_window;
+    m->samp_seed = p.sample_seed;
+    m->samp_ready = 1;
+    samp_state_seed(m);
+}
+
+static void samp_hist_push(vtm_t *m, int token) {
+    m->samp_hist[m->samp_hist_head] = token;
+    m->samp_hist_head = (m->samp_hist_head + 1) % VTM_MAX_REPETITION_WINDOW;
+    if (m->samp_hist_len < VTM_MAX_REPETITION_WINDOW) m->samp_hist_len++;
+}
+
+static int samp_hist_has(const vtm_t *m, uint32_t token) {
+    int k, lim = m->samp_repetition_window;
+    if (lim > m->samp_hist_len) lim = m->samp_hist_len;
+    for (k = 0; k < lim; k++) {
+        int idx = m->samp_hist_head - 1 - k;
+        if (idx < 0) idx += VTM_MAX_REPETITION_WINDOW;
+        if (m->samp_hist[idx] == (int)token) return 1;
+    }
+    return 0;
+}
+
+static int samp_penalty_active(const vtm_t *m) {
+    return m->samp_repetition_penalty != VTM_DEFAULT_REPETITION_PENALTY
+        && m->samp_repetition_window > 0
+        && m->samp_hist_len > 0;
+}
+
+static double samp_penalized(const vtm_t *m, uint32_t token, double value) {
+    if (!samp_penalty_active(m) || !samp_hist_has(m, token)) return value;
+    return value > 0.0 ? value / m->samp_repetition_penalty
+                       : value * m->samp_repetition_penalty;
+}
+
+// Жадный argmax — байт-в-байт как в v0.1, если штраф выключен.
+static int samp_greedy(const vtm_t *m, const float *v, uint32_t n) {
+    int best_i = 0;
+    double best = (double)v[0];
+    uint32_t j;
+
+    if (samp_penalty_active(m)) best = samp_penalized(m, 0, (double)v[0]);
     for (j = 1; j < n; j++) {
-        if (logits->f32[j] > best) {
-            best = logits->f32[j];
+        double value = samp_penalized(m, j, (double)v[j]);
+        if (value > best) {
+            best = value;
             best_i = (int)j;
         }
     }
-    token = best_i;
+    return best_i;
+}
 
+// Сортировка, затем температура/top-k/top-p и одно случайное число.
+static vtm_status samp_sample(vtm_t *m, uint32_t ins, const float *v, uint32_t n,
+                              int strategy, int *token) {
+    samp_cand *cand;
+    double *w;
+    uint32_t j, kept = n;
+    double top, total = 0.0, upto, acc, u;
+    double temperature = m->samp_temperature;
+    int penalty = samp_penalty_active(m);
+
+    // Один malloc на кандидатов и веса: словарь — сотни тысяч токенов,
+    // два вызова на каждый сэмпл дороже, чем кажется. sizeof(samp_cand)
+    // кратен 8, поэтому массив double после него выровнен.
+    {
+        size_t bytes = (size_t)n * (sizeof *cand + sizeof *w);
+        cand = (samp_cand *)malloc(bytes);
+        if (!cand)
+            return fail(m, ins, VTM_E_NOMEM,
+                        "SAMP: нет памяти под %u логитов", (unsigned)n);
+        w = (double *)(void *)(cand + n);
+    }
+    for (j = 0; j < n; j++) {
+        double value = (double)v[j];
+        if (isnan(value)) value = -INFINITY;
+        cand[j].value = penalty ? samp_penalized(m, j, value) : value;
+        cand[j].index = j;
+    }
+    qsort(cand, (size_t)n, sizeof *cand, samp_cand_cmp);
+    *token = (int)cand[0].index;
+    top = cand[0].value;
+
+    if (!isfinite(top)) {          // все логиты -inf/NaN — как argmax по ним
+        free(cand);
+        return VTM_OK;
+    }
+    if (strategy == VTM_SAMP_TOPK && m->samp_top_k > 0
+        && (uint32_t)m->samp_top_k < kept)
+        kept = (uint32_t)m->samp_top_k;
+    for (j = 0; j < kept; j++) {
+        w[j] = exp((cand[j].value - top) / temperature);
+        total += w[j];
+    }
+    if (strategy == VTM_SAMP_TOPP && m->samp_top_p < 1.0 && total > 0.0) {
+        double need = m->samp_top_p * total;
+        upto = 0.0;
+        for (j = 0; j < kept; j++) {
+            upto += w[j];
+            if (upto >= need) { kept = j + 1; break; }
+        }
+        total = 0.0;
+        for (j = 0; j < kept; j++) total += w[j];
+    }
+    if (total > 0.0 && isfinite(total)) {
+        u = samp_uniform(m) * total;
+        acc = 0.0;
+        for (j = 0; j < kept; j++) {
+            acc += w[j];
+            if (acc >= u) { *token = (int)cand[j].index; break; }
+        }
+        if (j >= kept) *token = (int)cand[kept - 1].index;
+    }
+    free(cand);
+    return VTM_OK;
+}
+
+static vtm_status op_samp(vtm_t *m, uint32_t ins, const vtm_instr *in,
+                          vtm_emit_fn emit, void *user, int *stop) {
+    vtm_status st;
+    const vtm_tensor *logits;
+    const vtm_tensor *tok = NULL;
+    uint32_t n;
+    int strategy, token, greedy;
+
+    *stop = 0;
+    logits = need(m, in->a, ins, "a (logits)", &st);
+    if (!logits) return st;
+    if ((st = req_f32(m, logits, ins, "a (logits)")) != VTM_OK) return st;
+    if (in->imm < VTM_SAMP_ARGMAX || in->imm > VTM_SAMP_TOPP)
+        return fail(m, ins, VTM_E_UNSUPPORTED,
+                    "SAMP: стратегия imm=%d не реализована (0..3)",
+                    (int)in->imm);
+    n = logits->n_elements;
+    if (n == 0)
+        return fail(m, ins, VTM_E_SHAPE, "SAMP: пустые логиты");
     if (in->dst != VTM_NO_TENSOR) {
         tok = need(m, in->dst, ins, "dst (token)", &st);
         if (!tok) return st;
@@ -833,10 +1143,30 @@ static vtm_status op_samp(vtm_t *m, uint32_t ins, const vtm_instr *in,
         if (tok->n_elements < 1)
             return fail(m, ins, VTM_E_SHAPE,
                         "SAMP: dst должен содержать хотя бы 1 элемент");
-        tok->f32[0] = (float)token;
     }
 
+    strategy = (int)in->imm;
+    samp_state_begin(m);
+
+    // Переходы в детерминированный argmax: стратегия 0, температура 0,
+    // top-k == 1, top-p <= 0. Именно они дают побитовый детерминизм.
+    greedy = strategy == VTM_SAMP_ARGMAX
+          || (strategy == VTM_SAMP_TEMPERATURE && m->samp_temperature <= 0.0)
+          || (strategy == VTM_SAMP_TOPK
+              && (m->samp_temperature <= 0.0 || m->samp_top_k == 1))
+          || (strategy == VTM_SAMP_TOPP
+              && (m->samp_temperature <= 0.0 || m->samp_top_p <= 0.0));
+    if (greedy) {
+        token = samp_greedy(m, logits->f32, n);
+    } else if ((st = samp_sample(m, ins, logits->f32, n, strategy,
+                                 &token)) != VTM_OK) {
+        return st;
+    }
+
+    if (tok) tok->f32[0] = (float)token;
+    samp_hist_push(m, token);
     m->generated++;
+    m->samp_prev_generated = m->generated;
     if (emit && emit(user, token, m->position) != 0) *stop = 1;
     return VTM_OK;
 }
