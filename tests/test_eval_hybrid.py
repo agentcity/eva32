@@ -48,12 +48,32 @@ eval_hybrid = _load_tool()
 
 #: Зафиксированные метрики прогона. Числа — минимум/максимум, а не «ровно»:
 #: улучшение допустимо, ухудшение видно. ``measured_at`` — дата прогона.
+#: 0105: набор вырос до 80 строк (60 исторических + 20 вопросов новых классов),
+#: поэтому базовые числа пересняты; исторические 60 проверяются отдельно ниже.
 BASELINE = {
     # Перебазировка после задачи 0038: промпт получил правило о переводе, вход
     # подорожал (188,20 → 230,15). Переснято на том же наборе, маршруты те же 60/60.
+    # 0105: новые классы (время/единицы/математика/валюта) добавлены 20 строками,
+    # скиллы дают 44/80, поэтому средняя цена на 1000 запросов упала до 172,61.
     "measured_at": "2026-11-18",
-    "total": 60,
     "accuracy": 1.00,
+    "skill_share": 0.55,
+    "cost_per_1000_rub": 172.61,
+    "content_checked": 44,
+    "content_ok": 44,
+}
+
+#: Сколько первых строк набора — историческое ядро (задачи 0019/0023/0038).
+#: 0105: их нельзя менять иначе, чем вместе с базовыми числами, поэтому у них
+#: отдельная проверка «маршруты как раньше».
+HISTORICAL_ROWS = 60
+#: Исторические числа по этим 60 строкам — сняты до задачи 0105.
+HISTORICAL = {
+    "total": 60,
+    "correct": 60,
+    "skill": 24,
+    "small": 14,
+    "big": 22,
     "skill_share": 0.40,
     "cost_per_1000_rub": 230.15,
     "content_checked": 24,
@@ -87,14 +107,19 @@ READY, SKIP_REASON = _hybrid_ready()
 
 
 class TestGoldenSet(unittest.TestCase):
-    """Формат набора: его можно менять, но 40–60 строк и три маршрута — нет."""
+    """Формат набора: его можно менять, но состав строк и три маршрута — нет."""
 
     def setUp(self):
         self.rows = eval_hybrid.load_golden(GOLDEN)
 
-    def test_size_is_40_to_60(self):
+    def test_size_matches_dataset(self):
+        # 0105: набор вырос до 80 строк, поэтому сверяем с файлом, а не с
+        # зашитым «40–60». Верхняя граница — защита от случайного раздувания.
+        with open(GOLDEN, encoding="utf-8") as handle:
+            lines = [line for line in handle if line.strip()]
+        self.assertEqual(len(self.rows), len(lines))
         self.assertGreaterEqual(len(self.rows), 40)
-        self.assertLessEqual(len(self.rows), 60)
+        self.assertLessEqual(len(self.rows), 200)
 
     def test_every_row_has_question_and_route(self):
         for row in self.rows:
@@ -218,8 +243,8 @@ class TestHybridMetrics(unittest.TestCase):
             print(eval_hybrid.format_report(cls.metrics))
 
     def test_total_matches_dataset(self):
+        # 0105: источник истины — файл набора, а не константа.
         self.assertEqual(self.metrics["total"], len(self.rows))
-        self.assertEqual(self.metrics["total"], BASELINE["total"])
 
     def test_no_answer_errors(self):
         self.assertEqual(
@@ -289,6 +314,31 @@ class TestHybridMetrics(unittest.TestCase):
         }
         new = sorted(actual - BASELINE_MISROUTES)
         self.assertEqual(new, [], f"новые промахи маршрутизации: {new}")
+
+    def test_historical_rows_route_as_before(self):
+        # 0105: набор вырос до 80 строк, но исторические 60 не должны поехать:
+        # их маршруты, доля скиллов и цена сверяются с числами до расширения.
+        rows = eval_hybrid.load_golden(GOLDEN)[:HISTORICAL_ROWS]
+        metrics = eval_hybrid.evaluate(rows, self.cfg, prices=self.prices)
+        self.assertEqual(metrics["total"], HISTORICAL["total"])
+        self.assertEqual(metrics["correct"], HISTORICAL["correct"])
+        for kind in eval_hybrid.ROUTE_KINDS:
+            self.assertEqual(
+                metrics["actual_counts"][kind],
+                HISTORICAL[kind],
+                f"исторические 60: маршрут {kind} поехал",
+            )
+        self.assertAlmostEqual(
+            metrics["skill_share"], HISTORICAL["skill_share"], places=6
+        )
+        self.assertAlmostEqual(
+            metrics["cost_per_1000_rub"],
+            HISTORICAL["cost_per_1000_rub"],
+            delta=COST_TOLERANCE,
+        )
+        self.assertEqual(metrics["content_checked"], HISTORICAL["content_checked"])
+        self.assertEqual(metrics["content_ok"], HISTORICAL["content_ok"])
+        self.assertEqual(metrics["mismatches"], [])
 
 
 

@@ -156,7 +156,14 @@ class TestClassBreakdownMetrics(unittest.TestCase):
         hits = self.metrics["skill_hits"]
         for name in eval_hybrid.registered_skill_names():
             self.assertIn(name, hits)
-        self.assertEqual(self.metrics["unused_skills"], ["time", "units", "math", "currency"])
+        # 0105: набор вырос до 80 строк, у новых классов появились вопросы —
+        # пустых скиллов в замере больше нет.
+        self.assertEqual(self.metrics["unused_skills"], [])
+        for name in ("time", "units", "math", "currency"):
+            with self.subTest(name=name):
+                self.assertGreater(
+                    hits[name], 0, f"у скилла {name} нет попаданий в наборе"
+                )
 
     def test_no_content_misses_on_golden(self):
         self.assertEqual(self.metrics["content_misses"], [])
@@ -165,7 +172,12 @@ class TestClassBreakdownMetrics(unittest.TestCase):
         report = eval_hybrid.format_report(self.metrics)
         self.assertIn("разбивка по классам", report)
         self.assertIn("скилл pricing", report)
-        self.assertIn("без попаданий: time, units, math, currency", report)
+        # 0105: все четыре новых класса отвечают, поэтому строки «без попаданий»
+        # в отчёте нет — она печатается только для пустых классов.
+        self.assertNotIn("без попаданий", report)
+        for name in ("time", "units", "math", "currency"):
+            with self.subTest(name=name):
+                self.assertIn(f"скилл {name}", report)
         self.assertIn("промахов содержания: 0", report)
 
     def test_routes_still_complete(self):

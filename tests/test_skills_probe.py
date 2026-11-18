@@ -94,28 +94,41 @@ class TestProbeCoverage(unittest.TestCase):
 
 
 class TestGoldenSetIsNotStolen(unittest.TestCase):
+    # 0105: набор вырос до 80 строк. Первые 60 — историческое ядро: новые
+    # скиллы по-прежнему не имеют права его перехватывать. Последние 20 —
+    # вопросы новых классов, их скиллы, наоборот, обязаны ловить.
+    HISTORICAL_ROWS = 60
+
     @classmethod
     def setUpClass(cls):
         with open(GOLDEN, encoding="utf-8") as handle:
             cls.rows = [json.loads(line) for line in handle if line.strip()]
         cls.ctx = {"now": NOW}
+        cls.historical = cls.rows[: cls.HISTORICAL_ROWS]
+        cls.new_class_rows = cls.rows[cls.HISTORICAL_ROWS:]
 
-    def test_no_new_skill_matches_golden_questions(self):
+    def test_new_class_rows_are_present(self):
+        self.assertGreaterEqual(len(self.new_class_rows), 16)
+        self.assertTrue(
+            all(row["expect_route"] == "skill" for row in self.new_class_rows)
+        )
+
+    def test_no_new_skill_matches_historical_questions(self):
         new_skills = [skill for skill in SKILLS if skill.name in NEW_SKILLS]
         self.assertEqual(len(new_skills), len(NEW_SKILLS))
-        for row in self.rows:
+        for row in self.historical:
             for skill in new_skills:
                 with self.subTest(skill=skill.name, question=row["question"]):
                     self.assertFalse(
                         skill.match(row["question"], self.ctx),
-                        "новый скилл перехватил вопрос eval-набора",
+                        "новый скилл перехватил вопрос исторического набора",
                     )
 
     def test_router_the_same_questions_keep_their_route(self):
         # try_skills — то, что зовёт роутер: не-skill строки обязаны молчать,
         # skill-строки — уходить в старые каталожные скиллы.
         catalog_skills = {"pricing", "hours", "refunds", "contacts"}
-        for row in self.rows:
+        for row in self.historical:
             with self.subTest(question=row["question"]):
                 result = try_skills(row["question"], self.ctx)
                 if row["expect_route"] == "skill":
@@ -123,6 +136,16 @@ class TestGoldenSetIsNotStolen(unittest.TestCase):
                     self.assertIn(result["skill"], catalog_skills)
                 else:
                     self.assertIsNone(result)
+
+    def test_new_class_questions_are_caught_by_skills(self):
+        seen: set[str] = set()
+        for row in self.new_class_rows:
+            with self.subTest(question=row["question"]):
+                result = try_skills(row["question"], self.ctx)
+                self.assertIsNotNone(result, "вопрос нового класса ушёл модели")
+                self.assertIn(result["skill"], NEW_SKILLS)
+                seen.add(result["skill"])
+        self.assertEqual(seen, set(NEW_SKILLS), "не все новые классы сработали")
 
 
 if __name__ == "__main__":
