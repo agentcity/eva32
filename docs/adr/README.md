@@ -10,6 +10,7 @@
 | [0006](0006-qat-method.md) | QAT: STE, absmax-блок 128, 8-bit Adam | accepted |
 | [0007](0007-task-workflow.md) | Задачи в `ai/tasks`, отчёт и приёмка | accepted |
 | [0008](0008-engineering-standards.md) | Инженерные стандарты: тесты, детерминизм, коммиты | accepted |
+| [0009](0009-hybrid-router.md) | Гибрид: скиллы, малая модель, большая модель | accepted |
 
 ## Правила
 

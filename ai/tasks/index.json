@@ -89,5 +89,61 @@
     "status": "done",
     "file": "0013-adr-process.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0014",
+    "title": "Гибрид: eva-core-router",
+    "status": "in_progress",
+    "file": "0014-eva-core-router.md",
+    "assignee": "agent:eva-core-router"
+  },
+  {
+    "id": "0015",
+    "title": "Гибрид: eva-skills",
+    "status": "in_progress",
+    "file": "0015-eva-skills.md",
+    "assignee": "agent:eva-skills"
+  },
+  {
+    "id": "0016",
+    "title": "Гибрид: eva-clients",
+    "status": "in_progress",
+    "file": "0016-eva-clients.md",
+    "assignee": "agent:eva-clients"
+  },
+  {
+    "id": "0017",
+    "title": "Гибрид: eva-server",
+    "status": "in_progress",
+    "file": "0017-eva-server.md",
+    "assignee": "agent:eva-server"
+  },
+  {
+    "id": "0018",
+    "title": "Гибрид: eva-classifier",
+    "status": "in_progress",
+    "file": "0018-eva-classifier.md",
+    "assignee": "agent:eva-classifier"
+  },
+  {
+    "id": "0019",
+    "title": "Гибрид: eva-eval",
+    "status": "in_progress",
+    "file": "0019-eva-eval.md",
+    "assignee": "agent:eva-eval"
+  },
+  {
+    "id": "0020",
+    "title": "Гибрид: eva-docs",
+    "status": "in_progress",
+    "file": "0020-eva-docs.md",
+    "assignee": "agent:eva-docs"
+  },
+  {
+    "id": "0021",
+    "title": "Гибрид: eva-telemetry",
+    "status": "in_progress",
+    "file": "0021-eva-telemetry.md",
+    "assignee": "agent:eva-telemetry"
   }
 ]
