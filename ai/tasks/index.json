@@ -506,14 +506,14 @@
   {
     "id": "0078",
     "title": "Быстрая проверка целостности: SHA-NI/ARMv8 + кеш",
-    "status": "in_progress",
+    "status": "done",
     "file": "0078-vtm-sha-fast.md",
     "assignee": "agent:vtm-sha-fast"
   },
   {
     "id": "0079",
     "title": "Сессии KV: снимок и восстановление по ADR 0008",
-    "status": "in_progress",
+    "status": "done",
     "file": "0079-vtm-kv-session.md",
     "assignee": "agent:vtm-kv-session"
   },

@@ -18,6 +18,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Внутренние функции kv_store.c (задача 0079). Не публичный API: объявлены
+// здесь, чтобы не заводить ещё один заголовок в зоне задачи.
+int vtm_session_save(const vtm_t *m, int32_t pending_token, const char *path,
+                     char *err, size_t errcap);
+int vtm_session_load(vtm_t *m, int32_t *pending_token, const char *path,
+                     char *err, size_t errcap);
+
 struct vtm_api {
     vtm_t *m;                 // загруженная машина; владеет контекст
     atomic_int cancel;        // 1 — запрошена остановка (пишут другие потоки)
@@ -25,6 +32,10 @@ struct vtm_api {
     uint32_t max_new_tokens;  // 0 — без лимита
     int32_t eos_token_id;     // < 0 — нет стоп-токена
     int last_status;          // код последнего generate() (для отладки)
+    // Сессия KV: токен, уже отданный колбэку, но ещё не скормленный машине.
+    // Снимок обязан его запомнить, иначе продолжение потеряет один шаг.
+    int32_t session_token;    // значим при session_token_valid
+    int session_token_valid;  // 1 — session_token можно подать машине
     char error[256];          // последняя ошибка; "" — ошибки не было
 };
 
@@ -152,20 +163,91 @@ static int api_cancelled(const vtm_api_t *ctx) {
     return atomic_load_explicit(&ctx->cancel, memory_order_acquire) != 0;
 }
 
+// Выдать cap->token хосту и крутить цикл до лимита/eos/остановки.
+// Позиция следующего прогона — текущая позиция машины + 1: ко входу сюда
+// m->position уже указывает на последний скормленный токен (промпта или
+// сгенерированный). Так цикл одинаково работает и после промпта, и после
+// восстановленной сессии. what — префикс сообщений об ошибке.
+static int api_decode(vtm_api_t *ctx, api_emit *cap, vtm_api_token_cb cb,
+                      void *user, const char *what) {
+    vtm_t *m = ctx->m;
+    int64_t generated = 0;
+    int status;
+
+    for (;;) {
+        int32_t token32;
+        int token;
+
+        if (api_cancelled(ctx)) {
+            return api_stop(ctx, VTM_API_CANCELLED);
+        }
+        token = cap->token;
+        token32 = (int32_t)token;
+
+        // Токен ещё не скормлен машине: снимок сессии должен его запомнить.
+        ctx->session_token = token32;
+        ctx->session_token_valid = 1;
+
+        if (cb != NULL) {
+            if (cb(&token32, 1, user) != 0) {
+                return api_stop(ctx, VTM_API_STOPPED);
+            }
+        }
+        // Отмена, пришедшая во время колбэка (или уже выставленная им через
+        // vtm_api_cancel), важнее eos/лимита.
+        if (api_cancelled(ctx)) {
+            return api_stop(ctx, VTM_API_CANCELLED);
+        }
+
+        generated++;
+        if (ctx->eos_token_id >= 0 && token == (int)ctx->eos_token_id) {
+            return api_stop(ctx, VTM_API_EOS);
+        }
+        if (ctx->max_new_tokens != 0
+            && (uint64_t)generated >= (uint64_t)ctx->max_new_tokens) {
+            return api_stop(ctx, VTM_API_OK);
+        }
+
+        {
+            const int64_t pos64 = (int64_t)vtm_position(m) + 1;
+            if (pos64 > (int64_t)INT_MAX) {
+                return api_fail(ctx, VTM_E_BOUNDS,
+                                "%s: позиция %lld не влезает в int",
+                                what, (long long)pos64);
+            }
+            vtm_set_position(m, (int)pos64);
+        }
+        // Токен уходит в машину — «висящего» токена больше нет.
+        ctx->session_token_valid = 0;
+        vtm_set_token(m, token);
+        memset(cap, 0, sizeof *cap);
+        status = (int)vtm_run(m, api_emit_cb, cap);
+        if (status != VTM_OK) {
+            return api_fail(ctx, status, "%s: токен %lld: %s: %s", what,
+                            (long long)generated,
+                            vtm_strerror((vtm_status)status),
+                            vtm_error_message(m));
+        }
+        if (!cap->have) {
+            // Программа дошла до HALT, не выбрав токен: генерация закончена.
+            return api_stop(ctx, VTM_API_OK);
+        }
+    }
+}
+
 // Возвращает код vtm_api_generate(); busy/cancel сбрасывает вызывающий.
 static int api_run(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
                    vtm_api_token_cb cb, void *user) {
     vtm_t *m = ctx->m;
     api_emit cap;
-    int64_t generated = 0;
     size_t i;
-    int status;
 
     // Повторное использование: каждый generate() — с начала. vtm_reset()
     // обнуляет позицию/входной токен/счётчик и (через счётчик) состояние
     // сэмплера; KV-кэш не чистится, но ATTN читает только позиции,
     // перезаписанные текущим промптом.
     vtm_reset(m);
+    ctx->session_token_valid = 0;
 
     for (i = 0; i < n; i++) {
         vtm_status st;
@@ -201,58 +283,7 @@ static int api_run(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
                         "последнем токене промпта");
     }
 
-    for (;;) {
-        int32_t token32;
-        int token;
-
-        if (api_cancelled(ctx)) {
-            return api_stop(ctx, VTM_API_CANCELLED);
-        }
-        token = cap.token;
-        token32 = (int32_t)token;
-
-        if (cb != NULL) {
-            if (cb(&token32, 1, user) != 0) {
-                return api_stop(ctx, VTM_API_STOPPED);
-            }
-        }
-        // Отмена, пришедшая во время колбэка (или уже выставленная им через
-        // vtm_api_cancel), важнее eos/лимита.
-        if (api_cancelled(ctx)) {
-            return api_stop(ctx, VTM_API_CANCELLED);
-        }
-
-        generated++;
-        if (ctx->eos_token_id >= 0 && token == (int)ctx->eos_token_id) {
-            return api_stop(ctx, VTM_API_EOS);
-        }
-        if (ctx->max_new_tokens != 0
-            && (uint64_t)generated >= (uint64_t)ctx->max_new_tokens) {
-            return api_stop(ctx, VTM_API_OK);
-        }
-
-        {
-            const int64_t pos64 = (int64_t)n + generated - 1;
-            if (pos64 > (int64_t)INT_MAX) {
-                return api_fail(ctx, VTM_E_BOUNDS,
-                                "vtm_api_generate: позиция %lld не влезает в int",
-                                (long long)pos64);
-            }
-            vtm_set_position(m, (int)pos64);
-        }
-        vtm_set_token(m, token);
-        memset(&cap, 0, sizeof cap);
-        status = (int)vtm_run(m, api_emit_cb, &cap);
-        if (status != VTM_OK) {
-            return api_fail(ctx, status, "vtm_api_generate: токен %lld: %s: %s",
-                            (long long)generated, vtm_strerror((vtm_status)status),
-                            vtm_error_message(m));
-        }
-        if (!cap.have) {
-            // Программа дошла до HALT, не выбрав токен: генерация закончена.
-            return api_stop(ctx, VTM_API_OK);
-        }
-    }
+    return api_decode(ctx, &cap, cb, user, "vtm_api_generate");
 }
 
 int vtm_api_generate(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
@@ -294,6 +325,121 @@ int vtm_api_generate(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
 
     // Флаг отмены живёт только в пределах одного generate(): иначе отмена,
     // пришедшая в конце, отменила бы следующий запуск.
+    atomic_store_explicit(&ctx->cancel, 0, memory_order_release);
+    atomic_store_explicit(&ctx->busy, 0, memory_order_release);
+    return rc;
+}
+
+// --- сессии KV (задача 0079) ----------------------------------------------
+
+// Занять контекст на время операции: та же защита, что у generate(), без
+// гонки с параллельным generate() (вернём VTM_E_ARG, не трогая error).
+static int api_try_busy(vtm_api_t *ctx) {
+    int expected = 0;
+    return atomic_compare_exchange_strong_explicit(
+        &ctx->busy, &expected, 1, memory_order_acq_rel, memory_order_acquire);
+}
+
+int vtm_api_session_save(vtm_api_t *ctx, const char *path) {
+    int rc;
+
+    if (ctx == NULL) return VTM_E_ARG;
+    ctx->error[0] = '\0';
+    ctx->last_status = VTM_API_OK;
+    if (path == NULL || *path == '\0') {
+        return api_fail(ctx, VTM_E_ARG, "vtm_api_session_save: пустой путь");
+    }
+    if (!api_try_busy(ctx)) return VTM_E_ARG;
+
+    rc = vtm_session_save(ctx->m,
+                          ctx->session_token_valid ? ctx->session_token : -1,
+                          path, ctx->error, sizeof ctx->error);
+    if (rc != VTM_OK) {
+        ctx->last_status = rc;
+        if (ctx->error[0] == '\0') {
+            snprintf(ctx->error, sizeof ctx->error, "vtm_api_session_save: %s",
+                     vtm_strerror((vtm_status)rc));
+        }
+    }
+    atomic_store_explicit(&ctx->busy, 0, memory_order_release);
+    return rc;
+}
+
+int vtm_api_session_load(vtm_api_t *ctx, const char *path) {
+    int32_t pending = -1;
+    int rc;
+
+    if (ctx == NULL) return VTM_E_ARG;
+    ctx->error[0] = '\0';
+    ctx->last_status = VTM_API_OK;
+    if (path == NULL || *path == '\0') {
+        return api_fail(ctx, VTM_E_ARG, "vtm_api_session_load: пустой путь");
+    }
+    if (!api_try_busy(ctx)) return VTM_E_ARG;
+
+    rc = vtm_session_load(ctx->m, &pending, path, ctx->error,
+                          sizeof ctx->error);
+    if (rc == VTM_OK) {
+        // pending < 0 — сессия закончилась HALT'ом, продолжать нечем.
+        ctx->session_token = pending;
+        ctx->session_token_valid = (pending >= 0);
+    } else {
+        ctx->last_status = rc;
+        if (ctx->error[0] == '\0') {
+            snprintf(ctx->error, sizeof ctx->error, "vtm_api_session_load: %s",
+                     vtm_strerror((vtm_status)rc));
+        }
+    }
+    atomic_store_explicit(&ctx->busy, 0, memory_order_release);
+    return rc;
+}
+
+int vtm_api_session_continue(vtm_api_t *ctx, vtm_api_token_cb cb, void *user) {
+    vtm_t *m;
+    api_emit cap;
+    int rc;
+    int status;
+
+    if (ctx == NULL) return VTM_E_ARG;
+    ctx->error[0] = '\0';
+    ctx->last_status = VTM_API_OK;
+    if (!ctx->session_token_valid) {
+        return api_fail(ctx, VTM_E_ARG,
+                        "vtm_api_session_continue: нет загруженной сессии "
+                        "(сначала vtm_api_session_load)");
+    }
+    if (!api_try_busy(ctx)) return VTM_E_ARG;
+
+    m = ctx->m;
+    if (api_cancelled(ctx)) {
+        rc = api_stop(ctx, VTM_API_CANCELLED);
+    } else {
+        const int64_t pos64 = (int64_t)vtm_position(m) + 1;
+        if (pos64 > (int64_t)INT_MAX) {
+            rc = api_fail(ctx, VTM_E_BOUNDS,
+                          "vtm_api_session_continue: позиция %lld не влезает "
+                          "в int", (long long)pos64);
+        } else {
+            vtm_set_position(m, (int)pos64);
+            vtm_set_token(m, ctx->session_token);
+            ctx->session_token_valid = 0;
+            memset(&cap, 0, sizeof cap);
+            status = (int)vtm_run(m, api_emit_cb, &cap);
+            if (status != VTM_OK) {
+                rc = api_fail(ctx, status,
+                              "vtm_api_session_continue: входной токен: "
+                              "%s: %s", vtm_strerror((vtm_status)status),
+                              vtm_error_message(m));
+            } else if (!cap.have) {
+                rc = api_stop(ctx, VTM_API_OK); // HALT: продолжать нечего
+            } else {
+                rc = api_decode(ctx, &cap, cb, user,
+                                "vtm_api_session_continue");
+            }
+        }
+    }
+
+    // Как и в generate(): отмена живёт только в пределах одного вызова.
     atomic_store_explicit(&ctx->cancel, 0, memory_order_release);
     atomic_store_explicit(&ctx->busy, 0, memory_order_release);
     return rc;

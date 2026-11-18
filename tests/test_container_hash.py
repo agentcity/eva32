@@ -285,6 +285,7 @@ class TestCLoader(_TmpCase):
             "-D_POSIX_C_SOURCE=200809L", "-DVTM_NO_AVX2",
             "-I", VTM_DIR, src,
             os.path.join(VTM_DIR, "loader.c"),
+            os.path.join(VTM_DIR, "sha256.c"),
             os.path.join(VTM_DIR, "interp.c"),
             os.path.join(VTM_DIR, "backend_scalar.c"),
             os.path.join(VTM_DIR, "backend_neon.c"),
