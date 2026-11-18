@@ -14,7 +14,14 @@
       "big":         клиент с .chat(messages, max_tokens=...),
       # алиасы: try_skills / classify / small_client / big_client,
       #         либо "clients": {"small": ..., "big": ...}
+      # контекст каталога (RAG): callable(text, catalog) -> RagContext|str|None
+      # и/или "catalog": Catalog | путь | список позиций,
+      # алиасы: "rag" / "retrieve"
     }
+
+Контекст каталога (``eva.rag``) подмешивается в сообщения для маршрутов
+``small`` и ``big`` отдельным system-сообщением после уже имеющихся system;
+сам запрос пользователя не меняется. Контекста нет — сообщения как раньше.
 
 Без ``deps`` модули ``eva.skills``, ``eva.classifier`` и ``eva.clients``
 импортируются **лениво** — пакет работает и тогда, когда их ещё нет.
@@ -22,6 +29,7 @@
 
 from __future__ import annotations
 
+import inspect
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -37,11 +45,13 @@ _SKILL_ALIASES = ("skills", "try_skills", "skill")
 _CLASSIFIER_ALIASES = ("classifier", "classify")
 _SMALL_ALIASES = ("small", "small_client", "client_small")
 _BIG_ALIASES = ("big", "big_client", "client_big")
+_RAG_ALIASES = ("rag", "retrieve")
 
 # Кэш только успешной загрузки: если модуля ещё нет, пробуем импорт при
 # следующем вызове (другие агенты кладут файлы параллельно).
 _SKILLS_FN: Any | None = None
 _CLASSIFIER_FN: Any | None = None
+_RAG_FN: Any | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -221,7 +231,11 @@ def _answer_with_models(
     started: float,
 ) -> Answer:
     budget = policy.Budget.from_config(cfg)
-    prompt_text = _prompt_text(req)
+    # Контекст каталога — в сообщения, а не в текст запроса: пользовательский
+    # ввод остаётся прежним. Оценка цены считается по тем же сообщениям,
+    # иначе добавленный контекст не попал бы в бюджет.
+    messages = _messages_with_context(req, deps)
+    prompt_text = _prompt_text(req, messages)
     clients: dict[str, Any | None] = {}
 
     def client_for(kind: str) -> Any | None:
@@ -281,7 +295,7 @@ def _answer_with_models(
             budget.check(estimate, route_kind=kind)  # всегда бросает BudgetExceeded
 
         try:
-            result = client.chat(list(req.messages), max_tokens=cfg.max_tokens_for(kind))
+            result = client.chat(list(messages), max_tokens=cfg.max_tokens_for(kind))
         except Exception as exc:  # noqa: BLE001 — политика решает, что делать
             cause = policy.error_kind(exc)
             target = _fallback_if_available(
@@ -378,6 +392,19 @@ def _load_classifier() -> Any | None:
     return _CLASSIFIER_FN
 
 
+def _load_rag() -> Any | None:
+    """Ленивая загрузка RAG по каталогу (``eva.rag``)."""
+    global _RAG_FN
+    if _RAG_FN is not None:
+        return _RAG_FN
+    try:
+        from eva.rag import retrieve
+    except Exception:
+        return None
+    _RAG_FN = retrieve
+    return _RAG_FN
+
+
 def _make_client(kind: str, cfg: Config) -> Any | None:
     """Ленивая сборка клиента модели; ``None`` — модель не настроена."""
     if kind == "big" and not cfg.big_available:
@@ -468,6 +495,89 @@ def _call_classifier(provider: Any, text: str, cfg: Config) -> Any:
     if callable(provider):
         return provider(text, cfg)
     raise TypeError("classifier: ожидался classify(text, cfg)")
+
+
+# --------------------------------------------------------------------------- #
+# контекст каталога (RAG)
+# --------------------------------------------------------------------------- #
+def _messages_with_context(
+    req: Request,
+    deps: Mapping[str, Any] | Any | None,
+) -> list[Message]:
+    """Сообщения для модели, при наличии контекста — с блоком каталога.
+
+    Вставка не меняет исходные сообщения: это новый список, пользовательский
+    текст остаётся байт в байт. Нет контекста — возвращаются прежние сообщения.
+    """
+    messages = list(req.messages)
+    try:
+        context = _rag_context(req, deps)
+    except Exception:
+        # RAG не имеет права ронять ответ: как и скилл, молчим.
+        return messages
+    text = _context_text(context)
+    if not text.strip():
+        return messages
+    return _insert_context(messages, text)
+
+
+def _rag_context(
+    req: Request,
+    deps: Mapping[str, Any] | Any | None,
+) -> Any | None:
+    text = _request_text(req)
+    if not text.strip():
+        return None
+    provider = _rag_provider(deps)
+    if provider is None:
+        return None
+    return _call_rag(provider, text, _lookup(deps, ("catalog",)))
+
+
+def _rag_provider(deps: Mapping[str, Any] | Any | None) -> Any | None:
+    provider = _lookup(deps, _RAG_ALIASES)
+    if provider is not None:
+        return provider
+    return _load_rag()
+
+
+def _call_rag(provider: Any, text: str, catalog: Any) -> Any:
+    """Позвать RAG; подмене в тестах достаточно и одного аргумента."""
+    target = getattr(provider, "retrieve", None)
+    if not callable(target):
+        target = provider
+    if not callable(target):
+        raise TypeError("rag: ожидался retrieve(text, catalog) или объект с .retrieve")
+    try:
+        inspect.signature(target).bind(text, catalog)
+    except (TypeError, ValueError):
+        # retrieve(text) — контракт задачи; каталог тогда берётся по умолчанию.
+        return target(text)
+    return target(text, catalog)
+
+
+def _context_text(context: Any) -> str:
+    """Достать текст контекста из ``RagContext``/словаря/строки."""
+    if context is None:
+        return ""
+    if isinstance(context, str):
+        return context
+    if isinstance(context, Mapping):
+        value = context.get("text")
+    else:
+        value = getattr(context, "text", None)
+    return str(value or "")
+
+
+def _insert_context(messages: list[Message], text: str) -> list[Message]:
+    """Вставить контекст system-сообщением после уже имеющихся system."""
+    context_message = Message(role="system", content=text)
+    if not messages:
+        return [context_message]
+    index = 0
+    while index < len(messages) and messages[index].role == "system":
+        index += 1
+    return [*messages[:index], context_message, *messages[index:]]
 
 
 # --------------------------------------------------------------------------- #
@@ -565,9 +675,14 @@ def _request_text(req: Request) -> str:
         return ""
 
 
-def _prompt_text(req: Request) -> str:
-    """Склеенный prompt — для оценки токенов и бюджета."""
-    parts = [f"{m.role}: {m.content}" for m in req.messages if (m.content or "").strip()]
+def _prompt_text(req: Request, messages: list[Message] | None = None) -> str:
+    """Склеенный prompt — для оценки токенов и бюджета.
+
+    ``messages`` — то, что реально уйдёт модели (с контекстом каталога);
+    без аргумента — исходные сообщения запроса, как раньше.
+    """
+    source = req.messages if messages is None else messages
+    parts = [f"{m.role}: {m.content}" for m in source if (m.content or "").strip()]
     if not parts:
         return ""
     parts.append("assistant:")

@@ -163,14 +163,14 @@
   {
     "id": "0024",
     "title": "RAG: контекст каталога в промпт",
-    "status": "in_progress",
+    "status": "done",
     "file": "0024-eva-rag.md",
     "assignee": "agent:eva-rag"
   },
   {
     "id": "0025",
     "title": "SSE-стриминг в сервере",
-    "status": "in_progress",
+    "status": "done",
     "file": "0025-eva-sse.md",
     "assignee": "agent:eva-sse"
   },
