@@ -254,7 +254,7 @@
   {
     "id": "0037",
     "title": "Рунбук аренды GPU под эксперимент",
-    "status": "in_progress",
+    "status": "done",
     "file": "0037-rental-runbook.md",
     "assignee": "agent:rental-runbook"
   },
