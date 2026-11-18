@@ -736,20 +736,6 @@
   },
   {
     "id": "0112",
-    "title": "Батчевый prefill: промпт 512 токенов считается 38 секунд",
-    "status": "pending",
-    "file": "0112-batched-prefill.md",
-    "assignee": ""
-  },
-  {
-    "id": "0113",
-    "title": "Декод 10 ток/с на 1.5B: куда уходит время",
-    "status": "pending",
-    "file": "0113-decode-speed.md",
-    "assignee": ""
-  },
-  {
-    "id": "0112",
     "title": "Батчевый prefill: промпт пачкой, а не по токену",
     "status": "in_progress",
     "file": "0112-prefill-batch.md",
