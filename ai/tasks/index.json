@@ -236,5 +236,12 @@
     "status": "done",
     "file": "0034-eva-cli.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0035",
+    "title": "Контейнер v0.2 — размерности u32",
+    "status": "in_progress",
+    "file": "0035-container-v02.md",
+    "assignee": "agent:container-v02"
   }
 ]

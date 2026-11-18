@@ -12,6 +12,7 @@
 | [0008](0008-engineering-standards.md) | Инженерные стандарты: тесты, детерминизм, коммиты | accepted |
 | [0009](0009-hybrid-router.md) | Гибрид: скиллы, малая модель, большая модель | accepted |
 | [0010](0010-voice-pipeline.md) | Голос как транспорт: ASR → LLM → TTS | accepted |
+| [0011](0011-container-v02.md) | Контейнер `.vtm` v0.2: размерности u32 | accepted |
 
 ## Правила
 
