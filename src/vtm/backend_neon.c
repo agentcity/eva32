@@ -54,6 +54,22 @@ extern int vtm_avx2_mm_f32(float *y, const float *a, const float *b,
 #define VTM_SIMD_X86 0
 #endif
 
+// Слова pack20 и масштабы лежат в TRT1-сегментах контейнера со смещением
+// 2 mod 4 (задача 0060): разыменование uint32_t*/float* по такому адресу —
+// UB, даже если CPU его терпит. Читаем через memcpy: компилятор сворачивает
+// байтовое копирование в одну обычную загрузку.
+static inline uint32_t load_u32_unaligned(const uint32_t *words, int64_t i) {
+    uint32_t v;
+    memcpy(&v, (const uint8_t *)words + (size_t)i * sizeof v, sizeof v);
+    return v;
+}
+
+static inline float load_f32_unaligned(const float *scales, int64_t i) {
+    float v;
+    memcpy(&v, (const uint8_t *)scales + (size_t)i * sizeof v, sizeof v);
+    return v;
+}
+
 // --- скалярные откаты для MM -----------------------------------------------
 //
 // В interp.c MM считается скалярно и к бэкенду не обращается, поэтому
@@ -96,7 +112,7 @@ static void mm_trit_scalar_rows(mm_scalar_job *j, int r0, int r1) {
                 if (blk != cur_block) {
                     if (cur_block >= 0)
                         acc += block_acc
-                             * (double)scales[(size_t)cur_block];
+                             * (double)load_f32_unaligned(scales, cur_block);
                     cur_block = blk;
                     block_acc = 0.0;
                 }
@@ -104,14 +120,15 @@ static void mm_trit_scalar_rows(mm_scalar_job *j, int r0, int r1) {
                 // слово берём по абсолютному индексу и перечитываем при
                 // смене слова, а не по idx % 20.
                 if (wi != cur_word) {
-                    vtm_trit_unpack20(words[wi], trit);
+                    vtm_trit_unpack20(load_u32_unaligned(words, wi), trit);
                     cur_word = wi;
                 }
                 block_acc += (double)trit[abs_idx % VTM_TRITS_PER_WORD]
                            * (double)b[(size_t)idx * (size_t)n + (size_t)c];
             }
             if (cur_block >= 0)
-                acc += block_acc * (double)scales[(size_t)cur_block];
+                acc += block_acc
+                     * (double)load_f32_unaligned(scales, cur_block);
             y[(size_t)r * (size_t)n + (size_t)c] = (float)acc;
         }
     }
@@ -300,10 +317,10 @@ static double row_dot_trit(const uint32_t *words, const float *scales,
         wi = st / VTM_TRITS_PER_WORD;
         wi_end = (e - 1) / VTM_TRITS_PER_WORD;
         for (; wi <= wi_end; wi++)
-            unpack20(words[wi],
+            unpack20(load_u32_unaligned(words, wi),
                      tp + (ptrdiff_t)(wi * VTM_TRITS_PER_WORD - st));
         sum = dot_i8_f32(tp, x + (st - base), (int)(e - st));
-        acc += sum * (double)scales[(size_t)(s / sb)];
+        acc += sum * (double)load_f32_unaligned(scales, s / sb);
     }
     return acc;
 }
@@ -565,11 +582,11 @@ static void mm_trit_neon_rows(mm_neon_job *j, int tid, int r0, int r1) {
             wi = st / VTM_TRITS_PER_WORD;
             wi_end = (e - 1) / VTM_TRITS_PER_WORD;
             for (; wi <= wi_end; wi++)
-                unpack20(words[wi],
+                unpack20(load_u32_unaligned(words, wi),
                          tp + (ptrdiff_t)(wi * VTM_TRITS_PER_WORD - st));
             len = (int)(e - st);
             lo = st - base;
-            scale = (double)scales[(size_t)(s / sb)];
+            scale = (double)load_f32_unaligned(scales, s / sb);
 
             for (c = 0; c + 4 <= n; c += 4) {
                 float32x4_t a = vdupq_n_f32(0.0f);

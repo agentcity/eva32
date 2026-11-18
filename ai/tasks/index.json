@@ -562,7 +562,7 @@
   {
     "id": "0086",
     "title": "UBSan: misaligned load в ядрах (memcpy)",
-    "status": "in_progress",
+    "status": "done",
     "file": "0086-unaligned-loads.md",
     "assignee": ""
   },

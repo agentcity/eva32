@@ -324,6 +324,22 @@ static int tmv_check(const float *y, const uint8_t *w, const float *scales,
     return 0;
 }
 
+// Слова pack20 и масштабы лежат в TRT1-сегментах контейнера со смещением
+// 2 mod 4 (задача 0060): разыменование uint32_t*/float* по такому адресу —
+// UB, даже если CPU его терпит. Читаем через memcpy: компилятор сворачивает
+// байтовое копирование в одну обычную загрузку.
+static inline uint32_t load_u32_unaligned(const uint32_t *words, int64_t i) {
+    uint32_t v;
+    memcpy(&v, (const uint8_t *)words + (size_t)i * sizeof v, sizeof v);
+    return v;
+}
+
+static inline float load_f32_unaligned(const float *scales, int64_t i) {
+    float v;
+    memcpy(&v, (const uint8_t *)scales + (size_t)i * sizeof v, sizeof v);
+    return v;
+}
+
 // Прямая распаковка: 20 делений на 3 на слово, зато без таблицы.
 // scale_block — 128 (канон Python) или 160 (docs/trit-format). Если блок
 // кратен 20, все 20 тритов слова лежат в одном блоке масштаба; иначе
@@ -347,7 +363,7 @@ static void tmv_direct_rows(float *y, const uint8_t *w, const float *scales,
 
         if (scale_block % VTM_TRITS_PER_WORD == 0) {
             for (; wi < wi_end; wi++) {
-                uint32_t v = words[wi];
+                uint32_t v = load_u32_unaligned(words, wi);
                 int64_t wbase = wi * (int64_t)VTM_TRITS_PER_WORD;
                 double block_acc = 0.0;
                 int k;
@@ -361,14 +377,14 @@ static void tmv_direct_rows(float *y, const uint8_t *w, const float *scales,
                     else if (d == 0u) block_acc -= (double)x[idx - base];
                 }
                 acc += block_acc
-                     * (double)scales[(size_t)((wi * VTM_TRITS_PER_WORD)
-                                               / scale_block)];
+                     * (double)load_f32_unaligned(
+                           scales, (wi * VTM_TRITS_PER_WORD) / scale_block);
             }
         } else {
             int64_t cur_block = -1;
             double block_acc = 0.0;
             for (; wi < wi_end; wi++) {
-                uint32_t v = words[wi];
+                uint32_t v = load_u32_unaligned(words, wi);
                 int64_t wbase = wi * (int64_t)VTM_TRITS_PER_WORD;
                 int k;
                 for (k = 0; k < VTM_TRITS_PER_WORD; k++) {
@@ -381,7 +397,9 @@ static void tmv_direct_rows(float *y, const uint8_t *w, const float *scales,
                     blk = idx / (int64_t)scale_block;
                     if (blk != cur_block) {
                         if (cur_block >= 0)
-                            acc += block_acc * (double)scales[cur_block];
+                            acc += block_acc
+                                 * (double)load_f32_unaligned(scales,
+                                                              cur_block);
                         cur_block = blk;
                         block_acc = 0.0;
                     }
@@ -390,7 +408,8 @@ static void tmv_direct_rows(float *y, const uint8_t *w, const float *scales,
                 }
             }
             if (cur_block >= 0)
-                acc += block_acc * (double)scales[cur_block];
+                acc += block_acc
+                     * (double)load_f32_unaligned(scales, cur_block);
         }
         y[r] = (float)acc;
     }
@@ -453,12 +472,12 @@ static void tmv_lut_rows(float *y, const uint8_t *w, const float *scales,
 
         if (scale_block % VTM_TRITS_PER_WORD == 0) {
             for (; wi < wi_end; wi++) {
-                uint32_t v = words[wi];
+                uint32_t v = load_u32_unaligned(words, wi);
                 int64_t wbase = wi * (int64_t)VTM_TRITS_PER_WORD;
                 double block_acc = 0.0;
                 int g;
-                double scale = (double)scales[(size_t)((wi * VTM_TRITS_PER_WORD)
-                                                      / scale_block)];
+                double scale = (double)load_f32_unaligned(
+                    scales, (wi * VTM_TRITS_PER_WORD) / scale_block);
                 for (g = 0; g < 4; g++) {
                     unsigned code = v % 243u;
                     const int8_t *trit = LUT243[code];
@@ -478,7 +497,7 @@ static void tmv_lut_rows(float *y, const uint8_t *w, const float *scales,
             int64_t cur_block = -1;
             double block_acc = 0.0;
             for (; wi < wi_end; wi++) {
-                uint32_t v = words[wi];
+                uint32_t v = load_u32_unaligned(words, wi);
                 int64_t wbase = wi * (int64_t)VTM_TRITS_PER_WORD;
                 int g;
                 for (g = 0; g < 4; g++) {
@@ -495,7 +514,9 @@ static void tmv_lut_rows(float *y, const uint8_t *w, const float *scales,
                         blk = idx / (int64_t)scale_block;
                         if (blk != cur_block) {
                             if (cur_block >= 0)
-                                acc += block_acc * (double)scales[cur_block];
+                                acc += block_acc
+                                     * (double)load_f32_unaligned(scales,
+                                                                  cur_block);
                             cur_block = blk;
                             block_acc = 0.0;
                         }
@@ -504,7 +525,8 @@ static void tmv_lut_rows(float *y, const uint8_t *w, const float *scales,
                 }
             }
             if (cur_block >= 0)
-                acc += block_acc * (double)scales[cur_block];
+                acc += block_acc
+                     * (double)load_f32_unaligned(scales, cur_block);
         }
         y[r] = (float)acc;
     }

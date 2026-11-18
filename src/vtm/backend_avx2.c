@@ -26,6 +26,22 @@
 // детект на старом CPU сам бы упал в SIGILL).
 #define VTM_AVX2 __attribute__((target("avx2,fma")))
 
+// Слова pack20 и масштабы лежат в TRT1-сегментах контейнера со смещением
+// 2 mod 4 (задача 0060): разыменование uint32_t*/float* по такому адресу —
+// UB, даже если CPU его терпит. Читаем через memcpy: компилятор сворачивает
+// байтовое копирование в одну обычную загрузку.
+static inline uint32_t load_u32_unaligned(const uint32_t *words, int64_t i) {
+    uint32_t v;
+    memcpy(&v, (const uint8_t *)words + (size_t)i * sizeof v, sizeof v);
+    return v;
+}
+
+static inline float load_f32_unaligned(const float *scales, int64_t i) {
+    float v;
+    memcpy(&v, (const uint8_t *)scales + (size_t)i * sizeof v, sizeof v);
+    return v;
+}
+
 // --- ядра ------------------------------------------------------------------
 
 // LUT на 8 тритов (3^8 = 6561 запись по 8 байт) — как в backend_neon.c:
@@ -114,10 +130,10 @@ VTM_AVX2 static double row_dot_trit(const uint32_t *words, const float *scales,
         wi = st / VTM_TRITS_PER_WORD;
         wi_end = (e - 1) / VTM_TRITS_PER_WORD;
         for (; wi <= wi_end; wi++)
-            unpack20(words[wi],
+            unpack20(load_u32_unaligned(words, wi),
                      tp + (ptrdiff_t)(wi * VTM_TRITS_PER_WORD - st));
         sum = dot_i8_f32(tp, x + (st - base), (int)(e - st));
-        acc += sum * (double)scales[(size_t)(s / sb)];
+        acc += sum * (double)load_f32_unaligned(scales, s / sb);
     }
     return acc;
 }
@@ -398,11 +414,11 @@ VTM_AVX2 static void mm_trit_avx2_rows(mm_avx2_job *j, int tid,
             wi = st / VTM_TRITS_PER_WORD;
             wi_end = (e - 1) / VTM_TRITS_PER_WORD;
             for (; wi <= wi_end; wi++)
-                unpack20(words[wi],
+                unpack20(load_u32_unaligned(words, wi),
                          tp + (ptrdiff_t)(wi * VTM_TRITS_PER_WORD - st));
             len = (int)(e - st);
             lo = st - base;
-            scale = (double)scales[(size_t)(s / sb)];
+            scale = (double)load_f32_unaligned(scales, s / sb);
 
             for (c = 0; c + 8 <= n; c += 8) {
                 __m256 a = _mm256_setzero_ps();
