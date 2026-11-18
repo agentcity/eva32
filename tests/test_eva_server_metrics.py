@@ -107,6 +107,8 @@ class StubAnswer:
     )
     cost_rub: float = 0.0
     latency_ms: int = 1
+    #: Prefill-часть TTFT, если маршрутизатор её сообщает (задача 0115).
+    prefill_ms: float | None = None
 
 
 class ScriptedStreamRouter:
@@ -836,6 +838,390 @@ class TestServerWiring(unittest.TestCase):
         self.assertIs(captured["kwargs"]["metrics"], metrics)
         self.assertIs(captured["kwargs"]["clock"], clock)
         self.assertEqual(captured["kwargs"]["router_name"], "injected")
+
+
+# --------------------------------------------------------------------------- #
+# Прогрев модели при старте и раздельный учёт prefill (задача 0115)
+# --------------------------------------------------------------------------- #
+
+
+class FakeLocalModel:
+    """Локальный клиент для прогрева: без libvtm, без модели и без сокета.
+
+    Повторяет только те методы, которые нужны прогреву: ``open()``,
+    ``encode()``, ``generate()`` и ``close()``. Ошибки инжектируются, чтобы
+    проверить, что неудачный прогрев не отменяет старт сервера.
+    """
+
+    def __init__(
+        self,
+        *,
+        error: Exception | None = None,
+        encode_error: Exception | None = None,
+        tokens=(11, 12, 13),
+    ) -> None:
+        self.error = error
+        self.encode_error = encode_error
+        self.tokens = list(tokens)
+        self.model_path = "/tmp/fake-model.vtm"
+        self.opened = 0
+        self.closed = 0
+        self.encoded: list[str] = []
+        self.calls: list[dict] = []
+
+    def open(self):
+        self.opened += 1
+        if self.error is not None:
+            raise self.error
+        return self
+
+    def encode(self, text: str) -> list[int]:
+        self.encoded.append(text)
+        if self.encode_error is not None:
+            raise self.encode_error
+        return list(self.tokens)
+
+    def generate(self, ids, *, max_new_tokens=None):
+        self.calls.append({"ids": list(ids), "max_new_tokens": max_new_tokens})
+        return [1]
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class TestWarmupWithoutSocket(unittest.TestCase):
+    """Прогрев вызывается, метрики заполняются, ошибка не роняет старт."""
+
+    def test_warmup_runs_and_records_metrics(self):
+        backend = FakeLocalModel()
+        metrics = Metrics()
+
+        record = server.warmup_local_model(backend, metrics=metrics)
+
+        self.assertTrue(record["ok"])
+        self.assertIsNone(record["error"])
+        self.assertEqual(backend.opened, 1)
+        self.assertEqual(backend.encoded, [server.WARMUP_PROMPT])
+        self.assertEqual(
+            backend.calls,
+            [{"ids": [11, 12, 13], "max_new_tokens": server.WARMUP_MAX_NEW_TOKENS}],
+        )
+        self.assertEqual(record["prefill_tokens"], 3)
+        self.assertEqual(record["model"], "/tmp/fake-model.vtm")
+        self.assertGreaterEqual(record["warmup_ms"], 0.0)
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["warmup_ms"], record["warmup_ms"])
+        self.assertEqual(snapshot["warmup"]["count"], 1)
+        self.assertTrue(snapshot["warmup"]["ok"])
+        self.assertEqual(snapshot["warmup"]["prefill_tokens"], 3)
+        self.assertEqual(snapshot["warmup"]["model"], "/tmp/fake-model.vtm")
+        self.assertIsNone(snapshot["warmup"]["error"])
+        # Прогрев — не запрос: счётчики обслуживания он не трогает.
+        self.assertEqual(snapshot["requests"], 0)
+        self.assertEqual(snapshot["ttft_ms"]["count"], 0)
+        json.dumps(snapshot)
+
+    def test_injected_client_is_not_closed(self):
+        backend = FakeLocalModel()
+
+        server.warmup_local_model(backend, metrics=Metrics())
+
+        self.assertEqual(backend.closed, 0, "переданный клиент — чужой")
+
+    def test_warmup_failure_is_a_warning_not_a_crash(self):
+        backend = FakeLocalModel(error=RuntimeError("libvtm не найдена"))
+        metrics = Metrics()
+
+        with self.assertLogs("eva.server", level="WARNING") as logs:
+            record = server.warmup_local_model(backend, metrics=metrics)
+
+        self.assertFalse(record["ok"])
+        self.assertIn("libvtm не найдена", record["error"])
+        self.assertIn("libvtm не найдена", "\n".join(logs.output))
+        snapshot = metrics.snapshot()
+        self.assertFalse(snapshot["warmup"]["ok"])
+        self.assertIn("libvtm не найдена", snapshot["warmup"]["error"])
+        self.assertEqual(snapshot["warmup"]["count"], 1)
+        json.dumps(snapshot)
+
+    def test_warmup_without_model_is_skipped(self):
+        metrics = Metrics()
+
+        self.assertIsNone(server.warmup_local_model(environ={}, metrics=metrics))
+        self.assertIsNone(server.warmup_local_model(metrics=metrics))
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["warmup"]["count"], 0)
+        self.assertIsNone(snapshot["warmup_ms"])
+        self.assertIsNone(snapshot["warmup"]["ok"])
+
+    def test_env_model_is_loaded_and_closed(self):
+        backend = FakeLocalModel()
+        metrics = Metrics()
+
+        with mock.patch.object(
+            server, "_make_warmup_backend", return_value=backend
+        ) as build:
+            record = server.warmup_local_model(
+                environ={"EVA_VTM_MODEL": "/models/1.5b.vtm"}, metrics=metrics
+            )
+
+        build.assert_called_once_with("/models/1.5b.vtm")
+        self.assertTrue(record["ok"])
+        self.assertEqual(record["model"], "/models/1.5b.vtm")
+        self.assertEqual(backend.opened, 1)
+        self.assertEqual(backend.closed, 1, "временный бэкенд закрывается")
+
+    def test_warmup_uses_ids_when_tokenizer_is_missing(self):
+        backend = FakeLocalModel(encode_error=RuntimeError("нет tokenizer.json"))
+
+        record = server.warmup_local_model(backend, metrics=Metrics())
+
+        self.assertTrue(record["ok"])
+        self.assertEqual(backend.calls[0]["ids"], [1, 2, 3])
+        self.assertEqual(record["prefill_tokens"], 3)
+
+    def test_server_warms_injected_model_without_socket(self):
+        backend = FakeLocalModel()
+        metrics = Metrics()
+
+        # Сокет не открываем: нужен только конструктор EvaHTTPServer.
+        with mock.patch.object(
+            server.ThreadingHTTPServer, "__init__", lambda self, *a, **k: None
+        ):
+            httpd = server.EvaHTTPServer(
+                ("127.0.0.1", 0), object, local_model=backend, metrics=metrics
+            )
+
+        self.assertTrue(httpd.warmup["ok"])
+        self.assertEqual(metrics.snapshot()["warmup"]["ok"], True)
+
+    def test_server_start_survives_failed_warmup(self):
+        metrics = Metrics()
+        failing = FakeLocalModel(error=RuntimeError("модель битая"))
+
+        with mock.patch.object(
+            server.ThreadingHTTPServer, "__init__", lambda self, *a, **k: None
+        ):
+            with self.assertLogs("eva.server", level="WARNING"):
+                httpd = server.EvaHTTPServer(
+                    ("127.0.0.1", 0), object, local_model=failing, metrics=metrics
+                )
+
+        self.assertFalse(httpd.warmup["ok"])
+        self.assertIn("модель битая", httpd.warmup["error"])
+        self.assertFalse(metrics.snapshot()["warmup"]["ok"])
+
+    def test_warmup_can_be_disabled(self):
+        backend = FakeLocalModel()
+        metrics = Metrics()
+
+        with mock.patch.object(
+            server.ThreadingHTTPServer, "__init__", lambda self, *a, **k: None
+        ):
+            httpd = server.EvaHTTPServer(
+                ("127.0.0.1", 0),
+                object,
+                local_model=backend,
+                metrics=metrics,
+                warmup=False,
+            )
+
+        self.assertIsNone(httpd.warmup)
+        self.assertEqual(backend.opened, 0)
+        self.assertEqual(metrics.snapshot()["warmup"]["count"], 0)
+
+    def test_create_server_forwards_warmup_settings(self):
+        captured = {}
+
+        class RecordingServer:
+            def __init__(self, address, handler, **kwargs):
+                captured["kwargs"] = kwargs
+                self.server_address = address
+
+        local = FakeLocalModel()
+        with mock.patch.object(server, "EvaHTTPServer", RecordingServer):
+            server.create_server(
+                router=StaticAnswerRouter(StubAnswer()),
+                auth_token="",
+                rate_limit_per_min=0,
+                local_model=local,
+                warmup=False,
+            )
+
+        self.assertIs(captured["kwargs"]["local_model"], local)
+        self.assertIs(captured["kwargs"]["warmup"], False)
+
+
+class TestPrefillMetrics(unittest.TestCase):
+    """prefill отдельно от TTFT: граница, остаток и счётчик токенов."""
+
+    def test_ttft_is_split_into_prefill_and_remainder(self):
+        metrics = Metrics()
+        metrics.observe(
+            route="small",
+            finish="stop",
+            ttft_ms=300,
+            prefill_ms=250,
+            latency_ms=400,
+            prompt_tokens=400,
+            prefill_tokens=512,
+            stream=True,
+        )
+
+        snapshot = metrics.snapshot()
+
+        self.assertEqual(snapshot["ttft_ms"]["p50"], 300.0)
+        self.assertEqual(snapshot["prefill_ms"]["p50"], 250.0)
+        self.assertEqual(snapshot["ttft_after_prefill_ms"]["p50"], 50.0)
+        self.assertEqual(snapshot["prefill_tokens"], 512)
+        self.assertEqual(snapshot["by_route"]["small"]["prefill_tokens"], 512)
+        self.assertEqual(snapshot["by_route"]["small"]["prefill_ms"]["p50"], 250.0)
+        self.assertEqual(
+            snapshot["by_route"]["small"]["ttft_after_prefill_ms"]["p50"], 50.0
+        )
+
+    def test_non_stream_prefill_has_no_remainder(self):
+        metrics = Metrics()
+        metrics.observe(
+            route="small", finish="ok", ttft_ms=None, prefill_ms=120, latency_ms=200
+        )
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["prefill_ms"]["count"], 1)
+        self.assertEqual(snapshot["prefill_ms"]["p50"], 120.0)
+        self.assertEqual(snapshot["ttft_after_prefill_ms"]["count"], 0)
+        self.assertIsNone(snapshot["ttft_after_prefill_ms"]["p50"])
+
+    def test_prefill_larger_than_ttft_is_not_invented(self):
+        metrics = Metrics()
+        metrics.observe(ttft_ms=100, prefill_ms=150, latency_ms=200)
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["prefill_ms"]["p50"], 150.0)
+        self.assertEqual(snapshot["ttft_after_prefill_ms"]["count"], 0)
+
+    def test_prefill_tokens_default_to_prompt_tokens(self):
+        metrics = Metrics()
+        metrics.observe(route="big", finish="ok", prompt_tokens=7, latency_ms=10)
+
+        self.assertEqual(metrics.snapshot()["prefill_tokens"], 7)
+
+    def test_reset_clears_prefill_and_warmup(self):
+        metrics = Metrics()
+        metrics.observe(ttft_ms=300, prefill_ms=250, prefill_tokens=9)
+        metrics.record_warmup(12.5, ok=True, prefill_tokens=3)
+        metrics.reset()
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["prefill_tokens"], 0)
+        self.assertEqual(snapshot["prefill_ms"]["count"], 0)
+        self.assertEqual(snapshot["ttft_after_prefill_ms"]["count"], 0)
+        self.assertEqual(snapshot["warmup"]["count"], 0)
+        self.assertIsNone(snapshot["warmup_ms"])
+
+
+class TestServerPrefillReporting(unittest.TestCase):
+    """Сервер: счётчик prefill_tokens и заголовок X-Prefill-Tokens."""
+
+    def test_non_stream_response_reports_prefill(self):
+        clock = FakeClock()
+        router = ScriptedStreamRouter(clock, step=0.25)
+        router.answer = StubAnswer(
+            route=StubRoute(kind="small"),
+            usage={"prompt_tokens": 3, "completion_tokens": 5},
+            prefill_ms=180,
+        )
+        metrics = Metrics()
+
+        handler = run_chat(
+            router, metrics=metrics, clock=clock, payload={"stream": False}
+        )
+
+        status, headers, _ = split_http(handler.wfile.raw)
+        self.assertEqual(status, 200)
+        # «Привет» — 6 символов, оценка промпта ~4 символа на токен.
+        self.assertEqual(headers["x-prefill-tokens"], "2")
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["prefill_tokens"], 2)
+        self.assertEqual(snapshot["prefill_ms"]["p50"], 180.0)
+        self.assertEqual(snapshot["ttft_after_prefill_ms"]["count"], 0)
+
+    def test_stream_ttft_split_uses_reported_prefill(self):
+        clock = FakeClock()
+        meta = StubAnswer(
+            text="",
+            route=StubRoute(kind="big"),
+            usage={"prompt_tokens": 7, "completion_tokens": 5},
+            prefill_ms=100,
+        )
+        router = ScriptedStreamRouter(clock, pieces=("При", "вет"), meta=meta)
+        metrics = Metrics()
+
+        handler = run_chat(
+            router, metrics=metrics, clock=clock, payload={"stream": True}
+        )
+
+        status, headers, _ = split_http(handler.wfile.raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["x-prefill-tokens"], "2")
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["ttft_ms"]["p50"], 125.0)
+        self.assertEqual(snapshot["prefill_ms"]["p50"], 100.0)
+        self.assertEqual(snapshot["ttft_after_prefill_ms"]["p50"], 25.0)
+        self.assertEqual(snapshot["prefill_tokens"], 2)
+
+    def test_stream_without_prefill_data_leaves_split_empty(self):
+        clock = FakeClock()
+        router = ScriptedStreamRouter(clock, pieces=("раз", "два"))
+        metrics = Metrics()
+
+        run_chat(router, metrics=metrics, clock=clock, payload={"stream": True})
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["ttft_ms"]["count"], 1)
+        self.assertEqual(snapshot["prefill_tokens"], 2)
+        self.assertEqual(snapshot["prefill_ms"]["count"], 0)
+        self.assertEqual(snapshot["ttft_after_prefill_ms"]["count"], 0)
+
+    def test_aborted_stream_still_counts_prompt_prefill_tokens(self):
+        clock = FakeClock()
+        router = ScriptedStreamRouter(clock, pieces=("раз", "два", "три"))
+        metrics = Metrics()
+        writer = FakeWriter(fail_after=1)  # клиент ушёл на первом чанке
+
+        run_chat(
+            router,
+            metrics=metrics,
+            clock=clock,
+            writer=writer,
+            payload={"stream": True},
+        )
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["finish"]["cancel"], 1)
+        # usage при обрыве неизвестен, но длина промпта — известна.
+        self.assertEqual(snapshot["prefill_tokens"], 2)
+
+    def test_metrics_endpoint_exposes_prefill_and_warmup(self):
+        metrics = Metrics()
+        metrics.record_warmup(12.5, ok=True, prefill_tokens=3, model="demo/model.vtm")
+        metrics.observe(route="small", finish="stop", ttft_ms=300, prefill_ms=250)
+
+        handler = run_get("/metrics", metrics=metrics, clock=FakeClock())
+        status, _, body = split_http(handler.wfile.raw)
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["warmup_ms"], 12.5)
+        self.assertTrue(payload["warmup"]["ok"])
+        self.assertEqual(payload["warmup"]["model"], "demo/model.vtm")
+        self.assertEqual(payload["prefill_ms"]["p50"], 250.0)
+        self.assertEqual(payload["ttft_after_prefill_ms"]["p50"], 50.0)
+        json.dumps(payload)
 
 
 if __name__ == "__main__":

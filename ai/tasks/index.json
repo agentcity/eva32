@@ -758,7 +758,7 @@
   {
     "id": "0115",
     "title": "Сервер: TTFT и прогрев модели",
-    "status": "in_progress",
+    "status": "done",
     "file": "0115-server-ttft.md",
     "assignee": "agent:server-ttft"
   },
@@ -789,5 +789,12 @@
     "status": "done",
     "file": "0119-prompt-shorten.md",
     "assignee": "agent:prompt-shorten"
+  },
+  {
+    "id": "0120",
+    "title": "Роутер отдаёт границу prefill для метрик TTFT",
+    "status": "pending",
+    "file": "0120-router-prefill-ms.md",
+    "assignee": ""
   }
 ]

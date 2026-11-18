@@ -28,6 +28,16 @@
 учитывается как ``cancel``. Сводка отдаётся ``GET /metrics`` (JSON, с
 перцентилями p50/p95/p99 по TTFT и полному времени).
 
+Прогрев модели (задача 0115): при старте, если задан ``EVA_VTM_MODEL`` или
+передан локальный клиент (``create_server(local_model=...)``), модель
+загружается и получает короткий prefill — иначе первый пользователь платит за
+mmap модели, загрузку ``libvtm`` и счёт промпта по токену. Время прогрева
+пишется в ``GET /metrics`` (``warmup_ms``), а его ошибка — только предупреждение:
+сервер стартует и принимает запросы. TTFT в метриках разделён на prefill
+(``prefill_ms``) и остаток (``ttft_after_prefill_ms``), если маршрутизатор
+сообщает границу prefill; ``prefill_tokens`` считается по длине промпта и
+отдаётся заголовком ``X-Prefill-Tokens``.
+
 Ошибки клиента — 4xx с человеческим текстом, ошибка маршрутизатора — 500 с
 человеческим текстом и идентификатором запроса; трейсбек уходит в лог сервера
 и наружу не попадает.
@@ -56,7 +66,7 @@ import uuid
 from collections import deque
 from collections.abc import Iterable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from math import ceil
+from math import ceil, isfinite
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -84,6 +94,7 @@ __all__ = [
     "make_handler",
     "reply_to_openai",
     "version",
+    "warmup_local_model",
 ]
 
 logger = logging.getLogger("eva.server")
@@ -109,6 +120,12 @@ _MAX_RATE_KEYS = 4096
 DEFAULT_MAX_PROMPT_TOKENS = 4000
 #: Таймаут генерации на запрос по умолчанию, секунд. ``0`` выключает предел.
 DEFAULT_REQUEST_TIMEOUT_S = 60.0
+#: Короткий промпт прогрева: prefill целиком, но без ожидания генерации.
+WARMUP_PROMPT = "Привет"
+#: Сколько новых токенов генерирует прогрев: один шаг декода после prefill.
+WARMUP_MAX_NEW_TOKENS = 1
+#: Переменная бэкенда ВТМ: задаёт модель, которую надо прогреть при старте.
+_ENV_VTM_MODEL = "EVA_VTM_MODEL"
 
 #: Сентинел «поток не дал ни одного куска» для ``next(..., _STREAM_END)``.
 _STREAM_END = object()
@@ -292,6 +309,171 @@ def estimate_prompt_tokens(pairs: Iterable[tuple[str, str]]) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Прогрев локальной модели при старте
+# --------------------------------------------------------------------------- #
+
+#: Минимум prefill-токенов, если у клиента нет токенизатора.
+_WARMUP_IDS = (1, 2, 3)
+
+
+def _now(clock: Callable[[], float] | None) -> float:
+    """Текущий момент для замера прогрева (часы инжектируются в тестах)."""
+    return time.monotonic() if clock is None else float(clock())
+
+
+def _elapsed_seconds(started: float, clock: Callable[[], float] | None) -> float:
+    """Секунды с ``started``; отрицательный результат (часы пошли назад) — 0."""
+    return max(0.0, _now(clock) - started)
+
+
+def _model_name(backend: Any) -> str:
+    """Человеческое имя модели для лога и метрик (путь, если есть)."""
+    for name in ("model_path", "model"):
+        value = getattr(backend, name, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return type(backend).__name__
+
+
+def _make_warmup_backend(model: str) -> Any:
+    """Локальная ВТМ по пути; импорт ленивый — без модели ничего не грузим.
+
+    Ошибка сборки конфига (мусор в ``EVA_VTM_BACKEND``) поднимается наверх:
+    вызывающий считает её неудачным прогревом и стартует без него.
+    """
+    from .backends.vtm_backend import VTMConfig, VtmBackend
+
+    return VtmBackend(VTMConfig.from_env(model=model))
+
+
+def _warmup_prompt_ids(backend: Any, prompt: str) -> list[int]:
+    """id промпта прогрева: через токенизатор клиента, иначе короткий список.
+
+    Если токенизатора нет (рядом с моделью нет ``tokenizer.json``), генерация
+    по id всё равно прогревает prefill и арену — прогрев не отменяется.
+    """
+    encode = getattr(backend, "encode", None)
+    if callable(encode):
+        try:
+            ids = [int(token) for token in encode(prompt)]
+        except Exception:  # noqa: BLE001 - прогрев важнее конкретного токенизатора
+            logger.debug("прогрев: encode недоступен, работаем по id", exc_info=True)
+        else:
+            if ids:
+                return ids
+    return list(_WARMUP_IDS)
+
+
+def _close_quietly(backend: Any) -> None:
+    """Закрыть временный бэкенд прогрева, не портя старт его ошибкой."""
+    closer = getattr(backend, "close", None)
+    if not callable(closer):
+        return
+    try:
+        closer()
+    except Exception:  # noqa: BLE001 - закрытие не должно ронять сервер
+        logger.debug("прогрев: временный бэкенд не закрылся", exc_info=True)
+
+
+def warmup_local_model(
+    backend: Any = None,
+    *,
+    metrics: Any = None,
+    prompt: str = WARMUP_PROMPT,
+    max_new_tokens: int = WARMUP_MAX_NEW_TOKENS,
+    clock: Callable[[], float] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any] | None:
+    """Загрузить локальную модель и прогнать короткий prefill.
+
+    ``backend`` — локальный клиент (``VtmBackend`` или совместимый объект с
+    ``open()``/``encode()``/``generate()``); ``None`` — взять модель из
+    ``EVA_VTM_MODEL``. Если ни клиента, ни переменной нет, прогревать нечего:
+    возвращается ``None``.
+
+    Прогрев намеренно не поднимает исключений: первый запрос не должен
+    приносить в жертву старт сервера. Ошибка остаётся предупреждением в
+    журнале и записью ``ok: false`` в метриках (``warmup_ms``, причина).
+
+    Возвращает запись прогрева::
+
+        {"ok": True, "warmup_ms": 41.2, "prefill_tokens": 3,
+         "model": "demo/model.vtm", "error": None}
+
+    Временный бэкенд, собранный из окружения, закрывается после прогрева:
+    страницы mmap, динамическая библиотека и токенизатор остаются горячими,
+    а второй контекст не держит лишнюю память. Переданный клиент — чужой:
+    его не закрывают.
+    """
+    source = os.environ if environ is None else environ
+    model = ""
+    if backend is None:
+        model = (source.get(_ENV_VTM_MODEL) or "").strip()
+        if not model:
+            return None  # локальная модель не задана — прогрев не нужен
+    else:
+        model = _model_name(backend)
+
+    def remember(*, ok: bool, ms: float, tokens: int, error: str | None) -> dict:
+        record = {
+            "ok": ok,
+            "warmup_ms": round(ms, 3),
+            "prefill_tokens": int(tokens),
+            "model": model,
+            "error": error,
+        }
+        if metrics is not None:
+            try:
+                metrics.record_warmup(
+                    record["warmup_ms"],
+                    ok=ok,
+                    prefill_tokens=tokens,
+                    error=error,
+                    model=model,
+                )
+            except Exception:  # noqa: BLE001 - метрика не важнее старта
+                logger.exception("не удалось записать метрику прогрева")
+        return record
+
+    started = _now(clock)
+    own_backend = False
+    ids: list[int] = []
+    try:
+        if backend is None:
+            backend = _make_warmup_backend(model)
+            own_backend = True
+        opener = getattr(backend, "open", None)
+        if callable(opener):
+            opener()
+        ids = _warmup_prompt_ids(backend, prompt)
+        generate = getattr(backend, "generate", None)
+        if not callable(generate):
+            raise TypeError("у локального клиента нет метода generate(prompt_ids)")
+        generate(ids, max_new_tokens=max(1, int(max_new_tokens)))
+    except Exception as exc:  # noqa: BLE001 - сервер стартует и без прогрева
+        elapsed_ms = _elapsed_seconds(started, clock) * 1000.0
+        reason = str(exc).strip() or type(exc).__name__
+        logger.warning(
+            "прогрев модели не удался (%s): %s; сервер стартует без прогрева",
+            model,
+            reason,
+        )
+        return remember(ok=False, ms=elapsed_ms, tokens=0, error=reason)
+    finally:
+        if own_backend and backend is not None:
+            _close_quietly(backend)
+
+    elapsed_ms = _elapsed_seconds(started, clock) * 1000.0
+    logger.info(
+        "прогрев модели: %.1f мс, prefill %d токенов (%s)",
+        elapsed_ms,
+        len(ids),
+        model,
+    )
+    return remember(ok=True, ms=elapsed_ms, tokens=len(ids), error=None)
+
+
+# --------------------------------------------------------------------------- #
 # Маршрутизатор
 # --------------------------------------------------------------------------- #
 
@@ -472,6 +654,34 @@ def _usage_summary(answer: Any) -> dict[str, int]:
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
     }
+
+
+def _prefill_ms_of(source: Any) -> float | None:
+    """Prefill-часть ответа, если маршрутизатор её сообщил.
+
+    Мягкий контракт (``eva/router.py`` — чужая зона): ``prefill_ms`` в самом
+    ответе или куске меты потока, либо в его ``usage``/``timings``. Нет поля —
+    ``None``: границу prefill сервер не угадывает и в метрики не пишет.
+    """
+    if source is None:
+        return None
+    raw = _field(source, "prefill_ms")
+    if raw is None:
+        for name in ("usage", "timings"):
+            nested = _field(source, name)
+            if isinstance(nested, Mapping):
+                raw = nested.get("prefill_ms")
+                if raw is not None:
+                    break
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(value) or value < 0:
+        return None
+    return value
 
 
 def _eva_summary(answer: Any, latency_ms: int) -> dict[str, Any]:
@@ -1403,6 +1613,10 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # Токены промпта считает сервер: при обрыве потока usage неизвестен, а
+        # длина промпта известна — по ней и пополняется счётчик prefill_tokens.
+        prompt_tokens = estimate_prompt_tokens(pairs)
+
         if stream:
             self._handle_chat_stream(
                 pairs,
@@ -1411,6 +1625,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                 include_usage=include_usage,
                 request_id=request_id,
                 started=started,
+                prompt_tokens=prompt_tokens,
             )
             return
 
@@ -1430,6 +1645,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                 route="unknown",
                 finish="error",
                 latency_ms=_elapsed_ms(started, self._clock()),
+                prefill_tokens=prompt_tokens,
                 stream=False,
             )
             self._send_timeout(request_id)
@@ -1441,6 +1657,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                 route="unknown",
                 finish="error",
                 latency_ms=_elapsed_ms(started, self._clock()),
+                prefill_tokens=prompt_tokens,
                 stream=False,
             )
             self._send_unavailable(request_id, exc)
@@ -1464,6 +1681,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                         route="unknown",
                         finish="error",
                         latency_ms=_elapsed_ms(started, self._clock()),
+                        prefill_tokens=prompt_tokens,
                         stream=False,
                     )
                     self._send_timeout(request_id)
@@ -1477,6 +1695,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                         route="unknown",
                         finish="error",
                         latency_ms=_elapsed_ms(started, self._clock()),
+                        prefill_tokens=prompt_tokens,
                         stream=False,
                     )
                     self._send_unavailable(request_id, exc)
@@ -1489,6 +1708,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                         route="unknown",
                         finish="error",
                         latency_ms=_elapsed_ms(started, self._clock()),
+                        prefill_tokens=prompt_tokens,
                         stream=False,
                     )
                     self._send_internal_error(request_id)
@@ -1499,6 +1719,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                     route="unknown",
                     finish="error",
                     latency_ms=_elapsed_ms(started, self._clock()),
+                    prefill_tokens=prompt_tokens,
                     stream=False,
                 )
                 self._send_internal_error(request_id)
@@ -1519,6 +1740,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                 route="unknown",
                 finish="error",
                 latency_ms=_elapsed_ms(started, self._clock()),
+                prefill_tokens=prompt_tokens,
                 stream=False,
             )
             self._send_internal_error(request_id)
@@ -1534,9 +1756,18 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
             total_tokens=usage.get("total_tokens"),
+            prefill_ms=_prefill_ms_of(answer),
+            prefill_tokens=prompt_tokens,
             stream=False,
         )
-        self._send_json(200, body, headers={"X-Request-Id": request_id})
+        self._send_json(
+            200,
+            body,
+            headers={
+                "X-Request-Id": request_id,
+                "X-Prefill-Tokens": str(prompt_tokens),
+            },
+        )
 
     # -- потоковая выдача -----------------------------------------------------
 
@@ -1549,6 +1780,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
         include_usage: bool,
         request_id: str,
         started: float,
+        prompt_tokens: int = 0,
     ) -> None:
         """SSE: куски из ``router.stream(request)`` или готовый ответ одним чанком.
 
@@ -1577,6 +1809,9 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
         route = "unknown"
         finish = "error"
         ttft_ms: int | None = None
+        # Граница prefill: её сообщает маршрутизатор (``prefill_ms`` в мете или
+        # ответе). Без цифры TTFT не делим и остаток не выдумываем.
+        prefill_ms: float | None = None
         deadline = self._deadline()
 
         def mark_ttft() -> None:
@@ -1602,6 +1837,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                     first_text = body["choices"][0]["message"]["content"]
                     first_meta = None
                     route = body["eva"]["route"]
+                    prefill_ms = _prefill_ms_of(answer)
                     self._bump_degraded(answer)
                 else:
                     if deadline is not None and not inspect.isgeneratorfunction(
@@ -1630,6 +1866,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                             route = _route_summary(
                                 _field(first_meta, "route")
                             )["route"]
+                            prefill_ms = _prefill_ms_of(first_meta)
             except (_RequestTimeout, ServiceUnavailable):
                 raise
             except Exception:  # noqa: BLE001 - до первого чанка ещё можно ответить JSON
@@ -1661,9 +1898,10 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                 first_text = body["choices"][0]["message"]["content"]
                 first_meta = None
                 route = body["eva"]["route"]
+                prefill_ms = _prefill_ms_of(answer)
 
             try:
-                self._open_sse(request_id)
+                self._open_sse(request_id, prefill_tokens=prompt_tokens)
             except _CLIENT_GONE:
                 # Клиент ушёл до заголовков: генерацию не начинаем.
                 logger.debug("клиент закрыл соединение до начала стрима")
@@ -1727,6 +1965,9 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                     if item_meta is not None:
                         answer_meta = item_meta
                         route = _route_summary(_field(item_meta, "route"))["route"]
+                        reported = _prefill_ms_of(item_meta)
+                        if reported is not None:
+                            prefill_ms = reported
                     if not text:
                         continue
                     delta: dict[str, Any] = {"content": text}
@@ -1827,18 +2068,25 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                 prompt_tokens=usage.get("prompt_tokens", 0),
                 completion_tokens=usage.get("completion_tokens", 0),
                 total_tokens=usage.get("total_tokens"),
+                prefill_ms=prefill_ms,
+                prefill_tokens=prompt_tokens,
                 stream=True,
             )
 
     # -- SSE ------------------------------------------------------------------
 
-    def _open_sse(self, request_id: str) -> None:
-        """Заголовки SSE. HTTP/1.1 — chunked (keep-alive), HTTP/1.0 — до закрытия."""
+    def _open_sse(self, request_id: str, *, prefill_tokens: int = 0) -> None:
+        """Заголовки SSE. HTTP/1.1 — chunked (keep-alive), HTTP/1.0 — до закрытия.
+
+        ``X-Prefill-Tokens`` — сколько токенов промпта посчитано: по этому
+        заголовку видно, что prefill доминирует в TTFT (задача 0115).
+        """
         self._sse_chunked = self.request_version != "HTTP/1.0"
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("X-Request-Id", request_id)
+        self.send_header("X-Prefill-Tokens", str(max(0, int(prefill_tokens))))
         # Прокси не должны копить поток в буфере.
         self.send_header("X-Accel-Buffering", "no")
         if self._sse_chunked:
@@ -2225,6 +2473,11 @@ class EvaHTTPServer(ThreadingHTTPServer):
     ``time.monotonic``); ``metrics`` — накопитель ``eva.telemetry.Metrics``
     (по умолчанию новый). Оба параметра инжектируются в тестах: фейковые часы
     дают детерминированный TTFT, а свой накопитель — изолированные счётчики.
+
+    ``local_model`` — локальный клиент ВТМ для прогрева (``None`` — взять
+    ``EVA_VTM_MODEL``); ``warmup`` — ``False`` выключает прогрев, ``None`` —
+    прогреть, если модель задана. Результат лежит в ``self.warmup`` (``None``,
+    если прогрева не было), а ошибка прогрева старт не отменяет.
     """
 
     daemon_threads = True
@@ -2242,6 +2495,8 @@ class EvaHTTPServer(ThreadingHTTPServer):
         max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS,
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT_S,
         degradation: DegradationChain | None = None,
+        local_model: Any = None,
+        warmup: bool | None = None,
     ) -> None:
         self.router_name = router_name
         self.access_guard = access_guard
@@ -2250,9 +2505,15 @@ class EvaHTTPServer(ThreadingHTTPServer):
         self.max_prompt_tokens = max(0, int(max_prompt_tokens))
         self.request_timeout = max(0.0, float(request_timeout))
         self.degradation = degradation
+        self.local_model = local_model
+        self.warmup: dict[str, Any] | None = None
         self.counters = ServerCounters()
         self.started_at = self.clock()
         super().__init__(address, handler)
+        if warmup is not False:
+            # Прогрев идёт после bind: даже зависшая/упавшая модель не мешает
+            # сокету и не отменяет старт — ошибка останется предупреждением.
+            self.warmup = warmup_local_model(local_model, metrics=self.metrics)
 
 
 def _auth_settings() -> tuple[str, int]:
@@ -2298,6 +2559,8 @@ def create_server(
     max_prompt_tokens: int | None = None,
     request_timeout: float | None = None,
     degradation: DegradationChain | None = None,
+    local_model: Any = None,
+    warmup: bool | None = None,
 ) -> EvaHTTPServer:
     """Создаёт (но не запускает) сервер; ``port=0`` — свободный порт.
 
@@ -2324,6 +2587,13 @@ def create_server(
     скилл → 503). Если ``router`` не задан, цепочка становится основным
     маршрутизатором; если задан — она используется как запасная после падения
     основного (стадия ``big`` уже пробована и не повторяется).
+
+    ``local_model`` и ``warmup`` — прогрев при старте (задача 0115). Модель для
+    прогрева берётся из ``local_model`` или ``EVA_VTM_MODEL``; прогрев грузит
+    её и считает короткий prefill, а результат (``warmup_ms``, успех, причина
+    отказа) попадает в ``GET /metrics``. Ошибка прогрева не мешает серверу
+    подняться: в журнал уходит предупреждение, сервер принимает запросы.
+    ``warmup=False`` выключает прогрев совсем.
     """
     env_token, env_limit = _auth_settings()
     token = env_token if auth_token is None else auth_token.strip()
@@ -2360,6 +2630,8 @@ def create_server(
         max_prompt_tokens=prompt_limit,
         request_timeout=timeout,
         degradation=degradation,
+        local_model=local_model,
+        warmup=warmup,
     )
     bound_host, bound_port = server.server_address[:2]
     logger.info("eva-server слушает http://%s:%s", bound_host, bound_port)

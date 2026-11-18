@@ -34,6 +34,20 @@ TTFT, полное время, токены, код завершения (``ok``
 и маршрут (``skill``/``small``/``big``). Их отдаёт ``GET /metrics``. Это другой
 источник: файл — бухгалтерия по завершённым ответам, ``Metrics`` — состояние
 процесса «здесь и сейчас», включая отменённые и упавшие запросы.
+
+Prefill и прогрев (задача 0115). Первый запрос к локальной ВТМ платит за
+загрузку модели и за prefill — счёт промпта по токену. Поэтому у запроса
+TTFT разделён на две части, когда маршрутизатор сообщает границу prefill:
+
+* ``prefill_ms`` — сколько заняла prefill-часть (нет данных — ``None``);
+* ``ttft_after_prefill_ms`` — остаток TTFT после prefill (``ttft_ms - prefill_ms``,
+  только если обе цифры известны и prefill не больше TTFT);
+* ``ttft_ms`` — по-прежнему полное время до первого отданного чанка;
+* ``prefill_tokens`` — накопительный счётчик посчитанных токенов промпта.
+
+Отдельно :meth:`Metrics.record_warmup` пишет прогрев при старте: последнее
+время прогрева (``warmup_ms``), его успех и причину отказа. Прогрев не
+считается запросом: ``requests``, ``latency_ms`` и ``ttft_ms`` он не трогает.
 """
 
 from __future__ import annotations
@@ -522,6 +536,21 @@ def _stats(samples: Any) -> dict[str, Any]:
     }
 
 
+def _warmup_block(last: dict[str, Any] | None, count: int) -> dict[str, Any]:
+    """Блок прогрева в ``/metrics``: последний замер и число прогревов."""
+    block: dict[str, Any] = {
+        "count": count,
+        "warmup_ms": None,
+        "ok": None,
+        "prefill_tokens": 0,
+        "error": None,
+        "model": None,
+    }
+    if last is not None:
+        block.update(last)
+    return block
+
+
 class Metrics:
     """Потокобезопасные счётчики запросов сервера и перцентили задержек.
 
@@ -535,9 +564,15 @@ class Metrics:
           "cancelled": 1, "errors": 1,
           "routes": {"skill": 4, "small": 6, "big": 1, "unknown": 1},
           "tokens": {"prompt": 120, "completion": 340, "total": 460},
+          "prefill_tokens": 120,
           "ttft_ms": {"count": 8, "min": ..., "max": ..., "avg": ...,
                       "p50": ..., "p95": ..., "p99": ...},
+          "prefill_ms": {...},              # только по замерам, где есть данные
+          "ttft_after_prefill_ms": {...},   # TTFT минус prefill
           "latency_ms": {...},
+          "warmup_ms": 41.2, "warmup": {"count": 1, "ok": true, "warmup_ms": 41.2,
+                                        "prefill_tokens": 3, "error": null,
+                                        "model": "demo/model.vtm"},
           "by_route": {"small": {...}, ...},
         }
 
@@ -546,6 +581,11 @@ class Metrics:
     в ``ttft_ms`` (``ttft_ms: null`` при вызове). Токены для оборванного
     потока часто неизвестны: маршрутизатор сообщает ``usage`` в финальном
     куске, которого при отмене нет, — такие запросы дают нули, а не выдумку.
+
+    ``prefill_ms`` и ``ttft_after_prefill_ms`` заполняются только когда
+    маршрутизатор передал ``prefill_ms``: без этой цифры сервер не угадывает
+    границу prefill и оставляет ``None``. ``prefill_tokens`` сервер считает
+    сам по длине промпта, поэтому счётчик есть у всех запросов.
 
     Замеры для перцентилей ограничены окном ``max_samples``; счётчики — нет.
     """
@@ -556,17 +596,25 @@ class Metrics:
         self._requests = 0
         self._streams = 0
         self._tokens = {"prompt": 0, "completion": 0, "total": 0}
+        self._prefill_tokens = 0
+        self._warmup_count = 0
+        self._warmup: dict[str, Any] | None = None
         self._finish = {code: 0 for code in FINISH_CODES}
         self._routes = {kind: 0 for kind in _ROUTE_KEYS}
         maxlen = self.max_samples
         self._ttft: deque[float] = deque(maxlen=maxlen)
+        self._prefill: deque[float] = deque(maxlen=maxlen)
+        self._ttft_after: deque[float] = deque(maxlen=maxlen)
         self._latency: deque[float] = deque(maxlen=maxlen)
         self._by_route: dict[str, dict[str, Any]] = {
             kind: {
                 "requests": 0,
                 "tokens": 0,
+                "prefill_tokens": 0,
                 "finish": {code: 0 for code in FINISH_CODES},
                 "ttft": deque(maxlen=maxlen),
+                "prefill": deque(maxlen=maxlen),
+                "ttft_after": deque(maxlen=maxlen),
                 "latency": deque(maxlen=maxlen),
             }
             for kind in _ROUTE_KEYS
@@ -585,12 +633,20 @@ class Metrics:
         completion_tokens: Any = 0,
         total_tokens: Any = None,
         stream: bool = False,
+        prefill_ms: Any = None,
+        prefill_tokens: Any = None,
     ) -> dict[str, Any]:
         """Учесть один запрос и вернуть его запись (для тестов и логов).
 
         Значения не доверенные: маршрут и код завершения сводятся к известным
         наборам, отрицательные и нечисловые задержки/токены — к нулю (а TTFT
         без значения не попадает в перцентили вовсе).
+
+        ``prefill_ms`` — prefill-часть TTFT, если маршрутизатор её сообщил;
+        ``prefill_tokens`` — посчитанные токены промпта (по умолчанию совпадают
+        с ``prompt_tokens``: без usage промпт всё равно посчитан). Отдельный
+        параметр нужен потому, что при обрыве потока usage неизвестен, а
+        длина промпта известна.
         """
         route_key = _route_key(route)
         finish_key = _finish_key(finish)
@@ -602,14 +658,28 @@ class Metrics:
         if total <= 0:
             # Так же, как в normalize_record: без явной суммы берём p + c.
             total = prompt + completion
+        prefill = _ms_or_none(prefill_ms)
+        counted = prompt if prefill_tokens is None else _count(prefill_tokens)
+        # Prefill больше TTFT — данные противоречат друг другу: остаток не
+        # выдумываем, оставляем None (в перцентили такой замер не попадёт).
+        ttft_after = (
+            ttft - prefill
+            if ttft is not None and prefill is not None and prefill <= ttft
+            else None
+        )
 
         record = {
             "route": route_key,
             "finish": finish_key,
             "stream": bool(stream),
             "ttft_ms": ttft,
+            "prefill_ms": None if prefill is None else round(prefill, 3),
+            "ttft_after_prefill_ms": (
+                None if ttft_after is None else round(ttft_after, 3)
+            ),
             "latency_ms": latency,
             "prompt_tokens": prompt,
+            "prefill_tokens": counted,
             "completion_tokens": completion,
             "total_tokens": total,
         }
@@ -623,17 +693,56 @@ class Metrics:
             self._tokens["prompt"] += prompt
             self._tokens["completion"] += completion
             self._tokens["total"] += total
+            self._prefill_tokens += counted
             if ttft is not None:
                 self._ttft.append(ttft)
+            if prefill is not None:
+                self._prefill.append(prefill)
+            if ttft_after is not None:
+                self._ttft_after.append(ttft_after)
             self._latency.append(latency)
 
             row = self._by_route[route_key]
             row["requests"] += 1
             row["tokens"] += total
+            row["prefill_tokens"] += counted
             row["finish"][finish_key] += 1
             if ttft is not None:
                 row["ttft"].append(ttft)
+            if prefill is not None:
+                row["prefill"].append(prefill)
+            if ttft_after is not None:
+                row["ttft_after"].append(ttft_after)
             row["latency"].append(latency)
+        return record
+
+    def record_warmup(
+        self,
+        ms: Any,
+        *,
+        ok: bool = True,
+        prefill_tokens: Any = 0,
+        error: Any = None,
+        model: Any = None,
+    ) -> dict[str, Any]:
+        """Записать результат прогрева модели; запросом прогрев не считается.
+
+        Хранится только последний прогрев (их и бывает один на процесс), но
+        счётчик ``count`` накопительный: перезапуск прогрева в тестах не
+        теряется. Ошибка прогрева — штатное значение (``ok: false`` плюс
+        текст причины), а не исключение.
+        """
+        duration = _ms_or_none(ms)
+        record = {
+            "warmup_ms": None if duration is None else round(duration, 3),
+            "ok": bool(ok),
+            "prefill_tokens": _count(prefill_tokens),
+            "error": None if ok else (str(error) if error else "прогрев не удался"),
+            "model": None if model is None else str(model),
+        }
+        with self._lock:
+            self._warmup_count += 1
+            self._warmup = record
         return record
 
     # -- чтение ---------------------------------------------------------------
@@ -646,14 +755,21 @@ class Metrics:
             finish = dict(self._finish)
             routes = dict(self._routes)
             tokens = dict(self._tokens)
+            prefill_tokens = self._prefill_tokens
             ttft = _stats(self._ttft)
+            prefill = _stats(self._prefill)
+            ttft_after = _stats(self._ttft_after)
             latency = _stats(self._latency)
+            warmup = _warmup_block(self._warmup, self._warmup_count)
             by_route = {
                 name: {
                     "requests": row["requests"],
                     "tokens": row["tokens"],
+                    "prefill_tokens": row["prefill_tokens"],
                     "finish": dict(row["finish"]),
                     "ttft_ms": _stats(row["ttft"]),
+                    "prefill_ms": _stats(row["prefill"]),
+                    "ttft_after_prefill_ms": _stats(row["ttft_after"]),
                     "latency_ms": _stats(row["latency"]),
                 }
                 for name, row in self._by_route.items()
@@ -666,8 +782,13 @@ class Metrics:
             "errors": finish["error"],
             "routes": routes,
             "tokens": tokens,
+            "prefill_tokens": prefill_tokens,
             "ttft_ms": ttft,
+            "prefill_ms": prefill,
+            "ttft_after_prefill_ms": ttft_after,
             "latency_ms": latency,
+            "warmup_ms": warmup["warmup_ms"],
+            "warmup": warmup,
             "by_route": by_route,
         }
 
@@ -676,6 +797,9 @@ class Metrics:
         with self._lock:
             self._requests = 0
             self._streams = 0
+            self._prefill_tokens = 0
+            self._warmup_count = 0
+            self._warmup = None
             for key in self._tokens:
                 self._tokens[key] = 0
             for code in self._finish:
@@ -683,10 +807,15 @@ class Metrics:
             for kind in self._routes:
                 self._routes[kind] = 0
             self._ttft.clear()
+            self._prefill.clear()
+            self._ttft_after.clear()
             self._latency.clear()
             for row in self._by_route.values():
                 row["requests"] = 0
                 row["tokens"] = 0
+                row["prefill_tokens"] = 0
                 row["finish"] = {code: 0 for code in FINISH_CODES}
                 row["ttft"].clear()
+                row["prefill"].clear()
+                row["ttft_after"].clear()
                 row["latency"].clear()
