@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 from dataclasses import dataclass, field
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from eva import server  # noqa: E402
@@ -869,6 +870,375 @@ class TestRouterInjection(unittest.TestCase):
 
         self.assertEqual(callable_router(FakeRequest()), StubAnswer(text="ok"))
         self.assertEqual(router.seen, ["Привет"])
+
+
+# --------------------------------------------------------------------------- #
+# Токен и лимиты запросов (задача 0030-eva-auth)
+# --------------------------------------------------------------------------- #
+
+
+def start_test_server(router, **kwargs):
+    """Поднимает сервер на loopback в отдельном потоке: (httpd, port, thread)."""
+    httpd = server.create_server(host=HOST, port=0, router=router, **kwargs)
+    port = httpd.server_address[1]
+    thread = threading.Thread(
+        target=httpd.serve_forever,
+        kwargs={"poll_interval": 0.01},
+        name="eva-guard-test-server",
+        daemon=True,
+    )
+    thread.start()
+    return httpd, port, thread
+
+
+def stop_test_server(httpd, thread) -> None:
+    httpd.shutdown()
+    httpd.server_close()
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "поток сервера не завершился после shutdown"
+
+
+class GuardedServerCase(ServerCase):
+    """Стенд с включённым токеном; квота заведомо выше числа тестов класса."""
+
+    auth_token = "test-token"
+    rate_limit_per_min = 120
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.router = cls.router_factory()
+        cls.httpd, cls.port, cls.thread = start_test_server(
+            cls.router,
+            auth_token=cls.auth_token,
+            rate_limit_per_min=cls.rate_limit_per_min,
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        stop_test_server(cls.httpd, cls.thread)
+
+    def bearer(self, token: str | None = None) -> dict[str, str]:
+        value = self.auth_token if token is None else token
+        return {"Authorization": "Bearer {}".format(value)}
+
+    def post_authorized(self, payload, token: str | None = None, **kwargs):
+        return self.post_chat(payload, headers=self.bearer(token), **kwargs)
+
+
+class PerTestServerCase(ServerCase):
+    """Сервер на каждый тест: счётчики лимита не перетекают между тестами."""
+
+    server_kwargs: dict = {"auth_token": "", "rate_limit_per_min": 120}
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        pass  # сервер поднимается в setUp, чтобы у каждого теста была своя квота
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        pass
+
+    def setUp(self) -> None:
+        self.router = self.router_factory()
+        self.httpd, self.port, self.thread = start_test_server(
+            self.router, **self.server_kwargs
+        )
+
+    def tearDown(self) -> None:
+        stop_test_server(self.httpd, self.thread)
+
+
+CHAT_PAYLOAD = {"messages": [{"role": "user", "content": "Привет"}]}
+
+
+class TestAuthToken(GuardedServerCase):
+    """Без валидного Bearer — 401 с JSON, обработчик маршрутизатора не зовётся."""
+
+    def test_request_without_token_is_401_json(self):
+        status, headers, raw, body = self.post_chat(CHAT_PAYLOAD)
+
+        self.assertEqual(status, 401)
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertEqual(body["error"]["code"], "unauthorized")
+        self.assertIn("Bearer", body["error"]["message"])
+        self.assertTrue(headers["WWW-Authenticate"].startswith("Bearer"))
+        self.assertEqual(self.router.calls, [])
+        self.assertNotIn(b"Traceback", raw)
+
+    def test_wrong_token_is_401(self):
+        status, _, _, body = self.post_authorized(CHAT_PAYLOAD, token="not-our-token")
+
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+        self.assertEqual(self.router.calls, [])
+
+    def test_non_bearer_scheme_is_401(self):
+        status, _, _, body = self.post_chat(
+            CHAT_PAYLOAD, headers={"Authorization": "Basic dGVzdDp0ZXN0"}
+        )
+
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+        self.assertEqual(self.router.calls, [])
+
+    def test_valid_token_is_200(self):
+        status, _, _, body = self.post_authorized(CHAT_PAYLOAD)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["object"], "chat.completion")
+        self.assertEqual(
+            body["choices"][0]["message"]["content"], "Здравствуйте! Чем помочь?"
+        )
+        self.assertEqual(body["eva"]["route"], "small")
+        self.assertEqual(len(self.router.calls), 1)
+
+    def test_models_endpoint_requires_token(self):
+        status, _, _, body = self.request("GET", "/v1/models")
+
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+
+        status, _, _, body = self.request("GET", "/v1/models", headers=self.bearer())
+        self.assertEqual(status, 200)
+        self.assertEqual(body["data"][0]["id"], server.DEFAULT_MODEL)
+
+    def test_health_stays_open_without_token(self):
+        status, _, _, body = self.request("GET", "/health")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "ok")
+
+    def test_token_is_not_echoed_in_401_body_or_log(self):
+        with self.assertLogs("eva.server", level="WARNING") as logs:
+            status, _, raw, _ = self.post_chat(CHAT_PAYLOAD)
+
+        self.assertEqual(status, 401)
+        self.assertNotIn(self.auth_token.encode("utf-8"), raw)
+        messages = "\n".join(logs.output)
+        self.assertIn("Bearer", messages)
+        self.assertNotIn(self.auth_token, messages)
+
+    def test_oversized_body_still_is_413_with_valid_token(self):
+        raw = raw_http(
+            self.port,
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: test\r\n"
+            b"Authorization: Bearer test-token\r\n"
+            b"Content-Length: 99999999\r\n\r\n",
+        )
+
+        status, body = parse_raw(raw)
+        self.assertEqual(status, 413)
+        self.assertEqual(json.loads(body)["error"]["code"], "payload_too_large")
+
+    def test_auth_is_checked_before_body_size(self):
+        raw = raw_http(
+            self.port,
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: test\r\n"
+            b"Content-Length: 99999999\r\n\r\n",
+        )
+
+        status, body = parse_raw(raw)
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body)["error"]["code"], "unauthorized")
+
+
+class TestRateLimit(PerTestServerCase):
+    """Два запроса в минуту на ключ: третий — 429 с Retry-After."""
+
+    server_kwargs = {"auth_token": "test-token", "rate_limit_per_min": 2}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.bearer = {"Authorization": "Bearer test-token"}
+
+    def post_valid(self):
+        return self.post_chat(CHAT_PAYLOAD, headers=self.bearer)
+
+    def test_third_request_is_429_with_retry_after(self):
+        self.assertEqual(self.post_valid()[0], 200)
+        self.assertEqual(self.post_valid()[0], 200)
+
+        status, headers, _, body = self.post_valid()
+
+        self.assertEqual(status, 429)
+        self.assertEqual(body["error"]["code"], "rate_limited")
+        self.assertIn("2", body["error"]["message"])
+        retry_after = int(headers["Retry-After"])
+        self.assertGreaterEqual(retry_after, 1)
+        self.assertLessEqual(retry_after, 60)
+        self.assertEqual(headers["X-RateLimit-Limit"], "2")
+        self.assertEqual(headers["X-RateLimit-Remaining"], "0")
+        # 429 не доходит до маршрутизатора: бюджет не тратится
+        self.assertEqual(len(self.router.calls), 2)
+
+    def test_failed_auth_does_not_spend_quota(self):
+        for _ in range(3):
+            status, _, _, body = self.post_chat(
+                CHAT_PAYLOAD, headers={"Authorization": "Bearer wrong"}
+            )
+            self.assertEqual(status, 401)
+            self.assertEqual(body["error"]["code"], "unauthorized")
+
+        self.assertEqual(self.post_valid()[0], 200)
+        self.assertEqual(self.post_valid()[0], 200)
+        self.assertEqual(self.post_valid()[0], 429)
+
+    def test_429_body_is_json_and_has_no_traceback(self):
+        self.post_valid()
+        self.post_valid()
+
+        _, headers, raw, body = self.post_valid()
+
+        self.assertIn("application/json", headers["Content-Type"])
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertNotIn(b"Traceback", raw)
+        self.assertNotIn(b"test-token", raw)
+
+
+class TestNoTokenMode(PerTestServerCase):
+    """Без токена — прежний доступ, но лимит на адрес клиента продолжает работать."""
+
+    server_kwargs = {"auth_token": "", "rate_limit_per_min": 2}
+
+    def test_requests_without_authorization_are_allowed_until_limit(self):
+        status, headers, _, _ = self.post_chat(CHAT_PAYLOAD)
+        self.assertEqual(status, 200)
+        self.assertNotIn("WWW-Authenticate", headers)
+        self.assertEqual(self.post_chat(CHAT_PAYLOAD)[0], 200)
+
+        status, headers, _, body = self.post_chat(CHAT_PAYLOAD)
+        self.assertEqual(status, 429)
+        self.assertEqual(body["error"]["code"], "rate_limited")
+        self.assertIn("Retry-After", headers)
+        self.assertEqual(len(self.router.calls), 2)
+
+
+class TestAccessConfiguration(unittest.TestCase):
+    """Как настройки попадают в сервер: окружение, явные аргументы, отказ стартовать."""
+
+    def post_status(self, port: int, token: str | None = None) -> int:
+        body = json.dumps(CHAT_PAYLOAD).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers["Authorization"] = "Bearer {}".format(token)
+        connection = http.client.HTTPConnection(HOST, port, timeout=5)
+        try:
+            connection.request("POST", "/v1/chat/completions", body=body, headers=headers)
+            response = connection.getresponse()
+            response.read()
+            return response.status
+        finally:
+            connection.close()
+
+    def test_env_token_and_limit_are_used(self):
+        env = {"EVA_AUTH_TOKEN": "env-token", "EVA_RATE_LIMIT_PER_MIN": "1"}
+        with mock.patch.dict(os.environ, env):
+            httpd, port, thread = start_test_server(StubRouter())
+            try:
+                self.assertEqual(self.post_status(port), 401)
+                self.assertEqual(self.post_status(port, "env-token"), 200)
+                self.assertEqual(self.post_status(port, "env-token"), 429)
+            finally:
+                stop_test_server(httpd, thread)
+
+    def test_explicit_token_overrides_env(self):
+        with mock.patch.dict(os.environ, {"EVA_AUTH_TOKEN": "env-token"}):
+            httpd, port, thread = start_test_server(
+                StubRouter(), auth_token="explicit-token", rate_limit_per_min=5
+            )
+            try:
+                self.assertEqual(self.post_status(port, "explicit-token"), 200)
+                self.assertEqual(self.post_status(port, "env-token"), 401)
+                self.assertEqual(self.post_status(port), 401)
+            finally:
+                stop_test_server(httpd, thread)
+
+    def test_invalid_limit_in_env_fails_before_listen(self):
+        with mock.patch.dict(os.environ, {"EVA_RATE_LIMIT_PER_MIN": "много"}):
+            with self.assertRaises(ValueError) as caught:
+                server.create_server(host=HOST, port=0, router=StubRouter())
+
+        self.assertIn("EVA_RATE_LIMIT_PER_MIN", str(caught.exception))
+
+    def test_server_without_token_warns_at_start(self):
+        with self.assertLogs("eva.server", level="WARNING") as logs:
+            httpd = server.create_server(
+                host=HOST, port=0, router=StubRouter(), auth_token="", rate_limit_per_min=5
+            )
+        try:
+            messages = "\n".join(logs.output)
+            self.assertIn("EVA_AUTH_TOKEN", messages)
+            self.assertIn("без аутентификации", messages)
+        finally:
+            httpd.server_close()
+
+    def test_server_with_token_does_not_warn(self):
+        httpd = None
+        try:
+            with self.assertNoLogs("eva.server", level="WARNING"):
+                httpd = server.create_server(
+                    host=HOST,
+                    port=0,
+                    router=StubRouter(),
+                    auth_token="test-token",
+                    rate_limit_per_min=5,
+                )
+        finally:
+            if httpd is not None:
+                httpd.server_close()
+
+
+class TestAccessGuard(unittest.TestCase):
+    """Счётчик лимита: окно, ключи, Retry-After — без HTTP и без ожидания."""
+
+    def test_without_token_accepts_any_request(self):
+        guard = server.AccessGuard(token="", rate_limit_per_min=0)
+
+        self.assertFalse(guard.enabled)
+        self.assertTrue(guard.authorized(None))
+        self.assertTrue(guard.authorized("любой"))
+        self.assertEqual(guard.key_for(None, "10.0.0.1"), "10.0.0.1")
+
+    def test_token_must_match_exactly(self):
+        guard = server.AccessGuard(token="s3cret")
+
+        self.assertTrue(guard.enabled)
+        self.assertTrue(guard.authorized("s3cret"))
+        self.assertFalse(guard.authorized("S3CRET"))
+        self.assertFalse(guard.authorized(""))
+        self.assertFalse(guard.authorized(None))
+        self.assertEqual(guard.key_for("s3cret", "10.0.0.1"), "s3cret")
+
+    def test_limit_counts_per_key(self):
+        guard = server.AccessGuard(token="s3cret", rate_limit_per_min=2)
+
+        self.assertEqual(guard.check("key-a", now=0.0), 0.0)
+        self.assertEqual(guard.check("key-a", now=1.0), 0.0)
+        self.assertGreater(guard.check("key-a", now=2.0), 0.0)
+        self.assertEqual(guard.check("key-b", now=2.0), 0.0)
+
+    def test_retry_after_is_time_left_in_window(self):
+        guard = server.AccessGuard(token="s3cret", rate_limit_per_min=1)
+
+        self.assertEqual(guard.check("k", now=0.0), 0.0)
+        self.assertAlmostEqual(guard.check("k", now=10.0), 50.0)
+        self.assertGreaterEqual(guard.check("k", now=59.9), 1.0)
+
+    def test_window_slides(self):
+        guard = server.AccessGuard(token="s3cret", rate_limit_per_min=2)
+        guard.check("k", now=0.0)
+        guard.check("k", now=30.0)
+
+        self.assertGreater(guard.check("k", now=59.9), 0.0)
+        # отметка now=0 вышла из окна — слот освободился
+        self.assertEqual(guard.check("k", now=60.0), 0.0)
+
+    def test_zero_limit_disables_throttling(self):
+        guard = server.AccessGuard(token="", rate_limit_per_min=0)
+
+        for _ in range(100):
+            self.assertEqual(guard.check("10.0.0.1", now=0.0), 0.0)
 
 
 if __name__ == "__main__":

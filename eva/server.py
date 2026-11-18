@@ -24,17 +24,23 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
+import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from math import ceil
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
 __all__ = [
+    "AccessGuard",
+    "AUTH_HEADER",
     "DEFAULT_MODEL",
     "EvaHTTPServer",
     "EvaRequestHandler",
@@ -50,12 +56,24 @@ __all__ = [
 ]
 
 logger = logging.getLogger("eva.server")
+# Библиотека не настраивает логирование: обработчик добавляет приложение
+# (eva/__main__.py). NullHandler убирает только последний рубеж logging —
+# вывод WARNING в stderr у процесса без настроенного журнала.
+logger.addHandler(logging.NullHandler())
 
 SERVICE_NAME = "eva-server"
 #: Имя по умолчанию для ответа, если клиент не передал model.
 DEFAULT_MODEL = "eva-hybrid"
 #: Больше мегабайта тело чата не бывает: защита от случайного мусора.
 MAX_BODY_BYTES = 1024 * 1024
+#: Заголовок с ключом доступа, как у OpenAI-совместимых клиентов.
+AUTH_HEADER = "Authorization"
+#: Схема авторизации из контракта; сравнивается без учёта регистра.
+_BEARER = "bearer"
+#: Окно лимита: запросов в минуту на ключ.
+RATE_LIMIT_WINDOW_S = 60.0
+#: Больше стольких ключей лимита в памяти не держим: устаревшие вычищаются.
+_MAX_RATE_KEYS = 4096
 
 #: Сентинел «поток не дал ни одного куска» для ``next(..., _STREAM_END)``.
 _STREAM_END = object()
@@ -73,6 +91,94 @@ def version() -> str:
     except OSError:
         return "0.0.0"
     return value or "0.0.0"
+
+
+# --------------------------------------------------------------------------- #
+# Доступ: токен и лимит запросов
+# --------------------------------------------------------------------------- #
+
+
+class AccessGuard:
+    """Аутентификация по Bearer-токену и лимит запросов на ключ.
+
+    Потокобезопасен: ``ThreadingHTTPServer`` обслуживает запросы параллельно,
+    поэтому счётчики закрыты одним замком. Ключ лимита — предъявленный токен,
+    а в режиме без токена — адрес клиента: разные ключи друг другу не мешают,
+    а локальный «умный» клиент всё равно не выжжет бюджет.
+
+    Окно скользящее (``window_s``, по умолчанию минута): хранятся отметки
+    времени запросов, попавших в окно; ``Retry-After`` — сколько осталось до
+    освобождения слота, но не меньше секунды. ``rate_limit_per_min <= 0``
+    выключает лимит.
+    """
+
+    def __init__(
+        self,
+        token: str = "",
+        rate_limit_per_min: int = 60,
+        *,
+        window_s: float = RATE_LIMIT_WINDOW_S,
+    ) -> None:
+        self.token = token.strip()
+        self.rate_limit_per_min = max(0, int(rate_limit_per_min))
+        self.window_s = max(1.0, float(window_s))
+        self._lock = threading.Lock()
+        self._hits: dict[str, deque[float]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        """Включена ли проверка токена."""
+        return bool(self.token)
+
+    def authorized(self, presented: str | None) -> bool:
+        """Совпадает ли предъявленный токен с настроенным.
+
+        Сравнение постоянного времени: иначе по задержке ответа токен можно
+        подбирать посимвольно. Без настроенного токена пропускается любой.
+        """
+        if not self.token:
+            return True
+        if not presented:
+            return False
+        return hmac.compare_digest(
+            self.token.encode("utf-8"), presented.strip().encode("utf-8")
+        )
+
+    def key_for(self, presented: str | None, client_ip: str = "") -> str:
+        """Ключ лимита: токен, если он настроен, иначе адрес клиента."""
+        if self.token:
+            return presented or ""
+        return client_ip or "unknown"
+
+    def check(self, key: str, *, now: float | None = None) -> float:
+        """Учитывает запрос: ``0.0`` — можно, иначе ``Retry-After``, сек.
+
+        ``now`` — для тестов: подменяет ``time.monotonic()``, чтобы проверить
+        скольжение окна без реального ожидания минуты.
+        """
+        if self.rate_limit_per_min <= 0:
+            return 0.0
+        moment = time.monotonic() if now is None else float(now)
+        cutoff = moment - self.window_s
+        with self._lock:
+            self._prune(cutoff)
+            hits = self._hits.setdefault(key, deque())
+            while hits and hits[0] <= cutoff:
+                hits.popleft()
+            if len(hits) >= self.rate_limit_per_min:
+                return max(1.0, hits[0] + self.window_s - moment)
+            hits.append(moment)
+            return 0.0
+
+    def _prune(self, cutoff: float) -> None:
+        """Выкидывает ключи, у которых все отметки старше окна (под замком)."""
+        if len(self._hits) <= _MAX_RATE_KEYS:
+            return
+        stale = [
+            key for key, hits in self._hits.items() if not hits or hits[-1] <= cutoff
+        ]
+        for key in stale:
+            del self._hits[key]
 
 
 # --------------------------------------------------------------------------- #
@@ -407,6 +513,8 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
     # -- маршрутизация методов ------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802 - имя задано BaseHTTPRequestHandler
+        if not self._check_access():
+            return
         path = self._path()
         if path == "/health":
             self._send_health()
@@ -418,6 +526,8 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
             self._send_not_found(path)
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._check_access():
+            return
         path = self._path()
         if path == "/v1/chat/completions":
             self._handle_chat()
@@ -427,21 +537,95 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
             self._send_not_found(path)
 
     def do_PUT(self) -> None:  # noqa: N802
-        self._handle_unsupported_method()
+        if self._check_access():
+            self._handle_unsupported_method()
 
     def do_PATCH(self) -> None:  # noqa: N802
-        self._handle_unsupported_method()
+        if self._check_access():
+            self._handle_unsupported_method()
 
     def do_DELETE(self) -> None:  # noqa: N802
-        self._handle_unsupported_method()
+        if self._check_access():
+            self._handle_unsupported_method()
 
     def do_OPTIONS(self) -> None:  # noqa: N802
+        if not self._check_access():
+            return
         path = self._path()
         allow = self._allowed_methods(path)
         if allow is None:
             self._send_not_found(path)
         else:
             self._send_no_content(headers={"Allow": allow})
+
+    # -- доступ ---------------------------------------------------------------
+
+    def _bearer_token(self) -> str | None:
+        """Токен из ``Authorization: Bearer ...``; ``None`` — заголовка нет."""
+        raw = self.headers.get(AUTH_HEADER)
+        if not isinstance(raw, str):
+            return None
+        scheme, separator, value = raw.strip().partition(" ")
+        if not separator or scheme.lower() != _BEARER:
+            return None
+        token = value.strip()
+        return token or None
+
+    def _check_access(self) -> bool:
+        """Аутентификация и лимит запросов; ``False`` — ответ уже отправлен.
+
+        ``GET /health`` открыт намеренно: по нему проверяют живость процесса,
+        и он ничего не стоит. Всё остальное (включая ``/v1/models`` и
+        незнакомые пути) при заданном ``EVA_AUTH_TOKEN`` требует Bearer-токен.
+        Проверка идёт до чтения тела: без токена байты не читаем и 413 не
+        выдаём — сначала 401.
+        """
+        if self._path() == "/health":
+            return True
+        guard: AccessGuard | None = getattr(self.server, "access_guard", None)
+        if guard is None:
+            return True
+
+        presented = self._bearer_token()
+        if not guard.authorized(presented):
+            logger.warning(
+                "%s: отказ в доступе: нет валидного заголовка %s: Bearer",
+                self.address_string(),
+                AUTH_HEADER,
+            )
+            self._send_error(
+                401,
+                "Нужен заголовок Authorization: Bearer <токен>. Токен задаётся "
+                "на сервере переменной EVA_AUTH_TOKEN.",
+                "unauthorized",
+                headers={"WWW-Authenticate": 'Bearer realm="eva"'},
+            )
+            return False
+
+        key = guard.key_for(presented, self.client_address[0])
+        retry_after = guard.check(key)
+        if retry_after <= 0.0:
+            return True
+
+        seconds = max(1, int(ceil(retry_after)))
+        logger.warning(
+            "%s: превышен лимит %s запросов в минуту, повтор через %s с",
+            self.address_string(),
+            guard.rate_limit_per_min,
+            seconds,
+        )
+        self._send_error(
+            429,
+            "Превышен лимит запросов: {} в минуту на ключ. "
+            "Повторите через {} с.".format(guard.rate_limit_per_min, seconds),
+            "rate_limited",
+            headers={
+                "Retry-After": str(seconds),
+                "X-RateLimit-Limit": str(guard.rate_limit_per_min),
+                "X-RateLimit-Remaining": "0",
+            },
+        )
+        return False
 
     # -- эндпоинты ------------------------------------------------------------
 
@@ -992,17 +1176,34 @@ class EvaHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], handler: type[EvaRequestHandler], *,
-                 router_name: str = "injected") -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        handler: type[EvaRequestHandler],
+        *,
+        router_name: str = "injected",
+        access_guard: AccessGuard | None = None,
+    ) -> None:
         self.router_name = router_name
+        self.access_guard = access_guard
         self.started_at = time.monotonic()
         super().__init__(address, handler)
+
+
+def _auth_settings() -> tuple[str, int]:
+    """(токен, лимит) из ``eva.config`` — только эти две настройки."""
+    from . import config as config_module
+
+    return config_module.auth_settings()
 
 
 def create_server(
     host: str = "127.0.0.1",
     port: int = 0,
     router: Any = None,
+    *,
+    auth_token: str | None = None,
+    rate_limit_per_min: int | None = None,
 ) -> EvaHTTPServer:
     """Создаёт (но не запускает) сервер; ``port=0`` — свободный порт.
 
@@ -1010,14 +1211,42 @@ def create_server(
     ``answer(request)``. Если у него есть ещё и ``stream(request)``,
     ``stream=true`` отдаёт ответ по частям. Без ``router`` используется боевая
     связка :func:`default_router`, которая собирается лениво.
+
+    Доступ: ``auth_token`` и ``rate_limit_per_min`` по умолчанию берутся из
+    окружения (``EVA_AUTH_TOKEN``, ``EVA_RATE_LIMIT_PER_MIN``). ``None`` —
+    «взять из окружения», пустая строка и ``0`` — явно выключить проверку
+    токена и лимит соответственно. Заданный токен включает требование
+    ``Authorization: Bearer`` на всех путях, кроме ``GET /health``.
     """
+    env_token, env_limit = _auth_settings()
+    token = env_token if auth_token is None else auth_token.strip()
+    limit = (
+        env_limit
+        if rate_limit_per_min is None
+        else max(0, int(rate_limit_per_min))
+    )
+
     server = EvaHTTPServer(
         (host, port),
         make_handler(router),
         router_name="default" if router is None else "injected",
+        access_guard=AccessGuard(token=token, rate_limit_per_min=limit),
     )
-    logger.info(
-        "eva-server слушает http://%s:%s", server.server_address[0],
-        server.server_address[1],
-    )
+    bound_host, bound_port = server.server_address[:2]
+    logger.info("eva-server слушает http://%s:%s", bound_host, bound_port)
+    if token:
+        logger.info(
+            "аутентификация включена (Authorization: Bearer), лимит %s "
+            "запросов в минуту на ключ",
+            limit,
+        )
+    else:
+        logger.warning(
+            "EVA_AUTH_TOKEN не задан: сервер работает без аутентификации. "
+            "Кто дотянется до %s:%s, тот и тратит бюджет на большие модели — "
+            "наружу не выставлять. Лимит: %s запросов в минуту на адрес клиента.",
+            bound_host,
+            bound_port,
+            limit,
+        )
     return server

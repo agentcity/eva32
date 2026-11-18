@@ -17,6 +17,8 @@
 ``EVA_BIG_*``                 то же для большой модели
 ``EVA_MAX_COST_RUB``          бюджет на запрос, ₽ (``none``/отрицательное — без лимита)
 ``EVA_MAX_TOKENS``            максимум completion-токенов на ответ
+``EVA_AUTH_TOKEN``            Bearer-токен HTTP-сервера (пусто — без проверки)
+``EVA_RATE_LIMIT_PER_MIN``    запросов в минуту на ключ (``0`` — без лимита)
 ``EVA_CLASSIFIER_LONG_CHARS`` порог «длинного» запроса для классификатора
 ``EVA_CLASSIFIER_LATIN_RATIO``порог доли латиницы
 ``EVA_CLASSIFIER_MARKERS``    маркеры рассуждения через запятую
@@ -29,7 +31,17 @@ import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-__all__ = ["Config", "DEFAULT_REASON_MARKERS", "load", "from_env"]
+__all__ = [
+    "Config",
+    "DEFAULT_RATE_LIMIT_PER_MIN",
+    "DEFAULT_REASON_MARKERS",
+    "auth_settings",
+    "load",
+    "from_env",
+]
+
+#: Лимит запросов HTTP-сервера по умолчанию: в минуту на ключ.
+DEFAULT_RATE_LIMIT_PER_MIN = 60
 
 #: Маркеры, после которых малой модели обычно не хватает знаний/дисциплины.
 DEFAULT_REASON_MARKERS = (
@@ -84,6 +96,21 @@ def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
         raise ValueError(f"{name}: ожидалось целое число, получено {value!r}") from exc
 
 
+def auth_settings(env: Mapping[str, str] | None = None) -> tuple[str, int]:
+    """Токен и лимит запросов из окружения — только эти две настройки.
+
+    Серверу нужны ровно они, поэтому собирать весь :class:`Config` (с базами и
+    ценами моделей) на старте HTTP-процесса незачем. Некорректный
+    ``EVA_RATE_LIMIT_PER_MIN`` — ``ValueError``: лучше не подняться вовсе, чем
+    молча остаться без лимита. Отрицательный лимит читается как ``0``
+    (лимит выключен).
+    """
+    source = os.environ if env is None else env
+    token = _env_str(source, "EVA_AUTH_TOKEN", "")
+    limit = _env_int(source, "EVA_RATE_LIMIT_PER_MIN", DEFAULT_RATE_LIMIT_PER_MIN)
+    return token, max(0, limit)
+
+
 @dataclass(frozen=True)
 class Config:
     """Настройки маршрутизатора, клиентов, бюджета и классификатора."""
@@ -109,6 +136,10 @@ class Config:
     # --- бюджет и лимиты ---
     max_cost_rub: float | None = 5.0
     max_tokens: int = 512
+
+    # --- доступ к HTTP-серверу (eva/server.py) ---
+    auth_token: str = ""
+    rate_limit_per_min: int = DEFAULT_RATE_LIMIT_PER_MIN
 
     # --- пороги классификатора (не хардкодятся в classify) ---
     classifier_long_chars: int = 120
@@ -194,6 +225,8 @@ class Config:
             if not markers:
                 markers = DEFAULT_REASON_MARKERS
 
+        auth_token, rate_limit_per_min = auth_settings(source)
+
         return cls(
             small_base=_env_str(source, "EVA_SMALL_BASE", "http://127.0.0.1:8001/v1"),
             small_key=_env_str(source, "EVA_SMALL_KEY", ""),
@@ -211,6 +244,8 @@ class Config:
             big_price_completion_rub_per_1k=_env_float(source, "EVA_BIG_PRICE_COMPLETION", 1.2),
             max_cost_rub=max_cost,
             max_tokens=_env_int(source, "EVA_MAX_TOKENS", 512),
+            auth_token=auth_token,
+            rate_limit_per_min=rate_limit_per_min,
             classifier_long_chars=_env_int(source, "EVA_CLASSIFIER_LONG_CHARS", 120),
             classifier_latin_ratio=_env_float(source, "EVA_CLASSIFIER_LATIN_RATIO", 0.35),
             classifier_reason_markers=markers,

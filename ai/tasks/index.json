@@ -205,7 +205,7 @@
   {
     "id": "0030",
     "title": "Сервер: токен, лимиты и защита от злоупотреблений",
-    "status": "in_progress",
+    "status": "done",
     "file": "0030-eva-auth.md",
     "assignee": "agent:eva-auth"
   },
