@@ -36,6 +36,13 @@ struct vtm_api {
     uint32_t max_new_tokens;  // 0 — без лимита
     int32_t eos_token_id;     // < 0 — нет стоп-токена
     int last_status;          // код последнего generate() (для отладки)
+    // Кэш префикса промпта между запросами (задача 0087): 0 — каждый
+    // generate() начинает с vtm_reset(), 1 — префикс переиспользуется.
+    int cache_prefix;
+    // 1 — следующий generate() обязан посчитать префикс заново, не доверяя
+    // снимку ядра (ставится vtm_api_session_load(): состояние машины —
+    // K/V и позиция — заменено данными с диска).
+    int cache_invalidate;
     // Сессия KV: токен, уже отданный колбэку, но ещё не скормленный машине.
     // Снимок обязан его запомнить, иначе продолжение потеряет один шаг.
     int32_t session_token;    // значим при session_token_valid
@@ -83,6 +90,7 @@ vtm_api_t *vtm_api_open(const char *path, const vtm_api_options *opts) {
     vtm_api_t *ctx;
     const vtm_backend *backend = NULL;
     uint32_t max_new = 0;
+    uint32_t cache_prefix = 0;
     int32_t eos = -1;
     size_t i;
 
@@ -125,6 +133,12 @@ vtm_api_t *vtm_api_open(const char *path, const vtm_api_options *opts) {
         }
         max_new = opts->max_new_tokens;
         eos = opts->eos_token_id;
+        if (opts->cache_prefix > 1u) {
+            open_fail("vtm_api_open: opts->cache_prefix=%u (ожидалось 0 или 1)",
+                      (unsigned)opts->cache_prefix);
+            return NULL;
+        }
+        cache_prefix = opts->cache_prefix;
     }
 
     ctx = (vtm_api_t *)calloc(1, sizeof *ctx);
@@ -136,6 +150,7 @@ vtm_api_t *vtm_api_open(const char *path, const vtm_api_options *opts) {
     atomic_init(&ctx->busy, 0);
     ctx->max_new_tokens = max_new;
     ctx->eos_token_id = eos;
+    ctx->cache_prefix = (int)cache_prefix;
 
     ctx->m = vtm_load(path);
     if (ctx->m == NULL) {
@@ -294,6 +309,85 @@ static int api_run(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
     return api_decode(ctx, &cap, cb, user, "vtm_api_generate");
 }
 
+// То же, но с кэшем префикса (задача 0087, opts->cache_prefix == 1).
+//
+// Кэш ядра — это снимок состояния машины после прогона ровно ids[0..len):
+// K/V уже лежат в тензорах, поэтому «попадание» не пересчитывает префикс, а
+// восстанавливает снимок и продолжает с позиции len. Хост-функция
+// vtm_run_cached() не вызывает emit (это прогон промпта, а не генерация), а
+// токен, выбранный SAMP на последнем токене промпта, нужен: с него начинается
+// api_decode(). Поэтому кэшируются все токены промпта, кроме последнего
+// (n-1): последний прогоняется здесь же с колбэком, как в api_run(). Цена —
+// один токен на запрос, выигрыш — весь остальной префикс.
+//
+// vtm_reset() в этом пути не вызывается: на промахе его делает сам
+// vtm_run_cached(), на попадании снимок восстанавливает позицию, счётчик и
+// состояние сэмплера. Сессия KV меняет состояние машины (K/V и позицию), не
+// трогая снимок, поэтому после vtm_api_session_load() ставится
+// cache_invalidate: следующий прогон префикса считается заново
+// (vtm_cache_prefix — это vtm_reset() + полный прогон + новый снимок).
+static int api_run_cached(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
+                          vtm_api_token_cb cb, void *user) {
+    vtm_t *m = ctx->m;
+    const size_t prefill = n - 1; // n >= 1 проверено vtm_api_generate()
+    api_emit cap;
+    vtm_status st;
+    size_t i;
+
+    ctx->session_token_valid = 0;
+
+    // Отрицательные id проверяются до прогона: vtm_run_cached() неделим и не
+    // даёт точки, где api_run() поймал бы VTM_E_ARG на середине промпта.
+    for (i = 0; i < n; i++) {
+        if (prompt_ids[i] < 0) {
+            return api_fail(ctx, VTM_E_ARG,
+                            "vtm_api_generate: prompt_ids[%zu]=%d отрицателен",
+                            i, (int)prompt_ids[i]);
+        }
+    }
+    if (api_cancelled(ctx)) {
+        return api_stop(ctx, VTM_API_CANCELLED);
+    }
+
+    if (ctx->cache_invalidate) {
+        st = vtm_cache_prefix(m, prompt_ids, (int)prefill);
+        ctx->cache_invalidate = 0;
+    } else {
+        st = vtm_run_cached(m, prompt_ids, (int)prefill);
+    }
+    if (st != VTM_OK) {
+        return api_fail(ctx, (int)st,
+                        "vtm_api_generate: промпт[0..%zu): %s: %s", prefill,
+                        vtm_strerror(st), vtm_error_message(m));
+    }
+    // Отмена во время префикса приходит уже после прогона (vtm_run_cached()
+    // неделим): проверяем здесь, чтобы не начинать генерацию.
+    if (api_cancelled(ctx)) {
+        return api_stop(ctx, VTM_API_CANCELLED);
+    }
+
+    // Последний токен промпта — ровно как в api_run(): с emit, потому что
+    // SAMP на нём выбирает первый токен ответа.
+    memset(&cap, 0, sizeof cap);
+    vtm_set_position(m, (int)prefill);
+    vtm_set_token(m, (int)prompt_ids[prefill]);
+    st = vtm_run(m, api_emit_cb, &cap);
+    if (st != VTM_OK) {
+        return api_fail(ctx, (int)st, "vtm_api_generate: промпт[%zu]: %s: %s",
+                        prefill, vtm_strerror(st), vtm_error_message(m));
+    }
+    if (api_cancelled(ctx)) {
+        return api_stop(ctx, VTM_API_CANCELLED);
+    }
+    if (!cap.have) {
+        return api_fail(ctx, VTM_E_ARG,
+                        "vtm_api_generate: программа не вызвала SAMP на "
+                        "последнем токене промпта");
+    }
+
+    return api_decode(ctx, &cap, cb, user, "vtm_api_generate");
+}
+
 int vtm_api_generate(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
                      vtm_api_token_cb cb, void *user) {
     int expected = 0;
@@ -327,6 +421,8 @@ int vtm_api_generate(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
 
     if (api_cancelled(ctx)) {
         rc = api_stop(ctx, VTM_API_CANCELLED);
+    } else if (ctx->cache_prefix) {
+        rc = api_run_cached(ctx, prompt_ids, n, cb, user);
     } else {
         rc = api_run(ctx, prompt_ids, n, cb, user);
     }
@@ -403,6 +499,10 @@ int vtm_api_session_load(vtm_api_t *ctx, const char *path) {
         // pending < 0 — сессия закончилась HALT'ом, продолжать нечем.
         ctx->session_token = pending;
         ctx->session_token_valid = (pending >= 0);
+        // K/V и позиция заменены данными с диска: снимок кэша префикса
+        // (задача 0087) описывает уже не это состояние — следующий
+        // generate() обязан посчитать префикс заново.
+        ctx->cache_invalidate = 1;
     } else {
         ctx->last_status = rc;
         if (ctx->error[0] == '\0') {

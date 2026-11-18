@@ -569,7 +569,7 @@
   {
     "id": "0087",
     "title": "Кэш промпта в C-ABI: не сбрасывать между запросами",
-    "status": "in_progress",
+    "status": "done",
     "file": "0087-api-cache.md",
     "assignee": ""
   },
@@ -628,5 +628,12 @@
     "status": "done",
     "file": "0095-tiny-qat-cpu.md",
     "assignee": "agent:tiny-qat-cpu"
+  },
+  {
+    "id": "0096",
+    "title": "eva: включить кэш префикса в Python-бэкенде",
+    "status": "pending",
+    "file": "0096-eva-cache-flag.md",
+    "assignee": ""
   }
 ]

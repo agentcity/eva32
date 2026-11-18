@@ -113,7 +113,11 @@ class QuantConfig:
     """Что и как квантуем."""
 
     block_size: int = 128
-    scale_dtype: str = "float16"
+    # float32 по умолчанию с 2026-11-18 (решение Юрия). Измерено на крошечной
+    # модели (0095): fp16-масштабы дают max|Δ| логитов 1,7e-03, fp32 — 4,3e-06.
+    # При пороге паритета 1e-4 fp16 не проходит, и «расхождение» не отличить от
+    # настоящей ошибки рантайма. Цена — ~2% размера (на 1.5B это ~23 МБ).
+    scale_dtype: str = "float32"
     target_suffixes: tuple[str, ...] = field(default=DEFAULT_TARGET_SUFFIXES)
     exclude_suffixes: tuple[str, ...] = field(default=DEFAULT_EXCLUDE_SUFFIXES)
     # Эмбеддинги отдельным решением: "none" (fp16/fp32), "int8" или "trit".

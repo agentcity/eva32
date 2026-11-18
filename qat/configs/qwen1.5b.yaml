@@ -26,8 +26,9 @@ quant:
   # absmax по 128 элементам вдоль входной размерности (последней оси веса).
   # 1536 и 8960 делятся на 128 без остатка, поэтому padding не нужен.
   block_size: 128
-  # float16 экономит половину места под масштабы; float32 — если нужна точность.
-  scale_dtype: float16
+  # float32: fp16-масштабы дают max|Δ| логитов ~1,7e-03 и не проходят порог
+  # паритета 1e-4 (замер 0095). Цена — ~2% размера.
+  scale_dtype: float32
   # Только эти проекции. gate_proj/up_proj/down_proj — FFN, q/k/v/o — attention.
   target_suffixes: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
   # Защита от случайного квантования выхода, эмбеддингов и роутеров MoE.
