@@ -488,5 +488,33 @@
     "status": "done",
     "file": "0075-attn-overflow.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0076",
+    "title": "ATTN: блочный attention с онлайн-softmax + окно контекста",
+    "status": "in_progress",
+    "file": "0076-vtm-attn-tiling.md",
+    "assignee": "agent:vtm-attn-tiling"
+  },
+  {
+    "id": "0077",
+    "title": "Многопоточность ядер: TMV/MM/RMSN по строкам",
+    "status": "in_progress",
+    "file": "0077-vtm-threads.md",
+    "assignee": "agent:vtm-threads"
+  },
+  {
+    "id": "0078",
+    "title": "Быстрая проверка целостности: SHA-NI/ARMv8 + кеш",
+    "status": "in_progress",
+    "file": "0078-vtm-sha-fast.md",
+    "assignee": "agent:vtm-sha-fast"
+  },
+  {
+    "id": "0079",
+    "title": "Сессии KV: снимок и восстановление по ADR 0008",
+    "status": "in_progress",
+    "file": "0079-vtm-kv-session.md",
+    "assignee": "agent:vtm-kv-session"
   }
 ]
