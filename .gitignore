@@ -272,3 +272,7 @@ src/vtm/test_vtm_session
 .pylibs/
 runs/
 *.dSYM/
+# Внешние датасеты и кэш HuggingFace: качаются заново, в репозиторий не идут.
+distill/pulled/
+.hfcache/
+distill/business_*_q.jsonl
