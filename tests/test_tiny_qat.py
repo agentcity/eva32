@@ -235,6 +235,10 @@ class ParseVtmRunTest(unittest.TestCase):
         self.assertEqual(parsed["generated"], [])
 
 
+@unittest.skipUnless(
+    os.path.exists(str(tiny.VAL_PATH)),
+    "нет data/val.jsonl (генерируется tools/prepare_qat_data.py, в git не лежит)",
+)
 class DataFilesTest(unittest.TestCase):
     """Пара question/answer из data/ читается без torch."""
 
