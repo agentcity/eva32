@@ -401,7 +401,7 @@
   {
     "id": "0063",
     "title": "Стриминг из CLI и безопасный UTF-8",
-    "status": "in_progress",
+    "status": "done",
     "file": "0063-vtm-stream-cli.md",
     "assignee": "agent:vtm-stream-cli"
   },

@@ -110,6 +110,54 @@ std::string utf8_sanitize(const std::string &bytes) {
     return out;
 }
 
+// Выпустить из bytes завершённые UTF-8 символы в out, оставив в bytes
+// недописанный хвост (не больше 3 байт). at_end == true: хвост больше не
+// допишется (конец генерации или сменился тип токена), поэтому битые байты
+// заменяются на U+FFFD — так ничего не теряется и не рвётся UTF-8.
+void utf8_emit_complete(std::string &bytes, std::string &out, bool at_end) {
+    std::size_t i = 0;
+    while (i < bytes.size()) {
+        const unsigned char c = static_cast<unsigned char>(bytes[i]);
+        if (c < 0x80) {
+            out.push_back(static_cast<char>(c));
+            ++i;
+            continue;
+        }
+        uint32_t cp = 0;
+        std::size_t len = 0;
+        if (utf8_decode(bytes, i, &cp, &len)) {
+            out.append(bytes, i, len);
+            i += len;
+            continue;
+        }
+        if (!at_end) {
+            // Сколько байт нужно символу с таким ведущим байтом (0 — байт
+            // не может начинать UTF-8 последовательность).
+            std::size_t need = 0;
+            if (c >= 0xC2 && c <= 0xDF) need = 2;
+            else if (c >= 0xE0 && c <= 0xEF) need = 3;
+            else if (c >= 0xF0 && c <= 0xF4) need = 4;
+            if (need != 0 && bytes.size() - i < need) {
+                // Не хватает байт: если все имеющиеся — продолжения, это
+                // недописанный символ, ждём следующий токен. Если нет —
+                // последовательность уже точно битая, не задерживаем.
+                bool plausible = true;
+                for (std::size_t k = 1; i + k < bytes.size(); ++k) {
+                    if ((static_cast<unsigned char>(bytes[i + k]) & 0xC0) !=
+                        0x80) {
+                        plausible = false;
+                        break;
+                    }
+                }
+                if (plausible) break;
+            }
+        }
+        utf8_append(out, kReplacement);
+        ++i;
+    }
+    if (i != 0) bytes.erase(0, i);
+}
+
 // ---------------------------------------------------------------------------
 // Классы символов для GPT-2 regex (приближение \p{L}, \p{N}, \s).
 // Полные Unicode-таблицы в рантайм не тянем; покрыты основные письменности.
@@ -1550,6 +1598,78 @@ std::string Tokenizer::decode(const std::vector<int32_t> &ids) const {
         }
     }
     flush_pending();
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Tokenizer: инкрементальный decode (стриминг по одному токену)
+// ---------------------------------------------------------------------------
+
+std::string DecoderStream::push(int32_t id, bool *stop) {
+    const Tokenizer &t = *tok_;
+    if (stop != nullptr) *stop = false;
+    if (id < 0 || static_cast<std::size_t>(id) >= t.id_to_token_.size() ||
+        t.id_to_token_[static_cast<std::size_t>(id)].empty()) {
+        throw TokenizerError("decode: неизвестный token id = " +
+                             std::to_string(id));
+    }
+    const std::size_t uid = static_cast<std::size_t>(id);
+    std::string out;
+
+    // Стоп-токен: текст не выдаём, генерацию пора заканчивать. Недописанный
+    // хвост отдаст finish() — не теряем возможный последний символ.
+    if (t.is_stop_token(id)) {
+        if (stop != nullptr) *stop = true;
+        return out;
+    }
+
+    const std::string &tok = t.id_to_token_[uid];
+    const bool is_added = uid < t.is_added_.size() && t.is_added_[uid] != 0;
+    if (is_added) {
+        // Управляющий добавочный токен (<|im_end|> и пр.) в текст не идёт.
+        if (t.is_special_token(id)) return out;
+        // Обычный добавочный токен — готовый текст, но до него надо
+        // доизвлечь всё, что успело накопиться.
+        utf8_emit_complete(pending_, out, true);
+        out += tok;
+        return out;
+    }
+    if (!t.decoder_byte_level_) {
+        utf8_emit_complete(pending_, out, true);
+        out += tok;
+        return out;
+    }
+
+    // byte-level: символы токена — это байты UTF-8 текста. Копим их; отдаём
+    // только целые символы, хвост (до 3 байт) ждёт следующий токен.
+    const ByteTables &tables = byte_tables();
+    std::size_t i = 0;
+    while (i < tok.size()) {
+        uint32_t cp = 0;
+        std::size_t len = 0;
+        if (!utf8_decode(tok, i, &cp, &len)) {
+            pending_.push_back(tok[i]);
+            ++i;
+            continue;
+        }
+        const auto it = tables.dec.find(cp);
+        if (it != tables.dec.end()) {
+            pending_.push_back(static_cast<char>(it->second));
+        } else {
+            pending_.append(tok, i, len);
+        }
+        i += len;
+    }
+    utf8_emit_complete(pending_, out, false);
+    return out;
+}
+
+std::string DecoderStream::finish() {
+    std::string out;
+    // Конец генерации: недописанный символ показать уже нечем, но и терять
+    // его нельзя — отдаём U+FFFD вместо сырых байт, чтобы stdout оставался
+    // валидным UTF-8.
+    utf8_emit_complete(pending_, out, true);
     return out;
 }
 

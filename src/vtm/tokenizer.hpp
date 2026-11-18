@@ -23,6 +23,9 @@
 
 namespace vtm {
 
+class Tokenizer;
+class DecoderStream;
+
 class TokenizerError : public std::runtime_error {
 public:
     explicit TokenizerError(const std::string &message)
@@ -112,8 +115,64 @@ public:
         return out;
     }
 
+    // Стоп-токены из tokenizer.json: model.eos_token (info_.eos_id) и
+    // special added_tokens с типовым маркером конца (<|im_end|>,
+    // <|endoftext|>, <|eot_id|>, ...). Идентификаторы берутся из словаря,
+    // в коде их нет: словарь с другими id даёт другие стоп-токены.
+    std::vector<int32_t> stop_token_ids() const {
+        std::vector<int32_t> out;
+        if (info_.eos_id >= 0) out.push_back(info_.eos_id);
+        for (const AddedToken &t : added_) {
+            if (!t.special || !is_end_marker(t.content)) continue;
+            bool seen = false;
+            for (const int32_t id : out) {
+                if (id == t.id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) out.push_back(t.id);
+        }
+        return out;
+    }
+
+    bool is_stop_token(int32_t id) const {
+        if (info_.eos_id >= 0 && id == info_.eos_id) return true;
+        for (const AddedToken &t : added_) {
+            if (t.id == id) return t.special && is_end_marker(t.content);
+        }
+        return false;
+    }
+
+    // added_token с special == true — управляющий токен, в текст не идёт.
+    bool is_special_token(int32_t id) const {
+        for (const AddedToken &t : added_) {
+            if (t.id == id) return t.special;
+        }
+        return false;
+    }
+
 private:
     friend class TokenizerBuilder;
+    friend class DecoderStream;
+
+    // Похоже ли содержимое токена на маркер конца генерации. Регистр не
+    // важен; список намеренно короткий, чтобы не принять за стоп обычный
+    // текстовый added_token.
+    static bool is_end_marker(const std::string &content) {
+        std::string low;
+        low.reserve(content.size());
+        for (const char c : content) {
+            low.push_back(c >= 'A' && c <= 'Z'
+                              ? static_cast<char>(c - 'A' + 'a')
+                              : c);
+        }
+        return low.find("im_end") != std::string::npos ||
+               low.find("endoftext") != std::string::npos ||
+               low.find("end_of_text") != std::string::npos ||
+               low.find("eot_id") != std::string::npos ||
+               low.find("eos") != std::string::npos;
+    }
 
     struct AddedToken {
         std::string content;
@@ -150,6 +209,28 @@ private:
     std::vector<int32_t> bpe(const std::string &piece) const;
     bool match_added(const std::string &text, std::size_t pos,
                      bool allow_special, std::size_t *len, int32_t *id) const;
+};
+
+// Инкрементальный декодер для стриминга: один вызов push() на сгенерированный
+// токен. Между токенами держит недописанные байты UTF-8 (символ может быть
+// разрезан на два BPE-токена) и отдаёт только завершённые символы; finish()
+// отдаёт хвост (невалидные байты заменяются на U+FFFD, чтобы ничего не
+// потерять). Спецтокены в текст не попадают, на стоп-токене push()
+// выставляет stop = true.
+class DecoderStream {
+public:
+    explicit DecoderStream(const Tokenizer &tok) : tok_(&tok) {}
+
+    // Вернуть готовые к печати байты (может быть пусто). stop — встретился
+    // стоп-токен: генерацию пора оборвать, текст токена не выдан.
+    std::string push(int32_t id, bool *stop = nullptr);
+    // Отдать недописанный хвост. После вызова буфер пуст.
+    std::string finish();
+    bool has_pending() const { return !pending_.empty(); }
+
+private:
+    const Tokenizer *tok_;
+    std::string pending_;  // байты недописанного UTF-8 символа
 };
 
 } // namespace vtm

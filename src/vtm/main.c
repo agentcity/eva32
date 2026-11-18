@@ -165,6 +165,103 @@ int vtm_tok_decode(vtm_tok *handle, const int32_t *ids, size_t n,
     }
 }
 
+// --- стриминг: инкрементальный декодер по одному токену --------------------
+//
+// Один объект — одна генерация. Держит недописанные байты UTF-8 между
+// токенами (буква может прийти двумя BPE-токенами), не печатает спецтокены и
+// сообщает о стоп-токене.
+
+struct vtm_tok_stream {
+    vtm::DecoderStream *dec;
+};
+
+static char *stream_dup(const std::string &text) {
+    char *copy = (char *)std::malloc(text.size() + 1);
+    if (copy == NULL) return NULL;
+    std::memcpy(copy, text.data(), text.size());
+    copy[text.size()] = '\0';
+    return copy;
+}
+
+vtm_tok_stream *vtm_tok_stream_open(vtm_tok *handle) {
+    if (handle == NULL) return NULL;
+    try {
+        vtm_tok_stream *s = new vtm_tok_stream;
+        s->dec = NULL;
+        try {
+            s->dec = new vtm::DecoderStream(handle->tok);
+        } catch (...) {
+            delete s;
+            throw;
+        }
+        return s;
+    } catch (...) {
+        return NULL;
+    }
+}
+
+void vtm_tok_stream_close(vtm_tok_stream *s) {
+    if (s == NULL) return;
+    delete s->dec;
+    delete s;
+}
+
+int vtm_tok_stream_push(vtm_tok_stream *s, int32_t id, char **out_text,
+                        int *out_stop, int32_t *out_stop_id, char *err,
+                        size_t errlen) {
+    if (out_text != NULL) *out_text = NULL;
+    if (out_stop != NULL) *out_stop = 0;
+    if (out_stop_id != NULL) *out_stop_id = -1;
+    if (s == NULL || s->dec == NULL || out_text == NULL || out_stop == NULL) {
+        bridge_error(err, errlen, "стриминговый декодер не инициализирован");
+        return -1;
+    }
+    try {
+        bool stop = false;
+        const std::string piece = s->dec->push(id, &stop);
+        char *copy = stream_dup(piece);
+        if (copy == NULL) {
+            bridge_error(err, errlen, "не хватило памяти под текст токена");
+            return -1;
+        }
+        *out_text = copy;
+        *out_stop = stop ? 1 : 0;
+        if (out_stop_id != NULL) *out_stop_id = stop ? id : -1;
+        return 0;
+    } catch (const std::exception &e) {
+        bridge_error(err, errlen, e.what());
+        return -1;
+    } catch (...) {
+        bridge_error(err, errlen, "неизвестная ошибка стримингового декодера");
+        return -1;
+    }
+}
+
+int vtm_tok_stream_finish(vtm_tok_stream *s, char **out_text, char *err,
+                          size_t errlen) {
+    if (out_text != NULL) *out_text = NULL;
+    if (s == NULL || s->dec == NULL || out_text == NULL) {
+        bridge_error(err, errlen, "стриминговый декодер не инициализирован");
+        return -1;
+    }
+    try {
+        const std::string tail = s->dec->finish();
+        char *copy = stream_dup(tail);
+        if (copy == NULL) {
+            bridge_error(err, errlen, "не хватило памяти под хвост ответа");
+            return -1;
+        }
+        *out_text = copy;
+        return 0;
+    } catch (const std::exception &e) {
+        bridge_error(err, errlen, e.what());
+        return -1;
+    } catch (...) {
+        bridge_error(err, errlen, "неизвестная ошибка стримингового декодера");
+        return -1;
+    }
+}
+
 // added_tokens: чат-шаблон берёт из них content/id спецтокенов
 // (<|im_start|>, <|im_end|>), поэтому id в C-части не захардкожены.
 int vtm_tok_added_count(vtm_tok *handle) {
@@ -242,6 +339,19 @@ int vtm_tok_added_at(vtm_tok *handle, int index, char **out_content,
 void vtm_tok_free_ids(int32_t *ids);
 void vtm_tok_free_text(char *text);
 
+// Стриминговый декодер (--stream): один объект на генерацию.
+typedef struct vtm_tok_stream vtm_tok_stream;
+vtm_tok_stream *vtm_tok_stream_open(vtm_tok *handle);
+void vtm_tok_stream_close(vtm_tok_stream *s);
+// 0 — ок; *out_text — malloc-строка готовых байт (может быть пустой),
+// *out_stop = 1 — встретился стоп-токен (*out_stop_id — его id).
+int vtm_tok_stream_push(vtm_tok_stream *s, int32_t id, char **out_text,
+                        int *out_stop, int32_t *out_stop_id, char *err,
+                        size_t errlen);
+// Отдать недописанный хвост (битые байты -> U+FFFD).
+int vtm_tok_stream_finish(vtm_tok_stream *s, char **out_text, char *err,
+                          size_t errlen);
+
 static void usage(FILE *out) {
     fprintf(out,
         "VTM — скалярный интерпретатор виртуальной троичной машины (v0.1)\n"
@@ -257,6 +367,12 @@ static void usage(FILE *out) {
         "      --chat                 обернуть текст в чат-шаблон Qwen2.5\n"
         "                             (<|im_start|>system/user/assistant <|im_end|>)\n"
         "      --system \"...\"         системное сообщение; только вместе с --chat\n"
+        "      --stream               печатать ответ по мере генерации (stdout,\n"
+        "                             без буферизации строки; только с --text).\n"
+        "                             Декодер ждёт завершения UTF-8 символа и\n"
+        "                             не печатает спецтокены; на стоп-токене\n"
+        "                             генерация обрывается. Служебные строки —\n"
+        "                             в stderr.\n"
         "      --backend auto|simd|scalar|lut|direct  бэкенд (по умолчанию VTM_BACKEND или lut)\n"
         "\n"
         "  vtm inspect model.vtm\n"
@@ -363,11 +479,49 @@ static int emit_first(void *user, int token, int position) {
     return 0;
 }
 
-static void print_tokens(const char *label, const int *v, size_t n) {
+static void print_tokens(FILE *out, const char *label, const int *v, size_t n) {
     size_t i;
-    printf("%s", label);
-    for (i = 0; i < n; i++) printf("%s%d", i ? " " : "", v[i]);
-    printf("\n");
+    fprintf(out, "%s", label);
+    for (i = 0; i < n; i++) fprintf(out, "%s%d", i ? " " : "", v[i]);
+    fprintf(out, "\n");
+}
+
+// --- --stream: печать по токену -------------------------------------------
+//
+// Токен декодируется инкрементально: декодер держит недописанный хвост
+// UTF-8, поэтому stdout получает только целые символы. Спецтокены не
+// печатаются, стоп-токен обрывает генерацию (см. DecoderStream).
+typedef struct {
+    vtm_tok_stream *stream;
+    int stopped;
+    int32_t stop_id;
+} stream_state;
+
+// 0 — ок, -1 — ошибка декодера/записи (текст в err).
+static int stream_token(stream_state *ss, int token, char *err, size_t errlen) {
+    char *piece = NULL;
+    int stop = 0;
+    int32_t stop_id = -1;
+    size_t len = 0;
+    int rc;
+
+    if (ss->stream == NULL) return 0;
+    rc = vtm_tok_stream_push(ss->stream, (int32_t)token, &piece, &stop,
+                             &stop_id, err, errlen);
+    if (rc != 0) return -1;
+    if (piece != NULL) len = strlen(piece);
+    if (len != 0 && fwrite(piece, 1, len, stdout) != len) {
+        vtm_tok_free_text(piece);
+        snprintf(err, errlen, "не удалось записать текст в stdout");
+        return -1;
+    }
+    if (len != 0) fflush(stdout);
+    vtm_tok_free_text(piece);
+    if (stop) {
+        ss->stopped = 1;
+        ss->stop_id = stop_id;
+    }
+    return 0;
 }
 
 // --- чат-шаблон Qwen2.5 ----------------------------------------------------
@@ -516,16 +670,19 @@ static int cmd_run(int argc, char **argv) {
     const char *system_s = NULL;
     const char *backend_name = NULL;  /* не задан — решает VTM_BACKEND/загрузчик */
     int chat = 0;
+    int stream = 0;
     int max_new = 8;
     int *tokens = NULL;
     size_t n_tokens = 0;
     int *generated = NULL;
     size_t n_generated = 0;
     vtm_tok *tokenizer = NULL;
+    vtm_tok_stream *tok_stream = NULL;
     char *prompt = NULL;
     char *answer = NULL;
     char tok_err[512];
     vtm_t *m;
+    stream_state ss;
     clock_t c0, c1;
     int i;
 
@@ -550,6 +707,8 @@ static int cmd_run(int argc, char **argv) {
             tokenizer_s = argv[i];
         } else if (strcmp(argv[i], "--chat") == 0) {
             chat = 1;
+        } else if (strcmp(argv[i], "--stream") == 0) {
+            stream = 1;
         } else if (strcmp(argv[i], "--system") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "vtm run: --system без значения\n");
@@ -592,6 +751,10 @@ static int cmd_run(int argc, char **argv) {
     }
     if (chat && !text_s) {
         fprintf(stderr, "vtm run: --chat имеет смысл только с --text\n");
+        return 2;
+    }
+    if (stream && !text_s) {
+        fprintf(stderr, "vtm run: --stream имеет смысл только с --text\n");
         return 2;
     }
     if (system_s && !chat) {
@@ -682,16 +845,22 @@ static int cmd_run(int argc, char **argv) {
     if (backend_name)
         vtm_set_backend(m, vtm_backend_by_name(backend_name));
 
-    printf("модель: %s\n", path);
-    printf("тензоров: %u, инструкций: %u, бэкенд: %s\n",
-           (unsigned)vtm_tensor_count(m), (unsigned)vtm_instr_count(m),
-           vtm_backend_name(m));
-    if (system_s) printf("система: %s\n", system_s);
-    if (text_s) printf("текст:   %s\n", text_s);
-    if (prompt) {
-        printf("шаблон:\n%sконец шаблона\n", prompt);
-        free(prompt);
-        prompt = NULL;
+    // В режиме --stream stdout отдан только тексту ответа (его читают голос и
+    // SSE), поэтому вся служебная информация уходит в stderr. Без --stream
+    // вывод прежний — в stdout.
+    {
+        FILE *info = stream ? stderr : stdout;
+        fprintf(info, "модель: %s\n", path);
+        fprintf(info, "тензоров: %u, инструкций: %u, бэкенд: %s\n",
+                (unsigned)vtm_tensor_count(m), (unsigned)vtm_instr_count(m),
+                vtm_backend_name(m));
+        if (system_s) fprintf(info, "система: %s\n", system_s);
+        if (text_s) fprintf(info, "текст:   %s\n", text_s);
+        if (prompt) {
+            fprintf(info, "шаблон:\n%sконец шаблона\n", prompt);
+            free(prompt);
+            prompt = NULL;
+        }
     }
 
     if (max_new > 0) {
@@ -705,6 +874,22 @@ static int cmd_run(int argc, char **argv) {
         }
     }
 
+    memset(&ss, 0, sizeof ss);
+    ss.stop_id = -1;
+    if (stream) {
+        tok_stream = vtm_tok_stream_open(tokenizer);
+        if (!tok_stream) {
+            fprintf(stderr, "vtm run: не удалось создать стриминговый "
+                            "декодер\n");
+            vtm_free(m);
+            free(tokens);
+            free(generated);
+            vtm_tok_close(tokenizer);
+            return 1;
+        }
+        ss.stream = tok_stream;
+    }
+
     c0 = clock();
     if (max_new == 0) {
         for (i = 0; i < (int)n_tokens; i++) {
@@ -715,6 +900,7 @@ static int cmd_run(int argc, char **argv) {
             if (st != VTM_OK) {
                 fprintf(stderr, "vtm run: %s: %s\n", vtm_strerror(st),
                         vtm_error_message(m));
+                vtm_tok_stream_close(tok_stream);
                 vtm_free(m);
                 free(tokens);
                 free(generated);
@@ -735,6 +921,7 @@ static int cmd_run(int argc, char **argv) {
             if (st != VTM_OK) {
                 fprintf(stderr, "vtm run: %s: %s\n", vtm_strerror(st),
                         vtm_error_message(m));
+                vtm_tok_stream_close(tok_stream);
                 vtm_free(m);
                 free(tokens);
                 free(generated);
@@ -750,6 +937,7 @@ static int cmd_run(int argc, char **argv) {
         if (st != VTM_OK) {
             fprintf(stderr, "vtm run: %s: %s\n", vtm_strerror(st),
                     vtm_error_message(m));
+            vtm_tok_stream_close(tok_stream);
             vtm_free(m);
             free(tokens);
             free(generated);
@@ -762,9 +950,20 @@ static int cmd_run(int argc, char **argv) {
         if (es.have) {
             generated[n_generated++] = es.token;
             last = es.token;
+            if (stream && stream_token(&ss, es.token, tok_err,
+                                       sizeof tok_err) != 0) {
+                fprintf(stderr, "vtm run: --stream: %s\n", tok_err);
+                vtm_tok_stream_close(tok_stream);
+                vtm_free(m);
+                free(tokens);
+                free(generated);
+                vtm_tok_close(tokenizer);
+                return 1;
+            }
         } else {
             fprintf(stderr, "vtm run: программа не вызвала SAMP; "
                             "генерировать нечего\n");
+            vtm_tok_stream_close(tok_stream);
             vtm_free(m);
             free(tokens);
             free(generated);
@@ -772,7 +971,7 @@ static int cmd_run(int argc, char **argv) {
             return 1;
         }
 
-        while (n_generated < (size_t)max_new) {
+        while (!ss.stopped && n_generated < (size_t)max_new) {
             memset(&es, 0, sizeof es);
             // Входной токен previous стоит на позиции len(prompt)+step-1.
             vtm_set_position(m, (int)(n_tokens + n_generated - 1));
@@ -781,6 +980,7 @@ static int cmd_run(int argc, char **argv) {
             if (st != VTM_OK) {
                 fprintf(stderr, "vtm run: %s: %s\n", vtm_strerror(st),
                         vtm_error_message(m));
+                vtm_tok_stream_close(tok_stream);
                 vtm_free(m);
                 free(tokens);
                 free(generated);
@@ -793,11 +993,53 @@ static int cmd_run(int argc, char **argv) {
                                 "CLI берёт первый токен\n", es.count);
             generated[n_generated++] = es.token;
             last = es.token;
+            if (stream && stream_token(&ss, es.token, tok_err,
+                                       sizeof tok_err) != 0) {
+                fprintf(stderr, "vtm run: --stream: %s\n", tok_err);
+                vtm_tok_stream_close(tok_stream);
+                vtm_free(m);
+                free(tokens);
+                free(generated);
+                vtm_tok_close(tokenizer);
+                return 1;
+            }
         }
     }
     c1 = clock();
 
-    if (text_s) {
+    // Конец генерации: отдать недописанный хвост символа, если он остался.
+    if (stream) {
+        char *tail = NULL;
+        size_t len = 0;
+        if (vtm_tok_stream_finish(tok_stream, &tail, tok_err,
+                                  sizeof tok_err) != 0) {
+            fprintf(stderr, "vtm run: --stream: %s\n", tok_err);
+            vtm_tok_stream_close(tok_stream);
+            vtm_free(m);
+            free(tokens);
+            free(generated);
+            vtm_tok_close(tokenizer);
+            return 1;
+        }
+        if (tail != NULL) len = strlen(tail);
+        if (len != 0 && fwrite(tail, 1, len, stdout) != len) {
+            fprintf(stderr, "vtm run: --stream: не удалось записать текст "
+                            "в stdout\n");
+            vtm_tok_free_text(tail);
+            vtm_tok_stream_close(tok_stream);
+            vtm_free(m);
+            free(tokens);
+            free(generated);
+            vtm_tok_close(tokenizer);
+            return 1;
+        }
+        if (len != 0) fflush(stdout);
+        vtm_tok_free_text(tail);
+        vtm_tok_stream_close(tok_stream);
+        tok_stream = NULL;
+    }
+
+    if (text_s && !stream) {
         int32_t *gen_ids = NULL;
         if (n_generated != 0) {
             gen_ids = (int32_t *)malloc(n_generated * sizeof(int32_t));
@@ -828,22 +1070,26 @@ static int cmd_run(int argc, char **argv) {
 
     {
         double sec = (double)(c1 - c0) / (double)CLOCKS_PER_SEC;
-        print_tokens("prompt: ", tokens, n_tokens);
+        FILE *info = stream ? stderr : stdout;
+        print_tokens(info, "prompt: ", tokens, n_tokens);
         if (n_generated)
-            print_tokens("вывод:  ", generated, n_generated);
+            print_tokens(info, "вывод:  ", generated, n_generated);
         else
-            printf("вывод:  (пусто)\n");
-        if (text_s) {
+            fprintf(info, "вывод:  (пусто)\n");
+        if (stream) {
+            if (ss.stopped)
+                fprintf(info, "стоп-токен: %d\n", (int)ss.stop_id);
+        } else if (text_s) {
             if (answer && *answer)
-                printf("ответ:   %s\n", answer);
+                fprintf(info, "ответ:   %s\n", answer);
             else
-                printf("ответ:   (пусто)\n");
+                fprintf(info, "ответ:   (пусто)\n");
         }
-        printf("время: %.3f мс", sec * 1000.0);
+        fprintf(info, "время: %.3f мс", sec * 1000.0);
         if (n_generated)
-            printf(", %zu токен(ов), %.1f ток/с", n_generated,
-                   sec > 0.0 ? (double)n_generated / sec : 0.0);
-        printf("\n");
+            fprintf(info, ", %zu токен(ов), %.1f ток/с", n_generated,
+                    sec > 0.0 ? (double)n_generated / sec : 0.0);
+        fprintf(info, "\n");
     }
 
     vtm_free(m);
