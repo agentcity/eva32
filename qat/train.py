@@ -543,6 +543,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rows,
                 tokenizer,
                 max_seq_len=cfg.data.max_seq_len,
+                long_pairs=cfg.data.long_pairs,
                 min_answer_tokens=cfg.data.min_answer_tokens,
                 use_teacher_logits=cfg.data.use_teacher_logits,
                 vocab_size=vocab_size,

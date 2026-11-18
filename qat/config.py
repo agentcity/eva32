@@ -132,6 +132,11 @@ class DataConfig:
 
     path: str = "distill/out/pairs.jsonl"
     max_seq_len: int = 2048
+    # Что делать с парой, которая не влезает в max_seq_len: "truncate" — обрезать
+    # ответ (хвост теряется, данные остаются) или "drop" — выбросить пару.
+    # Замер 0092: 15,6% пар длиннее 2048, поэтому drop терял бы шестую часть
+    # датасета из 3607 пар.
+    long_pairs: str = "truncate"
     max_samples: int = 0
     min_answer_tokens: int = 1
     use_teacher_logits: bool = False
@@ -146,7 +151,9 @@ class TrainConfig:
 
     micro_batch_size: int = 4
     grad_accum_steps: int = 8
-    max_steps: int = 2000
+    # 3 эпохи на 3607 парах при эффективном батче 32 = ~340 шагов (замер 0092).
+    # 2000 шагов означали бы ~18 эпох — переобучение на таком объёме.
+    max_steps: int = 350
     lr: float = 3.0e-5
     min_lr_ratio: float = 0.1
     warmup_steps: int = 50
@@ -350,6 +357,8 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError(f"суффиксы одновременно включены и исключены: {sorted(overlap)}")
     if d.max_seq_len <= 0:
         raise ConfigError("data.max_seq_len должен быть > 0")
+    if d.long_pairs not in ("truncate", "drop"):
+        raise ConfigError("data.long_pairs: допустимо truncate или drop")
     if d.min_answer_tokens < 1:
         raise ConfigError("data.min_answer_tokens должен быть >= 1")
     if d.use_teacher_logits and not (0.0 < d.kl_weight <= 1.0):

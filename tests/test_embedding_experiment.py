@@ -44,7 +44,8 @@ class TestConfigScalars(unittest.TestCase):
         values = ee.config_values(QAT_CONFIG)
         self.assertEqual(values["micro_batch_size"], 4)
         self.assertEqual(values["grad_accum_steps"], 8)
-        self.assertEqual(values["max_steps"], 2000)
+        # 350 = 3 эпохи на 3607 парах при батче 32 (0092); было 2000 (~18 эпох).
+        self.assertEqual(values["max_steps"], 350)
         self.assertEqual(values["save_every"], 100)
 
     def test_comments_quotes_and_duplicates(self):

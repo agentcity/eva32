@@ -632,8 +632,15 @@
   {
     "id": "0096",
     "title": "eva: включить кэш префикса в Python-бэкенде",
-    "status": "pending",
+    "status": "done",
     "file": "0096-eva-cache-flag.md",
     "assignee": ""
+  },
+  {
+    "id": "0097",
+    "title": "Политика длинных пар, max_steps и порог разреженности",
+    "status": "done",
+    "file": "0097-training-policies.md",
+    "assignee": "saron"
   }
 ]

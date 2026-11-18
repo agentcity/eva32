@@ -113,6 +113,7 @@ _ENV_LIB = "EVA_VTM_LIB"
 _ENV_TOKENIZER = "EVA_VTM_TOKENIZER"
 _ENV_MAX_TOKENS = "EVA_VTM_MAX_TOKENS"
 _ENV_BACKEND = "EVA_VTM_BACKEND"
+_ENV_CACHE = "EVA_VTM_CACHE"
 _ENV_THREADS = "EVA_VTM_THREADS"
 _ENV_CC = "EVA_VTM_CC"
 
@@ -147,7 +148,10 @@ class _VtmApiOptions(ctypes.Structure):
         ("backend", ctypes.c_void_p),
         ("max_new_tokens", ctypes.c_uint32),
         ("eos_token_id", ctypes.c_int32),
-        ("reserved", ctypes.c_uint32 * 6),
+        # Первый элемент прежнего reserved[6] занят cache_prefix (0087), поэтому
+        # sizeof остался 56 — раскладка ABI v1 не менялась.
+        ("cache_prefix", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 5),
     ]
 
 
@@ -197,6 +201,9 @@ class VTMConfig:
     backend: str = "auto"
     max_tokens: int = DEFAULT_MAX_TOKENS
     threads: int | None = None
+    # Кэш префикса (0087): следующий запрос с тем же началом не пересчитывается.
+    # По умолчанию выключен — поведение не меняется без явного согласия.
+    cache_prefix: bool = False
 
     def __post_init__(self) -> None:
         if self.max_tokens < 0:
@@ -219,6 +226,7 @@ class VTMConfig:
         backend: str | None = None,
         max_tokens: int | None = None,
         threads: int | None = None,
+        cache_prefix: bool | None = None,
     ) -> "VTMConfig":
         """Собрать конфиг: аргументы важнее окружения, окружение — дефолтов."""
         env = os.environ if environ is None else environ
@@ -266,6 +274,11 @@ class VTMConfig:
             backend=resolved_backend,
             max_tokens=resolved_max,
             threads=resolved_threads,
+            cache_prefix=(
+                cache_prefix
+                if cache_prefix is not None
+                else env.get(_ENV_CACHE, "") not in ("", "0", "no", "false")
+            ),
         )
 
 
@@ -521,6 +534,7 @@ class _VtmContext:
         backend: str = "auto",
         max_new_tokens: int = 0,
         eos_token_id: int = -1,
+        cache_prefix: bool | None = None,
     ) -> None:
         self._lib = library
         self._handle: int | None = None
@@ -533,6 +547,10 @@ class _VtmContext:
         options.backend_name = None if backend in ("", "auto") else backend.encode()
         options.max_new_tokens = int(max_new_tokens) if max_new_tokens > 0 else 0
         options.eos_token_id = int(eos_token_id)
+        # Кэш префикса (0087): по умолчанию выключен, чтобы не менять поведение.
+        if cache_prefix is None:
+            cache_prefix = os.environ.get(_ENV_CACHE, "") not in ("", "0", "no", "false")
+        options.cache_prefix = 1 if cache_prefix else 0
         try:
             handle = library.cdll.vtm_api_open(self.model.encode(), ctypes.byref(options))
         except Exception as exc:  # noqa: BLE001 — ctypes зовёт C, падать нельзя молча
@@ -693,6 +711,7 @@ class VtmBackend:
         backend: str | None = None,
         max_tokens: int | None = None,
         threads: int | None = None,
+        cache_prefix: bool | None = None,
         environ: Mapping[str, str] | None = None,
         prompt_builder: Callable[[Any], str] | None = None,
     ) -> None:
@@ -705,6 +724,8 @@ class VtmBackend:
             "max_tokens": max_tokens,
             "threads": threads,
         }
+        if cache_prefix is not None:
+            overrides["cache_prefix"] = cache_prefix
         overrides = {key: value for key, value in overrides.items() if value is not None}
         if overrides:
             resolved = replace(resolved, **overrides)

@@ -56,6 +56,11 @@ REQUIRED_MODULES = (("torch", "torch"), ("numpy", "numpy"))
 EMBED_TENSOR_NAME = "model.embed_tokens.weight"
 #: Режимы ``quant.quantize_embeddings`` (qat.config.QuantConfig).
 EMBED_MODES = ("none", "trit", "int8")
+
+# Доля нулей в тритах, выше которой печатается предупреждение. У здоровой
+# трит-модели 40-60%: модель «схлопнулась», если нулей почти все — это видно
+# только по метрике, по loss этого не понять (замер 0095: 84,3% при падающем loss).
+SPARSITY_WARN = 0.70
 #: int8-эмбеддинги в контейнер пока не переносятся (нужен kind 4 + loader).
 EMBED_INT8_DEFERRED = (
     "int8-эмбеддинги в контейнер отложены: нужен новый kind 4 (int8 + "
@@ -645,6 +650,9 @@ def encode_trit_table(
         "shape": list(dims),
         "dtype": "trit",
         "kind": "trit",
+        # Доля нулей: обученная трит-модель при здоровом QAT имеет 40-60%,
+        # заметно больше — признак схлопывания (см. SPARSITY_WARN).
+        "zero_fraction": round(trits.count(0) / n_trits, 6) if n_trits else 0.0,
     }
     return data, meta
 
@@ -697,6 +705,9 @@ def _encode_trit_segment_torch(
     trits = quant["trits"].cpu().contiguous()
     scales = quant["scales"].reshape(-1).cpu()
     n_trits = int(trits.numel())
+    # Доля нулей считается здесь же: иначе она попадала бы только из чистого
+    # (без torch) пути, а реальный экспорт идёт этим.
+    zero_fraction = float((trits == 0).sum().item()) / n_trits if n_trits else 0.0
     in_features = int(weight.shape[-1])
     if in_features % block_size != 0:
         raise RuntimeError(
@@ -766,6 +777,7 @@ def _encode_trit_segment_torch(
         "shape": shape,
         "dtype": "trit",
         "kind": "trit",
+        "zero_fraction": round(zero_fraction, 6),
     }
     payload = {
         "trits": trits,
@@ -1130,6 +1142,22 @@ def build_manifest(
             "skip_env": "VTM_SKIP_HASH",
         },
     }
+    # Суммарная разреженность тритов: считается по записям тензоров.
+    trit_entries = [e for e in files.tensor_entries if e.get("kind") == "trit"]
+    total_trits = sum(int(e.get("n_trits", 0)) for e in trit_entries)
+    weighted = sum(float(e.get("zero_fraction", 0.0)) * int(e.get("n_trits", 0))
+                   for e in trit_entries)
+    sparsity = (weighted / total_trits) if total_trits else 0.0
+    if trit_entries and sparsity > SPARSITY_WARN:
+        print(
+            f"ВНИМАНИЕ: доля нулей в тритах {sparsity:.1%} "
+            f"(порог {SPARSITY_WARN:.0%}). Похоже, модель схлопнулась: "
+            "проверьте lr и масштабы блоков, иначе качество будет низким "
+            "при формально нормальном loss.",
+            file=sys.stderr,
+            flush=True,
+        )
+
     manifest = {
         "format": "eva32.ternary.manifest",
         "format_version": MANIFEST_VERSION,
@@ -1163,6 +1191,12 @@ def build_manifest(
             "bytes": embed_bytes,
             "block_size": block_size,
             "rule": QUANT_RULE,
+        },
+        "sparsity": {
+            "zero_fraction": round(sparsity, 6),
+            "warn_threshold": SPARSITY_WARN,
+            "collapsed": bool(trit_entries and sparsity > SPARSITY_WARN),
+            "trits": total_trits,
         },
         "packing": {
             "magic": ternary.MAGIC.decode("ascii"),

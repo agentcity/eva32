@@ -123,6 +123,7 @@ class PairDataset:
         tokenizer: Any,
         *,
         max_seq_len: int,
+        long_pairs: str = "truncate",
         min_answer_tokens: int = 1,
         use_teacher_logits: bool = False,
         vocab_size: int | None = None,
@@ -130,6 +131,7 @@ class PairDataset:
         self.rows = list(rows)
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
+        self.long_pairs = long_pairs
         self.min_answer_tokens = min_answer_tokens
         self.use_teacher_logits = use_teacher_logits
         self.vocab_size = vocab_size
@@ -196,8 +198,16 @@ class PairDataset:
             self.stats["dropped_empty_answer"] += 1
             return None
         if len(prompt_ids) + len(answer_ids) > self.max_seq_len:
-            self.stats["dropped_long"] += 1
-            return None
+            if self.long_pairs == "drop" or len(prompt_ids) >= self.max_seq_len:
+                self.stats["dropped_long"] += 1
+                return None
+            # Обрезаем ответ, оставляя eos в конце: иначе модель не учится
+            # останавливаться, а потеря хвоста — цена, которую видно в метриках.
+            keep = self.max_seq_len - len(prompt_ids)
+            answer_ids = answer_ids[:keep]
+            if eos_id is not None:
+                answer_ids[-1] = eos_id
+            self.stats["truncated_long"] += 1
         labels = [-100] * len(prompt_ids) + answer_ids
         if sum(1 for x in labels if x != -100) < self.min_answer_tokens:
             self.stats["dropped_short"] += 1
