@@ -2563,6 +2563,1017 @@ static void test_cli_chat(void) {
     model_free(&md);
 }
 
+// --- CLI --stream: безопасный UTF-8 и стоп-токены --------------------------
+//
+// Синтетическая «модель-цепочка»: EMB с флагом VTM_FLAG_EMB_INPUT берёт
+// строку таблицы E по входному токену, SAMP выбирает argmax, CLI подаёт
+// выбранный токен на следующем шаге. Так программа выдаёт заранее заданную
+// последовательность id — на ней видно, как склеиваются байты, разрезанные
+// между токенами.
+//
+// Фикстура tokenizer.json: 259 = "hello" (промпт), 208 = байт 0xD0,
+// 191 = байт 0xBF (вместе — «п»), 65 = "A", 66 = "B", 501 = <|im_end|>
+// (model.eos_token — стоп-токен), 503 = <|im|> (спецтокен, но не стоп).
+
+#define STREAM_MAX_ID        504  /* 503 — максимальный id added_tokens;
+                                     столько же логитов у фикстуры */
+#define STREAM_PROMPT_TOKEN  259  /* "hello" в фикстуре */
+
+// Собрать модель-цепочку, прогнать CLI и вернуть его код возврата.
+// out/err — stdout/stderr процесса; stream != 0 — добавить --stream.
+static int stream_cli_run(const int *chain, int n_chain, int max_new,
+                          int stream, char *out, size_t out_cap,
+                          char *err, size_t err_cap) {
+    static const char *const cli_paths[] = {
+        "./vtm", "src/vtm/vtm", "../../src/vtm/vtm", NULL
+    };
+    static const char *const tok_paths[] = {
+        "../../tests/vtm/fixtures/tokenizer.json",
+        "tests/vtm/fixtures/tokenizer.json",
+        "../tests/vtm/fixtures/tokenizer.json",
+        NULL
+    };
+    static long counter = 0;
+    model_t md;
+    uint32_t dE[2] = {STREAM_MAX_ID, STREAM_MAX_ID};
+    uint32_t dlog[1] = {STREAM_MAX_ID};
+    uint32_t dto[1] = {1};
+    float logits[STREAM_MAX_ID];
+    float tokv[1] = {-1.0f};
+    float *e;
+    uint8_t *img = NULL;
+    size_t size = 0;
+    char model_path[160], out_path[160], err_path[160], cmd[2048];
+    const char *cli;
+    const char *fixture;
+    long stamp = (long)time(NULL);
+    FILE *f;
+    int i, rc;
+
+    out[0] = '\0';
+    err[0] = '\0';
+    cli = find_readable(cli_paths);
+    fixture = find_readable(tok_paths);
+    if (!cli || !fixture) {
+        snprintf(err, err_cap, "нет vtm или tokenizer.json");
+        return -1;
+    }
+
+    memset(logits, 0, sizeof logits);
+    e = (float *)xmalloc((size_t)STREAM_MAX_ID * STREAM_MAX_ID *
+                         sizeof(float));
+    memset(e, 0, (size_t)STREAM_MAX_ID * STREAM_MAX_ID * sizeof(float));
+    {
+        int from = STREAM_PROMPT_TOKEN;
+        for (i = 0; i < n_chain; i++) {
+            if (chain[i] < 0 || chain[i] >= STREAM_MAX_ID) break;
+            // Строка from указывает на следующий токен цепочки.
+            e[(size_t)from * STREAM_MAX_ID + (size_t)chain[i]] = 10.0f;
+            from = chain[i];
+        }
+    }
+
+    model_init(&md);
+    model_add_f32(&md, "logits", 1, dlog, logits);
+    model_add_f32(&md, "token", 1, dto, tokv);
+    model_add_f32(&md, "E", 2, dE, e);
+    free(e);
+    model_inst(&md, VTM_OP_EMB, VTM_FLAG_EMB_INPUT, 0, 2,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_SAMP, 0, 1, 0,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+
+    counter++;
+    snprintf(model_path, sizeof model_path, "/tmp/vtm_cli_stream_%ld_%ld.vtm",
+             stamp, counter);
+    snprintf(out_path, sizeof out_path, "/tmp/vtm_cli_stream_%ld_%ld.out",
+             stamp, counter);
+    snprintf(err_path, sizeof err_path, "/tmp/vtm_cli_stream_%ld_%ld.err",
+             stamp, counter);
+
+    f = fopen(model_path, "wb");
+    if (!f) {
+        free(img);
+        model_free(&md);
+        snprintf(err, err_cap, "не удалось записать модель");
+        return -1;
+    }
+    fwrite(img, 1, size, f);
+    fclose(f);
+
+    snprintf(cmd, sizeof cmd,
+             "%s run %s --text hello --tokenizer %s%s --max-new %d "
+             "> %s 2> %s",
+             cli, model_path, fixture, stream ? " --stream" : "", max_new,
+             out_path, err_path);
+    rc = system(cmd);
+    read_text_file(out_path, out, out_cap);
+    read_text_file(err_path, err, err_cap);
+
+    remove(model_path);
+    remove(out_path);
+    remove(err_path);
+    free(img);
+    model_free(&md);
+    return cli_exit_code(rc);
+}
+
+static void test_cli_stream(void) {
+    char out[8192], err[8192];
+    int rc;
+    int seq_cyr[] = {208, 191};        /* 0xD0 0xBF — «п» */
+    int seq_tail[] = {208, 501, 65};   /* обрыв на середине символа */
+    int seq_bad[] = {208, 65};         /* 0xD0 + "A": битая пара */
+    int seq_special[] = {65, 503, 66}; /* "A", <|im|>, "B" */
+    int seq_stop[] = {65, 501, 66};    /* "A", <|im_end|>, "B" */
+
+    // 1. Буква «п» разрезана между двумя токенами (0xD0 и 0xBF): стрим
+    //    отдаёт ровно два байта UTF-8, без замен и мусора. Служебные строки
+    //    (модель, токены, время) в stdout не попадают — только текст.
+    rc = stream_cli_run(seq_cyr, 2, 2, 1, out, sizeof out, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(strcmp(out, "\xD0\xBF") == 0);
+    CHECK(strstr(out, "модель:") == NULL);
+    CHECK(strstr(out, "время:") == NULL);
+    CHECK(strstr(err, "модель:") != NULL);
+    CHECK(strstr(err, "стоп-токен") == NULL);
+
+    // 2. Хвост не теряется: за 0xD0 сразу идёт стоп-токен. Недописанный
+    //    символ отдаётся в конце как U+FFFD (валидный UTF-8), а не остаётся
+    //    в буфере. Третий токен "A" не печатается — генерация оборвана.
+    rc = stream_cli_run(seq_tail, 3, 3, 1, out, sizeof out, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(strcmp(out, "\xEF\xBF\xBD") == 0);
+    CHECK(strstr(err, "стоп-токен: 501") != NULL);
+
+    // 3. Битая пара 0xD0 + "A": сырой 0xD0 наружу не выходит, вместо него
+    //    U+FFFD, дальше "A". stdout остаётся валидным UTF-8.
+    rc = stream_cli_run(seq_bad, 2, 2, 1, out, sizeof out, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(strcmp(out, "\xEF\xBF\xBD" "A") == 0);
+
+    // 4. Спецтокен <|im|> (не стоп) в текст не попадает, но генерация
+    //    продолжается: следующий токен "B" напечатан.
+    rc = stream_cli_run(seq_special, 3, 3, 1, out, sizeof out, err,
+                        sizeof err);
+    CHECK(rc == 0);
+    CHECK(strcmp(out, "AB") == 0);
+    CHECK(strstr(out, "<|im|>") == NULL);
+    CHECK(strstr(err, "стоп-токен") == NULL);
+
+    // 5. Стоп-токен <|im_end|> (id 501 из model.eos_token): не печатается,
+    //    генерация обрывается — следующий токен "B" не появляется.
+    rc = stream_cli_run(seq_stop, 3, 3, 1, out, sizeof out, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(strcmp(out, "A") == 0);
+    CHECK(strstr(err, "стоп-токен: 501") != NULL);
+    CHECK(strstr(err, "вывод:  65 501") != NULL);
+    CHECK(strstr(out, "B") == NULL);
+
+    // 6. Без --stream — прежнее поведение: служебное в stdout, «ответ:» с
+    //    текстом, спецтокены по-прежнему часть ответа, стоп не обрывает.
+    rc = stream_cli_run(seq_cyr, 2, 2, 0, out, sizeof out, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(strstr(out, "модель:") != NULL);
+    CHECK(strstr(out, "prompt: 259") != NULL);
+    CHECK(strstr(out, "ответ:   \xD0\xBF") != NULL);
+
+    rc = stream_cli_run(seq_stop, 3, 3, 0, out, sizeof out, err, sizeof err);
+    CHECK(rc == 0);
+    CHECK(strstr(out, "ответ:   A<|im_end|>B") != NULL);
+
+    // 7. --stream без --text — ошибка аргументов (код 2), а не молчаливый
+    //    переход к старому режиму.
+    {
+        static const char *const cli_paths[] = {
+            "./vtm", "src/vtm/vtm", "../../src/vtm/vtm", NULL
+        };
+        const char *cli = find_readable(cli_paths);
+        char cmd[1024];
+        long stamp = (long)time(NULL);
+
+        CHECK(cli != NULL);
+        if (cli) {
+            snprintf(cmd, sizeof cmd,
+                     "%s run /tmp/vtm_stream_missing_%ld.vtm --tokens 1 "
+                     "--stream > /tmp/vtm_stream_%ld.out 2> /tmp/vtm_stream_%ld.err",
+                     cli, stamp, stamp, stamp);
+            rc = system(cmd);
+            CHECK(cli_exit_code(rc) == 2);
+            snprintf(cmd, sizeof cmd, "/tmp/vtm_stream_%ld.err", stamp);
+            CHECK(read_text_file(cmd, err, sizeof err) == 0);
+            CHECK(strstr(err, "--stream") != NULL);
+            snprintf(cmd, sizeof cmd, "/tmp/vtm_stream_%ld.out", stamp);
+            remove(cmd);
+            snprintf(cmd, sizeof cmd, "/tmp/vtm_stream_%ld.err", stamp);
+            remove(cmd);
+        }
+    }
+}
+
+// --- mmap (задача 0060) ----------------------------------------------------
+//
+// Внутренние хуки загрузчика (vtm_internal.h): нужны, чтобы отличить
+// отображённый файл от фолбэка, не заглядывая в непрозрачную struct vtm.
+int vtm_internal_file_is_mapped(const vtm_t *m);
+int vtm_internal_tensor_is_mapped(const vtm_t *m, uint32_t index);
+
+static int write_image(const char *path, const uint8_t *img, size_t size) {
+    FILE *f = fopen(path, "wb");
+    int ok;
+    if (!f) return -1;
+    ok = (size == 0 || fwrite(img, 1, size, f) == size);
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+// Ожидается ли отображение в этом запуске: VTM_NO_MMAP=1 (и Windows)
+// переводят vtm_load() на чтение в память. Тесты ниже подстраиваются, чтобы
+// `VTM_NO_MMAP=1 ./test_vtm` тоже был зелёным.
+static int mmap_expected(void) {
+#if defined(_WIN32)
+    return 0;
+#else
+    const char *v = getenv("VTM_NO_MMAP");
+    return !(v && *v && strcmp(v, "0") != 0);
+#endif
+}
+
+// Модель для проверки mmap: тритовая матрица, in-place SCAL и KVW (пишет
+// не только dst, но и b — V-кэш). Индексы тензоров:
+//   0 W(trit) 1 x 2 y 3 act 4 kcache 5 vcache 6 k 7 v
+static void mmap_model_init(model_t *md) {
+    uint32_t dw[2] = {2, 2};
+    uint32_t dv[1] = {2};
+    uint32_t dcache[2] = {2, 2};
+    int8_t wt[4] = {1, -1, 0, 1};
+    float scales[1] = {2.0f};
+    float xv[2] = {1.0f, 2.0f};
+    float zero2[2] = {0.0f, 0.0f};
+    float zero4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float av[2] = {5.0f, 7.0f};
+    float kvv[2] = {1.5f, -2.5f};
+    float vvv[2] = {3.0f, 4.5f};
+
+    model_init(md);
+    model_add_trit(md, "W", 2, dw, wt, scales, 1);
+    model_add_f32(md, "x", 1, dv, xv);
+    model_add_f32(md, "y", 1, dv, zero2);
+    model_add_f32(md, "act", 1, dv, av);
+    model_add_f32(md, "kcache", 2, dcache, zero4);
+    model_add_f32(md, "vcache", 2, dcache, zero4);
+    model_add_f32(md, "k", 1, dv, kvv);
+    model_add_f32(md, "v", 1, dv, vvv);
+    model_inst(md, VTM_OP_TMV, 0, 2, 0, 1, VTM_NO_TENSOR, 0);
+    model_inst(md, VTM_OP_SCAL, 0, 3, 3, VTM_NO_TENSOR, VTM_NO_TENSOR, 2000);
+    model_inst(md, VTM_OP_KVW, 0, 4, 6, 5, 7, 0);
+    model_inst(md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+}
+
+// Проверить результаты mmap_get_model: y, act и оба KV-кэша.
+static void check_mmap_model(vtm_t *m) {
+    const vtm_tensor *t;
+    CHECK(run_ok(m));
+    t = vtm_tensor_by_name(m, "y");
+    CHECK(t && t->f32);
+    if (t && t->f32) {
+        CHECK_NEAR(t->f32[0], -2.0, 1e-6);
+        CHECK_NEAR(t->f32[1], 4.0, 1e-6);
+    }
+    t = vtm_tensor_by_name(m, "act");
+    CHECK(t && t->f32);
+    if (t && t->f32) {
+        CHECK_NEAR(t->f32[0], 10.0, 1e-6); // SCAL 2.0 на месте
+        CHECK_NEAR(t->f32[1], 14.0, 1e-6);
+    }
+    t = vtm_tensor_by_name(m, "kcache");
+    CHECK(t && t->f32);
+    if (t && t->f32) {
+        CHECK_NEAR(t->f32[0], 1.5, 1e-6);
+        CHECK_NEAR(t->f32[1], -2.5, 1e-6);
+    }
+    t = vtm_tensor_by_name(m, "vcache");
+    CHECK(t && t->f32);
+    if (t && t->f32) {
+        CHECK_NEAR(t->f32[0], 3.0, 1e-6);
+        CHECK_NEAR(t->f32[1], 4.5, 1e-6);
+    }
+}
+
+static void test_mmap_file_load(void) {
+    model_t md;
+    uint8_t *img;
+    size_t size;
+    char path[128];
+    long stamp = (long)time(NULL);
+    vtm_t *m;
+
+    mmap_model_init(&md);
+    model_build(&md, &img, &size);
+    snprintf(path, sizeof path, "/tmp/vtm_mmap_%ld.vtm", stamp);
+    CHECK(write_image(path, img, size) == 0);
+
+    m = vtm_load(path);
+    CHECK(m != NULL);
+    if (m) {
+        int map = mmap_expected();
+        // Файл отображён (или, при VTM_NO_MMAP=1, прочитан в память);
+        // fp32 и слова тритов при mmap ссылаются в отображение.
+        CHECK(vtm_internal_file_is_mapped(m) == map);
+        CHECK(vtm_internal_tensor_is_mapped(m, 0) == map); // W: триты
+        CHECK(vtm_internal_tensor_is_mapped(m, 1) == map); // x: fp32-источник
+        CHECK(vtm_internal_tensor_is_mapped(m, 2) == 0); // y: dst
+        CHECK(vtm_internal_tensor_is_mapped(m, 3) == 0); // act: dst (in-place)
+        CHECK(vtm_internal_tensor_is_mapped(m, 4) == 0); // kcache: dst KVW
+        CHECK(vtm_internal_tensor_is_mapped(m, 5) == 0); // vcache: b KVW
+        CHECK(vtm_internal_tensor_is_mapped(m, 6) == map); // k: только источник
+        CHECK(vtm_internal_tensor_is_mapped(m, 7) == map); // v: только источник
+        check_mmap_model(m);
+        vtm_free(m);
+    }
+
+    remove(path);
+    free(img);
+    model_free(&md);
+}
+
+static void test_mmap_fallback(void) {
+    model_t md;
+    uint8_t *img;
+    size_t size;
+    char path[128];
+    long stamp = (long)time(NULL);
+    vtm_t *m;
+
+    mmap_model_init(&md);
+    model_build(&md, &img, &size);
+    snprintf(path, sizeof path, "/tmp/vtm_mmap_fb_%ld.vtm", stamp);
+    CHECK(write_image(path, img, size) == 0);
+
+#if !defined(_WIN32)
+    // Чести «mmap не было» добиваемся флагом, а не отсутствием платформы.
+    // Прежнее значение сохраняем: `VTM_NO_MMAP=1 ./test_vtm` не должен
+    // включать mmap для следующих тестов.
+    {
+        const char *old = getenv("VTM_NO_MMAP");
+        char saved[64];
+        int had = 0;
+        if (old) {
+            snprintf(saved, sizeof saved, "%s", old);
+            had = 1;
+        }
+        CHECK(setenv("VTM_NO_MMAP", "1", 1) == 0);
+        m = vtm_load(path);
+        if (had) CHECK(setenv("VTM_NO_MMAP", saved, 1) == 0);
+        else CHECK(unsetenv("VTM_NO_MMAP") == 0);
+    }
+#else
+    m = vtm_load(path); // на Windows фолбэк всегда
+#endif
+    CHECK(m != NULL);
+    if (m) {
+        CHECK(vtm_internal_file_is_mapped(m) == 0);
+        CHECK(vtm_internal_tensor_is_mapped(m, 0) == 0);
+        check_mmap_model(m);
+        vtm_free(m);
+    }
+
+    remove(path);
+    free(img);
+    model_free(&md);
+}
+
+// Обрезанный файл не должен ни падать, ни читать за концом отображения:
+// загрузчик валидирует все смещения по фактическому размеру до доступа.
+static void test_mmap_truncated(void) {
+    model_t md;
+    uint8_t *img;
+    size_t size, cuts[8];
+    size_t n_cuts = 0, k;
+    char path[128];
+    long stamp = (long)time(NULL);
+
+    mmap_model_init(&md);
+    model_build(&md, &img, &size);
+    snprintf(path, sizeof path, "/tmp/vtm_mmap_tr_%ld.vtm", stamp);
+
+    cuts[n_cuts++] = 0;
+    cuts[n_cuts++] = 1;
+    cuts[n_cuts++] = VTM_HEADER_SIZE - 1;
+    cuts[n_cuts++] = VTM_HEADER_SIZE;
+    cuts[n_cuts++] = size / 2;
+    cuts[n_cuts++] = size - VTM_INSTR_SIZE;
+    cuts[n_cuts++] = size - 1;
+
+    for (k = 0; k < n_cuts; k++) {
+        vtm_t *m;
+        CHECK(write_image(path, img, cuts[k]) == 0);
+        m = vtm_load(path);
+        CHECK(m == NULL);
+        CHECK(strlen(vtm_last_error()) > 0);
+        if (m) vtm_free(m); // не должно случиться, но не течём
+    }
+
+    // Контроль: целый файл после всех обрезаний грузится и считает.
+    CHECK(write_image(path, img, size) == 0);
+    {
+        vtm_t *m = vtm_load(path);
+        CHECK(m != NULL);
+        if (m) {
+            check_mmap_model(m);
+            vtm_free(m);
+        }
+    }
+
+    remove(path);
+    free(img);
+    model_free(&md);
+}
+
+// fp16/bf16 интерпретатор читает как float*: их приходится разворачивать в
+// fp32 в арене, в отличие от fp32-источников и тритов (те в отображении).
+static void test_mmap_f16_bf16(void) {
+    model_t md;
+    uint32_t de[2] = {2, 2};
+    uint32_t dy[1] = {2};
+    float ev[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float fv[4] = {5.0f, 6.0f, 7.0f, 8.0f};
+    float zv[2] = {0.0f, 0.0f};
+    uint8_t *img;
+    size_t size;
+    char path[128];
+    long stamp = (long)time(NULL);
+    vtm_t *m;
+
+    model_init(&md);
+    model_add_f16(&md, "E", 2, de, ev);
+    model_add_bf16(&md, "F", 2, de, fv);
+    model_add_f32(&md, "y", 1, dy, zv);
+    model_add_f32(&md, "z", 1, dy, zv);
+    model_inst(&md, VTM_OP_EMB, 0, 2, 0, VTM_NO_TENSOR, VTM_NO_TENSOR, 1);
+    model_inst(&md, VTM_OP_EMB, 0, 3, 1, VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+    snprintf(path, sizeof path, "/tmp/vtm_mmap_f16_%ld.vtm", stamp);
+    CHECK(write_image(path, img, size) == 0);
+
+    m = vtm_load(path);
+    CHECK(m != NULL);
+    if (m) {
+        const vtm_tensor *t;
+        CHECK(vtm_internal_file_is_mapped(m) == mmap_expected());
+        CHECK(vtm_internal_tensor_is_mapped(m, 0) == 0); // fp16 скопирован
+        CHECK(vtm_internal_tensor_is_mapped(m, 1) == 0); // bf16 скопирован
+        CHECK(run_ok(m));
+        t = vtm_tensor_by_name(m, "y");
+        CHECK(t && t->f32);
+        if (t && t->f32) {
+            CHECK_NEAR(t->f32[0], 3.0, 1e-6);
+            CHECK_NEAR(t->f32[1], 4.0, 1e-6);
+        }
+        t = vtm_tensor_by_name(m, "z");
+        CHECK(t && t->f32);
+        if (t && t->f32) {
+            CHECK_NEAR(t->f32[0], 5.0, 1e-6);
+            CHECK_NEAR(t->f32[1], 6.0, 1e-6);
+        }
+        vtm_free(m);
+    }
+
+    remove(path);
+    free(img);
+    model_free(&md);
+}
+
+// Тритовые слова в отображении, а fp16-масштабы конвертируются в арену:
+// указателя в файл на float* не поставить, но это 1/128 данных тензора.
+static void test_mmap_trit_f16_scales(void) {
+    model_t md;
+    uint32_t dw[2] = {2, 2};
+    uint32_t dx[1] = {2};
+    int8_t wt[4] = {1, 1, -1, 0};
+    float scales[1] = {2.0f};
+    float xv[2] = {1.0f, 2.0f};
+    float zero2[2] = {0.0f, 0.0f};
+    uint8_t *img;
+    size_t size;
+    char path[128];
+    long stamp = (long)time(NULL);
+    vtm_t *m;
+
+    model_init(&md);
+    model_add_trit_scaled(&md, "W", 2, dw, wt, scales, 0,
+                          (int)VTM_SCALE_BLOCK_160);
+    md.header_flags |= VTM_HEADER_FLAG_SCALE_BLOCK_160;
+    model_add_f32(&md, "x", 1, dx, xv);
+    model_add_f32(&md, "y", 1, dx, zero2);
+    model_inst(&md, VTM_OP_TMV, 0, 2, 0, 1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+    snprintf(path, sizeof path, "/tmp/vtm_mmap_tf16_%ld.vtm", stamp);
+    CHECK(write_image(path, img, size) == 0);
+
+    m = vtm_load(path);
+    CHECK(m != NULL);
+    if (m) {
+        const vtm_tensor *t;
+        CHECK(vtm_internal_tensor_is_mapped(m, 0) == mmap_expected()); // слова
+        CHECK(run_ok(m));
+        t = vtm_tensor_by_name(m, "y");
+        CHECK(t && t->f32);
+        if (t && t->f32) {
+            CHECK_NEAR(t->f32[0], 6.0, 1e-6);
+            CHECK_NEAR(t->f32[1], -2.0, 1e-6);
+        }
+        vtm_free(m);
+    }
+
+    remove(path);
+    free(img);
+    model_free(&md);
+}
+
+// --- SAMP: буфер кандидатов и частичный отбор (задача 0059) ----------------
+//
+// Проверяем то, что задача меняет:
+//   1) буфер кандидатов выделяется один раз на машину и переиспользуется —
+//      на токен выделений нет (норма — 1 на жизнь машины);
+//   2) новый отбор (quickselect для top-k, LSD-radix для полного порядка)
+//      даёт те же токены, что прежняя полная сортировка qsort: эталон ниже
+//      повторяет код до 0059 дословно, включая порядок накопления суммы;
+//   3) на словаре Qwen 150 000 время на токен меряется рядом: прежний путь
+//      (malloc + qsort) против нового (буфер + частичный отбор).
+
+// Внутренние тест-хуки буфера (vtm_samp_alloc_count и т.п.). Заголовок
+// включает vtm.h сам, повторный include безопасен.
+#include "../../src/vtm/vtm_internal.h"
+
+// Эталон: копия samp_sample() до задачи 0059 — malloc на вызов, qsort по
+// всему словарю, штраф линейным сканом окна. u передаётся снаружи, чтобы
+// тест мог вести ГПСЧ в том же темпе, что машина.
+typedef struct {
+    double value;
+    uint32_t index;
+} ref_cand;
+
+static int ref_cand_cmp(const void *pa, const void *pb) {
+    const ref_cand *a = (const ref_cand *)pa;
+    const ref_cand *b = (const ref_cand *)pb;
+    if (a->value > b->value) return -1;
+    if (a->value < b->value) return 1;
+    if (a->index < b->index) return -1;
+    if (a->index > b->index) return 1;
+    return 0;
+}
+
+// hist/hist_len — уже сгенерированные токены по порядку; окно штрафа — как
+// у кольца samp_hist: последние window элементов.
+// *used_draw = 0, если прежний код не потреблял случайное число (максимум
+// неконечен) — тогда и машина его не потребляет.
+static int ref_samp_choose(const float *logits, uint32_t n, int strategy,
+                           double temperature, int top_k, double top_p,
+                           double penalty, int window,
+                           const int *hist, int hist_len, double u,
+                           int *used_draw) {
+    ref_cand *cand = (ref_cand *)xmalloc((size_t)n * (sizeof *cand
+                                                       + sizeof(double)));
+    double *w = (double *)(void *)(cand + n);
+    uint32_t j, kept = n;
+    double top, total = 0.0, upto, acc;
+    int token, pen = penalty != 1.0 && window > 0 && hist_len > 0;
+
+    for (j = 0; j < n; j++) {
+        double value = (double)logits[j];
+        if (isnan(value)) value = -INFINITY;
+        if (pen) {
+            int k, lim = window < hist_len ? window : hist_len, hit = 0;
+            for (k = 0; k < lim; k++) {
+                if (hist[hist_len - 1 - k] == (int)j) { hit = 1; break; }
+            }
+            if (hit) {
+                value = value > 0.0 ? value / penalty : value * penalty;
+            }
+        }
+        cand[j].value = value;
+        cand[j].index = j;
+    }
+    qsort(cand, (size_t)n, sizeof *cand, ref_cand_cmp);
+    token = (int)cand[0].index;
+    top = cand[0].value;
+    *used_draw = 0;
+    if (!isfinite(top)) {
+        free(cand);
+        return token;
+    }
+    if (strategy == VTM_SAMP_TOPK && top_k > 0 && (uint32_t)top_k < kept)
+        kept = (uint32_t)top_k;
+    for (j = 0; j < kept; j++) {
+        w[j] = exp((cand[j].value - top) / temperature);
+        total += w[j];
+    }
+    if (strategy == VTM_SAMP_TOPP && top_p < 1.0 && total > 0.0) {
+        double need = top_p * total;
+        upto = 0.0;
+        for (j = 0; j < kept; j++) {
+            upto += w[j];
+            if (upto >= need) { kept = j + 1; break; }
+        }
+        total = 0.0;
+        for (j = 0; j < kept; j++) total += w[j];
+    }
+    if (total > 0.0 && isfinite(total)) {
+        double threshold = u * total;
+        *used_draw = 1;
+        acc = 0.0;
+        for (j = 0; j < kept; j++) {
+            acc += w[j];
+            if (acc >= threshold) { token = (int)cand[j].index; break; }
+        }
+        if (j >= kept) token = (int)cand[kept - 1].index;
+    }
+    free(cand);
+    return token;
+}
+
+// ГПСЧ SAMP из docs/vtm.md — побитово тот же, что в машине.
+static uint64_t ref_samp_mix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+static double ref_samp_uniform(uint64_t *state) {
+    uint64_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    return (double)((x * 0x2545F4914F6CDD1Dull) >> 11)
+         * (1.0 / 9007199254740992.0);
+}
+
+// Детерминированные логиты для проверок: пила из формулы, поверх неё
+// группы равных значений (граница top-k/top-p часто попадает внутрь них —
+// именно там расходятся «стабильные» и «нестабильные» сортировки).
+static void samp_make_logits(float *v, uint32_t n) {
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        double x = (double)((i * 2654435761u) % 2000u) / 1000.0 - 1.0;
+        if (i % 5 == 0) x = 1.5;      // большая группа равных
+        else if (i % 11 == 0) x = -0.25;
+        v[i] = (float)x;
+    }
+}
+
+// Прогнать машину и эталон в одном темпе: u_i из одного ГПСЧ, история
+// повторов ведётся тестом (она же уходит в эталон).
+static void samp_ref_case(const float *logits, uint32_t n, int strategy,
+                          double temperature, int top_k, double top_p,
+                          double penalty, int window, uint64_t seed,
+                          int steps) {
+    char meta[256];
+    int hist[512], n_hist = 0, i;
+    vtm_t *m;
+    uint64_t rng;
+
+    snprintf(meta, sizeof meta,
+             "{\"sample_seed\": %lu, \"temperature\": %.17g, \"top_k\": %d,"
+             " \"top_p\": %.17g, \"repetition_penalty\": %.17g,"
+             " \"repetition_window\": %d}",
+             (unsigned long)seed, temperature, top_k, top_p, penalty, window);
+    m = samp_container(logits, n, meta, strategy);
+    CHECK(m != NULL);
+    if (!m) return;
+    rng = ref_samp_mix64(seed ^ 0x9E3779B97F4A7C15ull);
+    for (i = 0; i < steps; i++) {
+        int used = 0, want, got;
+        double u = ref_samp_uniform(&rng);
+        want = ref_samp_choose(logits, n, strategy, temperature, top_k, top_p,
+                               penalty, window, hist, n_hist, u, &used);
+        got = samp_next(m);
+        CHECK(used == 1);
+        if (got != want) {
+            fprintf(stderr, "FAIL samp_ref: стратегия %d, шаг %d: %d != %d "
+                    "(seed %lu)\n", strategy, i, got, want,
+                    (unsigned long)seed);
+            g_fail++;
+            break;
+        }
+        CHECK(n_hist < (int)(sizeof hist / sizeof hist[0]));
+        if (n_hist < (int)(sizeof hist / sizeof hist[0]))
+            hist[n_hist++] = got;
+    }
+    vtm_samp_free(m);   // в vtm_free() буфер ещё не освобождается (loader.c)
+    vtm_free(m);
+}
+
+static void test_samp_partial_select(void) {
+    uint32_t n = 257, big = 5000, i;
+    float *small = (float *)xmalloc((size_t)n * sizeof *small);
+    float *wide = (float *)xmalloc((size_t)big * sizeof *wide);
+
+    samp_make_logits(small, n);
+    samp_make_logits(wide, big);
+    // Маленький словарь (radix на 11 битах) и большой (16 бит): новый отбор
+    // обязан совпасть с полной сортировкой в обоих режимах.
+    samp_ref_case(small, n, VTM_SAMP_TEMPERATURE, 0.7, 0, 1.0, 1.0, 64,
+                  2024, 64);
+    samp_ref_case(small, n, VTM_SAMP_TOPK, 0.7, 3, 1.0, 1.0, 64, 1, 64);
+    samp_ref_case(small, n, VTM_SAMP_TOPK, 1.3, 17, 1.0, 1.0, 64, 7, 64);
+    samp_ref_case(small, n, VTM_SAMP_TOPK, 0.5, 256, 1.0, 1.0, 64, 2024, 64);
+    samp_ref_case(small, n, VTM_SAMP_TOPK, 1.0, 300, 1.0, 1.0, 64, 5, 32);
+    samp_ref_case(small, n, VTM_SAMP_TOPP, 1.0, 0, 0.5, 1.0, 64, 3, 64);
+    samp_ref_case(small, n, VTM_SAMP_TOPP, 0.8, 0, 0.9, 1.0, 64, 11, 64);
+    samp_ref_case(small, n, VTM_SAMP_TOPP, 0.8, 0, 1.0, 1.0, 64, 13, 64);
+    // Штраф за повторы: метки окна должны работать как линейный скан эталона.
+    samp_ref_case(small, n, VTM_SAMP_TEMPERATURE, 0.9, 0, 1.0, 1.7, 8,
+                  99, 64);
+    samp_ref_case(small, n, VTM_SAMP_TOPK, 0.9, 5, 1.0, 4.0, 2, 99, 64);
+    samp_ref_case(small, n, VTM_SAMP_TOPP, 0.6, 0, 0.85, 2.5, 32, 123456, 64);
+    // Большой словарь: top-k с отбором префикса и полный порядок для top-p.
+    samp_ref_case(wide, big, VTM_SAMP_TOPK, 0.8, 40, 1.0, 1.0, 64, 42, 24);
+    samp_ref_case(wide, big, VTM_SAMP_TOPK, 0.8, 1000, 1.0, 1.0, 64, 42, 16);
+    samp_ref_case(wide, big, VTM_SAMP_TOPP, 0.8, 0, 0.95, 1.0, 64, 42, 16);
+    samp_ref_case(wide, big, VTM_SAMP_TEMPERATURE, 1.1, 0, 1.0, 1.5, 16,
+                  77, 16);
+    // Края: все логиты равны, один лидер, отрицательные значения.
+    for (i = 0; i < big; i++) wide[i] = 0.0f;
+    samp_ref_case(wide, big, VTM_SAMP_TOPP, 1.0, 0, 0.75, 1.0, 64, 8, 16);
+    wide[big / 2] = 9.0f;
+    samp_ref_case(wide, big, VTM_SAMP_TOPK, 1.0, 100, 1.0, 1.0, 64, 8, 16);
+    for (i = 0; i < big; i++) wide[i] = -2.0f - (float)(i % 7);
+    samp_ref_case(wide, big, VTM_SAMP_TOPP, 0.9, 0, 0.6, 1.0, 64, 8, 16);
+
+    free(small);
+    free(wide);
+}
+
+static void test_samp_buffer_reuse(void) {
+    uint32_t n = 5000, i;
+    float *logits = (float *)xmalloc((size_t)n * sizeof *logits);
+    vtm_t *m;
+    size_t bytes;
+
+    samp_make_logits(logits, n);
+
+    // (1) До первого SAMP выделений нет, после первого — ровно одно.
+    m = samp_container(logits, n,
+                       "{\"temperature\": 0.9, \"top_k\": 40,"
+                       " \"sample_seed\": 42}", VTM_SAMP_TOPK);
+    CHECK(m != NULL);
+    if (m) {
+        CHECK(vtm_samp_alloc_count(m) == 0);
+        CHECK(vtm_samp_buffer_bytes(m) == 0);
+        (void)samp_next(m);
+        bytes = vtm_samp_buffer_bytes(m);
+        CHECK(vtm_samp_alloc_count(m) == 1);
+        // кандидаты (2×16) + метки (4) на токен + счётчики radix для
+        // большого словаря
+        CHECK(bytes >= (size_t)n * (2u * 16u + 4u) + 65536u * 4u);
+        for (i = 0; i < 100; i++) (void)samp_next(m);
+        CHECK(vtm_samp_alloc_count(m) == 1);        // malloc на токен нет
+        CHECK(vtm_samp_buffer_bytes(m) == bytes);   // и блок не перевыделялся
+        printf("  SAMP буфер: %lu байт, выделений %lu на 101 токен (n=%u)\n",
+               (unsigned long)bytes,
+               (unsigned long)vtm_samp_alloc_count(m), (unsigned)n);
+        vtm_samp_free(m);                           // см. отчёт: vtm_free в loader.c
+        CHECK(vtm_samp_buffer_bytes(m) == 0);
+        CHECK(vtm_samp_alloc_count(m) == 1);
+        vtm_free(m);
+    }
+
+    // (2) Чистый argmax буфера не требует вовсе.
+    m = samp_container(logits, n, NULL, VTM_SAMP_ARGMAX);
+    CHECK(m != NULL);
+    if (m) {
+        for (i = 0; i < 10; i++) (void)samp_next(m);
+        CHECK(vtm_samp_alloc_count(m) == 0);
+        CHECK(vtm_samp_buffer_bytes(m) == 0);
+        vtm_free(m);
+    }
+
+    // (3) argmax со штрафом: буфер нужен под метки окна, но тоже один раз.
+    m = samp_container(logits, n,
+                       "{\"repetition_penalty\": 3.0,"
+                       " \"repetition_window\": 8}", VTM_SAMP_ARGMAX);
+    CHECK(m != NULL);
+    if (m) {
+        for (i = 0; i < 10; i++) (void)samp_next(m);
+        CHECK(vtm_samp_alloc_count(m) == 1);
+        vtm_samp_free(m);
+        vtm_free(m);
+    }
+
+    free(logits);
+}
+
+// Переиспользованная память не должна штрафовать «чужие» токены.
+// vtm_free() вызывает vtm_samp_free(), и следующий malloc может отдать тот же
+// блок с метками прошлой машины (на glibc это штатное поведение). Тест-хук
+// vtm_samp_poison_stamps() воспроизводит это состояние на любой платформе:
+// метки заполнены значением, которое выберет следующее поколение, а счётчик
+// поколений обнулён — ровно как у свежей машины на грязном блоке.
+static void test_samp_stale_stamps(void) {
+    float logits[8] = {0.4f, 0.0f, 1.1f, 0.0f, 0.2f, 0.1f, 0.3f, 0.05f};
+    const char *meta = "{\"temperature\": 1.0, \"top_p\": 0.95,"
+                       " \"repetition_penalty\": 2.0,"
+                       " \"repetition_window\": 4,"
+                       " \"sample_seed\": 123456}";
+    int clean[24], dirty[24];
+    vtm_t *a = samp_container(logits, 8, meta, VTM_SAMP_TOPP);
+    vtm_t *b = samp_container(logits, 8, meta, VTM_SAMP_TOPP);
+
+    CHECK(a != NULL && b != NULL);
+    if (a && b) {
+        // Один шаг: буферы уже выделены, история и состояние ГПСЧ одинаковы.
+        (void)samp_next(a);
+        (void)samp_next(b);
+        // Блоку b «достались» метки поколения 1 от прошлой машины: именно
+        // это значение выберет следующий fill, если метки не обнулить, —
+        // тогда штраф получили бы все токены словаря, а не окно.
+        vtm_samp_poison_stamps(b, 1);
+        samp_seq(a, clean, 24);
+        samp_seq(b, dirty, 24);
+        CHECK(memcmp(clean, dirty, sizeof clean) == 0);
+        CHECK(vtm_samp_buffer_bytes(b) > 0);
+    }
+    vtm_free(a);
+    vtm_free(b);
+
+    // Тот же кейс, что ловил падение на glibc: новая машина после free
+    // обязана повторять чистую последовательность (метки не переезжают).
+    {
+        float wide[64];
+        char meta2[192];
+        int first[16], second[16];
+        vtm_t *m1, *m2;
+        int i;
+        for (i = 0; i < 64; i++) wide[i] = (float)((i * 37) % 29) / 7.0f - 2.0f;
+        for (i = 0; i < 4; i++) {
+            snprintf(meta2, sizeof meta2,
+                     "{\"temperature\": 0.8, \"top_p\": 0.9,"
+                     " \"repetition_penalty\": 1.7,"
+                     " \"repetition_window\": 8, \"sample_seed\": %d}",
+                     100 + i);
+            m1 = samp_container(wide, 64, meta2, VTM_SAMP_TOPP);
+            CHECK(m1 != NULL);
+            if (!m1) continue;
+            samp_seq(m1, first, 16);
+            vtm_free(m1);                       // освобождает буфер с метками
+            m2 = samp_container(wide, 64, meta2, VTM_SAMP_TOPP);
+            CHECK(m2 != NULL);
+            if (!m2) continue;
+            samp_seq(m2, second, 16);
+            CHECK(memcmp(first, second, sizeof first) == 0);
+            vtm_free(m2);
+        }
+    }
+}
+
+static double bench_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+// Замер на словаре Qwen: 150 000 логитов. Число прогонов можно поднять
+// через VTM_SAMP_BENCH (по умолчанию 12 — чтобы make test не тормозил).
+static void test_samp_bench_150k(void) {
+    const uint32_t n = 150000;
+    const char *env = getenv("VTM_SAMP_BENCH");
+    int iters = env ? atoi(env) : 12;
+    float *logits = (float *)xmalloc((size_t)n * sizeof *logits);
+    uint32_t i;
+    int pass;
+
+    if (iters < 1) iters = 1;
+    if (iters > 1000) iters = 1000;
+    for (i = 0; i < n; i++) {
+        // Логиты «как у модели»: основная масса около нуля, заметный лидер.
+        double x = (double)((i * 2654435761u) % 10000u) / 2000.0 - 2.5;
+        logits[i] = (float)x;
+    }
+    logits[n / 3] = 18.0f;
+
+    for (pass = 0; pass < 2; pass++) {
+        int strategy = pass == 0 ? VTM_SAMP_TOPK : VTM_SAMP_TEMPERATURE;
+        const char *name = pass == 0 ? "top-k 40" : "temperature";
+        char meta[160];
+        vtm_t *m;
+        uint64_t rng;
+        int hist[512];
+        int n_hist = 0, it, mismatches = 0;
+        double t0, old_ms, new_ms;
+
+        snprintf(meta, sizeof meta,
+                 "{\"temperature\": 0.8, \"top_k\": 40,"
+                 " \"sample_seed\": 7}");
+        m = samp_container(logits, n, meta, strategy);
+        CHECK(m != NULL);
+        if (!m) continue;
+        rng = ref_samp_mix64(7 ^ 0x9E3779B97F4A7C15ull);
+
+        (void)samp_next(m);          // первый SAMP выделяет буфер: не в замер
+        t0 = bench_now();
+        for (it = 0; it < iters; it++) (void)samp_next(m);
+        new_ms = (bench_now() - t0) * 1000.0 / (double)iters;
+
+        // Прежний путь на тех же данных: malloc + qsort + обход словаря.
+        t0 = bench_now();
+        for (it = 0; it < iters; it++) {
+            int used = 0, token;
+            double u = ref_samp_uniform(&rng);
+            token = ref_samp_choose(logits, n, strategy, 0.8, 40, 1.0,
+                                    1.0, 64, hist, n_hist, u, &used);
+            if (n_hist < (int)(sizeof hist / sizeof hist[0]))
+                hist[n_hist++] = token;
+        }
+        old_ms = (bench_now() - t0) * 1000.0 / (double)iters;
+
+        // И заодно паритет на широком словаре: те же токены, что у эталона.
+        n_hist = 0;
+        {
+            vtm_t *m2 = samp_container(logits, n, meta, strategy);
+            uint64_t rng2 = ref_samp_mix64(7 ^ 0x9E3779B97F4A7C15ull);
+            CHECK(m2 != NULL);
+            if (m2) {
+                for (it = 0; it < iters; it++) {
+                    int used = 0, want, got;
+                    double u = ref_samp_uniform(&rng2);
+                    want = ref_samp_choose(logits, n, strategy, 0.8, 40, 1.0,
+                                           1.0, 64, hist, n_hist, u, &used);
+                    got = samp_next(m2);
+                    if (got != want) mismatches++;
+                    if (n_hist < (int)(sizeof hist / sizeof hist[0]))
+                        hist[n_hist++] = got;
+                }
+                vtm_samp_free(m2);
+                vtm_free(m2);
+            }
+        }
+        CHECK(mismatches == 0);
+        printf("  SAMP 150k %-12s старое %7.3f мс/токен, новое %7.3f мс/токен"
+               ", ускорение %5.1fx\n", name, old_ms, new_ms,
+               new_ms > 0.0 ? old_ms / new_ms : 0.0);
+        vtm_samp_free(m);
+        vtm_free(m);
+    }
+    free(logits);
+}
+
+// RAW-раскладка (слова и масштабы в разных местах) тоже отображается без
+// копирования: offset и scale_offset кратны 32, поэтому указатели выровнены.
+static void test_mmap_raw_trit(void) {
+    model_t md;
+    uint32_t dw[2] = {1, 3};
+    uint32_t dx[1] = {3};
+    uint32_t dy[1] = {1};
+    int8_t wt[3] = {1, -1, 0};
+    float scales[1] = {3.0f};
+    float xv[3] = {2.0f, 5.0f, 7.0f};
+    float zero1[1] = {0.0f};
+    uint8_t *img;
+    size_t size;
+    char path[128];
+    long stamp = (long)time(NULL);
+    vtm_t *m;
+
+    model_init(&md);
+    md.header_flags = VTM_HEADER_FLAG_F32_SCALES;
+    model_add_raw_trit(&md, "W", 2, dw, wt, scales);
+    model_add_f32(&md, "x", 1, dx, xv);
+    model_add_f32(&md, "y", 1, dy, zero1);
+    model_inst(&md, VTM_OP_TMV, 0, 2, 0, 1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+    snprintf(path, sizeof path, "/tmp/vtm_mmap_raw_%ld.vtm", stamp);
+    CHECK(write_image(path, img, size) == 0);
+
+    m = vtm_load(path);
+    CHECK(m != NULL);
+    if (m) {
+        const vtm_tensor *w = vtm_tensor_by_name(m, "W");
+        CHECK(w != NULL && w->layout == VTM_LAYOUT_RAW);
+        CHECK(vtm_internal_tensor_is_mapped(m, 0) == mmap_expected());
+        CHECK(run_ok(m));
+        CHECK_NEAR(vtm_tensor_by_name(m, "y")->f32[0],
+                   (1.0 * 2.0 - 1.0 * 5.0) * 3.0, 1e-6);
+        vtm_free(m);
+    }
+
+    remove(path);
+    free(img);
+    model_free(&md);
+}
+
 // --- main ------------------------------------------------------------------
 
 int main(void) {
@@ -2591,6 +3602,17 @@ int main(void) {
     test_large_dims_u32();
     test_cli_text();
     test_cli_chat();
+    test_cli_stream();
+    test_mmap_file_load();
+    test_mmap_fallback();
+    test_mmap_truncated();
+    test_mmap_f16_bf16();
+    test_mmap_trit_f16_scales();
+    test_mmap_raw_trit();
+    test_samp_partial_select();
+    test_samp_buffer_reuse();
+    test_samp_stale_stamps();
+    test_samp_bench_150k();
 
     if (g_fail) {
         fprintf(stderr, "\nПРОВАЛЕНО проверок: %d\n", g_fail);

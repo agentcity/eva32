@@ -387,14 +387,14 @@
   {
     "id": "0059",
     "title": "Сэмплинг по словарю 150k: буфер и частичный отбор",
-    "status": "in_progress",
+    "status": "done",
     "file": "0059-vtm-samp-perf.md",
     "assignee": "agent:vtm-samp-perf"
   },
   {
     "id": "0060",
     "title": "Загрузка контейнера через mmap: память 2×→1×",
-    "status": "in_progress",
+    "status": "done",
     "file": "0060-vtm-mmap.md",
     "assignee": "agent:vtm-mmap"
   },

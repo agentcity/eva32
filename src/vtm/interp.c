@@ -831,21 +831,173 @@ static vtm_status op_attn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 // Python при одном seed дают одну и ту же последовательность токенов.
 // Всё, от чего зависит выбор, считается в double — как в Python-эталоне.
 
-// Эффективный argmax: первый максимум, NaN не побеждает (v0.1).
-// При включённом штрафе — по логитам, уже умноженным на штраф.
+// Кандидат: логит после штрафа и его токен. Порядок — по значению (убывание),
+// при равенстве — по индексу (возрастание). Это ровно тот порядок, который
+// задавал прежний qsort-компаратор: он виден снаружи, потому что сумма весов
+// накапливается по убыванию, а от порядка сложений зависят последние биты
+// (паритет C↔Python с tools/vtm_ref.py, задача 0051).
 typedef struct {
-    double   value;     // логит после штрафа
+    double   value;     // логит после штрафа (-0.0 приведён к +0.0)
     uint32_t index;     // токен
 } samp_cand;
 
-static int samp_cand_cmp(const void *pa, const void *pb) {
-    const samp_cand *a = (const samp_cand *)pa;
-    const samp_cand *b = (const samp_cand *)pb;
-    if (a->value > b->value) return -1;
-    if (a->value < b->value) return 1;
-    if (a->index < b->index) return -1;
-    if (a->index > b->index) return 1;
-    return 0;
+// x стоит в отсортированном массиве раньше y?
+static int samp_before(const samp_cand *x, const samp_cand *y) {
+    if (x->value > y->value) return 1;
+    if (x->value < y->value) return 0;
+    return x->index < y->index;
+}
+
+// Ключ сортировки: uint64, числовой порядок double становится лексикографи-
+// ческим. Для убывания ключ инвертирован, поэтому обычный LSD-radix даёт
+// «по убыванию значения»; равенство значений сохраняет исходный порядок
+// индексов (radix устойчив, массив заполняется по возрастанию индекса).
+static uint64_t samp_sort_key(double value) {
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    if (bits & 0x8000000000000000ull) bits = ~bits;
+    else bits |= 0x8000000000000000ull;
+    return ~bits;
+}
+
+// Сортировка вставками — для малых n и малого top-k: там она дешевле
+// radix (у того на каждый проход приходится обнуление таблицы счётчиков).
+static void samp_insertion_sort(samp_cand *a, uint32_t n) {
+    uint32_t i;
+    for (i = 1; i < n; i++) {
+        samp_cand cur = a[i];
+        uint32_t j = i;
+        while (j > 0 && samp_before(&cur, &a[j - 1])) {
+            a[j] = a[j - 1];
+            j--;
+        }
+        a[j] = cur;
+    }
+}
+
+// LSD-radix: линейное время вместо n·log n у qsort — это и есть основной
+// выигрыш задачи 0059 на словаре 150k. Компаратор не нужен вовсе, а
+// устойчивость проходов сохраняет порядок индексов внутри равных значений.
+// Разрядность — параметр: 16 бит (4 прохода, счётчики 256 КБ из буфера
+// машины) для больших словарей и 11 бит (6 проходов, 8 КБ на стеке) для
+// маленьких, где 256 КБ на каждую машину были бы дороже самой сортировки.
+// by_index: устойчивая сортировка по возрастанию индекса (нужна только
+// префиксу top-k, см. samp_radix_sort_prefix); иначе — по значению.
+static void samp_radix_sort_bits(samp_cand *a, samp_cand *tmp, uint32_t n,
+                                 uint32_t *count, unsigned bits,
+                                 int by_index) {
+    const uint32_t size = 1u << bits;
+    const uint32_t mask = size - 1u;
+    const unsigned width = by_index ? 32u : 64u;
+    const unsigned passes = (width + bits - 1u) / bits;
+    unsigned pass;
+    uint32_t i;
+    samp_cand *src = a, *dst = tmp;
+
+    for (pass = 0; pass < passes; pass++) {
+        unsigned shift = pass * bits;
+        memset(count, 0, (size_t)size * sizeof *count);
+        for (i = 0; i < n; i++) {
+            uint64_t key = by_index ? (uint64_t)src[i].index
+                                    : samp_sort_key(src[i].value);
+            count[(key >> shift) & mask]++;
+        }
+        {
+            uint32_t sum = 0;
+            for (i = 0; i < size; i++) {
+                uint32_t c = count[i];
+                count[i] = sum;
+                sum += c;
+            }
+        }
+        for (i = 0; i < n; i++) {
+            uint64_t key = by_index ? (uint64_t)src[i].index
+                                    : samp_sort_key(src[i].value);
+            dst[count[(key >> shift) & mask]++] = src[i];
+        }
+        {
+            samp_cand *t = src;
+            src = dst;
+            dst = t;
+        }
+    }
+    if (src != a) memcpy(a, src, (size_t)n * sizeof *a);
+}
+
+#define SAMP_RADIX_SMALL_BITS 11u
+#define SAMP_RADIX_SMALL_SIZE (1u << SAMP_RADIX_SMALL_BITS)
+
+// Полный порядок: значение по убыванию, равные — по возрастанию индекса.
+// Массив заполняется в порядке индексов, поэтому устойчивый radix по
+// значению сразу даёт нужный порядок равных.
+static void samp_radix_sort(vtm_t *m, samp_cand *a, samp_cand *tmp, uint32_t n) {
+    if (n < 2) return;
+    if (m->samp_count) {
+        samp_radix_sort_bits(a, tmp, n, m->samp_count, 16u, 0);
+    } else {
+        uint32_t count[SAMP_RADIX_SMALL_SIZE];
+        samp_radix_sort_bits(a, tmp, n, count, SAMP_RADIX_SMALL_BITS, 0);
+    }
+}
+
+// Порядок префикса, отобранного quickselect: тот же (значение по убыванию,
+// равные — по возрастанию индекса). Quickselect перемешивает равные
+// значения, поэтому сначала устойчиво сортируем по индексу, а затем
+// устойчиво по значению — сложение двух устойчивых сортировок даёт
+// (значение, индекс). Без первой фазы равные логиты встали бы произвольно.
+static void samp_radix_sort_prefix(vtm_t *m, samp_cand *a, samp_cand *tmp,
+                                   uint32_t n) {
+    if (n < 2) return;
+    if (m->samp_count) {
+        samp_radix_sort_bits(a, tmp, n, m->samp_count, 16u, 1);
+        samp_radix_sort_bits(a, tmp, n, m->samp_count, 16u, 0);
+    } else {
+        uint32_t count[SAMP_RADIX_SMALL_SIZE];
+        samp_radix_sort_bits(a, tmp, n, count, SAMP_RADIX_SMALL_BITS, 1);
+        samp_radix_sort_bits(a, tmp, n, count, SAMP_RADIX_SMALL_BITS, 0);
+    }
+}
+
+// Разбиение Ломуто: a[p] встаёт на своё место в полном порядке, слева —
+// меньшие, справа — большие. Медиана из трёх снимает худший случай на
+// отсортированных данных.
+static uint32_t samp_partition(samp_cand *a, uint32_t lo, uint32_t hi) {
+    uint32_t mid = lo + (hi - lo) / 2u, i, p = lo;
+    samp_cand pv, t;
+
+    if (samp_before(&a[mid], &a[lo])) { t = a[mid]; a[mid] = a[lo]; a[lo] = t; }
+    if (samp_before(&a[hi - 1], &a[mid])) {
+        t = a[hi - 1]; a[hi - 1] = a[mid]; a[mid] = t;
+    }
+    if (samp_before(&a[mid], &a[lo])) { t = a[mid]; a[mid] = a[lo]; a[lo] = t; }
+    pv = a[lo];
+    for (i = lo + 1; i < hi; i++) {
+        if (samp_before(&a[i], &pv)) {
+            p++;
+            if (p != i) { t = a[p]; a[p] = a[i]; a[i] = t; }
+        }
+    }
+    if (p != lo) { t = a[lo]; a[lo] = a[p]; a[p] = t; }
+    return p;
+}
+
+// Частичный отбор: в a[0..k) — k старших кандидатов (порядок внутри любой).
+// Число раундов ограничено: на патологии уходим в полную radix-сортировку,
+// чтобы не поймать квадратичное время.
+static void samp_select_prefix(vtm_t *m, samp_cand *a, samp_cand *tmp,
+                               uint32_t n, uint32_t k) {
+    uint32_t lo = 0, hi = n, rounds = 0, max_rounds = 64;
+
+    while (lo < k && hi - lo > 1) {
+        uint32_t p;
+        if (++rounds > max_rounds) {
+            samp_radix_sort(m, a, tmp, n);
+            return;
+        }
+        p = samp_partition(a, lo, hi);
+        if (p >= k) hi = p;
+        else lo = p + 1;
+    }
 }
 
 // splitmix64 — только для засева xorshift64*.
@@ -994,6 +1146,24 @@ static void samp_state_seed(vtm_t *m) {
     m->samp_hist_head = 0;
 }
 
+// Следующее поколение меток окна повторов. Ноль зарезервирован под «метки
+// недействительны» (блок только выделен или освобождён), поэтому живое
+// поколение всегда >= 1. Метки с меньшим поколением безопасны: сравнение с
+// текущим их не узнаёт. Переполнение счётчика чистит метки — иначе старое
+// значение снова стало бы «своим».
+static uint32_t samp_stamp_next_gen(vtm_t *m) {
+    uint32_t gen = m->samp_stamp_gen + 1u;
+
+    if (gen == 0u || m->samp_stamp_gen == 0u) {
+        if (m->samp_stamp)
+            memset(m->samp_stamp, 0,
+                   (size_t)m->samp_buf_cap * sizeof *m->samp_stamp);
+        gen = 1u;
+    }
+    m->samp_stamp_gen = gen;
+    return gen;
+}
+
 // Явный сброс состояния SAMP; вызывать из vtm_reset() (loader.c).
 // Пока загрузчик этого не делает, op_samp() замечает сброс сам — по
 // счётчику vtm_generated(), поэтому поведение одинаково в обоих случаях.
@@ -1001,6 +1171,8 @@ void vtm_samp_reset(vtm_t *m) {
     if (!m) return;
     m->samp_prev_generated = 0;
     if (m->samp_ready) samp_state_seed(m);
+    // Метки окна не должны пережить сброс: сдвигаем поколение.
+    if (m->samp_stamp) (void)samp_stamp_next_gen(m);
 }
 
 // Вызывается в начале каждого SAMP: ленивая инициализация параметров и
@@ -1052,15 +1224,146 @@ static double samp_penalized(const vtm_t *m, uint32_t token, double value) {
                        : value * m->samp_repetition_penalty;
 }
 
+// --- буфер кандидатов (задача 0059) ---------------------------------------
+//
+// Прежний код на каждый SAMP делал malloc под весь словарь (для Qwen 150k —
+// ~3,6 МБ) и free в конце. Теперь блок живёт в машине: первое выделение,
+// дальше только переиспользование; растём, если словарь оказался больше.
+// Раскладка блока (выравнивание сохраняется, malloc даёт ≥16 байт):
+//     [cand n × 16][tmp n × 16][stamp n × 4][счётчики radix 256 КБ]
+// tmp нужен radix-сортировке, а после неё играет роль массива весов w
+// (8n ≤ 16n), поэтому отдельного массива весов нет.
+//
+// Счётчики radix для большого словаря 16-битные (256 КБ): на 150k это четыре
+// прохода вместо шести и вдвое меньше времени. Мелкому словарю они были бы
+// дороже самой сортировки — там radix работает на 11 битах со стеком, а блок
+// машины остаётся маленьким.
+#define SAMP_BIG_VOCAB 4096u
+#define SAMP_RADIX_COUNT 65536u
+
+static int samp_buf_ensure(vtm_t *m, uint32_t n, uint32_t ins, vtm_status *st) {
+    size_t base, bytes;
+    void *p;
+
+    if (m->samp_buf && m->samp_buf_cap >= n) return 1;
+    base = (size_t)n * (2u * sizeof(samp_cand) + sizeof(uint32_t));
+    bytes = base + (n >= SAMP_BIG_VOCAB
+                    ? (size_t)SAMP_RADIX_COUNT * sizeof(uint32_t) : 0u);
+    p = realloc(m->samp_buf, bytes);
+    if (!p) {
+        *st = fail(m, ins, VTM_E_NOMEM,
+                   "SAMP: нет памяти под %u логитов (%lu байт)",
+                   (unsigned)n, (unsigned long)bytes);
+        return 0;
+    }
+    m->samp_buf = p;
+    m->samp_buf_cap = n;
+    m->samp_buf_bytes = bytes;
+    m->samp_buf_allocs++;
+    m->samp_w = (double *)(void *)((samp_cand *)p + n);
+    m->samp_stamp = (uint32_t *)(void *)((uint8_t *)p
+                                         + (size_t)n * 2u * sizeof(samp_cand));
+    m->samp_count = (n >= SAMP_BIG_VOCAB)
+        ? (uint32_t *)(void *)((uint8_t *)p + base) : NULL;
+    // Блок приходит из malloc/realloc, а не из calloc, и после vtm_samp_free()
+    // (его зовёт vtm_free()) та же память может достаться следующей машине с
+    // метками прошлой. Обнуляем метки один раз на выделение: O(n), зато
+    // дальше проверка — одно сравнение. Поколение стартует с 1: ноль — это
+    // «метки недействительны», иначе нулевые метки выглядели бы как свои.
+    memset(m->samp_stamp, 0, (size_t)n * sizeof *m->samp_stamp);
+    m->samp_stamp_gen = 1;
+    return 1;
+}
+
+void vtm_samp_free(vtm_t *m) {
+    if (!m) return;
+    free(m->samp_buf);
+    m->samp_buf = NULL;
+    m->samp_w = NULL;
+    m->samp_stamp = NULL;
+    m->samp_count = NULL;
+    m->samp_buf_cap = 0;
+    m->samp_buf_bytes = 0;
+    m->samp_stamp_gen = 0;
+}
+
+size_t vtm_samp_alloc_count(const vtm_t *m) {
+    return m ? m->samp_buf_allocs : 0;
+}
+
+size_t vtm_samp_buffer_bytes(const vtm_t *m) {
+    return m ? m->samp_buf_bytes : 0;
+}
+
+// Тест-хук (задача 0051): сымитировать блок, доставшийся от прошлой машины.
+// Заполняет все метки значением gen и сбрасывает счётчик поколений в 0 —
+// ровно то состояние, в котором оказывается свежая машина на грязной памяти
+// (malloc после vtm_samp_free). Норма: первый же SAMP метки чистит, поэтому
+// ни один «чужой» токен не получает штраф.
+void vtm_samp_poison_stamps(vtm_t *m, uint32_t gen) {
+    uint32_t i;
+
+    if (!m || !m->samp_stamp) return;
+    for (i = 0; i < m->samp_buf_cap; i++) m->samp_stamp[i] = gen;
+    m->samp_stamp_gen = 0;
+}
+
+// Метки окна повторов: поколение вместо линейного поиска по кольцу.
+// Прежний samp_hist_has() на каждый токен пробегал до 256 записей истории —
+// на словаре 150k это 38 млн сравнений на токен. Теперь окно один раз
+// помечается в stamp[], а проверка — одно сравнение.
+// Возвращает 1, если метки проставлены (штраф активен и буфер есть).
+static int samp_stamp_fill(vtm_t *m, uint32_t n) {
+    uint32_t gen;
+    int k, lim;
+
+    if (!samp_penalty_active(m)) return 0;
+    if (!m->samp_buf || m->samp_buf_cap < n || !m->samp_stamp) return 0;
+    // Метки обязаны быть чистыми перед первым использованием: блок приходит
+    // из malloc/realloc, и в «мусоре» может лежать значение, равное новому
+    // поколению, — тогда невинный токен получил бы штраф. samp_buf_ensure()
+    // чистит их при выделении, helper страхует состояния «поколение 0»
+    // (переиспользованная/испорченная память) и переполнение счётчика.
+    gen = samp_stamp_next_gen(m);
+    lim = m->samp_repetition_window;
+    if (lim > m->samp_hist_len) lim = m->samp_hist_len;
+    for (k = 0; k < lim; k++) {
+        int idx = m->samp_hist_head - 1 - k;
+        int token;
+        if (idx < 0) idx += VTM_MAX_REPETITION_WINDOW;
+        token = m->samp_hist[idx];
+        // Токен из прошлого словаря может быть >= n: он не может совпасть
+        // ни с одним j < n, поэтому просто не помечаем.
+        if (token >= 0 && (uint32_t)token < n) m->samp_stamp[token] = gen;
+    }
+    return 1;
+}
+
+// Штраф по готовым меткам (samp_stamp_fill); token < n ≤ samp_buf_cap.
+static double samp_penalized_stamped(const vtm_t *m, uint32_t token,
+                                     double value) {
+    if (m->samp_stamp[token] != m->samp_stamp_gen) return value;
+    return value > 0.0 ? value / m->samp_repetition_penalty
+                       : value * m->samp_repetition_penalty;
+}
+
 // Жадный argmax — байт-в-байт как в v0.1, если штраф выключен.
-static int samp_greedy(const vtm_t *m, const float *v, uint32_t n) {
+// stamped: метки окна уже проставлены (тогда штраф ищется за O(1)).
+static int samp_greedy(const vtm_t *m, const float *v, uint32_t n, int stamped) {
     int best_i = 0;
     double best = (double)v[0];
     uint32_t j;
 
-    if (samp_penalty_active(m)) best = samp_penalized(m, 0, (double)v[0]);
+    if (samp_penalty_active(m)) {
+        best = stamped ? samp_penalized_stamped(m, 0, best)
+                       : samp_penalized(m, 0, best);
+    }
     for (j = 1; j < n; j++) {
-        double value = samp_penalized(m, j, (double)v[j]);
+        double value = (double)v[j];
+        if (samp_penalty_active(m)) {
+            value = stamped ? samp_penalized_stamped(m, j, value)
+                            : samp_penalized(m, j, value);
+        }
         if (value > best) {
             best = value;
             best_i = (int)j;
@@ -1069,44 +1372,65 @@ static int samp_greedy(const vtm_t *m, const float *v, uint32_t n) {
     return best_i;
 }
 
-// Сортировка, затем температура/top-k/top-p и одно случайное число.
+// Температура/top-k/top-p и одно случайное число.
+//
+// Порядок кандидатов — по убыванию логита (при равенстве по возрастанию
+// индекса), потому что веса накапливаются именно в нём, и от порядка
+// сложений зависят последние биты. Полная сортировка нужна только там, где
+// сумма идёт по всему словарю (temperature и top-p); для top-k достаточно
+// отобрать k старших. Поэтому вместо qsort: quickselect (+ вставки на малом
+// k) для top-k и линейная LSD-radix — там, где порядок нужен целиком.
 static vtm_status samp_sample(vtm_t *m, uint32_t ins, const float *v, uint32_t n,
                               int strategy, int *token) {
-    samp_cand *cand;
+    samp_cand *cand, *tmp;
     double *w;
     uint32_t j, kept = n;
-    double top, total = 0.0, upto, acc, u;
+    double top = -INFINITY, total = 0.0, upto, acc, u;
     double temperature = m->samp_temperature;
     int penalty = samp_penalty_active(m);
+    int stamped, best_i = 0;
+    vtm_status st;
 
-    // Один malloc на кандидатов и веса: словарь — сотни тысяч токенов,
-    // два вызова на каждый сэмпл дороже, чем кажется. sizeof(samp_cand)
-    // кратен 8, поэтому массив double после него выровнен.
-    {
-        size_t bytes = (size_t)n * (sizeof *cand + sizeof *w);
-        cand = (samp_cand *)malloc(bytes);
-        if (!cand)
-            return fail(m, ins, VTM_E_NOMEM,
-                        "SAMP: нет памяти под %u логитов", (unsigned)n);
-        w = (double *)(void *)(cand + n);
-    }
+    if (!samp_buf_ensure(m, n, ins, &st)) return st;
+    cand = (samp_cand *)m->samp_buf;
+    tmp = cand + n;
+    w = m->samp_w;
+    stamped = samp_stamp_fill(m, n);
+
     for (j = 0; j < n; j++) {
         double value = (double)v[j];
         if (isnan(value)) value = -INFINITY;
-        cand[j].value = penalty ? samp_penalized(m, j, value) : value;
+        if (penalty) {
+            value = stamped ? samp_penalized_stamped(m, j, value)
+                            : samp_penalized(m, j, value);
+        }
+        // -0.0 и +0.0 численно равны, а ключ radix у них разный: приводим к
+        // +0.0, чтобы равные значения упорядочивались по индексу, как в
+        // прежнем компараторе.
+        if (value == 0.0) value = 0.0;
+        cand[j].value = value;
         cand[j].index = j;
+        if (value > top) {
+            top = value;
+            best_i = (int)j;
+        }
     }
-    qsort(cand, (size_t)n, sizeof *cand, samp_cand_cmp);
-    *token = (int)cand[0].index;
-    top = cand[0].value;
-
+    *token = best_i;
     if (!isfinite(top)) {          // все логиты -inf/NaN — как argmax по ним
-        free(cand);
         return VTM_OK;
     }
+
     if (strategy == VTM_SAMP_TOPK && m->samp_top_k > 0
-        && (uint32_t)m->samp_top_k < kept)
+        && (uint32_t)m->samp_top_k < kept) {
         kept = (uint32_t)m->samp_top_k;
+        samp_select_prefix(m, cand, tmp, n, kept);
+        if (kept <= 64) samp_insertion_sort(cand, kept);
+        else samp_radix_sort_prefix(m, cand, tmp, kept);
+    } else if (n <= 64) {
+        samp_insertion_sort(cand, n);
+    } else {
+        samp_radix_sort(m, cand, tmp, n);
+    }
     for (j = 0; j < kept; j++) {
         w[j] = exp((cand[j].value - top) / temperature);
         total += w[j];
@@ -1130,7 +1454,6 @@ static vtm_status samp_sample(vtm_t *m, uint32_t ins, const float *v, uint32_t n
         }
         if (j >= kept) *token = (int)cand[kept - 1].index;
     }
-    free(cand);
     return VTM_OK;
 }
 
@@ -1174,7 +1497,15 @@ static vtm_status op_samp(vtm_t *m, uint32_t ins, const vtm_instr *in,
           || (strategy == VTM_SAMP_TOPP
               && (m->samp_temperature <= 0.0 || m->samp_top_p <= 0.0));
     if (greedy) {
-        token = samp_greedy(m, logits->f32, n);
+        // Метки окна нужны и argmax'у со штрафом: иначе на каждый токен
+        // пробегается вся история. Буфер выделяется только при активном
+        // штрафе — чистый argmax остаётся без выделений вовсе.
+        int stamped = 0;
+        if (samp_penalty_active(m)) {
+            vtm_status bst = VTM_OK;
+            if (samp_buf_ensure(m, n, ins, &bst)) stamped = samp_stamp_fill(m, n);
+        }
+        token = samp_greedy(m, logits->f32, n, stamped);
     } else if ((st = samp_sample(m, ins, logits->f32, n, strategy,
                                  &token)) != VTM_OK) {
         return st;

@@ -15,6 +15,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if !defined(_WIN32)
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+// TRT1-сегмент устроен как «18 байт заголовка + масштабы + слова», поэтому
+// указатели внутри него не выровнены на 4: слово/масштаб идут по смещению
+// 2 (mod 4). x86 и ARM допускают такие загрузки; на строгих платформах
+// (и для проверки этого пути) можно собрать с -DVTM_UNALIGNED_LOADS=0 —
+// тогда такие тензоры копируются в выровненную арену.
+#ifndef VTM_UNALIGNED_LOADS
+#if defined(__x86_64__) || defined(__i386__) || defined(__aarch64__) || \
+    defined(__arm__) || defined(_M_X64) || defined(_M_IX86) || \
+    defined(_M_ARM64)
+#define VTM_UNALIGNED_LOADS 1
+#else
+#define VTM_UNALIGNED_LOADS 0
+#endif
+#endif
+
 static char g_last_error[256] = "нет ошибки";
 
 const char *vtm_last_error(void) {
@@ -156,59 +179,132 @@ static int tensor_arena_size(const vtm_tensor *t, size_t *out) {
     return 0;
 }
 
-// Скопировать данные тензора из файла в арену. Для тритов сначала идут слова
-// (выровнены на 64), затем масштабы (выровнены на 32, уже fp32).
-static void fill_tensor(vtm_tensor *t, const uint8_t *data, uint8_t *dst) {
+// План загрузки одного тензора. В mmap-режиме (can_reference) неизменяемые
+// fp32-тензоры и слова тритов остаются в отображении, поэтому в арене для них
+// места нет. Копируются:
+//   - всё, что интерпретатор может писать (writable: dst и V-кэш KVW);
+//   - fp16/bf16 — их всё равно нужно развернуть в fp32 (t->f32 — float*);
+//   - масштабы тритов в fp16: API отдаёт их как float*.
+typedef struct {
+    size_t arena_size;  // байт в арене
+    int    copy_data;   // fp32/fp16/bf16: копировать значения в арену
+    int    copy_words;  // трит: копировать слова в арену
+    int    copy_scales; // трит: копировать/конвертировать масштабы в арену
+} tensor_plan;
+
+static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
+                       tensor_plan *p) {
+    size_t sz;
+
+    p->arena_size = 0;
+    p->copy_data = 0;
+    p->copy_words = 0;
+    p->copy_scales = 0;
+
+    if (!can_reference || writable) {
+        if (tensor_arena_size(t, &sz) != 0) return -1;
+        p->arena_size = sz;
+        p->copy_data = 1;
+        if (t->kind == VTM_TENSOR_TRIT) {
+            p->copy_words = 1;
+            p->copy_scales = 1;
+        }
+        return 0;
+    }
+
+    if (t->kind == VTM_TENSOR_F32) return 0; // отображение читается как float
+    if (t->kind == VTM_TENSOR_F16 || t->kind == VTM_TENSOR_BF16) {
+        if (tensor_arena_size(t, &sz) != 0) return -1;
+        p->arena_size = sz;
+        p->copy_data = 1;
+        return 0;
+    }
+
+    // TRIT: слова — прямо в отображении (главный выигрыш по памяти).
+    // Масштабы fp32 тоже читаются из отображения; fp16 приходится развернуть.
+#if !VTM_UNALIGNED_LOADS
+    // Строгие платформы: TRT1 отдаёт указатели не по границе 4 байт.
+    if (t->layout == VTM_LAYOUT_TRT1) {
+        if (tensor_arena_size(t, &sz) != 0) return -1;
+        p->arena_size = sz;
+        p->copy_data = 1;
+        p->copy_words = 1;
+        p->copy_scales = 1;
+        return 0;
+    }
+#endif
+    p->copy_scales = !t->scale_is_f32;
+    if (p->copy_scales) {
+        if ((uint64_t)t->n_scales * 4u > (uint64_t)SIZE_MAX) return -1;
+        p->arena_size = (size_t)t->n_scales * 4u;
+    }
+    return 0;
+}
+
+static const uint8_t *trit_words_ptr(const vtm_tensor *t, const uint8_t *data) {
+    if (t->layout == VTM_LAYOUT_TRT1) {
+        size_t ss = t->scale_is_f32 ? 4u : 2u;
+        return data + t->offset + 18u + (size_t)t->n_scales * ss;
+    }
+    return data + t->offset;
+}
+
+static const uint8_t *trit_scales_ptr(const vtm_tensor *t, const uint8_t *data) {
+    if (t->layout == VTM_LAYOUT_TRT1) return data + t->offset + 18u;
+    return data + t->scale_offset;
+}
+
+// Разложить тензор по арене (copy_*) или выставить указатели в отображение.
+// data — начало секции данных (data_start уже прибавлен вызывающим).
+// Для тритов слова идут первыми (выровнены на 64), затем масштабы.
+static void fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
+                                uint8_t *dst, const tensor_plan *p) {
     if (t->kind == VTM_TENSOR_TRIT) {
         uint32_t nb = t->n_blocks;
         uint32_t ns = t->n_scales;
         uint32_t i;
-        const uint8_t *sp;
-        const uint8_t *wp;
-        uint32_t *words = (uint32_t *)dst;
-        float *scales = (float *)(void *)(dst + (size_t)nb * 32u);
+        const uint8_t *sp = trit_scales_ptr(t, data);
+        const uint8_t *wp = trit_words_ptr(t, data);
 
-        if (t->layout == VTM_LAYOUT_TRT1) {
-            const uint8_t *seg = data + t->offset;
-            size_t ss = t->scale_is_f32 ? 4u : 2u;
-            sp = seg + 18u;
-            wp = seg + 18u + (size_t)ns * ss;
+        if (p->copy_words) {
+            uint32_t *words = (uint32_t *)(void *)dst;
+            for (i = 0; i < nb; i++) {
+                uint32_t w;
+                for (w = 0; w < VTM_WORDS_PER_BLOCK; w++) {
+                    words[i * VTM_WORDS_PER_BLOCK + w] =
+                        rd32(wp + ((size_t)i * VTM_WORDS_PER_BLOCK + w) * 4u);
+                }
+            }
+            t->words = words;
         } else {
-            sp = data + t->scale_offset;
-            wp = data + t->offset;
+            t->words = (const uint32_t *)(const void *)wp;
         }
-        for (i = 0; i < ns; i++) {
-            scales[i] = t->scale_is_f32 ? rd_f32(sp + (size_t)i * 4u)
-                                        : vtm_half_to_float(rd16(sp + (size_t)i * 2u));
+
+        if (p->copy_scales) {
+            float *scales = (float *)(void *)(dst + (p->copy_words
+                                                     ? (size_t)nb * 32u : 0u));
+            for (i = 0; i < ns; i++) {
+                scales[i] = t->scale_is_f32
+                          ? rd_f32(sp + (size_t)i * 4u)
+                          : vtm_half_to_float(rd16(sp + (size_t)i * 2u));
+            }
+            t->scales = scales;
+        } else {
+            t->scales = (const float *)(const void *)sp;
         }
-        for (i = 0; i < nb; i++) {
-            words[i * VTM_WORDS_PER_BLOCK + 0] =
-                rd32(wp + ((size_t)i * VTM_WORDS_PER_BLOCK + 0) * 4u);
-            words[i * VTM_WORDS_PER_BLOCK + 1] =
-                rd32(wp + ((size_t)i * VTM_WORDS_PER_BLOCK + 1) * 4u);
-            words[i * VTM_WORDS_PER_BLOCK + 2] =
-                rd32(wp + ((size_t)i * VTM_WORDS_PER_BLOCK + 2) * 4u);
-            words[i * VTM_WORDS_PER_BLOCK + 3] =
-                rd32(wp + ((size_t)i * VTM_WORDS_PER_BLOCK + 3) * 4u);
-            words[i * VTM_WORDS_PER_BLOCK + 4] =
-                rd32(wp + ((size_t)i * VTM_WORDS_PER_BLOCK + 4) * 4u);
-            words[i * VTM_WORDS_PER_BLOCK + 5] =
-                rd32(wp + ((size_t)i * VTM_WORDS_PER_BLOCK + 5) * 4u);
-            words[i * VTM_WORDS_PER_BLOCK + 6] =
-                rd32(wp + ((size_t)i * VTM_WORDS_PER_BLOCK + 6) * 4u);
-            words[i * VTM_WORDS_PER_BLOCK + 7] =
-                rd32(wp + ((size_t)i * VTM_WORDS_PER_BLOCK + 7) * 4u);
-        }
-        // const-поля структуры заполняются один раз при загрузке.
-        t->words = words;
-        t->scales = scales;
     } else if (t->kind == VTM_TENSOR_F32) {
-        float *y = (float *)(void *)dst;
-        uint32_t i;
-        const uint8_t *src = data + t->offset;
-        for (i = 0; i < t->n_elements; i++)
-            y[i] = rd_f32(src + (size_t)i * 4u);
-        t->f32 = y;
+        if (p->copy_data) {
+            float *y = (float *)(void *)dst;
+            uint32_t i;
+            const uint8_t *src = data + t->offset;
+            for (i = 0; i < t->n_elements; i++)
+                y[i] = rd_f32(src + (size_t)i * 4u);
+            t->f32 = y;
+        } else {
+            // Немодифицируемый fp32 лежит в отображении как есть: offset
+            // кратен 32, отображение выровнено на страницу, float* валиден.
+            t->f32 = (float *)(void *)(uintptr_t)(data + t->offset);
+        }
     } else if (t->kind == VTM_TENSOR_F16) {
         float *y = (float *)(void *)dst;
         uint32_t i;
@@ -555,8 +651,12 @@ static int meta_parse(const char *json, size_t len, meta_fields *out) {
 
 // --- загрузка из памяти ----------------------------------------------------
 
-vtm_t *vtm_load_mem(const void *data, size_t size,
-                    vtm_status *status, char *errbuf, size_t errcap) {
+// Общее ядро загрузки. can_reference == 1 — данные лежат в mmap-отображении,
+// которое живёт до vtm_free(): неизменяемые тензоры можно оставить там.
+// can_reference == 0 — буфер принадлежит вызывающему (vtm_load_mem) или это
+// фолбэк: всё копируется в арену, как в v0.1.
+static vtm_t *load_core(const void *data, size_t size, int can_reference,
+                        vtm_status *status, char *errbuf, size_t errcap) {
     vtm_status st = VTM_OK;
     vtm_t *m;
     const uint8_t *p = (const uint8_t *)data;
@@ -564,7 +664,8 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
     size_t table_end, data_start, program_bytes, program_off, data_size;
     uint32_t meta_off = 0, meta_len = 0;
     int meta_valid = 0;
-    size_t *sizes = NULL;
+    tensor_plan *plans = NULL;
+    uint8_t *writable = NULL;
     uint32_t i;
 
     if (status) *status = VTM_OK;
@@ -635,6 +736,7 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
     table_end = 32u + (size_t)n_tensors * VTM_TENSOR_ENTRY_SIZE;
     if (align_up(table_end, VTM_DATA_ALIGN, &data_start) != 0 || data_start > size)
         FAIL(VTM_E_TRUNCATED, "не удалось выровнять начало данных");
+    m->data_start = data_start;
 
     if (n_instr > VTM_MAX_INSTR)
         FAIL(VTM_E_FORMAT, "n_instr=%u больше предела %u",
@@ -907,21 +1009,42 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
         }
     }
 
+    // --- какие тензоры интерпретатор может писать -------------------------
+    // В mmap-режиме отображение PROT_READ, поэтому всё, что может стать
+    // приёмником, обязано попасть в арену. KVW пишет не только dst (K-кэш),
+    // но и b (V-кэш) — единственная операция с выходом не в dst. HALT dst не
+    // использует (в тестах и компиляторе там 0), поэтому его не помечаем:
+    // иначе тензор 0 зря копировался бы в арену.
+    if (can_reference && n_tensors) {
+        writable = (uint8_t *)calloc((size_t)n_tensors, 1u);
+        if (!writable)
+            FAIL(VTM_E_NOMEM, "не хватило памяти на карту изменяемых тензоров");
+        for (i = 0; i < n_instr; i++) {
+            const vtm_instr *in = &m->instr[i];
+            if (in->opcode != VTM_OP_HALT && in->dst != VTM_NO_TENSOR)
+                writable[in->dst] = 1;
+            if (in->opcode == VTM_OP_KVW && in->b != VTM_NO_TENSOR)
+                writable[in->b] = 1;
+        }
+    }
+
     // --- арена -------------------------------------------------------------
-    sizes = (size_t *)calloc(n_tensors ? (size_t)n_tensors : 1u, sizeof(size_t));
-    if (!sizes)
-        FAIL(VTM_E_NOMEM, "не хватило памяти на размеры тензоров");
+    plans = (tensor_plan *)calloc(n_tensors ? (size_t)n_tensors : 1u,
+                                  sizeof(tensor_plan));
+    if (!plans)
+        FAIL(VTM_E_NOMEM, "не хватило памяти на планы тензоров");
     {
         size_t total = 0;
         for (i = 0; i < n_tensors; i++) {
             size_t sz, aligned;
-            if (tensor_arena_size(&m->tensors[i], &sz) != 0)
+            int w = writable ? writable[i] : 0;
+            if (plan_tensor(&m->tensors[i], w, can_reference, &plans[i]) != 0)
                 FAIL(VTM_E_NOMEM, "тензор %u: размер арены переполнен", i);
+            sz = plans[i].arena_size;
             if (align_up(total, VTM_ARENA_ALIGN, &aligned) != 0)
                 FAIL(VTM_E_NOMEM, "арена: переполнение выравнивания");
             if (sz > SIZE_MAX - aligned)
                 FAIL(VTM_E_NOMEM, "арена: переполнение размера");
-            sizes[i] = sz;
             total = aligned + sz;
         }
         m->arena_size = total;
@@ -944,20 +1067,24 @@ vtm_t *vtm_load_mem(const void *data, size_t size,
             size_t off;
             if (align_up(used, VTM_ARENA_ALIGN, &off) != 0)
                 FAIL(VTM_E_NOMEM, "арена: переполнение смещения");
-            fill_tensor(&m->tensors[i], p + data_start, m->arena + off);
-            used = off + sizes[i];
+            fill_tensor_planned(&m->tensors[i], p + data_start,
+                                m->arena ? m->arena + off : NULL, &plans[i]);
+            used = off + plans[i].arena_size;
         }
     }
 
-    free(sizes);
-    sizes = NULL;
+    free(plans);
+    plans = NULL;
+    free(writable);
+    writable = NULL;
     if (status) *status = VTM_OK;
     if (errbuf && errcap) errbuf[0] = '\0';
     set_global_error("нет ошибки");
     return m;
 
 fail:
-    free(sizes);
+    free(plans);
+    free(writable);
     if (status) *status = st;
     if (errbuf && errcap)
         snprintf(errbuf, errcap, "%s", m->error[0] ? m->error : g_last_error);
@@ -966,9 +1093,23 @@ fail:
 #undef FAIL
 }
 
+vtm_t *vtm_load_mem(const void *data, size_t size,
+                    vtm_status *status, char *errbuf, size_t errcap) {
+    return load_core(data, size, 0, status, errbuf, errcap);
+}
+
 // --- загрузка из файла -----------------------------------------------------
 
-vtm_t *vtm_load(const char *path) {
+#if !defined(_WIN32)
+static int env_flag(const char *name) {
+    const char *v = getenv(name);
+    return v && *v && strcmp(v, "0") != 0;
+}
+#endif
+
+// Прежний путь: прочитать файл целиком в malloc-буфер и разложить в арену.
+// Нужен на Windows, при VTM_NO_MMAP=1 и как фолбэк, если mmap не удался.
+static vtm_t *load_fread(const char *path) {
     FILE *f;
     long n;
     size_t size;
@@ -978,10 +1119,6 @@ vtm_t *vtm_load(const char *path) {
     vtm_t *m;
 
     err[0] = '\0';
-    if (!path) {
-        set_global_error("vtm_load: path == NULL");
-        return NULL;
-    }
     f = fopen(path, "rb");
     if (!f) {
         set_global_error("не удалось открыть %s", path);
@@ -1024,7 +1161,7 @@ vtm_t *vtm_load(const char *path) {
     }
     fclose(f);
 
-    m = vtm_load_mem(buf, size, &st, err, sizeof err);
+    m = load_core(buf, size, 0, &st, err, sizeof err);
     free(buf);
     if (!m) {
         if (err[0]) set_global_error("%s: %s", path, err);
@@ -1033,15 +1170,190 @@ vtm_t *vtm_load(const char *path) {
     return m;
 }
 
+#if !defined(_WIN32)
+// После конвертации fp16/bf16 в fp32 их страницы в отображении больше не
+// нужны. madvise — совет ядру: ошибка не фатальна, но сообщаем о ней, чтобы
+// не обещать «память освобождена», когда это не так.
+static void map_trim_copied(vtm_t *m) {
+#if defined(MADV_DONTNEED)
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t page = (ps > 0) ? (size_t)ps : 4096u;
+    uintptr_t base = (uintptr_t)m->map;
+    uintptr_t limit = base + (uintptr_t)m->map_size;
+    uint32_t i;
+    int warned = 0;
+
+    for (i = 0; i < m->n_tensors; i++) {
+        const vtm_tensor *t = &m->tensors[i];
+        uintptr_t begin, end, lo, hi;
+        if (t->kind != VTM_TENSOR_F16 && t->kind != VTM_TENSOR_BF16) continue;
+        begin = base + (uintptr_t)m->data_start + (uintptr_t)t->offset;
+        end = begin + (uintptr_t)t->n_elements * 2u;
+        lo = begin & ~(uintptr_t)(page - 1u);
+        hi = (end + (uintptr_t)page - 1u) & ~(uintptr_t)(page - 1u);
+        if (lo < base) lo = base;
+        if (hi > limit) hi = limit;
+        if (hi > lo &&
+            madvise((void *)lo, (size_t)(hi - lo), MADV_DONTNEED) != 0 &&
+            !warned) {
+            fprintf(stderr, "VTM: madvise(MADV_DONTNEED) не удался: %s "
+                            "(не фатально)\n", strerror(errno));
+            warned = 1;
+        }
+    }
+#else
+    (void)m;
+#endif
+}
+
+static vtm_t *load_mmap(const char *path) {
+    int fd;
+    struct stat st, again;
+    size_t size;
+    void *map;
+    vtm_status stt = VTM_OK;
+    char err[256];
+    vtm_t *m;
+
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+    __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    // Контейнер little-endian; отображать fp32/триты как есть нельзя.
+    fprintf(stderr, "VTM: big-endian хост — mmap отключён, "
+                    "читаем файл в память\n");
+    return load_fread(path);
+#endif
+
+    err[0] = '\0';
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        set_global_error("не удалось открыть %s: %s", path, strerror(errno));
+        return NULL;
+    }
+    if (fstat(fd, &st) != 0) {
+        int e = errno;
+        close(fd);
+        set_global_error("не удалось определить размер %s: %s",
+                         path, strerror(e));
+        return NULL;
+    }
+    if (st.st_size < 0 ||
+        (uint64_t)st.st_size > (uint64_t)VTM_MAX_FILE_BYTES) {
+        close(fd);
+        set_global_error("%s: файл больше предела %zu байт",
+                         path, VTM_MAX_FILE_BYTES);
+        return NULL;
+    }
+    size = (size_t)st.st_size;
+    if (size < VTM_HEADER_SIZE) {
+        close(fd);
+        set_global_error("%s: файл короче заголовка: %zu < %u байт",
+                         path, size, (unsigned)VTM_HEADER_SIZE);
+        return NULL;
+    }
+
+    map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map == MAP_FAILED) {
+        int e = errno;
+        close(fd);
+        fprintf(stderr, "VTM: mmap(%s) не удался: %s; читаем файл в память\n",
+                path, strerror(e));
+        return load_fread(path);
+    }
+
+    // Файл могли усечь между fstat и mmap. Доступ к странице за новым EOF —
+    // это SIGBUS, поэтому сверяем размер до разбора: лучше VTM_E_IO, чем
+    // падение. Гонку «усекли во время разбора» ловит проверка ниже; она уже
+    // не может предотвратить SIGBUS, но не отдаёт наружу половину модели.
+    if (fstat(fd, &again) != 0 || again.st_size != st.st_size) {
+        munmap(map, size);
+        close(fd);
+        set_global_error("%s: файл изменился во время отображения", path);
+        return NULL;
+    }
+
+    m = load_core(map, size, 1, &stt, err, sizeof err);
+    if (!m) {
+        munmap(map, size);
+        close(fd);
+        if (err[0]) set_global_error("%s: %s", path, err);
+        return NULL;
+    }
+    m->map = map;
+    m->map_size = size;
+    m->mapped = 1;
+
+    if (fstat(fd, &again) != 0 || again.st_size != st.st_size) {
+        close(fd);
+        vtm_free(m);
+        set_global_error("%s: файл изменился во время загрузки", path);
+        return NULL;
+    }
+    close(fd);
+    map_trim_copied(m);
+    return m;
+}
+#endif // !_WIN32
+
+vtm_t *vtm_load(const char *path) {
+    if (!path) {
+        set_global_error("vtm_load: path == NULL");
+        return NULL;
+    }
+#if defined(_WIN32)
+    // Windows: mmap нет — честно сообщаем и читаем файл в память, как раньше.
+    fprintf(stderr, "VTM: mmap недоступен на Windows — читаем файл в память\n");
+    return load_fread(path);
+#else
+    if (env_flag("VTM_NO_MMAP")) {
+        fprintf(stderr, "VTM: VTM_NO_MMAP=1 — mmap отключён, "
+                        "читаем файл в память\n");
+        return load_fread(path);
+    }
+    return load_mmap(path);
+#endif
+}
+
 // --- доступ, состояние, освобождение --------------------------------------
 
 void vtm_free(vtm_t *m) {
     if (!m) return;
+#if !defined(_WIN32)
+    if (m->map) {
+        munmap(m->map, m->map_size);
+        m->map = NULL;
+        m->map_size = 0;
+        m->mapped = 0;
+    }
+#endif
+    vtm_samp_free(m); // буфер кандидатов SAMP (задача 0059)
     free(m->meta_json);
     free(m->tensors);
     free(m->instr);
     free(m->arena_raw);
     free(m);
+}
+
+// --- отладка загрузчика (задача 0060) --------------------------------------
+
+int vtm_internal_file_is_mapped(const vtm_t *m) {
+    return (m && m->mapped) ? 1 : 0;
+}
+
+int vtm_internal_tensor_is_mapped(const vtm_t *m, uint32_t index) {
+    const vtm_tensor *t;
+    const uint8_t *p;
+    uintptr_t pv, base;
+    if (!m || !m->map || index >= m->n_tensors) return 0;
+    t = &m->tensors[index];
+    if (t->kind == VTM_TENSOR_TRIT) {
+        p = (const uint8_t *)(const void *)t->words;
+    } else {
+        p = (const uint8_t *)(const void *)t->f32;
+    }
+    if (!p) return 0;
+    pv = (uintptr_t)p;
+    base = (uintptr_t)m->map;
+    return pv >= base && pv < base + (uintptr_t)m->map_size;
 }
 
 uint32_t vtm_tensor_count(const vtm_t *m) {
