@@ -185,11 +185,11 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     mm = (int)a->dims[0];
     kk = (int)a->dims[1];
     nn = (int)b->dims[1];
-    if (b->dims[0] != (uint16_t)kk)
+    if (b->dims[0] != (uint32_t)kk)
         return fail(m, ins, VTM_E_SHAPE,
                     "MM: A=[%d,%d], B=[%u,%u]", mm, kk,
                     (unsigned)b->dims[0], (unsigned)b->dims[1]);
-    if (y->dims[0] != (uint16_t)mm || y->dims[1] != (uint16_t)nn)
+    if (y->dims[0] != (uint32_t)mm || y->dims[1] != (uint32_t)nn)
         return fail(m, ins, VTM_E_SHAPE,
                     "MM: Y=[%u,%u], ожидали [%d,%d]",
                     (unsigned)y->dims[0], (unsigned)y->dims[1], mm, nn);

@@ -52,19 +52,19 @@ make test       # тесты из tests/vtm/test_vtm.c
 Программа лежит **в конце файла**: `program_off = file_size - n_instr*16`.
 Поэтому секция данных имеет размер `program_off - data_start`, а `offset` в
 таблице тензоров — смещение от `data_start` (не от начала файла).
-`data_start = align32(32 + n_tensors*44)`, `offset` обязан быть кратен 32.
+`data_start = align32(32 + n_tensors*52)` (v0.2: запись тензора 52 байта), `offset` обязан быть кратен 32.
 
 `n_program` в спеке назван, но не расшифрован. Каноническое значение —
 размер программы в байтах. Загрузчик принимает 0 (не проверять) или
 `n_instr*16`.
 
-### Таблица тензоров, 44 байта
+### Таблица тензоров, 52 байта
 
 ```
 0   name[24]      NUL обязателен
 24  kind u8       0 trit, 1 f32, 2 f16, 3 bf16
 25  ndim u8       1..4
-26  dims u16[4]   dims[0] — старшая ось
+26  dims u32[4]   dims[0] — старшая ось
 34  offset u32    от data_start, кратен 32
 38  scale_offset u32
 42  reserve u16
