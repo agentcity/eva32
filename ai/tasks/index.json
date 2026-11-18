@@ -68,5 +68,12 @@
     "status": "in_progress",
     "file": "0010-ci-pipeline.md",
     "assignee": "agent:ci"
+  },
+  {
+    "id": "0011",
+    "title": "Выбор стека: C, C++17, Python, Go",
+    "status": "done",
+    "file": "0011-stack-decision.md",
+    "assignee": "saron"
   }
 ]
