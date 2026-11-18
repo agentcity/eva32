@@ -639,6 +639,14 @@ def check_environment() -> Environment:
     )
 
 
+# Паритет «бит-в-бит» возможен только на скалярном бэкенде: SIMD переупорядочивает
+# сложения, и логиты расходятся на ~1e-5 — для проверки корректности это нормально,
+# но порог 1e-5 тогда не имеет смысла. Поэтому C-пробы гоняем со скаляром; бэкенд
+# можно переопределить переменной VTM_PARITY_BACKEND (например, чтобы измерить
+# расхождение SIMD отдельно).
+PARITY_BACKEND = os.environ.get("VTM_PARITY_BACKEND", "scalar")
+
+
 def run_command(
     cmd: Sequence[str],
     *,
@@ -653,9 +661,12 @@ def run_command(
             flush=True,
         )
     try:
+        env = os.environ.copy()
+        env["VTM_BACKEND"] = PARITY_BACKEND
         return subprocess.run(
             [str(part) for part in cmd],
             cwd=str(cwd),
+            env=env,
             capture_output=True,
             text=True,
             encoding="utf-8",

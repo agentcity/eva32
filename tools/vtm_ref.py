@@ -273,6 +273,9 @@ SAMP_TOPK = 2
 SAMP_TOPP = 3
 VFLAG_KNOWN = VFLAG_F32_SCALES | VFLAG_CAUSAL
 
+#: Предел int в C: позиция KVW/ATTN и context_window за него не выходят.
+INT_MAX = 2_147_483_647
+
 #: Контроль целостности (задача 0066). Блок лежит в мете под этим ключом:
 #: {"algo": "sha256", "data_sha256": "<hex>", "meta_sha256": "<hex>"}.
 #: data_sha256 — хеш секции данных; meta_sha256 — хеш JSON меты, в котором
@@ -1584,11 +1587,12 @@ def _samp_mix64(value: int) -> int:
     return value ^ (value >> 31)
 
 
-def _samp_meta_number(meta: dict, key: str) -> float | None:
+def _meta_number(meta: dict, key: str) -> float | None:
     """Первое числовое значение ключа на минимальной глубине — как C-сканер.
 
     C ищет ключ по тексту JSON на любом уровне вложенности и при нескольких
-    вхождениях берёт самое внешнее; здесь тот же порядок обхода.
+    вхождениях берёт самое внешнее; здесь тот же порядок обхода. Числа из
+    `bool` не считаются числом (в C `true`/`false` не разбирает `strtod`).
     """
     found: list[tuple[int, float]] = []
 
@@ -1612,10 +1616,30 @@ def _samp_meta_number(meta: dict, key: str) -> float | None:
     return min(found, key=lambda pair: pair[0])[1]
 
 
+#: Прежнее имя помощника: так его звал разбор SAMP (задача 0051).
+_samp_meta_number = _meta_number
+
+
+def _context_window(meta: dict) -> int:
+    """`meta["context_window"]` -> длина кольца или 0, если ключа нет/он битый.
+
+    Ровно как `kv_window()` в `src/vtm/interp.c`: берётся конечное число в
+    диапазоне `[1, INT_MAX]` и усекается к int; всё остальное (NaN, `0`,
+    отрицательное, строка, bool, слишком большое) — «ключа нет», окно равно
+    длине KV-кэша.
+    """
+    value = _meta_number(meta, "context_window")
+    if value is None or not math.isfinite(value):
+        return 0
+    if value < 1.0 or value > float(INT_MAX):
+        return 0
+    return int(value)
+
+
 def _samp_params(meta: dict) -> dict:
     """Разбор и кламп параметров SAMP — ровно как samp_params_from_meta()."""
     params = dict(_SAMP_DEFAULTS)
-    number = _samp_meta_number
+    number = _meta_number
 
     value = number(meta, "temperature")
     if value is not None:
@@ -1788,6 +1812,9 @@ class _Interpreter:
         self.meta = vtm.meta
         self.theta = float(self.meta.get("rope_theta", 10000.0))
         self.rope_layout = str(self.meta.get("rope_layout", "half"))
+        #: Длина кольца KV-окна: `min(ctx, meta["context_window"])`, как в C.
+        #: 0 — ключа нет (или он битый), окно равно длине кэша.
+        self.context_window = _context_window(self.meta)
         self.sampler = _Sampler(self.meta)
         #: индексы тензоров-кэшей KV: они не сбрасываются между проходами
         #: KVW пишет в dst (K-кэш) и b (V-кэш): их не сбрасываем между проходами.
@@ -1831,6 +1858,12 @@ class _Interpreter:
         if index not in self.workspace:
             self.workspace[index] = [0.0] * self.tensors[index].n_elements
         return self.workspace[index]
+
+    def _window(self, ctx: int) -> int:
+        """Эффективное окно кольца: `min(ctx, context_window)` (C: kv_window)."""
+        if 0 < self.context_window < ctx:
+            return self.context_window
+        return ctx
 
     # -- проход --------------------------------------------------------------
 
@@ -1960,8 +1993,8 @@ class _Interpreter:
                     f"{v_cache_tensor.dims}"
                 )
             pos = state.pos + int(instr.imm)
-            if not 0 <= pos < ctx:
-                raise ValueError(f"KVW: позиция {pos} вне кэша длины {ctx}")
+            if pos < 0 or pos > INT_MAX:
+                raise ValueError(f"KVW: позиция {pos} вне диапазона")
             k = self._read(int(instr.a))
             v = self._read(int(instr.c))
             if len(k) != kv_dim or len(v) != kv_dim:
@@ -1970,7 +2003,11 @@ class _Interpreter:
                 )
             k_cache = self._ensure_cache(int(instr.dst))
             v_cache = self._ensure_cache(int(instr.b))
-            base = pos * kv_dim
+            # Кольцо (задача 0076): токен глобальной позиции p живёт в слоте
+            # p % win, win = min(ctx, context_window). Позиция >= ctx — не
+            # ошибка: она затирает самый старый слот (C: op_kvw).
+            win = self._window(ctx)
+            base = (pos % win) * kv_dim
             k_cache[base:base + kv_dim] = [_f32(value) for value in k]
             v_cache[base:base + kv_dim] = [_f32(value) for value in v]
         elif op == Op.ATTN:
@@ -2003,16 +2040,18 @@ class _Interpreter:
                 )
             group = n_heads // n_kv_heads
             q_start = state.pos + int(instr.imm)
-            if q_start < 0:
-                raise ValueError(f"ATTN: q_start={q_start} отрицателен")
-            key_count = q_start + q_len
-            if key_count > ctx:
+            # Верхней границы «меньше ctx» больше нет: 2-D кэш стал кольцом
+            # (0076), длинный диалог законен. Осталась защита от битого imm —
+            # та же, что в C (`qs > INT_MAX - q_len`).
+            if q_start < 0 or q_start > INT_MAX - q_len:
                 raise ValueError(
-                    f"ATTN: ключей {key_count} больше длины кэша {ctx}"
+                    f"ATTN: q_start={q_start} вне диапазона (q_len={q_len})"
                 )
+            key_count = q_start + q_len
             k_cache = self.workspace.get(int(instr.b), [0.0] * (ctx * kv_dim))
             v_cache = self.workspace.get(int(instr.c), [0.0] * (ctx * kv_dim))
             causal = bool(instr.flags & IFLAG_CAUSAL)
+            win = self._window(ctx)
             scale = 1.0 / math.sqrt(head_dim)
             out = [0.0] * (n_heads * q_len * head_dim)
             for head in range(n_heads):
@@ -2020,39 +2059,48 @@ class _Interpreter:
                 for qi in range(q_len):
                     q_base = (head * q_len + qi) * head_dim
                     out_base = q_base
+                    # Видимые ключи запроса qi — [lo, hi] в глобальных
+                    # позициях. Кэш — кольцо: ATTN читает только последние
+                    # win ключей, слот глобальной позиции j — `j % win`
+                    # (хронологический обход, как в C), поэтому q_start >= ctx
+                    # не ошибка.
+                    hi = q_start + qi if causal else key_count - 1
+                    if hi > key_count - 1:
+                        hi = key_count - 1
+                    lo = hi - win + 1
+                    if lo < 0:
+                        lo = 0
+                    if hi < lo:
+                        continue
+                    scores: list[float] = []
                     peak = -math.inf
-                    scores = [None] * key_count
-                    for j in range(key_count):
-                        if causal and j > q_start + qi:
-                            continue
-                        base = j * kv_dim + kv_head * head_dim
+                    for j in range(lo, hi + 1):
+                        base = (j % win) * kv_dim + kv_head * head_dim
                         dot = 0.0
                         for d in range(head_dim):
                             dot += q[q_base + d] * k_cache[base + d]
                         value = dot * scale
-                        scores[j] = value
+                        scores.append(value)
                         if value > peak:
                             peak = value
                     if peak == -math.inf:
                         continue
-                    exps = [0.0] * key_count
+                    # Онлайн-softmax C копит p·V и делит на сумму в конце;
+                    # здесь тот же порядок, чтобы паритет не терял биты.
+                    acc = [0.0] * head_dim
                     total = 0.0
-                    for j, value in enumerate(scores):
-                        if value is None:
-                            continue
+                    for offset, value in enumerate(scores):
                         weight = math.exp(value - peak)
-                        exps[j] = weight
                         total += weight
+                        if weight == 0.0:
+                            continue
+                        base = ((lo + offset) % win) * kv_dim + kv_head * head_dim
+                        for d in range(head_dim):
+                            acc[d] += weight * v_cache[base + d]
                     if total <= 0.0 or not math.isfinite(total):
                         continue
                     for d in range(head_dim):
-                        acc = 0.0
-                        for j in range(key_count):
-                            if scores[j] is None:
-                                continue
-                            base = j * kv_dim + kv_head * head_dim
-                            acc += (exps[j] / total) * v_cache[base + d]
-                        out[out_base + d] = acc
+                        out[out_base + d] = acc[d] / total
             self._write(int(instr.dst), out)
         elif op == Op.SAMP:
             logits = self._read(int(instr.a))

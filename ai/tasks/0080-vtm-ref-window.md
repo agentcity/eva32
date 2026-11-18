@@ -5,7 +5,7 @@ title: Эталон догоняет окно контекста
 created_at: 2026-11-18T11:45:00Z
 author: yuri
 assignee: agent:vtm-ref-window
-status: in_progress
+status: done
 scope:
   docs: false
   code: true
@@ -46,4 +46,19 @@ scope:
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: `vtm_ref.py` повторяет кольцо (`pos % win`) и окно (`win = min(ctx,
+context_window)`) с теми же клампами, что C `kv_window()`; ATTN в эталоне читает
+видимые ключи `[max(0, hi-win+1), hi]`; 30 тестов в `test_vtm_sampling`, раздел про
+KVW/ATTN в docs/vtm.md.
+
+Проверено: паритет C↔Python на 2×ctx (ctx=8, 16 токенов) — **max|Δ| = 0 побитово** на
+скалярном бэкенде, 1,9e-06 на SIMD. `python3 -m unittest discover -s tests` — 1071 OK.
+
+**Побочная находка, важная:** `tools/parity_random.py` на дефолтном бэкенде стал
+красным (42/50, худшее 1,05e-04) — SIMD переупорядочивает суммы. Это не регресс 0080,
+а следствие переключения на `auto` (1570828). Решено так: C-пробы паритета теперь
+форсируют `VTM_BACKEND=scalar` (переопределяется `VTM_PARITY_BACKEND`), потому что
+«бит-в-бит» — свойство скалярного пути; для SIMD отдельно измеряется расхождение.
+
+Также обновлён `src/vtm/README.md`: убраны устаревшие «без тайлинга / scores malloc /
+нужно q_start+q_len <= ctx» и пункт про кэш промпта и сессии KV.

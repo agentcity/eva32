@@ -7,6 +7,10 @@
 посимвольно: одинаковый `sample_seed` и одинаковые логиты обязаны дать
 одинаковый вывод.
 
+Задача 0080 добавила сюда паритет по кольцевому KV-окну: контейнер
+прогоняется на 2×ctx токенах (позиция уходит за длину кэша), C и Python
+сравниваются по самим логитам, а не только по выбранному токену.
+
 C-рантайм вызывается как `src/vtm/vtm run ... --tokens 1 --max-new N`.
 Если он не собран (`cd src/vtm && make`) или собран под другую версию
 контейнера, тест пропускается, как и в tests/test_vtm_full.py.
@@ -22,11 +26,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from tools import vtm_ref  # noqa: E402
+from tools import parity_real, vtm_compile, vtm_ref  # noqa: E402
 
 VTM_BIN = os.path.join(ROOT, "src", "vtm", "vtm")
 
@@ -270,6 +275,277 @@ class TestSamplerEdgeCases(unittest.TestCase):
         model = _samp_program(LOGITS, 9, {})
         with self.assertRaises(ValueError):
             vtm_ref.execute(model, [1], 1)
+
+
+# ---------------------------------------------------------------------------
+# Кольцевое KV-окно (задача 0076) в Python-эталоне (задача 0080)
+# ---------------------------------------------------------------------------
+
+
+class TestContextWindowParsing(unittest.TestCase):
+    """`meta["context_window"]`: те же клампы, что `kv_window()` в C."""
+
+    def test_missing_and_broken_values_mean_no_window(self):
+        for meta in (
+            {},
+            {"context_window": 0},
+            {"context_window": -4},
+            {"context_window": 0.5},
+            {"context_window": 2_147_483_648},
+            {"context_window": "8"},
+            {"context_window": True},
+            {"context_window": math.nan},
+            {"context_window": math.inf},
+        ):
+            self.assertEqual(vtm_ref._context_window(meta), 0, meta)
+
+    def test_valid_values_and_nesting(self):
+        self.assertEqual(vtm_ref._context_window({"context_window": 4}), 4)
+        self.assertEqual(vtm_ref._context_window({"context_window": 4.9}), 4)
+        self.assertEqual(vtm_ref._context_window({"context_window": 1}), 1)
+        # Как C-сканер: ключ на любом уровне, внешний приоритетнее.
+        self.assertEqual(
+            vtm_ref._context_window(
+                {"model": {"context_window": 3}, "context_window": 7}
+            ),
+            7,
+        )
+
+
+class TestKvRingWindow(unittest.TestCase):
+    """Кольцо без C: 5 проходов при ctx=2 и окне 1.
+
+    E[0]=[1,0], E[1]=[0,1], E[2]=[1,1]; K=V=эмбеддинг токена прохода.
+    `context_window=1` оставляет ATTN только текущий ключ, поэтому на
+    позиции 4 (token 1) out обязан быть ровно [0, 1]; с окном длины кэша
+    (2) в out подмешивается токен позиции 3 — это и различает окна.
+    """
+
+    TOKENS = [0, 1, 2, 0, 1]
+
+    @classmethod
+    def _model(cls, context_window=None):
+        e = vtm_ref.Tensor.f32("e", (3, 2), [1.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+        x = vtm_ref.Tensor.f32("x", (2,), [0.0, 0.0])
+        k_cache = vtm_ref.Tensor.f32("kc", (2, 2), [0.0] * 4)
+        v_cache = vtm_ref.Tensor.f32("vc", (2, 2), [0.0] * 4)
+        q = vtm_ref.Tensor.f32("q", (1, 1, 2), [0.0, 0.0])
+        out = vtm_ref.Tensor.f32("out", (1, 1, 2), [0.0, 0.0])
+        program = [
+            vtm_ref.Instr(vtm_ref.Op.EMB, dst=1, a=0,
+                          flags=vtm_ref.IFLAG_EMB_INPUT),
+            vtm_ref.Instr(vtm_ref.Op.KVW, dst=2, a=1, b=3, c=1),
+            vtm_ref.Instr(vtm_ref.Op.CPY, dst=4, a=1),
+            vtm_ref.Instr(vtm_ref.Op.ATTN, dst=5, a=4, b=2, c=3,
+                          flags=vtm_ref.IFLAG_CAUSAL),
+            vtm_ref.Instr(vtm_ref.Op.HALT),
+        ]
+        meta = {} if context_window is None else {"context_window": context_window}
+        return vtm_ref.VTM(
+            tensors=[e, x, k_cache, v_cache, q, out],
+            program=program,
+            meta=meta,
+        )
+
+    def test_position_past_cache_is_not_an_error(self):
+        # 5 проходов при ctx=2: раньше KVW падал на позиции 2.
+        result = vtm_ref.execute(self._model(context_window=1), self.TOKENS, 0)
+        self.assertEqual(result.steps, len(self.TOKENS))
+        self.assertIsNotNone(result.get("out"))
+
+    def test_window_one_sees_only_current_key(self):
+        result = vtm_ref.execute(self._model(context_window=1), self.TOKENS, 0)
+        self.assertEqual(result.get("out"), [0.0, 1.0])
+        # win=1: пишется только слот 0, слот 1 так и остался нулевым.
+        self.assertEqual(result.get("kc"), [0.0, 1.0, 0.0, 0.0])
+
+    def test_full_cache_window_mixes_previous_token(self):
+        result = vtm_ref.execute(self._model(), self.TOKENS, 0)
+        out = result.get("out")
+        self.assertIsNotNone(out)
+        score = 1.0 / math.sqrt(2.0)
+        expected = math.exp(score) / (math.exp(score) + 1.0)
+        self.assertAlmostEqual(out[0], 1.0 - expected, places=6)
+        self.assertAlmostEqual(out[1], expected, places=6)
+        # Оба слота кольца (ctx=2) использованы.
+        self.assertEqual(result.get("kc"), [0.0, 1.0, 1.0, 0.0])
+
+    def test_negative_position_is_still_an_error(self):
+        model = self._model(context_window=1)
+        # imm=-1 на позиции 0: отрицательный слот кольца запрещён, как в C.
+        model.program[1] = vtm_ref.Instr(
+            vtm_ref.Op.KVW, dst=2, a=1, b=3, c=1, imm=-1
+        )
+        with self.assertRaises(ValueError):
+            vtm_ref.execute(model, [0], 0)
+
+
+#: Проба для паритета по логитам: `vtm run` логиты не печатает, поэтому
+#: тест собирает крошечный C-бинарник (во временном каталоге, не в репозитории)
+#: и линкует его с `src/vtm/libvtm.a`. `%.17g` — чтобы max|Δ| не упирался в
+#: точность печати.
+_KV_WINDOW_PROBE = r'''/* Снять logits последнего прохода .vtm. */
+#include "vtm.h"
+
+#include <locale.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char **argv) {
+    vtm_t *machine;
+    const vtm_tensor *logits;
+    int position = 0;
+    int arg;
+    uint32_t i;
+
+    if (argc < 3) {
+        fprintf(stderr, "нужны model.vtm и токены\n");
+        return 2;
+    }
+    setlocale(LC_NUMERIC, "C");  /* десятичная точка, а не запятая */
+    machine = vtm_load(argv[1]);
+    if (machine == NULL) {
+        fprintf(stderr, "vtm_load: %s\n", vtm_last_error());
+        return 1;
+    }
+    for (arg = 2; arg < argc; arg++) {
+        vtm_set_position(machine, position);
+        vtm_set_token(machine, atoi(argv[arg]));
+        if (vtm_run(machine, NULL, NULL) != VTM_OK) {
+            fprintf(stderr, "прогон %d: %s\n", position,
+                    vtm_error_message(machine));
+            vtm_free(machine);
+            return 1;
+        }
+        position++;
+    }
+    logits = vtm_tensor_by_name(machine, "logits");
+    if (logits == NULL || logits->kind != VTM_TENSOR_F32
+        || logits->f32 == NULL) {
+        fprintf(stderr, "в контейнере нет fp32-тензора logits\n");
+        vtm_free(machine);
+        return 1;
+    }
+    for (i = 0; i < logits->n_elements; i++)
+        printf("%.17g\n", (double)logits->f32[i]);
+    vtm_free(machine);
+    return 0;
+}
+'''
+
+
+class TestKvWindowParity(unittest.TestCase):
+    """C ↔ Python на 2×ctx токенах: кольцо и `context_window`.
+
+    Модель — синтетический слой `vtm_compile.make_synthetic(mode="attn")`:
+    EMB → RMSN → Q/K/V → ROPE → KVW → ATTN → … → logits. Длина KV-кэша 8,
+    прогонов 16 = 2·ctx, поэтому позиции 8..15 затирают старейшие слоты.
+
+    Порог 1e-6 на скалярном бэкенде; фактически числа совпадают побитово
+    (max|Δ| = 0.0, проба печатает `%.17g`). На `auto`/SIMD к этому
+    добавляется ~1e-6…1e-5 из-за другого порядка суммирования в NEON/AVX2 —
+    это проверяет отдельный тест с порогом 1e-4.
+    """
+
+    ctx = 8
+    vocab = 32
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.access(VTM_BIN, os.X_OK):
+            raise unittest.SkipTest(
+                "C-рантайм не собран: src/vtm/vtm отсутствует "
+                "(cd src/vtm && make)"
+            )
+        if not parity_real.VTM_LIB.is_file():
+            raise unittest.SkipTest(
+                "C-библиотека не собрана: src/vtm/libvtm.a отсутствует "
+                "(cd src/vtm && make)"
+            )
+        cls.cc = parity_real.find_c_compiler()
+        if cls.cc is None:
+            raise unittest.SkipTest("нет C-компилятора (cc/clang/gcc)")
+        cls.workdir = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.workdir.cleanup)
+        workdir = Path(cls.workdir.name)
+        source = workdir / "kv_window_probe.c"
+        source.write_text(_KV_WINDOW_PROBE, encoding="utf-8")
+        cls.probe = workdir / "kv_window_probe"
+        proc = subprocess.run(
+            [
+                cls.cc, "-std=c99", "-O2", "-Wall", "-Wextra",
+                "-I", str(parity_real.VTM_INCLUDE),
+                "-o", str(cls.probe), str(source),
+                str(parity_real.VTM_LIB), "-lm",
+            ],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise unittest.SkipTest(
+                "C-проба не собралась: " + proc.stderr.strip()[-500:]
+            )
+        cls.model = vtm_compile.make_synthetic(seed=5, size=32, mode="attn")
+
+    def _parity(self, context_window, backend):
+        """Прогнать 2·ctx токенов в C и Python; вернуть (max|Δ|, logits…)."""
+        meta = dict(self.model.meta)
+        if context_window is None:
+            meta.pop("context_window", None)
+        else:
+            meta["context_window"] = context_window
+        # Один и тот же тензорный граф, отличается только мета.
+        model = vtm_ref.VTM(
+            tensors=self.model.tensors,
+            program=self.model.program,
+            meta=meta,
+        )
+        tokens = [
+            (index * 7 + 1) % self.vocab for index in range(2 * self.ctx)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "kv_window.vtm")
+            vtm_ref.write_vtm(path, model.tensors, model.program, meta)
+            expected = vtm_ref.execute(path, tokens, 0).logits
+            env = dict(os.environ)
+            env["VTM_BACKEND"] = backend
+            proc = subprocess.run(
+                [str(self.probe), path, *[str(token) for token in tokens]],
+                capture_output=True, text=True, env=env, timeout=180,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNotNone(expected)
+        got = [float(value) for value in proc.stdout.split()]
+        self.assertEqual(len(got), len(expected), proc.stdout)
+        deltas = [abs(a - b) for a, b in zip(expected, got)]
+        self.assertEqual(
+            vtm_ref._argmax(expected), vtm_ref._argmax(got),
+            f"argmax разошёлся при context_window={context_window}",
+        )
+        return max(deltas), expected, got
+
+    def test_ring_at_two_contexts(self):
+        # context_window нет: win = ctx = 8, позиции 8..15 работают по кольцу.
+        delta, _, _ = self._parity(None, "scalar")
+        self.assertLessEqual(delta, 1e-6, f"max|Δ|={delta:.3e}")
+
+    def test_context_window_shorter_than_cache(self):
+        # win = 4 < ctx: в кэше живут только последние 4 ключа.
+        delta, _, _ = self._parity(self.ctx // 2, "scalar")
+        self.assertLessEqual(delta, 1e-6, f"max|Δ|={delta:.3e}")
+
+    def test_context_window_longer_than_cache_is_clamped(self):
+        # context_window > ctx: окно упирается в длину кэша (как kv_window).
+        delta, clamped, _ = self._parity(4 * self.ctx, "scalar")
+        self.assertLessEqual(delta, 1e-6, f"max|Δ|={delta:.3e}")
+        # Тот же контейнер без ключа обязан дать те же логиты.
+        _, plain, _ = self._parity(None, "scalar")
+        self.assertEqual(clamped, plain)
+
+    def test_default_backend_ring(self):
+        # auto = SIMD, если CPU умеет: другой порядок суммирования даёт
+        # ~1e-6…1e-5, но кольцо обязано остаться тем же (порог 1e-4).
+        delta, _, _ = self._parity(self.ctx // 2, "auto")
+        self.assertLessEqual(delta, 1e-4, f"max|Δ|={delta:.3e}")
 
 
 if __name__ == "__main__":

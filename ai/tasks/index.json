@@ -520,7 +520,7 @@
   {
     "id": "0080",
     "title": "Эталон догоняет окно контекста",
-    "status": "in_progress",
+    "status": "done",
     "file": "0080-vtm-ref-window.md",
     "assignee": "agent:vtm-ref-window"
   },
@@ -571,6 +571,13 @@
     "title": "Кэш промпта в C-ABI: не сбрасывать между запросами",
     "status": "pending",
     "file": "0087-api-cache.md",
+    "assignee": ""
+  },
+  {
+    "id": "0088",
+    "title": "Паритет SIMD: измерить и задокументировать расхождение",
+    "status": "pending",
+    "file": "0088-simd-parity.md",
     "assignee": ""
   }
 ]
