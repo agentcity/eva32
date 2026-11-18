@@ -212,7 +212,7 @@
   {
     "id": "0031",
     "title": "Живой замер качества: гибрид против большой модели",
-    "status": "in_progress",
+    "status": "done",
     "file": "0031-eva-live-eval.md",
     "assignee": "agent:eva-live-eval"
   },
@@ -226,7 +226,7 @@
   {
     "id": "0033",
     "title": "Документация: свести состояние проекта",
-    "status": "in_progress",
+    "status": "done",
     "file": "0033-docs-sync.md",
     "assignee": "agent:docs-sync"
   }
