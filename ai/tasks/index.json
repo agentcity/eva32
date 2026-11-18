@@ -702,7 +702,7 @@
   {
     "id": "0107",
     "title": "KL-дистилляция от учителя: проверить путь на крошечной модели",
-    "status": "in_progress",
+    "status": "done",
     "file": "0107-kl-distill.md",
     "assignee": "agent:kl-distill"
   },
@@ -725,6 +725,13 @@
     "title": "KV-кэш: кэп на суммарный размер и явный отказ старым бинарям",
     "status": "pending",
     "file": "0110-kv-caps.md",
+    "assignee": ""
+  },
+  {
+    "id": "0111",
+    "title": "Логиты учителя: top-k формат и потоковое чтение",
+    "status": "pending",
+    "file": "0111-topk-logits.md",
     "assignee": ""
   }
 ]
