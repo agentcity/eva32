@@ -10,7 +10,7 @@ DEV_PORT   ?= 11434
 PROD_PORT  ?= 8000
 COMPOSE    := docker compose -f serving/compose.yaml
 
-.PHONY: help status bundle eval eval-dev dev-serve dev-stop dev pull-dev compose-up compose-down compose-logs clean
+.PHONY: help status bundle eval eval-dev dev-serve dev-stop dev pull-dev test distill distill-mock compose-up compose-down compose-logs clean
 
 help:  ## список команд
 	@echo "EVA32"
@@ -80,5 +80,14 @@ compose-down:  ## погасить vLLM
 compose-logs:  ## логи vLLM
 	$(COMPOSE) --env-file .env logs -f --tail=200
 
-clean:  ## удалить локальные результаты eval
-	rm -rf eval/results
+test:  ## юнит-тесты (фильтры дистилляции, кодек)
+	@$(PY) -m unittest discover -s tests -q
+
+distill-mock:  ## конвейер дистилляции на заглушке (без сети и ключей)
+	@$(PY) distill/run.py --mock --limit 10
+
+distill:  ## сбор пар у настоящего учителя (нужны TEACHER_BASE/TEACHER_KEY)
+	@$(PY) distill/run.py --questions distill/questions.txt
+
+clean:  ## удалить локальные результаты eval и пары дистилляции
+	rm -rf eval/results distill/out

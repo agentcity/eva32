@@ -236,6 +236,9 @@ models/
 .env.*
 !.env.example
 
+# Выходы конвейера дистилляции
+distill/out/
+
 # IDE / OS
 .idea/
 .DS_Store
