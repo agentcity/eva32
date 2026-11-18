@@ -601,8 +601,11 @@ const vtm_backend *vtm_backend_from_env(void) {
     const char *env = getenv("VTM_BACKEND");
     const vtm_backend *backend;
 
-    // Без переменной — ровно прежнее поведение (скалярный LUT243).
-    if (!env || !*env) return &vtm_backend_scalar_lut;
+    // Без переменной — auto: SIMD, если он собран и процессор его умеет, иначе
+    // скалярный LUT243. Раньше по умолчанию был скаляр, и без флага VTM_BACKEND
+    // терялось 5,5x на проходе (замер 0071). auto ничего не ломает: бэкенд сам
+    // откатывается на скаляр, если SIMD недоступен.
+    if (!env || !*env) return vtm_backend_by_name("auto");
     backend = vtm_backend_by_name(env);
     if (backend) return backend;
     fprintf(stderr, "vtm: неизвестный VTM_BACKEND='%s' "
