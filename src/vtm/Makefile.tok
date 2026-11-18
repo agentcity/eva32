@@ -1,0 +1,48 @@
+# VTM: BPE-токенизатор (отдельно от Makefile интерпретатора).
+#
+#   make -f Makefile.tok test-tok     собрать и прогнать тесты токенизатора
+#   make -f Makefile.tok tok          собрать vtm-tok
+#   make -f Makefile.tok all-tok      собрать vtm-tok и test_tokenizer
+#   make -f Makefile.tok clean-tok    удалить артефакты этой сборки
+#
+# Цели основного src/vtm/Makefile (all/test/bench/clean) здесь сознательно
+# не переопределяются: C-интерпретатор собирается своим Makefile.
+CXX       ?= c++
+CXXFLAGS  ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
+CPPFLAGS  ?= -I.
+LDFLAGS   ?=
+
+FIXTURE   ?= ../../tests/vtm/fixtures/tokenizer.json
+TEST_SRC  ?= ../../tests/vtm/test_tokenizer.cpp
+
+TOK       = vtm-tok
+TEST_BIN  = test_tokenizer
+
+# Ядро — все .cpp, кроме драйверов *_main.cpp и тестов test_*.cpp.
+CORE_SRC  = $(filter-out %_main.cpp test_%.cpp,$(wildcard *.cpp))
+CORE_OBJ  = $(CORE_SRC:.cpp=.o)
+TOK_OBJ   = tok_main.o
+DEP       = $(CORE_OBJ:.o=.d) tok_main.d
+
+.PHONY: all-tok tok test-tok clean-tok
+
+all-tok: $(TOK) $(TEST_BIN)
+
+tok: $(TOK)
+
+$(TOK): $(TOK_OBJ) $(CORE_OBJ)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $(TOK_OBJ) $(CORE_OBJ) $(LDLIBS)
+
+$(TEST_BIN): $(TEST_SRC) tokenizer.hpp $(CORE_OBJ)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) -o $@ $(TEST_SRC) $(CORE_OBJ) $(LDLIBS)
+
+test-tok: $(TEST_BIN)
+	./$(TEST_BIN) "$(FIXTURE)"
+
+%.o: %.cpp tokenizer.hpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c -o $@ $<
+
+clean-tok:
+	rm -f $(TOK) $(TEST_BIN) $(CORE_OBJ) $(TOK_OBJ) $(DEP)
+
+-include $(DEP)
