@@ -145,5 +145,12 @@
     "status": "in_progress",
     "file": "0021-eva-telemetry.md",
     "assignee": "agent:eva-telemetry"
+  },
+  {
+    "id": "0022",
+    "title": "Голос как транспорт: ADR",
+    "status": "done",
+    "file": "0022-voice-adr.md",
+    "assignee": "saron"
   }
 ]
