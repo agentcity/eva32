@@ -75,5 +75,12 @@
     "status": "done",
     "file": "0011-stack-decision.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0012",
+    "title": "BPE-токенизатор для ВТМ (C++17)",
+    "status": "in_progress",
+    "file": "0012-bpe-tokenizer.md",
+    "assignee": "agent:tokenizer"
   }
 ]
