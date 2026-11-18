@@ -376,5 +376,12 @@
     "status": "pending",
     "file": "0057-trit-storage-abstraction.md",
     "assignee": ""
+  },
+  {
+    "id": "0058",
+    "title": "Сверка настоящей Qwen с ВТМ",
+    "status": "done",
+    "file": "0058-parity-real.md",
+    "assignee": "saron"
   }
 ]
