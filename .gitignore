@@ -256,3 +256,6 @@ src/vtm/test_tokenizer
 
 # Логи гибрида (телеметрия)
 logs/
+
+# артефакты демо (генерируются scripts/demo_ternary_model.py)
+demo/

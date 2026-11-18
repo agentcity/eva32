@@ -285,5 +285,12 @@
     "status": "done",
     "file": "0041-mm-casts.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0042",
+    "title": "Демонстрационная троичная модель",
+    "status": "done",
+    "file": "0042-demo-ternary.md",
+    "assignee": "saron"
   }
 ]
