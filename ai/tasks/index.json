@@ -464,7 +464,7 @@
   {
     "id": "0072",
     "title": "Волна 4: случайный паритет C↔Python",
-    "status": "in_progress",
+    "status": "done",
     "file": "0072-vtm-parity-random.md",
     "assignee": "agent:vtm-parity-random"
   },
