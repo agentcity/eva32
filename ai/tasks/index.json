@@ -422,7 +422,7 @@
   {
     "id": "0066",
     "title": "Волна 1: целостность контейнера (sha256)",
-    "status": "in_progress",
+    "status": "done",
     "file": "0066-vtm-integrity.md",
     "assignee": "agent:vtm-integrity"
   },
@@ -473,6 +473,13 @@
     "title": "KV: окно контекста и сброс между запросами",
     "status": "pending",
     "file": "0073-kv-window-reset.md",
+    "assignee": ""
+  },
+  {
+    "id": "0074",
+    "title": "Быстрая проверка целостности: SHA-NI или кеш по mtime",
+    "status": "pending",
+    "file": "0074-fast-integrity.md",
     "assignee": ""
   }
 ]

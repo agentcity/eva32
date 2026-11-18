@@ -68,7 +68,8 @@ typedef enum {
     VTM_E_OPCODE = -11,     // неизвестный opcode
     VTM_E_UNSUPPORTED = -12,// операция/режим пока не реализованы
     VTM_E_SCALE = -13,      // испорченный масштаб/слово тритов
-    VTM_E_CALLBACK = -14    // ошибка внутри callback
+    VTM_E_CALLBACK = -14,   // ошибка внутри callback
+    VTM_E_INTEGRITY = -15   // sha256 данных/меты не совпал (задача 0066)
 } vtm_status;
 
 // Человеческая строка для кода ошибки (русская, статическая).

@@ -1107,6 +1107,29 @@ def build_manifest(
         },
     }
     files_section.update(file_stats)
+    # Целостность (задача 0066). Сами sha256 файлов уже в files; здесь
+    # продублированы коротко (имя -> sha256) и, главное, зафиксирован
+    # контракт контейнера: sha256 секции данных и меты пишет
+    # tools/vtm_ref.write_vtm (integrity=True или VTM_WRITE_HASH=1) в
+    # meta["integrity"], а загрузчик сверяет их при открытии. Экспорт
+    # .vtm не собирает — это делает tools/vtm_compile.py.
+    integrity = {
+        "algo": "sha256",
+        "files": {
+            name: record["sha256"]
+            for name, record in files_section.items()
+            if isinstance(record, dict) and record.get("sha256")
+        },
+        "container": {
+            "format": "vtm",
+            "format_version": 2,
+            "hash_location": "meta.integrity.data_sha256 / meta.integrity.meta_sha256",
+            "covered": "секция данных + JSON мета",
+            "writer": "tools/vtm_ref.write_vtm(integrity=True) или VTM_WRITE_HASH=1",
+            "verified_by": ["src/vtm/loader.c", "tools/vtm_ref.py"],
+            "skip_env": "VTM_SKIP_HASH",
+        },
+    }
     manifest = {
         "format": "eva32.ternary.manifest",
         "format_version": MANIFEST_VERSION,
@@ -1170,6 +1193,7 @@ def build_manifest(
             "note": non_ternary_note,
         },
         "files": files_section,
+        "integrity": integrity,
         "totals": {
             "tensors": len(files.tensor_entries),
             "params": files.trit_params,

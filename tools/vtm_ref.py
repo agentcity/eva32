@@ -198,13 +198,16 @@ opcode u8 | flags u8 | dst u16 | a u16 | b u16 | c u16 | reserved u16 | imm i32
 * C v0.1 не читает метаданные: `rope_theta` (Qwen 1e6) и `rope_layout`
   он пока не знает — синтетика использует theta=10000/half, чтобы гейт
   проходил без этого;
-* в контейнере нет контрольной суммы: битые данные ловятся по magic, версии,
-  диапазонам и длинам, но не по содержимому;
+* контроль целостности — по желанию писателя (write_vtm(..., integrity=True)
+  или VTM_WRITE_HASH=1): sha256 секции данных и меты лежит в meta["integrity"];
+  старые контейнеры без блока читаются как раньше, VTM_SKIP_HASH=1 отключает
+  проверку;
 * тритовые тензоры ограничены 4 ГиБ смещениями u32; файл больше — ошибка.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -269,6 +272,19 @@ SAMP_TEMPERATURE = 1
 SAMP_TOPK = 2
 SAMP_TOPP = 3
 VFLAG_KNOWN = VFLAG_F32_SCALES | VFLAG_CAUSAL
+
+#: Контроль целостности (задача 0066). Блок лежит в мете под этим ключом:
+#: {"algo": "sha256", "data_sha256": "<hex>", "meta_sha256": "<hex>"}.
+#: data_sha256 — хеш секции данных; meta_sha256 — хеш JSON меты, в котором
+#: значение meta_sha256 заменено 64 символами '0' (иначе хеш невычислим).
+INTEGRITY_KEY = "integrity"
+INTEGRITY_ALGO = "sha256"
+INTEGRITY_DATA_FIELD = "data_sha256"
+INTEGRITY_META_FIELD = "meta_sha256"
+INTEGRITY_SKIP_ENV = "VTM_SKIP_HASH"
+#: Включить запись хеша в контейнер, не меняя вызовы write_vtm: полезно
+#: компилятору (tools/vtm_compile.py), который зовёт write_vtm без флага.
+INTEGRITY_WRITE_ENV = "VTM_WRITE_HASH"
 
 #: Флаги инструкции — локальны для opcode (как в C).
 IFLAG_CAUSAL = 0x01            # SM, ATTN
@@ -872,18 +888,152 @@ def _validate_names(tensors: Sequence[Tensor]) -> None:
             raise ValueError(f"повторяющееся имя тензора: {tensor.name!r}")
         seen.add(tensor.name)
 
+# ---------------------------------------------------------------------------
+# Контроль целостности (задача 0066)
+# ---------------------------------------------------------------------------
+
+
+def _is_sha256_hex(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(ch in "0123456789abcdef" for ch in value)
+    )
+
+
+def _integrity_requested(explicit: bool | None) -> bool:
+    """Записывать ли хеш: явный параметр, иначе VTM_WRITE_HASH=1."""
+    if explicit is not None:
+        return bool(explicit)
+    value = os.environ.get(INTEGRITY_WRITE_ENV, "")
+    return value not in ("", "0")
+
+
+def _json_string_value_offset(blob: bytes, name: str) -> int | None:
+    """Смещение значения "name": "<64 hex>" в сыром JSON или None.
+
+    Тот же поиск, что и в C-загрузчике: сырые байты, без разбора JSON, чтобы
+    испорченная мета не «теряла» блок целостности.
+    """
+    key = b'"' + name.encode("ascii") + b'"'
+    start = blob.find(key)
+    while start != -1:
+        i = start + len(key)
+        while i < len(blob) and blob[i:i + 1] in b" \t\r\n":
+            i += 1
+        if blob[i:i + 1] != b":":
+            start = blob.find(key, start + 1)
+            continue
+        i += 1
+        while i < len(blob) and blob[i:i + 1] in b" \t\r\n":
+            i += 1
+        if blob[i:i + 1] != b'"':
+            start = blob.find(key, start + 1)
+            continue
+        i += 1
+        value = blob[i:i + 64]
+        if len(value) == 64 and all(ch in b"0123456789abcdef" for ch in value):
+            if blob[i + 64:i + 65] == b'"':
+                return i
+        start = blob.find(key, start + 1)
+    return None
+
+
+def _json_object_key_present(blob: bytes, name: str) -> bool:
+    """Есть ли в сыром JSON ключ "name", значение которого — объект."""
+    key = b'"' + name.encode("ascii") + b'"'
+    start = blob.find(key)
+    while start != -1:
+        i = start + len(key)
+        while i < len(blob) and blob[i:i + 1] in b" \t\r\n":
+            i += 1
+        if blob[i:i + 1] == b":":
+            i += 1
+            while i < len(blob) and blob[i:i + 1] in b" \t\r\n":
+                i += 1
+            if blob[i:i + 1] == b"{":
+                return True
+        start = blob.find(key, start + 1)
+    return False
+
+
+def _hash_meta(meta_bytes: bytes, meta_value_offset: int) -> str:
+    """sha256(мета), где значение meta_sha256 заменено 64 символами '0'."""
+    zeroed = (
+        meta_bytes[:meta_value_offset]
+        + b"0" * 64
+        + meta_bytes[meta_value_offset + 64:]
+    )
+    return hashlib.sha256(zeroed).hexdigest()
+
+
+def _verify_integrity(meta_bytes: bytes, data: bytes) -> None:
+    """Сверить сырые поля integrity. Блока нет — старый контейнер.
+
+    Работаем по сырым байтам, а не по разобранному JSON: испорченная мета
+    может перестать парситься, но подмена обязана дать ошибку integrity,
+    а не «битый JSON».
+    """
+    data_pos = _json_string_value_offset(meta_bytes, INTEGRITY_DATA_FIELD)
+    meta_pos = _json_string_value_offset(meta_bytes, INTEGRITY_META_FIELD)
+    if data_pos is None and meta_pos is None:
+        if _json_object_key_present(meta_bytes, INTEGRITY_KEY):
+            raise ValueError(
+                "integrity: блок в мете есть, но data_sha256/meta_sha256 "
+                "в нём отсутствуют (блок повреждён)"
+            )
+        return
+    if data_pos is None or meta_pos is None:
+        raise ValueError(
+            "integrity: в мете нет пары data_sha256/meta_sha256 "
+            "(блок повреждён)"
+        )
+    expected_data = meta_bytes[data_pos:data_pos + 64].decode("ascii")
+    expected_meta = meta_bytes[meta_pos:meta_pos + 64].decode("ascii")
+
+    if os.environ.get(INTEGRITY_SKIP_ENV, "") not in ("", "0"):
+        print(
+            f"VTM: {INTEGRITY_SKIP_ENV}=1 — проверка sha256 контейнера "
+            "пропущена (данные не сверены)",
+            file=sys.stderr,
+        )
+        return
+
+    actual_data = hashlib.sha256(data).hexdigest()
+    if actual_data != expected_data:
+        raise ValueError(
+            "integrity: sha256 секции данных не совпал: "
+            f"в файле {actual_data[:16]}…, в мете {expected_data[:16]}…; "
+            f"контейнер повреждён ({INTEGRITY_SKIP_ENV}=1 — пропустить)"
+        )
+    actual_meta = _hash_meta(meta_bytes, meta_pos)
+    if actual_meta != expected_meta:
+        raise ValueError(
+            "integrity: sha256 метаданных не совпал: "
+            f"в файле {actual_meta[:16]}…, в мете {expected_meta[:16]}…; "
+            f"контейнер повреждён ({INTEGRITY_SKIP_ENV}=1 — пропустить)"
+        )
+
 
 def write_vtm(
     path: str | os.PathLike[str],
     tensors: Sequence[Tensor | dict[str, Any]],
     program: Sequence[Instr | tuple[Any, ...] | dict[str, Any]],
     meta: dict[str, Any] | None = None,
+    *,
+    integrity: bool | None = None,
 ) -> VTM:
     """Собрать контейнер `.vtm` строго по спеке и записать на диск.
 
     Возвращает собранный `VTM` (с проставленными offset'ами) — его можно
     сразу передать в `execute`. Порядок `tensors` = порядок таблицы, индексы
     в `program` ссылаются на него.
+
+    `integrity=True` кладёт в мету `meta["integrity"]` с sha256 секции данных
+    и самой меты (задача 0066). По умолчанию это делает `VTM_WRITE_HASH=1`,
+    чтобы компилятор мог включить защиту, не меняя вызов; без флага формат
+    байт-в-байт прежний (старые тесты и контейнеры не ломаются). Загрузчик
+    проверяет блок всегда, когда он есть; `VTM_SKIP_HASH=1` отключает сверку.
     """
     tensor_list = [_as_tensor(item) for item in tensors]
     program_list = [_as_instr(item) for item in program]
@@ -894,11 +1044,13 @@ def write_vtm(
         raise ValueError(f"тензоров {len(tensor_list)}, максимум {MAX_TENSORS}")
 
     payloads = [encode_tensor_payload(tensor) for tensor in tensor_list]
+    write_integrity = _integrity_requested(integrity)
 
     n_tensors = len(tensor_list)
     table_end = HEADER_SIZE + TENSOR_ENTRY_SIZE * n_tensors
     data_start = align_up(table_end)
 
+    digest = hashlib.sha256() if write_integrity else None
     data_size = 0
     for tensor, payload in zip(tensor_list, payloads):
         tensor.offset = data_size
@@ -907,9 +1059,29 @@ def write_vtm(
             raise RuntimeError(  # pragma: no cover - защита от ошибки в align_up
                 f"тензор {tensor.name!r}: offset не выровнен"
             )
-        data_size = align_up(data_size + len(payload))
+        start = data_size
+        data_size = align_up(start + len(payload))
+        if digest is not None:
+            # Секция данных целиком, включая выравнивающие нули: ровно эти
+            # байты C-загрузчик хеширует от data_start до meta_offset.
+            digest.update(payload)
+            digest.update(b"\x00" * (data_size - start - len(payload)))
+
+    if digest is not None:
+        block = {
+            "algo": INTEGRITY_ALGO,
+            "data_sha256": digest.hexdigest(),
+            # Плейсхолдер: сериализация с ним и есть вход для meta_sha256
+            # (в C/Python при проверке значение заменяется нулями).
+            INTEGRITY_META_FIELD: "0" * 64,
+        }
+        meta_dict.pop(INTEGRITY_KEY, None)
+        meta_dict[INTEGRITY_KEY] = block
 
     meta_bytes = _encode_meta(meta_dict) if meta_dict else b""
+    if digest is not None:
+        block[INTEGRITY_META_FIELD] = hashlib.sha256(meta_bytes).hexdigest()
+        meta_bytes = _encode_meta(meta_dict)
     meta_offset = data_start + data_size if meta_bytes else 0
     program_offset = data_start + data_size + align_up(len(meta_bytes))
     program_bytes = b"".join(instr.pack() for instr in program_list)
@@ -1147,6 +1319,13 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     # --- метаданные ---------------------------------------------------------
     meta: dict[str, Any] = {}
     if meta_len:
+        # Контроль целостности (задача 0066): блок есть — сверяем всегда,
+        # кроме VTM_SKIP_HASH=1. Старые контейнеры без блока читаются как
+        # раньше.
+        _verify_integrity(
+            data[meta_offset:meta_offset + meta_len],
+            data[data_start:meta_offset],
+        )
         try:
             decoded_meta = json.loads(data[meta_offset:meta_offset + meta_len].decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:

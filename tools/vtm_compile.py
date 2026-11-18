@@ -1568,7 +1568,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             out_dir = os.path.dirname(os.path.abspath(args.out))
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
-            vtm_ref.write_vtm(args.out, vtm.tensors, vtm.program, vtm.meta)
+            vtm_ref.write_vtm(args.out, vtm.tensors, vtm.program, vtm.meta, integrity=True)
             _print_manifest(export, vtm, args.out)
             return 0
 
@@ -1577,7 +1577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             out_dir = os.path.dirname(os.path.abspath(args.out))
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
-            vtm_ref.write_vtm(args.out, vtm.tensors, vtm.program, vtm.meta)
+            vtm_ref.write_vtm(args.out, vtm.tensors, vtm.program, vtm.meta, integrity=True)
     except (ValueError, OSError) as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
         return 2
