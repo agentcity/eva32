@@ -5,7 +5,7 @@ title: Гибрид — eva-core-router
 created_at: 2026-11-18T04:40:00Z
 author: yuri
 assignee: agent:eva-core-router
-status: in_progress
+status: done
 scope:
   docs: false
   code: true
@@ -45,7 +45,17 @@ scope:
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: `eva/types.py`, `config.py`, `policy.py`, `router.py`, `__init__.py`, 50 тестов.
+
+Проверено архитектором при приёмке (руками, не по отчёту):
+- скилл отвечает → модели не вызываются вообще, cost_rub=0
+- бюджет 0 при платной малой модели → BudgetExceeded (needed=0,618 ₽), ни один клиент не вызван
+- малая падает → фолбэк на большую, cost берётся из usage
+- конфиг иммутабельный (frozen dataclass) — правки только конструктором
+
+Риски приняты: тарифы big 0.40/1.20 ₽ за 1k — консервативная оценка для pre-flight;
+оценка completion = max_tokens может дать ложный downgrade; пороги латиницы пока
+в classifier.py, не в Config.
 
 ## Ссылки
 

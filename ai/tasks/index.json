@@ -93,7 +93,7 @@
   {
     "id": "0014",
     "title": "Гибрид: eva-core-router",
-    "status": "in_progress",
+    "status": "done",
     "file": "0014-eva-core-router.md",
     "assignee": "agent:eva-core-router"
   },
@@ -114,7 +114,7 @@
   {
     "id": "0017",
     "title": "Гибрид: eva-server",
-    "status": "in_progress",
+    "status": "done",
     "file": "0017-eva-server.md",
     "assignee": "agent:eva-server"
   },
@@ -142,7 +142,7 @@
   {
     "id": "0021",
     "title": "Гибрид: eva-telemetry",
-    "status": "in_progress",
+    "status": "done",
     "file": "0021-eva-telemetry.md",
     "assignee": "agent:eva-telemetry"
   },
