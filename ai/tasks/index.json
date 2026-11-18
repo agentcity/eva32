@@ -429,7 +429,7 @@
   {
     "id": "0067",
     "title": "Волна 1: C-ABI для сервера — колбэк и отмена",
-    "status": "in_progress",
+    "status": "done",
     "file": "0067-vtm-c-api.md",
     "assignee": "agent:vtm-c-api"
   },

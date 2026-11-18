@@ -15,7 +15,7 @@ BIN      = vtm
 # SIMD-ядра: backend_neon.c собирается всегда (на ARM — NEON, иначе только
 # диспетчер с откатом на scalar). AVX2-ядра — отдельный TU с -mavx2, только
 # на x86-64; WITH_AVX2=1 можно задать руками при кросс-сборке.
-SRC      = trit.c loader.c interp.c backend_scalar.c backend_neon.c
+SRC      = trit.c loader.c interp.c backend_scalar.c backend_neon.c api.c
 UNAME_M := $(shell uname -m)
 WITH_AVX2 ?= $(if $(filter x86_64 amd64,$(UNAME_M)),1,0)
 ifeq ($(WITH_AVX2),1)
@@ -28,6 +28,8 @@ TOK_OBJ  = tokenizer.o
 BRIDGE   = tok_bridge.o
 TEST_SRC = ../../tests/vtm/test_vtm.c
 TEST_BIN = test_vtm
+TEST_API_SRC = ../../tests/test_vtm_api.c
+TEST_API_BIN = test_vtm_api
 BENCH_SRC = ../../tests/vtm/bench_backend.c
 BENCH_BIN = bench_backend
 
@@ -44,6 +46,12 @@ $(LIB): $(OBJ)
 %.o: %.c vtm.h vtm_internal.h vtm_backend.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -c -o $@ $<
 
+# api.c использует <stdatomic.h> (C11) для флага отмены и признака «занято».
+# Остальные файлы остаются на C99; -std=c11 идёт после CFLAGS намеренно,
+# чтобы перекрыть -std=c99, если его передали снаружи.
+api.o: api.c api.h vtm.h vtm_backend.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -I. -c -o $@ $<
+
 # Тот же main.c, но как C++17: C-ABI моста к tokenizer.hpp (см. main.c).
 $(BRIDGE): main.c tokenizer.hpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -DVTM_TOK_BRIDGE -I. -x c++ -c -o $@ main.c
@@ -55,6 +63,11 @@ $(TOK_OBJ): tokenizer.cpp tokenizer.hpp
 $(TEST_BIN): $(TEST_SRC) $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -I../.. -o $@ $(TEST_SRC) $(LIB) $(LDLIBS)
 
+# C-ABI: колбэк стриминга и отмена из другого потока (pthread в тесте).
+$(TEST_API_BIN): $(TEST_API_SRC) $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -I../.. -o $@ $(TEST_API_SRC) $(LIB) \
+		$(LDLIBS) -lpthread
+
 # Бенчмарк/проверка SIMD (tests/vtm/bench_backend.c). Собирается тем же CC,
 # что и библиотека, поэтому видит тот же SIMD.
 $(BENCH_BIN): $(BENCH_SRC) $(LIB)
@@ -65,8 +78,9 @@ $(BENCH_BIN): $(BENCH_SRC) $(LIB)
 
 # $(BIN) нужен интеграционному тесту CLI (текст -> токены -> ответ).
 # bench_backend --check — тест «simd == scalar» (1e-5) на наборе форм.
-test: $(TEST_BIN) $(BIN) $(BENCH_BIN)
+test: $(TEST_BIN) $(TEST_API_BIN) $(BIN) $(BENCH_BIN)
 	./$(TEST_BIN)
+	./$(TEST_API_BIN)
 	./$(BENCH_BIN) --check
 
 # Сборка токенизатора живёт отдельно (Makefile.tok), цели объединяются здесь:
@@ -82,4 +96,5 @@ bench-backend: $(BENCH_BIN)
 	./$(BENCH_BIN)
 
 clean:
-	rm -f $(OBJ) main.o $(BRIDGE) $(LIB) $(BIN) $(TEST_BIN) $(BENCH_BIN)
+	rm -f $(OBJ) main.o $(BRIDGE) $(LIB) $(BIN) $(TEST_BIN) $(TEST_API_BIN) \
+		$(BENCH_BIN)
