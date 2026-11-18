@@ -667,7 +667,7 @@
   {
     "id": "0102",
     "title": "CI: сборка, тесты, санитайзеры одной командой",
-    "status": "in_progress",
+    "status": "done",
     "file": "0102-ci-pipeline.md",
     "assignee": "agent:ci-pipeline"
   },

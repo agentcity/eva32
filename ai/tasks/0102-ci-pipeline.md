@@ -5,7 +5,7 @@ title: CI: сборка, тесты, санитайзеры одной кома�
 created_at: 2026-11-18T16:20:00Z
 author: yuri
 assignee: agent:ci-pipeline
-status: in_progress
+status: done
 scope:
   docs: false
   code: true
@@ -49,4 +49,21 @@ scope:
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: `make ci` в `src/vtm` (обычная сборка + тесты + UBSan-прогон с проверкой, что
+санитайзер реально слинкован), `tools/ci.py` (C, Python, check_tasks, check_vtm_docs и
+отдельная проверка «Python-тесты без собранных артефактов»), `.github/workflows/ci.yml`
+(ubuntu + macos, Python 3.12).
+
+Проверено: `python3 tools/ci.py` — **5/5 зелёные за 32,7 с** (C 8 с, Python 1533 теста,
+реестр, доки, «без артефактов» 1516 тестов); `make -C src/vtm ci` — 16 с, UBSan чистый,
+реально слинкован (проверка через `nm`). Негативные проверки: красный тест → exit 1,
+сломанный C → понятный FAIL, UBSan ловит signed overflow (trap-тест, exit 134).
+
+Попутно исправлено: `make clean` не удалял `backend_avx2.o`, `tok_main.o`, `tokenizer.o`
+— CI переиспользовал объекты от другой сборки (теперь `rm -f *.o`).
+
+По рекомендации агента корневой `make ci` заменён на вызов `tools/ci.py` — раньше это
+была другая, расходящаяся проверка (без C-сборки и без UBSan); проверено: 5/5 зелёные.
+
+Риски: Linux/gcc локально не проверялся (нет Linux/docker), возможны gcc-варнинги под
+-Werror; macos-плечо матрицы на раннере не проверялось.
