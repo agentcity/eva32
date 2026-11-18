@@ -3,7 +3,8 @@
 
 Конвейер (ADR 0010)::
 
-    WAV → ASR (whisper.cpp) → текст → eva.router (скилл) → текст → TTS (say -v Milena)
+    WAV → ASR (whisper.cpp) → текст → eva.router (скилл) → текст → TTS
+                                                        (Piper → say/espeak)
 
 Что важно знать до запуска:
 
@@ -12,9 +13,12 @@
   честно печатает маршрут ``small``/``big`` и не идёт в сеть/ollama.
 * **ASR опционален.** Нет собранного whisper.cpp — скрипт не падает, а печатает
   команды сборки и предлагает ``--text`` для отладки цепочки без ASR.
-* **TTS — macOS ``say`` с голосом Milena (ru_RU).** Синтез идёт в WAV
-  (16 кГц, моно, 16 бит), затем файл проигрывается ``afplay``. Так можно
-  измерить и первый фрагмент синтеза, и реальный старт звука.
+* **TTS — адаптер ``eva.tts``.** По умолчанию Piper (локальный нейро-TTS),
+  если есть бинарь ``piper`` и модель ``.onnx`` (``PIPER_BIN``/``PIPER_MODEL``);
+  иначе системный ``say`` (macOS, голос Milena) или ``espeak`` (Linux).
+  ``--tts piper|system|null`` перекрывает автовыбор. Синтез идёт в WAV
+  (16 кГц, моно, 16 бит для say), затем файл проигрывается ``afplay``. Так
+  можно измерить и первый фрагмент синтеза, и реальный старт звука.
 * **Замеры.** ASR, маршрут, синтез TTS, первый фрагмент TTS, старт
   воспроизведения и итог до первого звука — в миллисекундах.
 * **Потоковая речь (по умолчанию).** Ответ режется на предложения; первое
@@ -28,6 +32,8 @@
     python3 scripts/voice_loop.py --text "Сколько стоит тариф Старт"
     python3 scripts/voice_loop.py --text "Сколько стоит тариф Старт" --no-play
     python3 scripts/voice_loop.py --text "Сколько стоит тариф Старт" --no-stream
+    python3 scripts/voice_loop.py --text "..." --tts system
+    python3 scripts/voice_loop.py --text "..." --tts piper --piper-model voice.onnx
     python3 scripts/voice_loop.py --text "..." --out /tmp/reply.wav
     python3 scripts/voice_loop.py --wav request.wav \
         --whisper-bin ./whisper.cpp/build/bin/whisper-cli \
@@ -62,6 +68,17 @@ if str(ROOT) not in sys.path:
 from eva.config import load as load_config  # noqa: E402
 from eva.router import answer as router_answer  # noqa: E402
 from eva.router import decide as router_decide  # noqa: E402
+from eva.tts import DEFAULT_SAY_VOICE  # noqa: E402
+from eva.tts import ENGINE_CHOICES  # noqa: E402
+from eva.tts import NullTTS  # noqa: E402
+from eva.tts import SynthesisResult  # noqa: E402
+from eva.tts import TTSAdapter  # noqa: E402
+from eva.tts import TTSError as TtsError  # noqa: E402
+from eva.tts import TTSUnavailable as TtsUnavailable  # noqa: E402
+from eva.tts import build_say_command as _build_say_command  # noqa: E402
+from eva.tts import describe_engine  # noqa: E402
+from eva.tts import find_say_binary  # noqa: E402
+from eva.tts import select_engine  # noqa: E402
 from eva.types import Message, Request  # noqa: E402
 
 try:  # скиллы — отдельный пакет; без них прототип остаётся работоспособным
@@ -70,7 +87,11 @@ except Exception:  # pragma: no cover — зависит от состояния
     _try_skills = None  # type: ignore[assignment]
 
 
-DEFAULT_VOICE = os.environ.get("EVA_VOICE", "Milena")
+DEFAULT_VOICE = os.environ.get("EVA_VOICE", DEFAULT_SAY_VOICE).strip() or DEFAULT_SAY_VOICE
+_ENGINE_ENV = (os.environ.get("EVA_TTS") or "auto").strip().lower()
+#: Движок TTS по умолчанию: EVA_TTS, если значение корректно, иначе auto
+#: (Piper → system → null).
+DEFAULT_TTS_ENGINE = _ENGINE_ENV if _ENGINE_ENV in ENGINE_CHOICES else "auto"
 DEFAULT_LANG = os.environ.get("EVA_WHISPER_LANG", "ru")
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_TTS_TIMEOUT = 120.0
@@ -84,10 +105,6 @@ STREAM_WORKERS = 2
 #: Максимальная длина чанка, который уходит в один синтез. Длинное предложение
 #: без точек режется по пробелам/запятым, иначе потоковая речь теряет смысл.
 MAX_CHUNK_CHARS = 220
-
-#: say пишет WAV с выровненным 4-КиБ заголовком; всё, что больше, — аудиоданные.
-#: Порог нужен, чтобы «первый фрагмент» не оказывался моментом записи заголовка.
-WAV_HEADER_BYTES = 4096
 
 #: Имена бинарника whisper.cpp: новое (whisper-cli) и старое (main в build/bin).
 WHISPER_BINARY_NAMES = ("whisper-cli", "whisper-cpp")
@@ -135,14 +152,6 @@ class AsrError(VoiceError):
     """whisper.cpp запустился, но распознать не смог."""
 
 
-class TtsUnavailable(VoiceError):
-    """TTS недоступен (нет say/afplay или голоса)."""
-
-
-class TtsError(VoiceError):
-    """TTS запустился, но синтез/воспроизведение не удались."""
-
-
 @dataclass
 class RouteResult:
     """Ответ гибрида, подготовленный к озвучке."""
@@ -155,15 +164,6 @@ class RouteResult:
     skill: str | None
     latency_ms: float
     answered: bool
-
-
-@dataclass
-class SynthesisResult:
-    """Результат синтеза WAV через say."""
-
-    path: Path
-    synth_ms: float
-    first_fragment_ms: float | None
 
 
 @dataclass
@@ -286,7 +286,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         prog="voice_loop.py",
         description=(
             "Прототип голосового конвейера EVA32: WAV → whisper.cpp → eva → "
-            "say -v Milena. Если whisper.cpp нет, используйте --text."
+            "TTS (Piper, если установлен, иначе say/espeak). "
+            "Если whisper.cpp нет, используйте --text."
         ),
     )
     source = parser.add_mutually_exclusive_group(required=True)
@@ -310,7 +311,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--voice",
         default=DEFAULT_VOICE,
-        help=f"голос say (по умолчанию {DEFAULT_VOICE})",
+        help=f"голос say/espeak (по умолчанию {DEFAULT_VOICE})",
     )
     parser.add_argument(
         "--lang",
@@ -331,16 +332,38 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="путь к модели ggml-*.bin (иначе WHISPER_MODEL и типовые каталоги)",
     )
     parser.add_argument(
+        "--tts",
+        dest="tts_engine",
+        choices=ENGINE_CHOICES,
+        default=DEFAULT_TTS_ENGINE,
+        help=(
+            "TTS-движок: auto — Piper, если доступен, иначе say/espeak "
+            f"(по умолчанию {DEFAULT_TTS_ENGINE}); piper; system; null"
+        ),
+    )
+    parser.add_argument(
+        "--piper-bin",
+        default=None,
+        metavar="FILE",
+        help="путь к piper (иначе PIPER_BIN, PATH и типовые каталоги)",
+    )
+    parser.add_argument(
+        "--piper-model",
+        default=None,
+        metavar="FILE",
+        help="модель Piper .onnx (иначе PIPER_MODEL и типовые каталоги)",
+    )
+    parser.add_argument(
         "--say-bin",
         default=None,
         metavar="FILE",
-        help="путь к say (по умолчанию из PATH)",
+        help="путь к say для системного TTS (по умолчанию из PATH)",
     )
     parser.add_argument(
         "--rate",
         type=int,
         default=None,
-        help="скорость речи say (-r), слов в минуту",
+        help="скорость речи say (-r) / espeak (-s) / piper (length_scale), слов в минуту",
     )
     parser.add_argument(
         "--no-play",
@@ -365,7 +388,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--tts-timeout",
         type=positive_float,
         default=DEFAULT_TTS_TIMEOUT,
-        help=f"таймаут синтеза say, сек (по умолчанию {DEFAULT_TTS_TIMEOUT:g})",
+        help=f"таймаут синтеза TTS, сек (по умолчанию {DEFAULT_TTS_TIMEOUT:g})",
     )
     parser.add_argument(
         "--play-timeout",
@@ -1023,20 +1046,18 @@ def transcribe_wav(
 
 
 # --------------------------------------------------------------------------- #
-# say / afplay
+# TTS-адаптер (eva.tts: Piper → say/espeak → null) и afplay
 # --------------------------------------------------------------------------- #
 def find_say(explicit: str | Path | None = None) -> Path:
-    if explicit:
-        path = Path(explicit).expanduser()
-        if not path.is_file() or not os.access(path, os.X_OK):
-            raise TtsUnavailable(f"say не найден: {path}")
-        return path
-    found = shutil.which("say")
-    if not found:
+    """Найти ``say`` для системного TTS (совместимость со старым API)."""
+    say = find_say_binary(explicit)
+    if say is None:
         raise TtsUnavailable(
-            "TTS недоступен: say не найден. Прототип рассчитан на macOS с голосом Milena."
+            "TTS недоступен: say не найден. На macOS проверьте голос "
+            "`say -v '?' | grep Milena`; на Linux используйте espeak "
+            "(--tts system)."
         )
-    return Path(found)
+    return say
 
 
 def build_say_command(
@@ -1047,20 +1068,8 @@ def build_say_command(
     *,
     rate: int | None = None,
 ) -> list[str]:
-    """Команда say, которая пишет WAV 16 кГц/моно/16 бит."""
-    command = [
-        str(say_bin),
-        "-v",
-        voice,
-        "-o",
-        str(out_path),
-        "--file-format=WAVE",
-        "--data-format=LEI16@16000",
-    ]
-    if rate is not None:
-        command.extend(["-r", str(int(rate))])
-    command.append(text)
-    return command
+    """Команда say, которая пишет WAV 16 кГц/моно/16 бит (см. eva.tts)."""
+    return _build_say_command(say_bin, voice, out_path, text, rate=rate)
 
 
 def synthesize(
@@ -1071,70 +1080,41 @@ def synthesize(
     say_bin: str | Path | None = None,
     rate: int | None = None,
     timeout: float = DEFAULT_TTS_TIMEOUT,
+    engine: TTSAdapter | None = None,
+    tts_engine: str | None = None,
+    piper_bin: str | Path | None = None,
+    piper_model: str | Path | None = None,
 ) -> SynthesisResult:
-    """Синтезировать текст в WAV и замерить первый фрагмент.
+    """Синтезировать текст в WAV через выбранный TTS-движок и замерить его.
+
+    ``engine`` — уже выбранный адаптер (в потоковой озвучке он один на все
+    предложения). Без него движок выбирается заново: Piper, если есть бинарь
+    и модель, иначе системный say/espeak (``tts_engine``/``EVA_TTS``
+    перекрывает автовыбор).
 
     ``first_fragment_ms`` — время до появления первых байт аудио в файле:
-    это нижняя оценка того, когда заговорил бы живой say.
+    это нижняя оценка того, когда заговорил бы живой движок.
     """
-    say = find_say(say_bin)
+    chosen = engine
+    if chosen is None:
+        chosen = select_engine(
+            tts_engine,
+            piper_bin=piper_bin,
+            piper_model=piper_model,
+            say_bin=say_bin,
+            voice=voice,
+        )
+    if isinstance(chosen, NullTTS) or chosen.name == "null":
+        raise TtsUnavailable(
+            "TTS недоступен: не найден ни Piper (PIPER_BIN/PIPER_MODEL), ни "
+            "системный say/espeak. Установите Piper или включите --tts system."
+        )
+
     target = Path(out_path).expanduser()
     if target.parent and not target.parent.exists():
         raise TtsError(f"каталог для --out не существует: {target.parent}")
-    try:
-        target.unlink(missing_ok=True)
-    except OSError as exc:
-        raise TtsError(f"не удалось подготовить {target}: {exc}") from exc
-
-    command = build_say_command(say, voice, target, text, rate=rate)
-    started = time.perf_counter()
-    try:
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except OSError as exc:
-        raise TtsUnavailable(f"say не запустился: {exc}") from exc
-
-    first_fragment_ms: float | None = None
-    while proc.poll() is None:
-        if first_fragment_ms is None:
-            try:
-                if target.stat().st_size > WAV_HEADER_BYTES:  # уже аудиоданные
-                    first_fragment_ms = (time.perf_counter() - started) * 1000.0
-            except OSError:
-                pass
-        if time.perf_counter() - started > timeout:
-            proc.kill()
-            proc.communicate()
-            raise TtsError(
-                f"say не уложился в {timeout:g} с. Увеличьте --tts-timeout "
-                "или сократите ответ."
-            )
-        time.sleep(0.005)
-
-    stdout, stderr = proc.communicate()
-    synth_ms = (time.perf_counter() - started) * 1000.0
-    if first_fragment_ms is None and target.exists() and target.stat().st_size > WAV_HEADER_BYTES:
-        first_fragment_ms = synth_ms
-
-    if proc.returncode != 0:
-        detail = (stderr or stdout or "").strip().splitlines()
-        tail = " | ".join(detail[-3:]) if detail else "без вывода"
-        raise TtsError(f"say завершился с кодом {proc.returncode}: {tail}")
-
-    if not target.is_file() or target.stat().st_size <= 44:
-        raise TtsError(
-            "say не создал аудио. Проверьте голос: say -v '?' | grep Milena "
-            f"(запрошен {voice!r})."
-        )
-
-    return SynthesisResult(
-        path=target,
-        synth_ms=synth_ms,
-        first_fragment_ms=first_fragment_ms,
+    return chosen.synthesize_timed(
+        text, target, rate=rate, voice=voice, timeout=timeout
     )
 
 
@@ -1175,8 +1155,8 @@ def play_audio(path: Path, *, timeout: float = DEFAULT_PLAY_TIMEOUT) -> PlayResu
 def concat_wavs(paths: Sequence[Path], out_path: Path) -> Path:
     """Склеить части потоковой озвучки в один WAV для ``--out``.
 
-    Все части пишет один и тот же ``say`` с одинаковыми параметрами, поэтому
-    формат проверяется и должен совпасть; иначе — понятная ошибка.
+    Все части пишет один и тот же TTS-движок с одинаковыми параметрами,
+    поэтому формат проверяется и должен совпасть; иначе — понятная ошибка.
     """
     parts = [Path(path) for path in paths]
     if not parts:
@@ -1223,6 +1203,10 @@ def speak_stream(
     play_timeout: float = DEFAULT_PLAY_TIMEOUT,
     play: bool = True,
     workers: int = STREAM_WORKERS,
+    engine: TTSAdapter | None = None,
+    tts_engine: str | None = None,
+    piper_bin: str | Path | None = None,
+    piper_model: str | Path | None = None,
 ) -> StreamResult:
     """Озвучить ответ по предложениям, не дожидаясь синтеза всего текста.
 
@@ -1230,6 +1214,10 @@ def speak_stream(
     Остальные синтезируются в пуле (``workers`` потоков), пока звучит
     предыдущее; воспроизведение идёт строго по порядку. Если следующий чанк не
     успел — речь делает паузу, и это видно в ``wait_ms``.
+
+    ``engine`` — адаптер из ``eva.tts``; если не передан, он выбирается один
+    раз на всю озвучку (Piper → system → null), чтобы все предложения шли
+    через один и тот же движок.
 
     ``first_sound_ms`` — от старта этой функции до запуска afplay с первым
     предложением; вызывающий код прибавляет к нему ASR и маршрут.
@@ -1242,6 +1230,16 @@ def speak_stream(
     directory = Path(out_dir).expanduser()
     if not directory.is_dir():
         raise TtsError(f"каталог для частей WAV не существует: {directory}")
+
+    chosen = engine
+    if chosen is None:
+        chosen = select_engine(
+            tts_engine,
+            piper_bin=piper_bin,
+            piper_model=piper_model,
+            say_bin=say_bin,
+            voice=voice,
+        )
 
     started = time.perf_counter()
 
@@ -1262,6 +1260,7 @@ def speak_stream(
             say_bin=say_bin,
             rate=rate,
             timeout=tts_timeout,
+            engine=chosen,
         )
 
     first_sound_ms: float | None = None
@@ -1406,6 +1405,7 @@ def _json_payload(
     audio_saved: bool,
     played: bool,
     audio_parts: Sequence[Path] | None = None,
+    tts: dict[str, Any] | None = None,
     error: str | None = None,
     stage: str | None = None,
 ) -> dict[str, Any]:
@@ -1431,6 +1431,8 @@ def _json_payload(
             "parts": [str(part) for part in audio_parts] if audio_parts else [],
         },
     }
+    if tts is not None:
+        payload["tts"] = tts
     if error is not None:
         payload["error"] = error
         payload["stage"] = stage
@@ -1555,6 +1557,18 @@ def run(args: argparse.Namespace, *, cfg: Any | None = None) -> int:
             print(f"Ответ: {route.answer_text}")
             print(f"Озвучка: {route.spoken_text}")
 
+        # Движок выбирается один раз на весь ответ: Piper, если есть бинарь и
+        # модель, иначе системный say/espeak. Явный --tts перекрывает автовыбор.
+        engine = select_engine(
+            args.tts_engine,
+            piper_bin=args.piper_bin,
+            piper_model=args.piper_model,
+            say_bin=args.say_bin,
+            voice=args.voice,
+        )
+        if not args.json:
+            print(f"TTS-движок: {describe_engine(engine)}")
+
         sentences = split_sentences(route.spoken_text)
         if not sentences:
             raise VoiceError("не удалось разбить ответ на предложения для озвучки")
@@ -1580,6 +1594,7 @@ def run(args: argparse.Namespace, *, cfg: Any | None = None) -> int:
                     say_bin=args.say_bin,
                     rate=args.rate,
                     timeout=args.tts_timeout,
+                    engine=engine,
                 )
                 timings.tts_synth_ms = synthesis.synth_ms
                 timings.tts_first_fragment_ms = synthesis.first_fragment_ms
@@ -1601,6 +1616,7 @@ def run(args: argparse.Namespace, *, cfg: Any | None = None) -> int:
                     tts_timeout=args.tts_timeout,
                     play_timeout=args.play_timeout,
                     play=not args.no_play,
+                    engine=engine,
                 )
                 audio_parts = list(stream.parts)
                 first_chunk = stream.chunks[0]
@@ -1632,6 +1648,10 @@ def run(args: argparse.Namespace, *, cfg: Any | None = None) -> int:
                             audio_saved=audio_saved,
                             played=played,
                             audio_parts=audio_parts,
+                            tts={
+                                "engine": engine.name,
+                                "description": describe_engine(engine),
+                            },
                         ),
                         ensure_ascii=False,
                         indent=2,

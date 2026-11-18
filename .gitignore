@@ -265,3 +265,5 @@ demo/
 src/vtm/test_vtm_api
 src/vtm/test_vtm
 src/vtm/bench_backend
+src/vtm/test_sha256
+src/vtm/test_vtm_session

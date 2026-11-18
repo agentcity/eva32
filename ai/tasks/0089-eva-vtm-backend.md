@@ -5,7 +5,7 @@ title: eva ↔ ВТМ: локальный бэкенд через C-ABI
 created_at: 2026-11-18T13:10:00Z
 author: yuri
 assignee: agent:eva-vtm-backend
-status: in_progress
+status: done
 scope:
   docs: false
   code: true
@@ -53,4 +53,19 @@ scope:
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: пакет `eva/backends/` — ctypes-обвязка над C-ABI ВТМ
+(`vtm_api_open/generate/cancel/close/last_error`), автосборка `.dylib` из `libvtm.a` в
+кэш, чистый Python-BPE из `tokenizer.json` (без запуска процесса `vtm`), стриминг через
+поток-воркер и очередь, отмена из любого потока, `chat()/stream_chat()` в форме
+`eva.clients`. 35 тестов.
+
+Проверено исполнителем: генерация на `demo/model.vtm` даёт 3 токена, повтор
+детерминирован; `stream_text` склеивается в `decode(ids)`; частичный UTF-8 (`0xD0`)
+не рвётся; отмена из другого потока → `VtmCancelled`, контекст после отмены работает;
+без библиотеки тесты уходят в skip с внятным текстом.
+
+Риски: автосборка `.so` на Linux из не-PIC объектов может не слинковаться (лечится
+`EVA_VTM_LIB`); `EVA_VTM_MAX_TOKENS=64` может превысить контекст демо-модели;
+`chat()` использует переносимый шаблон, а не чат-шаблон модели; один контекст = одна
+генерация (`VtmBusy`). В `eva/router` бэкенд не подключён — передаётся как
+`deps["small"]`.

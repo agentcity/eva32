@@ -5,7 +5,7 @@ title: Голос: адаптер TTS с фолбэком (Piper)
 created_at: 2026-11-18T13:10:00Z
 author: yuri
 assignee: agent:eva-tts-piper
-status: in_progress
+status: done
 scope:
   docs: false
   code: true
@@ -50,4 +50,17 @@ scope:
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: `eva/tts.py` — `synthesize(text)`, реализации `PiperTTS` (бинарь + .onnx из
+`PIPER_BIN`/`PIPER_MODEL`, текст в stdin), `SystemTTS` (macOS `say`, Linux
+`espeak-ng`/`espeak`), `NullTTS`; автовыбор piper → system → null, явный конфиг
+перекрывает; `synthesize_timed` (полное время + время до первого фрагмента).
+`voice_loop.py` переведён на адаптер, стриминг по предложениям сохранён, старые имена
+оставлены обёртками. 33 теста.
+
+Проверено на mock-процессе: успех, код 1, таймаут, отсутствие файла, битый
+`PIPER_BIN` (автовыбор не падает), явный piper без бинаря → `TTSUnavailable`,
+`--tts null` → exit 3 без traceback.
+
+Риски: реальный Piper не запускался (нет бинаря/модели) — качество и скорость не
+измерены; частоты 22 кГц у Piper против 16 кГц у `say`; `espeak` проверен только на
+уровне команды.
