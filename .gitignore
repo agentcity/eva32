@@ -141,7 +141,7 @@ celerybeat.pid
 # RabbitMQ
 mnesia/
 rabbitmq/
-rabbitmq-data/
+rabbitmq-data/*
 
 # ActiveMQ
 activemq-data/
@@ -224,7 +224,8 @@ __marimo__/
 
 # --- EVA32: бандл модели ---
 # Данные и модели
-data/
+data/*
+!data/catalog.json
 local_model/
 *.gguf
 *.safetensors
