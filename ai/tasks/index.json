@@ -369,5 +369,12 @@
     "status": "done",
     "file": "0056-check-ternary.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0057",
+    "title": "Абстракция хранения тритов: packed20 и native",
+    "status": "pending",
+    "file": "0057-trit-storage-abstraction.md",
+    "assignee": ""
   }
 ]
