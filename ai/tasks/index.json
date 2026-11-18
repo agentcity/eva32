@@ -625,7 +625,7 @@
   {
     "id": "0095",
     "title": "Крошечная модель: сквозная проверка цепочки на своём железе",
-    "status": "in_progress",
+    "status": "done",
     "file": "0095-tiny-qat-cpu.md",
     "assignee": "agent:tiny-qat-cpu"
   }
