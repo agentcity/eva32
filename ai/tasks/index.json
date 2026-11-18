@@ -324,7 +324,7 @@
   {
     "id": "0053",
     "title": "Чат-шаблон Qwen в текстовом пути",
-    "status": "in_progress",
+    "status": "done",
     "file": "0053-vtm-chat.md",
     "assignee": "agent:vtm-chat"
   },
@@ -551,5 +551,12 @@
     "status": "in_progress",
     "file": "0085-vtm-status-doc.md",
     "assignee": "agent:vtm-status-doc"
+  },
+  {
+    "id": "0082",
+    "title": "Метрики по операциям вместо оценки (trace)",
+    "status": "pending",
+    "file": "0082-vtm-metrics.md",
+    "assignee": ""
   }
 ]

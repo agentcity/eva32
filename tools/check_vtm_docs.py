@@ -27,6 +27,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DOC = Path("docs/vtm.md")
 
+# Корни, по которым узнаём путь репозитория в обратных кавычках.
+_REPO_ROOTS = {
+    "src", "docs", "tools", "tests", "qat", "distill", "eva", "scripts",
+    "prompts", "ai", "demo", "configs",
+}
+
 # Опкоды в docs/vtm.md: | 0x01 | `TMV` | ...
 _DOC_OP_RE = re.compile(
     r"^\|\s*(0x[0-9A-Fa-f]{2})\s*\|\s*`([A-Za-z][A-Za-z0-9_]*)`\s*\|"
@@ -142,6 +148,12 @@ def _check_links(doc: Path, text: str) -> int:
             return
         if target.startswith("/"):
             raise CheckError(f"ссылки: абсолютный путь {target!r} не переносим")
+        # В обратных кавычках встречаются системные заголовки (sys/mman.h) и имена
+        # функций — они не пути репозитория. Проверяем только то, что начинается с
+        # известного корня проекта: иначе чекер краснеет на честной документации.
+        root_component = target.split("/", 1)[0]
+        if "/" in target and root_component not in _REPO_ROOTS:
+            return
         candidates = [(doc.parent / target), (ROOT / target)]
         for candidate in candidates:
             resolved = candidate.resolve()
