@@ -334,5 +334,12 @@
     "status": "in_progress",
     "file": "0045-code-data.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0046",
+    "title": "Замер качества обученной модели",
+    "status": "done",
+    "file": "0046-eval-torch.md",
+    "assignee": "saron"
   }
 ]
