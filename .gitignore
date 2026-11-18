@@ -260,3 +260,8 @@ logs/
 
 # артефакты демо (генерируются scripts/demo_ternary_model.py)
 demo/
+
+# собранные бинарники тестов
+src/vtm/test_vtm_api
+src/vtm/test_vtm
+src/vtm/bench_backend
