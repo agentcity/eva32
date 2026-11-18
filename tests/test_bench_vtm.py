@@ -821,6 +821,20 @@ class TestMockRuns(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+_VTM_STUB_CACHE: list[str] = []
+
+
+def vtm_stub_path() -> str:
+    """Путь к заглушке бинарника vtm (тестам не нужен собранный C)."""
+    if not _VTM_STUB_CACHE:
+        fd, path = tempfile.mkstemp(prefix="vtm-stub-", suffix=".sh")
+        os.write(fd, b"#!/bin/sh\nexit 0\n")
+        os.close(fd)
+        os.chmod(path, 0o755)
+        _VTM_STUB_CACHE.append(path)
+    return _VTM_STUB_CACHE[0]
+
+
 class TestMainJson(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -839,6 +853,7 @@ class TestMainJson(unittest.TestCase):
         os.chmod(self.vtm_stub, 0o755)
         self.base_args = [
             "--vtm", self.vtm_stub,
+            "--vtm", vtm_stub_path(),
             "--model", self.model,
             "--contexts", "8",
             "--gen", "2",
@@ -916,6 +931,7 @@ class TestMainJson(unittest.TestCase):
 
     def test_breakdown_from_mock(self):
         args = [
+            "--vtm", vtm_stub_path(),
             "--model", self.model,
             "--contexts", "8",
             "--gen", "1",
@@ -946,6 +962,7 @@ class TestMainJson(unittest.TestCase):
 
     def test_trace_used_when_supported(self):
         args = [
+            "--vtm", vtm_stub_path(),
             "--model", self.model,
             "--contexts", "8",
             "--gen", "1",
@@ -970,6 +987,7 @@ class TestMainJson(unittest.TestCase):
 
     def test_trace_present_but_unparsed_falls_back(self):
         args = [
+            "--vtm", vtm_stub_path(),
             "--model", self.model,
             "--contexts", "8",
             "--gen", "1",
@@ -999,6 +1017,7 @@ class TestMainJson(unittest.TestCase):
 
     def test_missing_model_returns_2(self):
         args = [
+            "--vtm", vtm_stub_path(),
             "--model", os.path.join(self.tmp.name, "nope.vtm"),
             "--contexts", "8", "--gen", "1", "--repeat", "1",
             "--no-breakdown", "--workdir", self.workdir, "--json",
@@ -1122,6 +1141,7 @@ class TestMeasureBreakdown(unittest.TestCase):
         """Разбивка на контексте, которого нет в сценарной матрице."""
         runner = FakeRunner(time_ms=2.0)
         args = [
+            "--vtm", vtm_stub_path(),
             "--model", self.path,
             "--contexts", "8",
             "--gen", "1",
@@ -1212,6 +1232,7 @@ class TestArguments(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         model = write_tiny_model(os.path.join(tmp.name, "m.vtm"), context=8, with_samp=True)
         args = [
+            "--vtm", vtm_stub_path(),
             "--model", model,
             "--contexts", "8", "--gen", "1", "--backends", "scalar",
             "--repeat", "1",
@@ -1233,6 +1254,7 @@ class TestScenarioProductInMain(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         model = write_tiny_model(os.path.join(tmp.name, "m.vtm"), context=8, with_samp=True)
         args = [
+            "--vtm", vtm_stub_path(),
             "--model", model,
             "--contexts", "8,9",
             "--gen", "1,2",
