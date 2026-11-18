@@ -779,7 +779,7 @@
   {
     "id": "0118",
     "title": "KV: кэп на суммарный размер и отказ старым бинарям",
-    "status": "in_progress",
+    "status": "done",
     "file": "0118-kv-caps.md",
     "assignee": "agent:kv-caps"
   },

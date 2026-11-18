@@ -44,6 +44,37 @@
 #endif
 #endif
 
+// --- KV-кэши вне файла: кэп и признак нового контейнера (задача 0118) ------
+//
+// 0101 вынесла KV-кэши из файла: у помеченного тензора (VTM_TENSOR_FLAG_KV_CACHE)
+// payload'а нет, а загрузчик выделяет буфер n_elements×4 в арене. Файл в
+// 192 байта (заголовок + таблица + программа) мог запросить до
+// VTM_MAX_ELEMENTS×4 = 4 ГиБ — это вектор амплификации из 0110. Сумма всех
+// KV-кэшей ограничена VTM_MAX_KV_BYTES.
+//
+// Почему 512 МиБ: каноническая 1.5B-раскладка (ctx 2048, kv_dim 256, 28 слоёв)
+// — 112 МиБ, то есть запас ×4,5 (тот же профиль при ctx 8192); при этом
+// 192-байтный файл просит полгигабайта виртуальной памяти, а не четыре.
+// Меньше 256 МиБ нельзя: ctx 4096 у той же формы — уже 224 МиБ. Предел
+// переопределяется на сборке: -DVTM_MAX_KV_BYTES=...
+#ifndef VTM_MAX_KV_BYTES
+#define VTM_MAX_KV_BYTES ((uint64_t)512u << 20)
+#endif
+
+// Флаг заголовка «KV-кэши (если есть) лежат вне файла». Бит 2 свободен:
+// бит 0 — fp32-масштабы (C и Python), бит 15 — блок 160 (расширение C),
+// бит 1 пишет Python (VFLAG_CAUSAL), C его не смотрит. Старые контейнеры
+// присылают 0 и читаются прежним путём; контейнер с флагом обязан нести
+// хотя бы один KV-кэш.
+#define VTM_HEADER_FLAG_KV_OUT_OF_FILE 0x0004u
+
+// offset KV-кэша в контейнере с флагом выше: payload'а нет, поэтому поле —
+// не адрес. 0xFFFFFFFF = «смещения нет» (как VTM_NO_OFFSET у scale_offset).
+// Это же — отказ старому бинарю: загрузчик до 0101 не знает ни флага, ни
+// роли тензора, зато первым делом проверяет `offset % 32 != 0` и возвращает
+// VTM_E_FORMAT, не читая данные (подробности — в отчёте задачи 0118).
+#define VTM_KV_NO_OFFSET 0xFFFFFFFFu
+
 static char g_last_error[256] = "нет ошибки";
 
 const char *vtm_last_error(void) {
@@ -858,6 +889,9 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
     size_t table_end, data_start, program_bytes, program_off, data_size;
     uint32_t meta_off = 0, meta_len = 0;
     int meta_valid = 0;
+    int kv_flag = 0;
+    int has_kv = 0;
+    uint64_t kv_bytes = 0;
     tensor_plan *plans = NULL;
     uint8_t *writable = NULL;
     uint32_t i;
@@ -928,6 +962,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
              (unsigned)rd16(p + 4), (unsigned)VTM_FORMAT_VERSION);
 
     m->header_flags = rd16(p + 6);
+    kv_flag = (m->header_flags & VTM_HEADER_FLAG_KV_OUT_OF_FILE) != 0;
     n_instr = rd32(p + 8);
     n_tensors = rd32(p + 12);
     n_program = rd32(p + 16);
@@ -1042,11 +1077,17 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         t->layout = VTM_LAYOUT_TRT1;
 
         // KV-кэш (VTM_TENSOR_FLAG_KV_CACHE): payload'а в файле нет — ни слов,
-        // ни масштабов. offset/scale_offset у такой записи нули и адресами не
+        // ни масштабов. offset/scale_offset у такой записи адресами не
         // являются, поэтому проверки границ и TRT1 ниже не применяются:
         // буфер создаётся в арене (plan_tensor/fill_tensor_planned). Старые
         // контейнеры флаг не ставят и идут прежним путём, с данными из файла.
+        //
+        // Новый вид контейнера (0118) отмечается флагом заголовка, и тогда
+        // offset KV-кэша — VTM_KV_NO_OFFSET: файл без полезной нагрузки не
+        // должен выглядеть как валидный старый контейнер. Без флага (0101 и
+        // старее) принимаем прежний offset=0.
         if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) {
+            uint64_t bytes;
             if (t->kind == VTM_TENSOR_TRIT)
                 FAIL(VTM_E_FORMAT,
                      "тензор %u (%s): KV-кэш обязан быть fp-тензором (kind %u)",
@@ -1055,6 +1096,31 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                 FAIL(VTM_E_FORMAT,
                      "тензор %u (%s): у KV-кэша scale_offset=%u, ожидался 0",
                      i, t->name, t->scale_offset);
+            if (kv_flag) {
+                if (t->offset != VTM_KV_NO_OFFSET)
+                    FAIL(VTM_E_FORMAT,
+                         "тензор %u (%s): у KV-кэша offset=%u, ожидался 0x%08X "
+                         "(payload'а нет; флаг KV_OUT_OF_FILE)",
+                         i, t->name, t->offset, (unsigned)VTM_KV_NO_OFFSET);
+            } else if (t->offset != 0) {
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): KV-кэш без флага KV_OUT_OF_FILE, но "
+                     "offset=%u (ожидался 0)",
+                     i, t->name, t->offset);
+            }
+            // Кэп на суммарный размер: один помеченный тензор в 192-байтном
+            // файле иначе просит calloc до VTM_MAX_ELEMENTS×4 байт.
+            bytes = (uint64_t)t->n_elements * 4u;
+            if (bytes > VTM_MAX_KV_BYTES ||
+                kv_bytes > VTM_MAX_KV_BYTES - bytes)
+                FAIL(VTM_E_FORMAT,
+                     "KV-кэши: суммарный размер %llu байт больше предела %llu "
+                     "(VTM_MAX_KV_BYTES); тензор %u (%s) — %u элементов",
+                     (unsigned long long)(kv_bytes + bytes),
+                     (unsigned long long)VTM_MAX_KV_BYTES,
+                     i, t->name, t->n_elements);
+            kv_bytes += bytes;
+            has_kv = 1;
             continue;
         }
 
@@ -1193,6 +1259,14 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                      i, t->name, (unsigned long long)bytes);
         }
     }
+
+    // Флаг обещает новый вид контейнера: в нём обязан быть хотя бы один
+    // KV-кэш (иначе это ошибка писателя, а не старый контейнер). Обратное не
+    // требуется: старые контейнеры с кэшами внутри и 0101-контейнеры без
+    // флага читаются по-прежнему, их KV-записи несут offset=0.
+    if (kv_flag && !has_kv)
+        FAIL(VTM_E_FORMAT,
+             "флаг KV_OUT_OF_FILE поднят, но в таблице нет KV-кэшей");
 
     m->n_instr = n_instr;
     if (n_instr) {
@@ -1422,8 +1496,9 @@ static void map_trim_copied(vtm_t *m) {
         const vtm_tensor *t = &m->tensors[i];
         uintptr_t begin, end, lo, hi;
         if (t->kind != VTM_TENSOR_F16 && t->kind != VTM_TENSOR_BF16) continue;
-        // KV-кэша в файле нет (offset == 0), его страницы в отображении не
-        // занимались — трогать их madvise'ом нельзя.
+        // KV-кэша в файле нет (offset — не адрес: 0 или VTM_KV_NO_OFFSET),
+        // его страницы в отображении не занимались — трогать их madvise'ом
+        // нельзя.
         if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) continue;
         begin = base + (uintptr_t)m->data_start + (uintptr_t)t->offset;
         end = begin + (uintptr_t)t->n_elements * 2u;

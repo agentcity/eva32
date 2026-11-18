@@ -28,6 +28,8 @@
  25  ndim u8                        1..4
  26  dims u32[4]                    недостающие измерения = 0
  42  offset u32                     смещение ОТ НАЧАЛА СЕКЦИИ ДАННЫХ, кратно 32
+                                    (у KV-кэша — не адрес: 0 или 0xFFFFFFFF
+                                     при флаге VFLAG_KV_OUT_OF_FILE)
  46  scale_offset u32               0xFFFFFFFF (VTM_NO_OFFSET) — масштабы лежат
                                     внутри TRT1-сегмента по offset; для fp — 0
                                     (читатель принимает и offset+18 как синоним)
@@ -43,15 +45,25 @@ program_offset = meta_start + align32(meta_len)  — программа идёт
 программа:          n_instr * 16 байт, файл заканчивается ровно на ней
 ```
 
-KV-кэши вне контейнера (задача 0101). Поле по смещению 50 было резервом и
+KV-кэши вне контейнера (задачи 0101, 0118). Поле по смещению 50 было резервом и
 всегда 0; младший бит занят ролью `KV_CACHE`. Такой тензор существует только
 в таблице (`name`/`kind`/`dims`), а его payload в секцию данных **не пишется**:
-`offset = 0`, `scale_offset = 0`. Кэш пуст на старте и заполняется KVW, поэтому
-хранить под него `ctx × kv_dim × 4` байт в файле незачем — для 1.5B-раскладки
-(28 слоёв, ctx 2048, kv_dim 256) это 112 МиБ. Читатель создаёт буфер сам
-(Python — список нулей, C — буфер в арене); старые контейнеры присылают 0 в
-этом поле и читаются прежним путём, с содержимым из файла. Тензор с флагом
-обязан быть fp (kind 1..3); неизвестные биты читатель игнорирует.
+`offset` — не адрес, `scale_offset = 0`. Кэш пуст на старте и заполняется KVW,
+поэтому хранить под него `ctx × kv_dim × 4` байт в файле незачем — для
+1.5B-раскладки (28 слоёв, ctx 2048, kv_dim 256) это 112 МиБ. Читатель создаёт
+буфер сам (Python — список нулей, C — буфер в арене); старые контейнеры
+присылают 0 в этом поле и читаются прежним путём, с содержимым из файла.
+Тензор с флагом обязан быть fp (kind 1..3); неизвестные биты читатель
+игнорирует.
+
+Новый вид контейнера (задача 0118) отмечается флагом заголовка
+`VFLAG_KV_OUT_OF_FILE` (0x0004) и `offset == KV_NO_OFFSET` (0xFFFFFFFF) у
+каждого KV-кэша. Старый загрузчик до 0101 этот бит игнорирует, зато проверяет
+выравнивание offset и отказывает с `VTM_E_FORMAT`, не читая данные: мусор в
+кэш вместо отказа — ровно тот риск, ради которого флаг введён. Контейнеры без
+флага (0101 и старше) по-прежнему несут `offset = 0` и читаются как раньше.
+Суммарный размер KV-кэшей ограничен `MAX_KV_BYTES` (512 МиБ): 192-байтный файл
+иначе просит `calloc` до 4 ГиБ (предел `VTM_MAX_ELEMENTS`).
 
 Почему программа в конце: C-читатель, который ничего не знает про метаданные,
 всё равно может взять её как `file_size - n_instr*16`; `program_offset` из
@@ -280,16 +292,32 @@ KIND_NAMES = {
 #: сохраняются, но поведение не меняют — контейнер будущей версии читается.
 TFLAG_KV_CACHE = 0x0001
 
+#: offset KV-кэша в контейнере с флагом VFLAG_KV_OUT_OF_FILE: payload'а нет,
+#: поэтому поле — не адрес («смещения нет», как NO_OFFSET у scale_offset).
+#: Старый загрузчик видит здесь невыровненное смещение и отказывает, не читая
+#: данные (задача 0118).
+KV_NO_OFFSET = 0xFFFFFFFF
+
+#: Кэп на суммарный размер KV-кэшей при загрузке (в C — VTM_MAX_KV_BYTES).
+#: 1.5B-раскладка (ctx 2048, kv_dim 256, 28 слоёв) — 112 МиБ, запас ×4,5
+#: (ctx 8192); 192-байтный файл не должен просить 4 ГиБ. Значения в двух
+#: загрузчиках обязаны совпадать: tools/vtm_ref.py — эталон для C.
+MAX_KV_BYTES = 512 << 20
+
 #: Флаги контейнера (заголовок).
 VFLAG_F32_SCALES = 0x0001  # масштабы тритов по умолчанию float32
 VFLAG_CAUSAL = 0x0002      # модель причинная (LM)
+#: KV-кэши (если есть) лежат вне файла: у их записей offset == KV_NO_OFFSET.
+#: Контейнер с этим флагом обязан нести хотя бы один KV-кэш; старые
+#: контейнеры присылают 0 и читаются прежним путём (задача 0118).
+VFLAG_KV_OUT_OF_FILE = 0x0004
 
 #: Стратегии SAMP (imm инструкции, задача 0051; см. docs/vtm.md).
 SAMP_ARGMAX = 0
 SAMP_TEMPERATURE = 1
 SAMP_TOPK = 2
 SAMP_TOPP = 3
-VFLAG_KNOWN = VFLAG_F32_SCALES | VFLAG_CAUSAL
+VFLAG_KNOWN = VFLAG_F32_SCALES | VFLAG_CAUSAL | VFLAG_KV_OUT_OF_FILE
 
 #: Предел int в C: позиция KVW/ATTN и context_window за него не выходят.
 INT_MAX = 2_147_483_647
@@ -1100,9 +1128,17 @@ def write_vtm(
 
     `integrity=True` кладёт в мету `meta["integrity"]` с sha256 секции данных
     и самой меты (задача 0066). По умолчанию это делает `VTM_WRITE_HASH=1`,
-    чтобы компилятор мог включить защиту, не меняя вызов; без флага формат
-    байт-в-байт прежний (старые тесты и контейнеры не ломаются). Загрузчик
-    проверяет блок всегда, когда он есть; `VTM_SKIP_HASH=1` отключает сверку.
+    чтобы компилятор мог включить защиту, не меняя вызов; без этой опции
+    файл без KV-кэшей пишется байт-в-байт как раньше (старые тесты и
+    контейнеры не ломаются). Загрузчик проверяет блок всегда, когда он есть;
+    `VTM_SKIP_HASH=1` отключает сверку.
+
+    Контейнер с KV-кэшами (TFLAG_KV_CACHE) получает флаг заголовка
+    `VFLAG_KV_OUT_OF_FILE` и offset `KV_NO_OFFSET` у кэшей (задача 0118):
+    старый загрузчик до 0101 видит невыровненный offset и отказывает, а не
+    читает мусор. Суммарный размер кэшей проверяется по `MAX_KV_BYTES` —
+    ровно так же, как это сделает загрузчик, чтобы не записать нечитаемый
+    файл.
     """
     tensor_list = [_as_tensor(item) for item in tensors]
     program_list = [_as_instr(item) for item in program]
@@ -1112,6 +1148,14 @@ def write_vtm(
     if len(tensor_list) > MAX_TENSORS:
         raise ValueError(f"тензоров {len(tensor_list)}, максимум {MAX_TENSORS}")
 
+    kv_caches = [t for t in tensor_list if getattr(t, "flags", 0) & TFLAG_KV_CACHE]
+    kv_bytes = sum(t.n_elements * 4 for t in kv_caches)
+    if kv_bytes > MAX_KV_BYTES:
+        raise ValueError(
+            f"KV-кэши: суммарный размер {kv_bytes} байт больше предела "
+            f"{MAX_KV_BYTES} (MAX_KV_BYTES); уменьшите ctx или kv_dim"
+        )
+
     payloads = [encode_tensor_payload(tensor) for tensor in tensor_list]
     write_integrity = _integrity_requested(integrity)
 
@@ -1120,14 +1164,16 @@ def write_vtm(
     data_start = align_up(table_end)
 
     digest = hashlib.sha256() if write_integrity else None
+    has_kv = bool(kv_caches)
     data_size = 0
     for tensor, payload in zip(tensor_list, payloads):
         if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
-            # KV-кэш места в секции данных не занимает: offset/scale_offset
-            # нули (payload'а нет), размер известен из dims. Старые читатели,
-            # которые флаг не знают, увидят тензор по offset 0 — но их KVW всё
-            # равно перезапишет слоты до чтения, так что старый бинарь живёт.
-            tensor.offset = 0
+            # KV-кэш места в секции данных не занимает: payload'а нет, размер
+            # известен из dims. У контейнера нового вида offset — маркер
+            # KV_NO_OFFSET (не адрес): старый загрузчик до 0101 проверяет
+            # выравнивание offset и отказывает, не читая данные. Без флага
+            # (0101 и старше) сохраняем прежний offset=0 — совместимость.
+            tensor.offset = KV_NO_OFFSET if has_kv else 0
             tensor.scale_offset = 0
             continue
         tensor.offset = data_size
@@ -1172,6 +1218,11 @@ def write_vtm(
     flags = VFLAG_CAUSAL
     if all(t.kind != KIND_TRITS or t.scale_dtype == "float32" for t in tensor_list):
         flags |= VFLAG_F32_SCALES
+    if has_kv:
+        # Новый вид контейнера (0118): KV-кэши вне файла, их offset —
+        # KV_NO_OFFSET. Бита 0x0004 старый загрузчик не знает и игнорирует,
+        # отказ даёт offset (см. write_vtm).
+        flags |= VFLAG_KV_OUT_OF_FILE
 
     header = _HEADER_STRUCT.pack(
         VTM_MAGIC, VTM_VERSION, flags, len(program_list), n_tensors, len(program_bytes)
@@ -1276,6 +1327,10 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
         )
     if version != VTM_VERSION:
         raise ValueError(f"неизвестная версия контейнера: {version}")
+    # Задача 0118: флаг «KV-кэши вне файла». Старые контейнеры его не ставят
+    # и читаются прежним путём; контейнер с флагом обязан нести KV-кэши, а их
+    # offset — маркер KV_NO_OFFSET, а не адрес.
+    kv_flag = bool(flags & VFLAG_KV_OUT_OF_FILE)
     if n_tensors > MAX_TENSORS:
         raise ValueError(f"n_tensors={n_tensors} больше предела {MAX_TENSORS}")
 
@@ -1325,6 +1380,8 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     # --- таблица тензоров ---------------------------------------------------
     tensors: list[Tensor] = []
     ranges: list[tuple[int, int, str]] = []
+    kv_bytes = 0
+    has_kv = False
     for index in range(n_tensors):
         entry_offset = HEADER_SIZE + TENSOR_ENTRY_SIZE * index
         raw_name, kind, ndim, d0, d1, d2, d3, offset, scale_offset, tflags = (
@@ -1345,14 +1402,37 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
         if any(d == 0 for d in dims):
             raise ValueError(f"тензор {name!r}: нулевое измерение в {dims}")
         if tflags & TFLAG_KV_CACHE:
-            # KV-кэш: payload'а в файле нет, offset/scale_offset — нули и
-            # адресами не являются. Буфер создаст исполнитель по dims.
+            # KV-кэш: payload'а в файле нет, offset — не адрес. В контейнере
+            # нового вида (флаг VFLAG_KV_OUT_OF_FILE) это маркер
+            # KV_NO_OFFSET; старый загрузчик до 0101 на нём отказывает, а не
+            # читает данные по offset=0 как мусор. Контейнеры без флага
+            # (0101 и старше) по-прежнему несут offset=0.
             if kind == KIND_TRITS:
                 raise ValueError(f"тензор {name!r}: KV-кэш обязан быть fp-тензором")
             if scale_offset != 0:
                 raise ValueError(
                     f"тензор {name!r}: у KV-кэша scale_offset={scale_offset}, ожидался 0"
                 )
+            if kv_flag:
+                if offset != KV_NO_OFFSET:
+                    raise ValueError(
+                        f"тензор {name!r}: KV-кэш с флагом KV_OUT_OF_FILE, "
+                        f"offset={offset}, ожидался 0x{KV_NO_OFFSET:08X} "
+                        "(payload'а в файле нет)"
+                    )
+            elif offset != 0:
+                raise ValueError(
+                    f"тензор {name!r}: KV-кэш без флага KV_OUT_OF_FILE, "
+                    f"offset={offset}, ожидался 0"
+                )
+            kv_bytes += prod(dims) * 4
+            if kv_bytes > MAX_KV_BYTES:
+                raise ValueError(
+                    f"KV-кэши: суммарный размер {kv_bytes} байт больше предела "
+                    f"{MAX_KV_BYTES} (MAX_KV_BYTES); тензор {name!r} — "
+                    f"{prod(dims)} элементов"
+                )
+            has_kv = True
             tensor = Tensor(
                 name=name, kind=kind, dims=dims, offset=offset,
                 scale_offset=0, flags=tflags,
@@ -1389,6 +1469,14 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
         decode_tensor_values(tensor, data[start:end])
         ranges.append((start, end, name))
         tensors.append(tensor)
+
+    # Флаг обещает новый вид контейнера: в нём обязан быть хотя бы один
+    # KV-кэш. Обратное не требуется — старые контейнеры с кэшами внутри и
+    # 0101-контейнеры без флага читаются по-прежнему (задача 0118).
+    if kv_flag and not has_kv:
+        raise ValueError(
+            "флаг KV_OUT_OF_FILE поднят, но в таблице нет KV-кэшей"
+        )
 
     ranges.sort()
     for (prev_start, prev_end, prev_name), (next_start, _next_end, next_name) in zip(
