@@ -5,8 +5,7 @@
 // вытеснением старых сессий по mtime.
 //
 // Сборка (из корня репозитория):
-//   cc -std=c99 -O2 -I src/vtm -o /tmp/t tests/test_vtm_session.c \
-//      src/vtm/libvtm.a -lpthread
+//   cc -std=c99 -O2 -I src/vtm -o /tmp/t tests/test_vtm_session.c src/vtm/libvtm.a -lpthread
 // Модель по умолчанию — demo/model.vtm (аргументом можно задать другую).
 #include <dirent.h>
 #include <errno.h>
@@ -101,7 +100,7 @@ static int dir_usage(const char *dir, int *count, unsigned long long *bytes) {
 
     if (d == NULL) return -1;
     while ((de = readdir(d)) != NULL) {
-        char path[512];
+        char path[1024];
         struct stat st;
 
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
@@ -136,7 +135,7 @@ static void clear_dir(const char *dir) {
 
     if (d == NULL) return;
     while ((de = readdir(d)) != NULL) {
-        char path[512];
+        char path[1024];
 
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
             continue;
@@ -365,9 +364,9 @@ int main(int argc, char **argv) {
     //    не падает, а только что записанный файл не удаляется даже при лимите
     //    меньше его размера.
     {
-        char dir[512];
-        char paths[5][512];
-        char probe_path[512];
+        char dir[1024];
+        char paths[5][1024];
+        char probe_path[1024];
         const uint64_t limit = 5u * 1024u;
         unsigned long long bytes = 0;
         long mtime_base = (long)time(NULL) - 3600;
