@@ -1615,7 +1615,10 @@ static vtm_status op_samp(vtm_t *m, uint32_t ins, const vtm_instr *in,
     const vtm_tensor *logits;
     const vtm_tensor *tok = NULL;
     uint32_t n;
-    int strategy, token, greedy;
+    // token инициализируем явно: gcc с -Wmaybe-uninitialized не видит запись
+    // через указатель внутри samp_sample и валит сборку. Значение перезапишется
+    // на любом успешном пути; ноль — безопасный «первый токен» для страховки.
+    int strategy, token = 0, greedy;
 
     *stop = 0;
     logits = need(m, in->a, ins, "a (logits)", &st);
