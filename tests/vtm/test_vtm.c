@@ -4256,7 +4256,7 @@ static void cache_add_trit(model_t *md, const char *name, int rows, int cols) {
 
 static vtm_t *cache_model(const cache_cfg *cfg) {
     model_t md;
-    uint32_t d_emb[2], d_vec[1], d_kv[1], d_q[3], d_k[3], d_c[2], d_g[1];
+    uint32_t d_emb[2], d_vec[1], d_q[3], d_k[3], d_c[2], d_g[1];
     uint32_t d_log[2], d_one[1];
     int kv_dim = cfg->kv_heads * cfg->head_dim;
     uint8_t *img;
@@ -4267,7 +4267,6 @@ static vtm_t *cache_model(const cache_cfg *cfg) {
     d_emb[0] = (uint32_t)cfg->vocab;
     d_emb[1] = (uint32_t)cfg->hidden;
     d_vec[0] = (uint32_t)cfg->hidden;
-    d_kv[0] = (uint32_t)kv_dim;
     d_q[0] = (uint32_t)cfg->heads;
     d_q[1] = 1;
     d_q[2] = (uint32_t)cfg->head_dim;
@@ -4715,7 +4714,7 @@ enum {
 // Та же программа, что у cache_model(), плюс context_window в мете.
 static vtm_t *batch_model(const batch_cfg *cfg) {
     model_t md;
-    uint32_t d_emb[2], d_vec[1], d_kv[1], d_q[3], d_k[3], d_c[2], d_g[1];
+    uint32_t d_emb[2], d_vec[1], d_q[3], d_k[3], d_c[2], d_g[1];
     uint32_t d_log[2], d_one[1];
     int kv_dim = cfg->kv_heads * cfg->head_dim;
     uint8_t *img;
@@ -4726,7 +4725,6 @@ static vtm_t *batch_model(const batch_cfg *cfg) {
     d_emb[0] = (uint32_t)cfg->vocab;
     d_emb[1] = (uint32_t)cfg->hidden;
     d_vec[0] = (uint32_t)cfg->hidden;
-    d_kv[0] = (uint32_t)kv_dim;
     d_q[0] = (uint32_t)cfg->heads;
     d_q[1] = 1;
     d_q[2] = (uint32_t)cfg->head_dim;
@@ -4900,12 +4898,11 @@ enum { BMM_EMB, BMM_X, BMM_XCOL, BMM_LOGITS, BMM_TOKEN };
 
 static vtm_t *batch_mm_model(void) {
     model_t md;
-    uint32_t d_emb[2], d_x[1], d_col[2], d_log[2], d_one[1];
+    uint32_t d_x[1], d_col[2], d_log[2], d_one[1];
     uint8_t *img;
     size_t size;
     vtm_t *m;
 
-    d_emb[0] = 16; d_emb[1] = 8;
     d_x[0] = 8;
     d_col[0] = 8; d_col[1] = 1;
     d_log[0] = 16; d_log[1] = 1;

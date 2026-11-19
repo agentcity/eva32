@@ -10,7 +10,7 @@ AR       ?= ar
 # `opcode < 256` при uint8_t. Включаем их локально, чтобы не узнавать из CI.
 CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -qi clang && echo 1 || echo 0)
 ifeq ($(CC_IS_CLANG),1)
-CFLAGS   ?= -std=c99 -O2 -Wall -Wextra -Wtautological-compare -Wtautological-constant-out-of-range-compare -Werror
+CFLAGS   ?= -std=c99 -O2 -Wall -Wextra -Wtautological-compare -Wtautological-constant-out-of-range-compare -Wunused-but-set-variable -Werror
 else
 CFLAGS   ?= -std=c99 -O2 -Wall -Wextra -Werror
 endif
