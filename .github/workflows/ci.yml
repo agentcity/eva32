@@ -44,6 +44,20 @@ jobs:
         working-directory: src/vtm
         run: make test
 
+      # Если C-сборка упала, её вывод нужно увидеть в аннотациях: логи job'а
+      # требуют токена, а `::error::` из workflow-команд доступен через API.
+      - name: C build diagnostics
+        if: failure()
+        working-directory: src/vtm
+        run: |
+          echo "compiler: $(${CC:-cc} --version | head -1)"
+          echo "machine: $(uname -srm)"
+          make clean >/dev/null 2>&1 || true
+          make 2>&1 | tee /tmp/build.log || true
+          grep -E "error:|Error [0-9]" /tmp/build.log | head -10 | while IFS= read -r line; do
+            echo "::error file=src/vtm/Makefile::$line"
+          done
+
       - name: Python tests (unittest discover)
         run: python3 -m unittest discover -s tests
 
