@@ -57,6 +57,12 @@ jobs:
           grep -E "error:|Error [0-9]" /tmp/build.log | head -10 | while IFS= read -r line; do
             echo "::error file=src/vtm/Makefile::$line"
           done
+          # Сборка прошла, но упал тест: показываем строки провала как аннотации.
+          make test 2>&1 | tee /tmp/test.log || true
+          grep -nE "FAIL|fail|error|Error|assert|Assertion|Segmentation|abort|Abort|ошибк|Ошибк|OK|ok" /tmp/test.log \
+            | tail -25 | while IFS= read -r line; do
+            echo "::error file=src/vtm/Makefile::$line"
+          done
 
       - name: Python tests (unittest discover)
         run: python3 -m unittest discover -s tests
