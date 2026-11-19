@@ -365,16 +365,42 @@ static int validate_words(const uint8_t *p, uint32_t n_words,
     return 0;
 }
 
-static int tensor_arena_size(const vtm_tensor *t, size_t *out) {
-    uint64_t n;
-    if (t->kind == VTM_TENSOR_TRIT) {
-        n = (uint64_t)t->n_blocks * 32u + (uint64_t)t->n_scales * 4u;
-    } else {
-        n = (uint64_t)t->n_elements * 4u;
-    }
-    if (n > (uint64_t)SIZE_MAX) return -1;
-    *out = (size_t)n;
+// Проверки размера без «всегда ложных» сравнений.
+//
+// Было `n > (uint64_t)SIZE_MAX`: на 64-битных системах SIZE_MAX == UINT64_MAX,
+// сравнение всегда ложно, и gcc честно валил сборку (-Wtype-limits). Заодно
+// такие проверки не ловили переполнение умножения. Теперь считаем аккуратно:
+// переполнение uint64 и выход за size_t (на 32-битных) проверяются раздельно.
+static int mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (b != 0 && a > UINT64_MAX / b) return -1;
+    *out = a * b;
     return 0;
+}
+
+static int add_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (a > UINT64_MAX - b) return -1;
+    *out = a + b;
+    return 0;
+}
+
+static int fits_size_t(uint64_t v, size_t *out) {
+#if SIZE_MAX < UINT64_MAX
+    if (v > (uint64_t)SIZE_MAX) return -1;
+#endif
+    *out = (size_t)v;
+    return 0;
+}
+
+static int tensor_arena_size(const vtm_tensor *t, size_t *out) {
+    uint64_t n, a, b;
+    if (t->kind == VTM_TENSOR_TRIT) {
+        if (mul_u64(t->n_blocks, 32u, &a) != 0) return -1;
+        if (mul_u64(t->n_scales, 4u, &b) != 0) return -1;
+        if (add_u64(a, b, &n) != 0) return -1;
+    } else {
+        if (mul_u64(t->n_elements, 4u, &n) != 0) return -1;
+    }
+    return fits_size_t(n, out);
 }
 
 // План загрузки одного тензора. В mmap-режиме (can_reference) неизменяемые
@@ -396,6 +422,7 @@ typedef struct {
 static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
                        tensor_plan *p) {
     size_t sz;
+    uint64_t kv_bytes = 0, scale_bytes = 0;
 
     p->arena_size = 0;
     p->copy_data = 0;
@@ -406,8 +433,8 @@ static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
         // writable и can_reference тут ни при чём: файла нет, копировать
         // нечего. Размер считается по dims, а не по payload'у; kind проверен
         // при разборе записи таблицы.
-        if ((uint64_t)t->n_elements * 4u > (uint64_t)SIZE_MAX) return -1;
-        p->arena_size = (size_t)t->n_elements * 4u;
+        if (mul_u64(t->n_elements, 4u, &kv_bytes) != 0) return -1;
+        if (fits_size_t(kv_bytes, &p->arena_size) != 0) return -1;
         return 0;
     }
 
@@ -445,8 +472,8 @@ static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
 #endif
     p->copy_scales = !t->scale_is_f32;
     if (p->copy_scales) {
-        if ((uint64_t)t->n_scales * 4u > (uint64_t)SIZE_MAX) return -1;
-        p->arena_size = (size_t)t->n_scales * 4u;
+        if (mul_u64(t->n_scales, 4u, &scale_bytes) != 0) return -1;
+        if (fits_size_t(scale_bytes, &p->arena_size) != 0) return -1;
     }
     return 0;
 }
@@ -1189,12 +1216,16 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                          i, t->name, n_scales, n128, n160);
                 }
                 ss = (seg[5] & 1u) ? 4u : 2u;
-                need = 18u + (uint64_t)n_scales * ss
-                     + (uint64_t)storage_blocks * 32u;
-                if (need > (uint64_t)SIZE_MAX)
-                    FAIL(VTM_E_BOUNDS, "тензор %u (%s): TRT1 слишком велик",
-                         i, t->name);
-                seg_bytes = (size_t)need;
+                {
+                    uint64_t part1, part2;
+                    if (mul_u64(n_scales, ss, &part1) != 0 ||
+                        mul_u64(storage_blocks, 32u, &part2) != 0 ||
+                        add_u64(part1, part2, &need) != 0 ||
+                        add_u64(need, 18u, &need) != 0 ||
+                        fits_size_t(need, &seg_bytes) != 0)
+                        FAIL(VTM_E_BOUNDS, "тензор %u (%s): TRT1 слишком велик",
+                             i, t->name);
+                }
                 if (!range_ok(t->offset, (uint64_t)seg_bytes, data_size))
                     FAIL(VTM_E_BOUNDS,
                          "тензор %u (%s): TRT1-сегмент (%zu байт) за границей",

@@ -563,7 +563,11 @@ static double monotonic_now(void) {
 // заканчивается длительностью в нс — тот же вид, что у строк --trace-summary,
 // поэтому tools/bench_vtm.py разбирает оба режима одним парсером.
 
+// Массив трассы на все 256 значений uint8_t: тогда проверка диапазона не нужна.
+// gcc справедливо ругался на `(unsigned)opcode < TRACE_OP_SLOTS` при слотах 256:
+// сравнение всегда истинно (-Wtype-limits). Проверка заменена compile-time assert.
 #define TRACE_OP_SLOTS 256
+typedef char trace_slots_cover_uint8[(TRACE_OP_SLOTS >= 256) ? 1 : -1];
 
 typedef struct trace_state {
     int lines;                  // 1 — печатать каждую инструкцию (--trace)
@@ -581,11 +585,9 @@ static int trace_cli_cb(void *user, const vtm_trace_rec *rec) {
     if (!ts || !rec) return 0;
     ts->events++;
     ts->events_ns += rec->dur_ns;
-    if ((unsigned)rec->opcode < TRACE_OP_SLOTS) {
-        ts->per_op_ns[rec->opcode] += rec->dur_ns;
-        ts->per_op_count[rec->opcode]++;
-        ts->per_op_bytes[rec->opcode] += rec->out_bytes;
-    }
+    ts->per_op_ns[rec->opcode] += rec->dur_ns;
+    ts->per_op_count[rec->opcode]++;
+    ts->per_op_bytes[rec->opcode] += rec->out_bytes;
     if (ts->lines) {
         fprintf(stderr, "%s pc=%u seq=%u out=%u dur=%.1f ns\n",
                 vtm_opcode_name(rec->opcode), (unsigned)rec->pc,

@@ -160,10 +160,26 @@ static int collect_kv(const vtm_t *m, const vtm_tensor **ks,
     return VTM_OK;
 }
 
+// Проверки размера (те же, что в loader.c): сравнение с SIZE_MAX на 64-битных
+// всегда ложно и валит gcc -Wtype-limits; заодно ловим переполнение умножения.
+static int mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (b != 0 && a > UINT64_MAX / b) return -1;
+    *out = a * b;
+    return 0;
+}
+
+static int fits_size_t(uint64_t v, uint64_t *out) {
+#if SIZE_MAX < UINT64_MAX
+    if (v > (uint64_t)SIZE_MAX) return -1;
+#endif
+    *out = v;
+    return 0;
+}
+
 static int kv_geometry(uint32_t ctx_len, uint32_t kv_dim, uint32_t n_layers,
                        uint64_t *frame_bytes, uint64_t *kv_bytes,
                        char *err, size_t errcap) {
-    uint64_t one, total;
+    uint64_t one, total, one_sz = 0, total_sz = 0;
 
     if (ctx_len == 0 || kv_dim == 0 || n_layers == 0)
         return session_fail(err, errcap, VTM_E_FORMAT,
@@ -174,12 +190,18 @@ static int kv_geometry(uint32_t ctx_len, uint32_t kv_dim, uint32_t n_layers,
         return session_fail(err, errcap, VTM_E_FORMAT,
                             "абсурдные размеры KV-кэша: %ux%u",
                             (unsigned)ctx_len, (unsigned)kv_dim);
-    one = (uint64_t)ctx_len * (uint64_t)kv_dim * 4u;
-    if (one > (uint64_t)SIZE_MAX / 2u)
+    if (mul_u64(ctx_len, kv_dim, &one) != 0 ||
+        mul_u64(one, 4u, &one) != 0)
+        return session_fail(err, errcap, VTM_E_NOMEM,
+                            "размер KV-кадра не влезает в uint64");
+    if (fits_size_t(one, &one_sz) != 0)
         return session_fail(err, errcap, VTM_E_NOMEM,
                             "размер KV-кадра не влезает в size_t");
-    total = one * 2u * (uint64_t)n_layers;
-    if (total > (uint64_t)SIZE_MAX)
+    if (mul_u64(one, 2u, &total) != 0 ||
+        mul_u64(total, (uint64_t)n_layers, &total) != 0)
+        return session_fail(err, errcap, VTM_E_NOMEM,
+                            "суммарный размер KV-кадров не влезает в uint64");
+    if (fits_size_t(total, &total_sz) != 0)
         return session_fail(err, errcap, VTM_E_NOMEM,
                             "суммарный размер KV-кадров не влезает в size_t");
     *frame_bytes = one;
