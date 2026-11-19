@@ -817,5 +817,12 @@
     "status": "done",
     "file": "0124-golden-competence.md",
     "assignee": "architect"
+  },
+  {
+    "id": "0125",
+    "title": "CI на Ubuntu: gcc-предупреждения валили сборку",
+    "status": "done",
+    "file": "0125-ci-ubuntu-green.md",
+    "assignee": "architect"
   }
 ]
