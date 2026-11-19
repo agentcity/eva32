@@ -129,20 +129,38 @@ static void set_mtime(const char *path, long sec) {
     (void)utimes(path, tv);
 }
 
+static char *join_path(const char *dir, const char *name);
+
 static void clear_dir(const char *dir) {
     DIR *d = opendir(dir);
     struct dirent *de;
 
     if (d == NULL) return;
     while ((de = readdir(d)) != NULL) {
-        char path[1024];
+        char *path;
 
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
             continue;
-        snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
-        (void)unlink(path);
+        path = join_path(dir, de->d_name);
+        if (path != NULL) {
+            (void)unlink(path);
+            free(path);
+        }
     }
     (void)closedir(d);
+}
+
+// Склейка пути через malloc: gcc -Wformat-truncation не может ограничить
+// длину "%s" и валит сборку даже при буфере 1024. Здесь усечения нет вовсе.
+static char *join_path(const char *dir, const char *name) {
+    size_t n = strlen(dir);
+    size_t m = strlen(name);
+    char *out = (char *)malloc(n + 1 + m + 1);
+    if (out == NULL) return NULL;
+    memcpy(out, dir, n);
+    out[n] = '/';
+    memcpy(out + n + 1, name, m + 1);
+    return out;
 }
 
 static uint32_t le32(const unsigned char *p) {
@@ -365,7 +383,7 @@ int main(int argc, char **argv) {
     //    меньше его размера.
     {
         char dir[1024];
-        char paths[5][1024];
+        char *paths[5];
         char probe_path[1024];
         const uint64_t limit = 5u * 1024u;
         unsigned long long bytes = 0;
@@ -401,7 +419,13 @@ int main(int argc, char **argv) {
             // секунду и «самый старый» не определить.
             saves_ok = 1;
             for (i = 0; i < 5; i++) {
-                snprintf(paths[i], sizeof paths[i], "%s/s%zu.vtms", dir, i);
+                char name[32];
+                snprintf(name, sizeof name, "s%zu.vtms", i);
+                paths[i] = join_path(dir, name);
+                if (paths[i] == NULL) {
+                    saves_ok = 0;
+                    break;
+                }
                 if (vtm_api_session_save(lru, paths[i]) != VTM_OK) {
                     saves_ok = 0;
                     break;
@@ -450,7 +474,12 @@ int main(int argc, char **argv) {
 
             // Только что записанный файл не вытесняется, даже если один
             // больше лимита: иначе save() терял бы свой же результат.
-            snprintf(paths[0], sizeof paths[0], "%s/keep.vtms", dir);
+            if (paths[0] == NULL) paths[0] = join_path(dir, "keep.vtms");
+            else {
+                free(paths[0]);
+                paths[0] = join_path(dir, "keep.vtms");
+            }
+            check(paths[0] != NULL, "путь keep.vtms собран");
             check(vtm_api_sessions_limit(lru, 1) == VTM_OK,
                   "лимит 1 байт принят");
             rc = vtm_api_session_save(lru, paths[0]);
