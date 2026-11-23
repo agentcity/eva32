@@ -5,7 +5,7 @@ title: KV-кэш — кэп на суммарный размер и явный �
 created_at: 2026-11-18T17:30:00Z
 author: yuri
 assignee: ""
-status: pending
+status: done
 scope:
   docs: false
   code: true
@@ -44,7 +44,10 @@ scope:
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Закрыто как **дубликат**: та же работа выполнена в задаче 0118 (кэп
+`VTM_MAX_KV_BYTES = 512 МиБ`, header-флаг `VTM_HEADER_FLAG_KV_OUT_OF_FILE`,
+отказ старым бинарям через `offset = 0xFFFFFFFF`, ADR 0015). Здесь остаётся
+история постановки; подробности и замеры — в `ai/tasks/0118-kv-caps.md`.
 
 ## Ссылки
 
