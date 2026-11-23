@@ -4,9 +4,11 @@
 [0027](../ai/tasks/0027-trit-embeddings.md): один прогон QAT на арендованной **RTX 4090
 24 ГиБ**, от данных до замера качества. Устройство QAT, память и OOM — [docs/qat.md](qat.md);
 здесь — карта, установка, данные, порядок шагов, деньги и чек-лист «до оплаты».
+Первый запуск одной командой (preflight + дым 100 шагов + val loss) — §0.1.
 
-Снимок на 2026-11-18. У каждого числа — задача, где оно получено, или команда, которой оно
-проверяется. **«⚠️ сверить»** — репозиторием не подтверждено; рядом команда, показывающая факт.
+Снимок на 2026-11-18; раздел §0.1 и команды preflight — 2026-11-23 (задача 0126).
+У каждого числа — задача, где оно получено, или команда, которой оно проверяется.
+**«⚠️ сверить»** — репозиторием не подтверждено; рядом команда, показывающая факт.
 
 ## 0. Что изменилось с прошлой версии
 
@@ -22,6 +24,89 @@
 | «2000 шагов ≈ 6 ч» | 3 эпохи на 4008 парах — **376 шагов**, ≈1,13 ч по оценке 10,8 с/шаг | [0036](../ai/tasks/0036-emb-experiment.md) |
 | «сутки — 2400 ₽» | пилот ≈2,1 ч ≈ **192–256 ₽** при 90–120 ₽/ч; сутки не нужны | расчёт §10 |
 | данные — `distill/out/pairs.jsonl` | реальные пары — `distill/out/code_pairs.jsonl`; `pairs.jsonl` — 206 мок-пар | [0045](../ai/tasks/0045-code-data.md) |
+
+## 0.1. Первый запуск за 10 минут
+
+Короткий путь: проверить окружение, прогнать 100 шагов и увидеть val loss, а не
+испечь час аренды на настройке. Полный пилот — следующим шагом, после того как
+дым прошёл. Команды — `tools/rental_preflight.py` и `scripts/rental_run.sh`; пакеты
+они не ставят. Preflight не скачивает ничего, а `--dry-run` у `rental_run.sh` при
+пустом кеше HF скачает веса (~3 ГиБ, 5–10 мин).
+
+### 0.1.1. Что скопировать
+
+`data/train.jsonl` (3607 пар) и `data/val.jsonl` (401) — split задачи
+[0092](../ai/tasks/0092-qat-data-prep.md), ровно под него в конфиге `max_steps: 350`
+(3,1 эпохи). `runs/mixture/` (67,5 тыс. пар) — микс для экспериментов: на нём те же
+350 шагов дают 0,17 эпохи, preflight об этом предупреждает.
+
+```bash
+rsync -avP --exclude .git --exclude .pylibs --exclude .hfcache \
+  --exclude 'runs/bench_shape' --exclude 'runs/sweep' --exclude 'runs/tiny*' \
+  --exclude 'runs/rental' \
+  ./ user@HOST:~/eva32/
+ssh user@HOST 'cd ~/eva32 && wc -l data/train.jsonl data/val.jsonl'   # 3607 и 401
+```
+
+Зависимости — §2 (`python3 -m pip install -r qat/requirements-qat.txt`), один раз.
+
+### 0.1.2. Что запустить
+
+```bash
+cd ~/eva32
+python3 tools/rental_preflight.py     # «можно» / «нельзя» + точная следующая команда
+bash scripts/rental_run.sh --dry-run  # план без обучения; можно и до оплаты
+bash scripts/rental_run.sh            # dry-run → 100 шагов → val loss → стоп
+```
+
+Preflight проверяет Python 3.10–3.12, torch/CUDA и имя GPU, свободную и полную VRAM
+против оценки **21,32 ГиБ** (запас +2,68), данные и val, конфиг и оценку
+`estimate_memory`, `transformers`/`bitsandbytes`/`numpy`/`pyyaml`, кеш HF и свободное
+место. Код 0 — «можно», 1 — «нельзя»; в конце печатается одна точная команда запуска.
+
+`rental_run.sh` делает шаги и останавливается: preflight → `qat.train --dry-run`
+(3 шага на случайных данных, ловят импорты/CUDA) → 100 шагов на `data/train.jsonl` →
+val loss через `tools/eval_torch.py` по `data/val.jsonl`. Всё пишется в
+`runs/rental/` — `<id>.log` и каталог `<id>/`.
+
+### 0.1.3. Сколько это займёт и стоит
+
+| Шаг | Шагов | Счёт | С арендой | ₽ при 90–120 ₽/ч |
+|---|---:|---:|---:|---:|
+| `rental_preflight.py` | — | ~15 с | — | 0 |
+| `--dry-run` (веса в кеше) | 3 | 2–5 мин | — | — |
+| дым `rental_run.sh` | 100 | 18 мин | ≈1,05 ч | 94–126 |
+| **полный пилот** | **350** | **63 мин** | **≈2,1 ч** | **192–256** |
+
+Счёт — по 10,8 с/шаг (замер [0036](../ai/tasks/0036-emb-experiment.md)); после первых
+20 шагов возьмите `step_sec` из `log.jsonl` и перезапустите оценку с `--sec-per-step`.
+Первый запуск с пустым кешем HF добавляет 5–10 мин на веса (~3 ГиБ) — preflight это
+показывает. 350 шагов ≈ 3,1 эпохи на `data/train.jsonl` — это пилот; бюджет §10
+считался на 350–376 шагов.
+
+### 0.1.4. Где смотреть результат
+
+```bash
+ls -la runs/rental/                                   # <id>.log и <id>/
+tail -3 runs/rental/<id>/step100/log.jsonl            # loss, step_sec, gpu_peak_gb
+grep -E 'val loss' runs/rental/<id>.log               # итог шага 4
+cat runs/rental/<id>/val.json                         # accuracy, perplexity, ppl_pairs
+```
+
+`val loss = ln(perplexity)` печатается последним. Сравнивать его надо с base-моделью
+на тех же парах (`python3 tools/eval_torch.py --model Qwen/Qwen2.5-1.5B-Instruct
+--ppl-data data/val.jsonl`), а не с train loss. Чекпоинт —
+`runs/rental/<id>/step100/checkpoints/step_000100`, экспорт —
+`python3 -m qat.export --run runs/rental/<id>/step100 --out export/rental` (§6).
+
+### 0.1.5. Как не потратить лишний час
+
+- `rental_preflight.py` — до `tmux` и до старта: он говорит «нельзя» и что именно.
+- Прогон только в `tmux` (§5): SSH-обрыв убивает процесс, лог остаётся, шаги — нет.
+- `--max-steps` не больше 350: `2000` — это ~18 эпох на 3607 парах (§10.4).
+- Сначала дым 100 шагов и val loss; полный пилот — если loss и `step_sec` вменяемые.
+- OOM — §12 (`micro_batch_size: 2` в копии конфига), экспорт — §6, выгрузка — §7.
+- Выключить инстанс сразу после `rsync`; «оставлю на сутки» — 2160–2880 ₽ (§10).
 
 ## 1. Какую карту брать
 
@@ -262,6 +347,8 @@ python3 tools/embedding_experiment.py --data distill/out/code_pairs.jsonl \
 
 ## 11. Чек-лист перед тем, как платить
 
+- [ ] `python3 tools/rental_preflight.py` — «можно»; если «нельзя», исправить и
+      повторить (§0.1), а не запускать обучение «на удачу».
 - [ ] `nvidia-smi` — 4090 (cc 8.9), ≥ 23 ГиБ свободных, драйвер записан; `df -h .` — ≥ 40 ГБ
       (один прогон) или ≥ 100 ГБ (три прогона 0027).
 - [ ] `torch.cuda.is_available()` → `True`, `is_bf16_supported()` → `True`; `bitsandbytes`

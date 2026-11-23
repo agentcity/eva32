@@ -828,7 +828,7 @@
   {
     "id": "0126",
     "title": "Преflight аренды GPU: одна команда проверки и запуска",
-    "status": "in_progress",
+    "status": "done",
     "file": "0126-rental-preflight.md",
     "assignee": "agent:preflight"
   },
