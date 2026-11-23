@@ -730,7 +730,7 @@
   {
     "id": "0111",
     "title": "Логиты учителя: top-k формат и потоковое чтение",
-    "status": "in_progress",
+    "status": "done",
     "file": "0111-topk-logits.md",
     "assignee": "agent:topk"
   },
@@ -858,6 +858,27 @@
     "title": "qat/export.py: экспорт int8-эмбеддинга end-to-end",
     "status": "pending",
     "file": "0130-export-int8.md",
+    "assignee": ""
+  },
+  {
+    "id": "0131",
+    "title": "Двоичный sidecar для top-k логитов (6 ГиБ вместо 12 на 40k)",
+    "status": "pending",
+    "file": "0131-topk-sidecar.md",
+    "assignee": ""
+  },
+  {
+    "id": "0132",
+    "title": "`data.max_top_k` в конфиге: фиксировать k на весь прогон",
+    "status": "pending",
+    "file": "0132-max-top-k.md",
+    "assignee": ""
+  },
+  {
+    "id": "0133",
+    "title": "Sidecar-индекс для PairStore: старт на 40k пар без двойного парсинга",
+    "status": "pending",
+    "file": "0133-pairstore-index.md",
     "assignee": ""
   }
 ]

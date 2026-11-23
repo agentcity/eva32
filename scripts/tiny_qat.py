@@ -25,7 +25,9 @@ C-интерпретатор ``src/vtm/vtm``, после чего сверяет
 * ``logits``  — «учитель» без API: логиты текущего tiny-чекпоинта для
   ``--logits-pairs`` пар в формате ``qat.kl``, HF-каталог учителя и два
   конфига ``qat.train`` (с KL и без) — задача 0107.
-* ``all``     — всё подряд (по умолчанию), кроме ``logits``.
+* ``topk``    — замер top-k против полного словаря: размер, память, KL и
+  время шага для k=32/64/128 (задача 0111). В ``all`` не входит.
+* ``all``     — всё подряд (по умолчанию), кроме ``logits`` и ``topk``.
 
 Решения, которые стоит знать
 ============================
@@ -57,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import subprocess
 import sys
@@ -810,26 +813,19 @@ def _export_teacher_model(model: Any, tokenizer: Any, out_dir: Path) -> int:
     return sum(int(t.numel()) for t in model.state_dict().values())  # с tied-дублем
 
 
-def stage_logits(args: argparse.Namespace) -> dict[str, Any]:
-    """Логиты «учителя» (текущий tiny-чекпоинт) + конфиги прогонов qat.train.
+def _logits_setup(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
+    """Общая подготовка стадий ``logits``/``topk``: чекпоинт, пары, учитель.
 
-    Без API и без сети: учитель — тот же tiny-чекпоинт, снятый после
-    ``train``. Пишет в ``--logits-out`` (по умолчанию ``runs/tiny_kl``):
-
-    * ``pairs_logits.jsonl`` — пары с полем ``logits`` в формате ``qat.kl``;
-    * ``teacher_model/`` — HF-каталог для ``qat.train`` (fp32-мастер-веса);
-    * ``config_kl.yaml`` / ``config_ce.yaml`` — два прогона, отличается только
-      ``data.use_teacher_logits``;
-    * ``logits_metrics.json`` — размеры, CE и само-дистилляция: KL на старте
-      (должна быть ~0, иначе разъехались позиции/промпт/токенизатор).
+    Возвращает ``(context, dataset_parts)``: ``context`` — словарь с ``ckpt``,
+    ``logits_out``, ``tokenizer``, ``teacher``, ``dataset``; ``dataset_parts`` —
+    ``{"rows", "encoded"}`. Обе стадии снимают логиты с одного и того же
+    учителя и на одних и тех же закодированных парах — иначе замер top-k и
+    файл full-vocab были бы про разные данные.
     """
     import torch  # noqa: PLC0415
 
     from qat import checkpoint as checkpoint_mod  # noqa: PLC0415
     from qat.data import PairDataset, load_pairs  # noqa: PLC0415
-    from qat.kl import (  # noqa: PLC0415
-        kl_div_sum_torch, read_logits_file, write_logits_file,
-    )
     from qat.model import apply_ternary  # noqa: PLC0415
 
     ckpt = checkpoint_mod.latest_checkpoint(args.out)
@@ -874,9 +870,60 @@ def stage_logits(args: argparse.Namespace) -> dict[str, Any]:
     teacher.eval()
     apply_ternary(teacher, quant_config(args.scale_dtype, "none"))
     checkpoint_mod.restore_model(teacher, ckpt, device)
+    context = {
+        "ckpt": ckpt,
+        "logits_out": logits_out,
+        "tokenizer": tokenizer,
+        "teacher": teacher,
+        "dataset": dataset,
+        "device": device,
+    }
+    return context, {"rows": rows, "encoded": encoded}
+
+
+def _topk_path(logits_out: Path, k: int) -> Path:
+    """Путь файла логитов: top-k пишется отдельно, чтобы не затирать full-vocab."""
+    return logits_out / ("pairs_logits.jsonl" if k <= 0 else f"pairs_topk{k}.jsonl")
+
+
+def stage_logits(args: argparse.Namespace) -> dict[str, Any]:
+    """Логиты «учителя» (текущий tiny-чекпоинт) + конфиги прогонов qat.train.
+
+    Без API и без сети: учитель — тот же tiny-чекпоинт, снятый после
+    ``train``. Пишет в ``--logits-out`` (по умолчанию ``runs/tiny_kl``):
+
+    * ``pairs_logits.jsonl`` (полный словарь) или ``pairs_topk{k}.jsonl``
+      (``--top-k k``: только ``k`` индексов и логитов на токен ответа) —
+      формат ``qat.kl``;
+    * ``teacher_model/`` — HF-каталог для ``qat.train`` (fp32-мастер-веса);
+    * ``config_kl.yaml`` / ``config_ce.yaml`` — два прогона, отличается только
+      ``data.use_teacher_logits``; данные в них — записанный файл (top-k или
+      полный), поэтому top-k проверяется тем же путём, что и full-vocab;
+    * ``logits_metrics.json`` — размеры, CE и само-дистилляция: KL на старте
+      (должна быть ~0, иначе разъехались позиции/промпт/токенизатор).
+    """
+    import torch  # noqa: PLC0415
+
+    from qat.kl import (  # noqa: PLC0415
+        TopKLogits, kl_div_sum_topk, kl_div_sum_torch, read_logits_file, read_topk_file,
+        write_logits_file, write_topk_file,
+    )
+    from qat.model import apply_ternary  # noqa: PLC0415
+
+    context, parts = _logits_setup(args)
+    ckpt = context["ckpt"]
+    logits_out = context["logits_out"]
+    tokenizer = context["tokenizer"]
+    teacher = context["teacher"]
+    encoded = parts["encoded"]
+    device = context["device"]
+    top_k = int(getattr(args, "top_k", 0) or 0)
+    if top_k < 0:
+        raise TinyError(f"--top-k должен быть >= 0, а не {top_k}")
 
     out_rows: list[dict[str, Any]] = []
     answer_tokens = 0
+    topk_mass = 0.0
     with torch.no_grad():
         for item in encoded:
             sample = item["sample"]
@@ -885,22 +932,44 @@ def stage_logits(args: argparse.Namespace) -> dict[str, Any]:
             answer_len = len(sample["labels"]) - prompt_len
             logits = teacher(input_ids=input_ids, use_cache=False).logits[0]
             teacher_rows = teacher_logits_rows(logits, prompt_len, answer_len)
-            out_rows.append({
+            row: dict[str, Any] = {
                 "question": item["row"]["question"],
                 "answer": item["row"]["answer"],
-                "logits": teacher_rows.cpu().tolist(),
-            })
+            }
+            if top_k:
+                # top-k строим сразу из тензора: полный словарь остаётся в
+                # тензоре и не превращается в A×V Python-чисел ещё раз.
+                if top_k > teacher_rows.size(-1):
+                    raise TinyError(
+                        f"--top-k {top_k} больше словаря {teacher_rows.size(-1)}")
+                values, indices = torch.topk(teacher_rows.float(), top_k, dim=-1)
+                row["topk"] = TopKLogits(indices.tolist(), values.tolist())
+                probs = torch.softmax(teacher_rows.float(), dim=-1)
+                topk_mass += float(
+                    probs.gather(-1, indices).sum().item()) / max(1, answer_len)
+            else:
+                row["logits"] = teacher_rows.cpu().tolist()
+            out_rows.append(row)
             answer_tokens += answer_len
 
-    logits_path = logits_out / "pairs_logits.jsonl"
-    written = write_logits_file(logits_path, out_rows)
+    logits_path = _topk_path(logits_out, top_k)
+    if top_k:
+        written = write_topk_file(logits_path, out_rows, k=top_k)
+    else:
+        written = write_logits_file(logits_path, out_rows)
     print(f"[tiny] логиты: {written} пар -> {logits_path.relative_to(ROOT)} "
-          f"({human_bytes(logits_path.stat().st_size)})")
+          f"({human_bytes(logits_path.stat().st_size)}"
+          + (f", top-k={top_k}" if top_k else "") + ")")
     # Читаем записанный файл тем же парсером, что и тесты: артефакт для аренды
     # проверяется целиком по формату, а не «writer и reader когда-то сойдутся».
-    checked = read_logits_file(logits_path, vocab_size=VOCAB_SIZE, limit=3)
-    print(f"[tiny] файл читается: {len(checked)} строк примеров, "
-          f"{len(checked[0]['logits'])} x {len(checked[0]['logits'][0])} логитов")
+    if top_k:
+        checked = read_topk_file(logits_path, vocab_size=VOCAB_SIZE, limit=3, max_k=top_k)
+        print(f"[tiny] файл читается: {len(checked)} строк примеров, "
+              f"{len(checked[0]['topk'])} x {checked[0]['topk'].k} top-k")
+    else:
+        checked = read_logits_file(logits_path, vocab_size=VOCAB_SIZE, limit=3)
+        print(f"[tiny] файл читается: {len(checked)} строк примеров, "
+              f"{len(checked[0]['logits'])} x {len(checked[0]['logits'][0])} логитов")
 
     teacher_dir = logits_out / "teacher_model"
     params = _export_teacher_model(teacher, tokenizer, teacher_dir)
@@ -925,14 +994,30 @@ def stage_logits(args: argparse.Namespace) -> dict[str, Any]:
             sample = encoded[index]["sample"]
             prompt_len = next(i for i, value in enumerate(sample["labels"]) if value != -100)
             answer_len = len(sample["labels"]) - prompt_len
-            teacher_rows = torch.tensor(out_rows[index]["logits"], dtype=torch.float32)
             input_ids = torch.tensor([sample["input_ids"]], dtype=torch.long, device=device)
             labels = torch.tensor([sample["labels"]], dtype=torch.long, device=device)
             logits = student(input_ids=input_ids, use_cache=False).logits[0]
             student_rows = logits[prompt_len - 1:prompt_len - 1 + answer_len]
-            kl_total += float(kl_div_sum_torch(torch, student_rows, teacher_rows).item())
-            max_delta = max(max_delta, float(
-                (student_rows - teacher_rows).abs().max().item()))
+            if top_k:
+                # Обе стороны усечены одинаково: у выровненных весов наборы
+                # top-k совпадают, и KL по объединению — ровно 0. Сдвиг позиций
+                # даёт заметную KL, то есть порог 1e-4 ловит именно его.
+                teacher_topk = out_rows[index]["topk"]
+                values, indices = torch.topk(student_rows.float(), top_k, dim=-1)
+                student_topk = TopKLogits(indices.tolist(), values.tolist())
+                kl_total += float(kl_div_sum_topk(teacher_topk, student_topk))
+                teacher_indices = torch.tensor(
+                    teacher_topk.indices, dtype=torch.long, device=device)
+                teacher_values = torch.tensor(
+                    teacher_topk.logits, dtype=torch.float32, device=device)
+                picked = student_rows.float().gather(-1, teacher_indices)
+                max_delta = max(max_delta, float(
+                    (picked - teacher_values).abs().max().item()))
+            else:
+                teacher_rows = torch.tensor(out_rows[index]["logits"], dtype=torch.float32)
+                kl_total += float(kl_div_sum_torch(torch, student_rows, teacher_rows).item())
+                max_delta = max(max_delta, float(
+                    (student_rows - teacher_rows).abs().max().item()))
             # sr[t] предсказывает метку P+t, поэтому метке P+1 отвечает sr[1].
             shift_logits = student_rows[1:]
             shift_labels = labels[0, prompt_len + 1:]
@@ -960,30 +1045,556 @@ def stage_logits(args: argparse.Namespace) -> dict[str, Any]:
     _write_yaml(config_ce, _kl_config(str(teacher_dir), logits_path, kl=False, **common))
     print(f"[tiny] конфиги: {config_kl.relative_to(ROOT)}, {config_ce.relative_to(ROOT)}")
 
+    logits_bytes = logits_path.stat().st_size
+    bytes_per_pair = logits_bytes / max(1, written)
+    width = checked[0]["topk"].k if top_k else len(checked[0]["logits"][0])
     metrics = {
         "stage": "logits",
+        "format": "topk" if top_k else "full",
+        "top_k": top_k or None,
         "teacher_checkpoint": str(ckpt),
         "pairs": written,
         "answer_tokens": answer_tokens,
         "vocab_size": VOCAB_SIZE,
-        "logits_bytes": logits_path.stat().st_size,
+        "logits_bytes": logits_bytes,
+        "logits_bytes_per_pair": bytes_per_pair,
+        "logits_bytes_per_answer_token": logits_bytes / max(1, answer_tokens),
+        "extrapolation_40k_pairs_bytes": bytes_per_pair * 40_000,
         "logits_path": str(logits_path),
         "logits_file_check": {
             "rows": len(checked),
-            "width": len(checked[0]["logits"][0]),
+            "width": width,
         },
         "teacher_model": str(teacher_dir),
         "configs": {"kl": str(config_kl), "ce": str(config_ce)},
         # Позиционная сверка: KL(ученик‖учитель) на одинаковых весах.
         "alignment": {
             "pairs_checked": check_count,
+            "method": "union_topk" if top_k else "full_vocab",
             "kl_per_token": student_kl_per_token,
             "max_abs_logit_delta": max_delta,
             "teacher_ce": ce_total / max(1, tokens),
         },
     }
+    if top_k:
+        # Доля массы учителя, попавшая в top-k: именно остаток отброшен, и
+        # именно он объясняет расхождение KL с полным словарём.
+        metrics["alignment"]["topk_mass_mean"] = topk_mass / max(1, len(out_rows))
     write_json_atomic(logits_out / "logits_metrics.json", metrics)
     print(f"[tiny] метрики: {(logits_out / 'logits_metrics.json').relative_to(ROOT)}")
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Стадия 1c: замер top-k против полного словаря (задача 0111)
+# ---------------------------------------------------------------------------
+
+
+_MEASURE_WRAPPER = (
+    "import json, resource, subprocess, sys\n"
+    "code = subprocess.run(sys.argv[1:]).returncode\n"
+    "usage = resource.getrusage(resource.RUSAGE_CHILDREN)\n"
+    "print('[measure] ' + json.dumps(\n"
+    "    {'returncode': code, 'maxrss': usage.ru_maxrss}))\n"
+)
+
+
+def _measure_peak_mib(callable_: Any) -> float:
+    """Пик Python-аллокаций при вызове, МиБ (tracemalloc)."""
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        callable_()
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return peak / 2 ** 20
+
+
+def _teacher_rows_pass(
+    teacher: Any, encoded: Sequence[dict[str, Any]], device: Any,
+) -> Any:
+    """Генератор: (вопрос, ответ, логиты учителя [A, vocab]) по парам.
+
+    Один проход forward на пару: так полный словарь нигде не накапливается —
+    каждая строка сразу уходит в файл (или в top-k) и забывается.
+    """
+    import torch  # noqa: PLC0415
+
+    with torch.no_grad():
+        for item in encoded:
+            sample = item["sample"]
+            input_ids = torch.tensor([sample["input_ids"]], dtype=torch.long, device=device)
+            prompt_len = next(i for i, value in enumerate(sample["labels"]) if value != -100)
+            answer_len = len(sample["labels"]) - prompt_len
+            logits = teacher(input_ids=input_ids, use_cache=False).logits[0]
+            yield (
+                item["row"]["question"],
+                item["row"]["answer"],
+                teacher_logits_rows(logits, prompt_len, answer_len),
+            )
+
+
+def _topk_of_rows(rows: Any, k: int) -> Any:
+    """``TopKLogits`` из тензора ``[A, V]``: индексы и логиты по убыванию."""
+    import torch  # noqa: PLC0415
+
+    from qat.kl import TopKLogits  # noqa: PLC0415
+
+    values, indices = torch.topk(rows.float(), k, dim=-1)
+    return TopKLogits(indices.tolist(), values.tolist())
+
+
+def _student_rows(
+    student: Any, sample: dict[str, Any], device: Any,
+) -> Any:
+    """Логиты ученика на позициях, которые предсказывают токены ответа."""
+    import torch  # noqa: PLC0415
+
+    with torch.no_grad():
+        input_ids = torch.tensor([sample["input_ids"]], dtype=torch.long, device=device)
+        prompt_len = next(i for i, value in enumerate(sample["labels"]) if value != -100)
+        answer_len = len(sample["labels"]) - prompt_len
+        logits = student(input_ids=input_ids, use_cache=False).logits[0]
+        return logits[prompt_len - 1:prompt_len - 1 + answer_len]
+
+
+def _fresh_run_dir(path: Path, *, root: Path) -> Path:
+    """Пустой каталог прогона под ``root`` (qat.train отказывается писать в непустой)."""
+    import shutil  # noqa: PLC0415
+
+    resolved, resolved_root = path.resolve(), root.resolve()
+    if resolved_root not in resolved.parents and resolved != resolved_root:
+        raise TinyError(f"отказ чистить {resolved}: он вне {resolved_root}")
+    if resolved.exists():
+        shutil.rmtree(resolved)
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def _run_measured(argv: Sequence[str]) -> dict[str, Any]:
+    """Запустить процесс и вернуть код возврата и пик RSS (МиБ) его самого.
+
+    Обёртка в отдельном процессе нужна, чтобы ``ru_maxrss`` относился только к
+    этому запуску, а не к максимуму по всем детям (иначе числа сравнивать нельзя).
+    ``ru_maxrss`` в macOS — байты, в Linux — килобайты.
+    """
+    import subprocess  # noqa: PLC0415
+
+    command = [sys.executable, "-c", _MEASURE_WRAPPER, *argv]
+    # cwd=ROOT: дочерний `python -m qat.train` должен видеть пакет qat и данные
+    # независимо от того, откуда запустили сам скрипт.
+    process = subprocess.run(command, capture_output=True, text=True, cwd=str(ROOT))
+    maxrss = 0
+    for line in process.stdout.splitlines():
+        if line.startswith("[measure] "):
+            payload = json.loads(line[len("[measure] "):])
+            maxrss = int(payload.get("maxrss") or 0)
+    if process.returncode != 0:
+        raise TinyError(
+            f"qat.train завершился с кодом {process.returncode}:\n"
+            + "\n".join(process.stdout.splitlines()[-20:])
+            + "\n" + "\n".join(process.stderr.splitlines()[-20:])
+        )
+    scale = 1 if sys.platform == "darwin" else 1024
+    return {"returncode": process.returncode,
+            "maxrss_mib": maxrss * scale / 2 ** 20,
+            "stdout_tail": process.stdout.splitlines()[-5:]}
+
+
+def _step_timings(run_dir: Path) -> dict[str, Any]:
+    """Шаги из log.jsonl прогона: step_sec, kl_sec, data_sec (последний шаг и среднее)."""
+    records: list[dict[str, Any]] = []
+    log_path = run_dir / "log.jsonl"
+    if not log_path.exists():
+        raise TinyError(f"нет {log_path}: qat.train не дошёл до логов")
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            record = json.loads(line)
+            if record.get("step_sec") is not None:
+                records.append(record)
+    if not records:
+        raise TinyError(f"в {log_path} нет шагов с step_sec")
+    # Первый шаг включает ленивую инициализацию: для сравнения форматов берём
+    # хвост (все шаги, кроме первого), а первый показываем отдельно.
+    tail = records[1:] or records
+    step_secs = sorted(r["step_sec"] for r in tail)
+    return {
+        "steps": len(records),
+        "step_sec_last": records[-1]["step_sec"],
+        "step_sec_mean": sum(step_secs) / len(step_secs),
+        # Медиана устойчивее среднего: на ноутбуке один шаг легко ловит
+        # чужую нагрузку и утраивает «время формата».
+        "step_sec_median": step_secs[len(step_secs) // 2],
+        "compute_sec_mean": sum(r.get("compute_sec", 0.0) for r in tail) / len(tail),
+        "data_sec_mean": sum(r.get("data_sec", 0.0) for r in tail) / len(tail),
+        "kl_sec_mean": (sum(r.get("kl_sec", 0.0) for r in tail) / len(tail)
+                        if any("kl_sec" in r for r in tail) else None),
+        "loss_last": records[-1].get("loss"),
+        "kl_last": records[-1].get("kl"),
+    }
+
+
+def _write_benchmark_config(
+    logits_out: Path, teacher_dir: Path, data_path: Path, name: str,
+    args: argparse.Namespace, *, steps: int, batch_size: int, seed: int,
+) -> Path:
+    """Конфиг qat.train для замера шага; отличается только файлом логитов."""
+    payload = _kl_config(
+        str(teacher_dir), data_path, kl=True, steps=steps, batch_size=batch_size,
+        lr=args.kl_lr, max_seq_len=args.max_seq_len,
+        min_answer_tokens=args.min_answer_tokens, seed=seed,
+    )
+    # Каждый шаг в log.jsonl: иначе при 3 шагах замер есть только на первом,
+    # а он включает прогрев.
+    payload["train"]["log_every"] = 1
+    path = logits_out / "topk" / f"config_{name}.yaml"
+    _write_yaml(path, payload)
+    return path
+
+
+def _stream_peak_mib(
+    path: Path, tokenizer: Any, k: int, *, seq_len: int = MAX_SEQ_LEN,
+    limit: int = 0,
+) -> float:
+    """Пик памяти потокового чтения файла с логитами через PairStore + PairDataset."""
+    from qat.data import PairDataset, PairStore  # noqa: PLC0415
+
+    def read_all() -> None:
+        store = PairStore(path, limit)
+        dataset = PairDataset(
+            store, tokenizer,
+            max_seq_len=seq_len, long_pairs="truncate",
+            min_answer_tokens=1, use_teacher_logits=True,
+            vocab_size=VOCAB_SIZE, expected_top_k=(k or None),
+        )
+        for index in range(len(store)):
+            dataset.encode(index)
+
+    return _measure_peak_mib(read_all)
+
+
+def _read_all_peak_mib(path: Path, k: int) -> float:
+    """Пик памяти «прочитать всё в список» — то, что делает read_logits_file."""
+    from qat.kl import read_logits_file, read_topk_file  # noqa: PLC0415
+
+    def read_all() -> None:
+        if k:
+            read_topk_file(path, vocab_size=VOCAB_SIZE, max_k=k)
+        else:
+            read_logits_file(path, vocab_size=VOCAB_SIZE)
+
+    return _measure_peak_mib(read_all)
+
+
+def _time_stream_pass(
+    path: Path, tokenizer: Any, k: int, *, seq_len: int, repeats: int = 3,
+) -> float:
+    """Лучшее время полного потокового прохода: PairStore + encode всех пар.
+
+    Это «цена данных» без forward/backward: JSON-разбор строки и приведение
+    логитов к тензору. ``kl_sec`` в логе шага меряет только KL, а ``data_sec``
+    на 8 примерах шумит — здесь файл проходится целиком и берётся лучшее из
+    повторов (холодный кеш файла не влияет на сравнение форматов).
+    """
+    from qat.data import PairDataset, PairStore  # noqa: PLC0415
+
+    best = float("inf")
+    for _ in range(max(1, repeats)):
+        started = time.perf_counter()
+        store = PairStore(path)
+        dataset = PairDataset(
+            store, tokenizer, max_seq_len=seq_len, long_pairs="truncate",
+            min_answer_tokens=1, use_teacher_logits=True,
+            vocab_size=VOCAB_SIZE, expected_top_k=(k or None),
+        )
+        for index in range(len(store)):
+            dataset.encode(index)
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
+def stage_topk(args: argparse.Namespace) -> dict[str, Any]:
+    """Замер top-k: k=32/64/128 против полного словаря на tiny (задача 0111).
+
+    Что меряется и зачем:
+
+    * **размер**: байт на пару и экстраполяция на 40 тыс. пар — сверка с
+      оценкой «4,9 ТБ full-vocab против 4,1 ГБ top-k=64». В JSON выходит
+      больше оценки: она считает ~4 байта на кандидата, а JSONL — ~7; зато
+      формат читается любым парсером и не требует своего загрузчика;
+    * **качество**: KL с top-k учителя против полной KL при **одном и том же**
+      ученике — расхождение на токен и доля массы учителя, попавшая в top-k;
+      иначе сравнивались бы разные модели, а не разные форматы;
+    * **память**: пик потокового чтения (``PairStore``) против «прочитать всё
+      в список», плюс тот же файл, повторённый N раз: потоковая память не
+      должна расти с числом пар;
+    * **время шага**: настоящий ``qat.train`` на нескольких шагах для
+      full-vocab и каждого k (step_sec, kl_sec, data_sec, пик RSS процесса).
+    """
+    import torch  # noqa: PLC0415
+    from transformers import AutoModelForCausalLM  # noqa: PLC0415
+
+    from qat import checkpoint as checkpoint_mod  # noqa: PLC0415
+    from qat.kl import (  # noqa: PLC0415
+        TopKLogits, iter_logits_file, kl_divergence, kl_divergence_topk_full,
+        kl_div_sum, kl_div_sum_topk, log_softmax, topk_from_logits,
+        write_logits_file, write_topk_file,
+    )
+    from qat.model import apply_ternary  # noqa: PLC0415
+
+    values = sorted({int(part) for part in str(args.topk_values).split(",") if part.strip()})
+    if not values or values[0] <= 0:
+        raise TinyError(f"--topk-values: ожидались k > 0, а не {args.topk_values!r}")
+    if values[-1] > VOCAB_SIZE:
+        raise TinyError(f"--topk-values: k={values[-1]} больше словаря {VOCAB_SIZE}")
+    if args.topk_steps <= 0:
+        raise TinyError(f"--topk-steps должен быть > 0, а не {args.topk_steps}")
+    if args.topk_mem_scale < 1:
+        raise TinyError(f"--topk-mem-scale должен быть >= 1, а не {args.topk_mem_scale}")
+
+    context, parts = _logits_setup(args)
+    encoded = parts["encoded"]
+    logits_out = context["logits_out"]
+    tokenizer = context["tokenizer"]
+    teacher = context["teacher"]
+    device = context["device"]
+    teacher_dir = logits_out / "teacher_model"
+    if not teacher_dir.exists():
+        raise TinyError(
+            f"нет {teacher_dir}: сначала стадия logits (она пишет HF-каталог учителя)"
+        )
+    topk_dir = logits_out / "topk"
+    topk_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- файлы: полный словарь и каждый k (один проход на файл) -------------
+    print("[tiny] пишу логиты: full-vocab и " + ", ".join(f"k={k}" for k in values))
+    files: dict[int, Path] = {}
+    files[0] = _topk_path(logits_out, 0)
+    written = write_logits_file(
+        files[0],
+        ({"question": question, "answer": answer, "logits": rows.tolist()}
+         for question, answer, rows in _teacher_rows_pass(teacher, encoded, device)),
+    )
+    for k in values:
+        path = _topk_path(logits_out, k)
+        count = write_topk_file(
+            path,
+            ({"question": question, "answer": answer,
+              "topk": _topk_of_rows(rows, k)}
+             for question, answer, rows in _teacher_rows_pass(teacher, encoded, device)),
+            k=k,
+        )
+        if count != written:
+            raise TinyError(f"k={k}: строк {count}, а в full-vocab {written}")
+        files[k] = path
+
+    # --- размеры и экстраполяция -------------------------------------------
+    answer_tokens = sum(
+        len(item["sample"]["labels"]) - item["sample"]["labels"].count(-100)
+        for item in encoded
+    )
+    variants: dict[str, dict[str, Any]] = {}
+    for k, path in files.items():
+        size = path.stat().st_size
+        variants["full" if k == 0 else f"k{k}"] = {
+            "k": k or None,
+            "path": str(path),
+            "bytes": size,
+            "bytes_per_pair": size / written,
+            "bytes_per_answer_token": size / max(1, answer_tokens),
+            "extrapolation_40k_pairs_bytes": size / written * 40_000,
+        }
+    full_bytes_per_token = variants["full"]["bytes_per_answer_token"]
+    for name, variant in variants.items():
+        variant["size_vs_full"] = variant["bytes_per_answer_token"] / full_bytes_per_token
+
+    # --- ученик для замера качества ----------------------------------------
+    student = AutoModelForCausalLM.from_pretrained(
+        str(teacher_dir), dtype=torch.float32, attn_implementation="eager",
+    )
+    student.eval()
+    apply_ternary(student, quant_config(args.scale_dtype, "none"))
+    student_ckpt: Path | None = None
+    if args.topk_student:
+        student_ckpt = Path(args.topk_student).expanduser()
+        if not student_ckpt.exists():
+            raise TinyError(f"--topk-student: нет {student_ckpt}")
+    else:
+        # Ученик из 0107 (обучен с KL на этих же парах): его веса отличаются от
+        # учителя, поэтому расхождение top-k — про усечение, а не про KL(0).
+        student_ckpt = checkpoint_mod.latest_checkpoint(logits_out / "kl")
+        if student_ckpt is None:
+            print("[tiny] ВНИМАНИЕ: ученик = учитель (чекпоинта kl нет): полная KL "
+                  "равна 0, расхождение top-k — только сдвиг от усечения")
+    if student_ckpt is not None:
+        checkpoint_mod.restore_model(student, student_ckpt, device)
+        print(f"[tiny] ученик для качества: {student_ckpt}")
+    else:
+        print("[tiny] ученик для качества: веса учителя (тождественный)")
+
+    # --- качество: KL top-k против полной KL, по токенам --------------------
+    quality = {k: {"kl_sum": 0.0, "delta_sum": 0.0, "delta_abs_max": 0.0,
+                   "coverage_sum": 0.0} for k in values}
+    kl_full_total = 0.0
+    tokens = 0
+    for index, row in enumerate(iter_logits_file(files[0], vocab_size=VOCAB_SIZE)):
+        teacher_rows = row["logits"]
+        student_rows = _student_rows(student, encoded[index]["sample"], device).tolist()
+        if len(teacher_rows) != len(student_rows):
+            raise TinyError(
+                f"{row['question'][:40]!r}: строк учителя {len(teacher_rows)}, "
+                f"ученика {len(student_rows)} — позиции разъехались"
+            )
+        for teacher_row, student_row in zip(teacher_rows, student_rows):
+            probs = log_softmax(teacher_row)
+            full_row_kl = kl_divergence(teacher_row, student_row)
+            kl_full_total += full_row_kl
+            tokens += 1
+            for k in values:
+                indices, logits_k = topk_from_logits(teacher_row, k)
+                row_kl = kl_divergence_topk_full(indices, logits_k, student_row)
+                delta = row_kl - full_row_kl
+                quality[k]["kl_sum"] += row_kl
+                quality[k]["delta_sum"] += delta
+                quality[k]["delta_abs_max"] = max(
+                    quality[k]["delta_abs_max"], abs(delta))
+                quality[k]["coverage_sum"] += sum(math.exp(probs[i]) for i in indices)
+    if tokens == 0:
+        raise TinyError("ни одного токена в логитах: проверьте пары и обрезку")
+    for k in values:
+        variant = variants[f"k{k}"]
+        variant.update({
+            "kl_full_per_token": kl_full_total / tokens,
+            "kl_topk_per_token": quality[k]["kl_sum"] / tokens,
+            "kl_delta_mean_per_token": quality[k]["delta_sum"] / tokens,
+            "kl_delta_abs_max_per_token": quality[k]["delta_abs_max"],
+            "kl_relative_delta": (quality[k]["delta_sum"] / kl_full_total
+                                  if kl_full_total else None),
+            "coverage_mean": quality[k]["coverage_sum"] / tokens,
+        })
+    variants["full"]["kl_full_per_token"] = kl_full_total / tokens
+
+    # --- память: потоковое чтение против «прочитать всё» --------------------
+    print("[tiny] память: потоковое чтение (PairStore) против чтения всего файла")
+    memory: dict[str, Any] = {}
+    for k, path in files.items():
+        name = "full" if k == 0 else f"k{k}"
+        stream_peak = _stream_peak_mib(path, tokenizer, k, seq_len=args.max_seq_len)
+        read_all_peak = _read_all_peak_mib(path, k)
+        variants[name]["memory"] = {
+            "stream_peak_mib": stream_peak,
+            "read_all_peak_mib": read_all_peak,
+            "pairs": written,
+        }
+        memory[name] = variants[name]["memory"]
+        print(f"        {name:>4}: stream {stream_peak:7.1f} МиБ, "
+              f"read-all {read_all_peak:7.1f} МиБ")
+    # --- цена данных без forward/backward: чтение всех пар файла ----------
+    print("[tiny] чтение данных: весь файл через PairStore + encode")
+    for k, path in files.items():
+        name = "full" if k == 0 else f"k{k}"
+        seconds = _time_stream_pass(path, tokenizer, k, seq_len=args.max_seq_len)
+        variants[name]["load"] = {
+            "seconds": seconds,
+            "pairs": written,
+            "pairs_per_second": written / seconds if seconds else None,
+            "mib_per_second": (path.stat().st_size / 2 ** 20 / seconds
+                               if seconds else None),
+        }
+        print(f"        {name:>4}: {seconds:.2f} с на {written} пар "
+              f"({written / seconds:.0f} пар/с)")
+
+    # Тот же файл в N раз длиннее: потоковая память не должна вырасти, а
+    # read-all — вырастет линейно. Это и есть критерий «не растёт с числом пар».
+    scale_k = 64 if 64 in values else values[-1]
+    scale_path = topk_dir / f"pairs_topk{scale_k}_x{args.topk_mem_scale}.jsonl"
+    print(f"[tiny] масштаб: {scale_path.name} (k={scale_k} × {args.topk_mem_scale})")
+    try:
+        with scale_path.open("w", encoding="utf-8") as handle:
+            for _ in range(args.topk_mem_scale):
+                for row in iter_logits_file(files[scale_k], vocab_size=VOCAB_SIZE):
+                    packed = {"question": row["question"], "answer": row["answer"],
+                              "topk": row["topk"].to_json()}
+                    handle.write(json.dumps(packed, ensure_ascii=False) + "\n")
+        scaling = {
+            "k": scale_k,
+            "multiplier": args.topk_mem_scale,
+            "pairs": written * args.topk_mem_scale,
+            "bytes": scale_path.stat().st_size,
+            "stream_peak_mib": _stream_peak_mib(
+                scale_path, tokenizer, scale_k, seq_len=args.max_seq_len),
+            "read_all_peak_mib": _read_all_peak_mib(scale_path, scale_k),
+        }
+        print(f"        пар {scaling['pairs']}: stream "
+              f"{scaling['stream_peak_mib']:.1f} МиБ, "
+              f"read-all {scaling['read_all_peak_mib']:.1f} МиБ")
+    finally:
+        scale_path.unlink(missing_ok=True)
+
+    # --- время шага: настоящий qat.train на full и на каждом k ---------------
+    print(f"[tiny] время шага: qat.train, по {args.topk_steps} шагов на формат")
+    timing: dict[str, Any] = {}
+    for k, path in files.items():
+        name = "full" if k == 0 else f"k{k}"
+        config_path = _write_benchmark_config(
+            logits_out, teacher_dir, path, name, args,
+            steps=args.topk_steps, batch_size=args.batch_size, seed=args.seed,
+        )
+        run_dir = _fresh_run_dir(topk_dir / "runs" / name, root=logits_out)
+        measured = _run_measured([
+            sys.executable, "-m", "qat.train",
+            "--config", str(config_path),
+            "--out", str(run_dir),
+            "--max-steps", str(args.topk_steps),
+            "--no-save",
+        ])
+        timings = _step_timings(run_dir)
+        timing[name] = {
+            "k": k or None,
+            "data_path": str(path),
+            "config": str(config_path),
+            "run_dir": str(run_dir),
+            "maxrss_mib": measured["maxrss_mib"],
+            **timings,
+        }
+        variants[name]["timing"] = timing[name]
+        print(f"        {name:>4}: step {timings['step_sec_mean']:.2f} с "
+              f"(kl {timings['kl_sec_mean']:.3f} с, data {timings['data_sec_mean']:.2f} с), "
+              f"RSS {measured['maxrss_mib']:.0f} МиБ")
+
+    metrics = {
+        "stage": "topk",
+        "teacher_checkpoint": str(context["ckpt"]),
+        "student_checkpoint": str(student_ckpt) if student_ckpt is not None else None,
+        "student_is_teacher": student_ckpt is None,
+        "vocab_size": VOCAB_SIZE,
+        "pairs": written,
+        "answer_tokens": answer_tokens,
+        "topk_values": values,
+        "full": variants["full"],
+        "variants": {f"k{k}": variants[f"k{k}"] for k in values},
+        "memory": memory,
+        "scaling": scaling,
+        "timing": timing,
+        "notes": {
+            "kl": "KL считается по top-k учителя и полному словарю ученика; "
+                  "хвост учителя за top-k отброшен — это оценка, а не полная KL",
+            "memory": "tracemalloc: пик Python-аллокаций на один проход; "
+                      "read_all — весь файл списками (как read_logits_file)",
+            "timing": "qat.train --no-save, последние шаги без первого (прогрев); "
+                      "maxrss — пик RSS процесса обучения",
+        },
+    }
+    write_json_atomic(topk_dir / "topk_metrics.json", metrics)
+    print(f"[tiny] метрики: {(topk_dir / 'topk_metrics.json').relative_to(ROOT)}")
+    for k in values:
+        variant = variants[f"k{k}"]
+        print(f"[tiny] k={k:>3}: {variant['bytes_per_pair'] / 1024:8.1f} КиБ/пара, "
+              f"KL Δ {variant['kl_delta_mean_per_token']:+.3e}/токен "
+              f"(полная {variant['kl_full_per_token']:.3e}), "
+              f"масса в top-k {variant['coverage_mean']:.4f}")
     return metrics
 
 
@@ -1334,7 +1945,7 @@ def stage_parity(args: argparse.Namespace) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-STAGES = ("all", "train", "logits", "export", "compile", "run", "parity")
+STAGES = ("all", "train", "logits", "topk", "export", "compile", "run", "parity")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1396,6 +2007,19 @@ def build_parser() -> argparse.ArgumentParser:
                         help="шагов в сгенерированных конфигах KL/CE (150)")
     parser.add_argument("--kl-lr", type=float, default=1e-3,
                         help="lr в сгенерированных конфигах KL/CE (1e-3)")
+    parser.add_argument("--top-k", type=int, default=0,
+                        help="стадия logits: писать top-k из k кандидатов вместо "
+                             "полного словаря (0 — полный словарь)")
+    parser.add_argument("--topk-values", default="32,64,128",
+                        help="стадия topk: ширины k через запятую (32,64,128)")
+    parser.add_argument("--topk-steps", type=int, default=3,
+                        help="стадия topk: шагов qat.train на формат (3)")
+    parser.add_argument("--topk-student", default=None,
+                        help="стадия topk: чекпоинт ученика для замера качества "
+                             "(по умолчанию последний из <logits-out>/kl)")
+    parser.add_argument("--topk-mem-scale", type=int, default=10,
+                        help="стадия topk: во сколько раз удлинить файл для "
+                             "проверки, что память не растёт (10)")
     return parser
 
 
@@ -1420,6 +2044,16 @@ def _update_report(out_dir: Path, stage: str, metrics: dict[str, Any]) -> None:
         alignment = metrics.get("alignment") or {}
         summary["kl_alignment"] = alignment.get("kl_per_token")
         summary["kl_pairs"] = metrics.get("pairs")
+    elif stage == "topk":
+        summary["topk_pairs"] = metrics.get("pairs")
+        variants = metrics.get("variants") or {}
+        summary["topk_bytes_per_pair"] = {
+            name: variant.get("bytes_per_pair") for name, variant in variants.items()
+        }
+        summary["topk_kl_delta_per_token"] = {
+            name: variant.get("kl_delta_mean_per_token")
+            for name, variant in variants.items()
+        }
     elif stage == "compile":
         summary["vtm_bytes"] = metrics.get("vtm_bytes")
     elif stage == "parity":
@@ -1448,6 +2082,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 metrics = stage_train(args)
             elif stage == "logits":
                 metrics = stage_logits(args)
+            elif stage == "topk":
+                metrics = stage_topk(args)
             elif stage == "export":
                 metrics = stage_export(args)
                 if not args.skip_fp16 and args.scale_dtype != "float16":

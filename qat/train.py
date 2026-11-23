@@ -283,13 +283,19 @@ def _kl_sum(
 
     logits — срез модели начиная с позиции ``logits_start``; teacher_logits[b]
     выровнены на токены ответа (первый supervised-токен). Считаем по кускам,
-    чтобы [длина ответа, словарь] не раздувал память. Сама формула — в
-    ``qat.kl.kl_div_sum_torch`` (её же проверяет тест без torch на эталоне).
+    чтобы [длина ответа, словарь] не раздувал память.
+
+    Элемент ``teacher_logits[b]`` — либо тензор ``[A, V]`` (полный словарь,
+    ``qat.kl.kl_div_sum_torch``), либо ``{"indices", "logits"}`` с тензорами
+    ``[A, k]`` — top-k учителя (задача 0111): тогда ``qat.kl.kl_div_sum_topk_torch``
+    собирает логиты ученика по индексам учителя, а хвост учителя отбрасывается
+    (см. оговорку в ``qat.kl``). Оба пути считаются по кускам одинаково.
     """
-    from .kl import kl_div_sum_torch  # noqa: PLC0415 - модуль без torch
+    from .kl import kl_div_sum_topk_torch, kl_div_sum_torch  # noqa: PLC0415
 
     batch_size = logits.size(0)
     total = logits.new_zeros((), dtype=torch.float32)
+    vocab = int(logits.size(-1))
     for b in range(batch_size):
         supervised = (labels[b] != -100).nonzero(as_tuple=False).reshape(-1)
         teacher = teacher_logits[b]
@@ -299,20 +305,45 @@ def _kl_sum(
         start_in_logits = first - logits_start - 1
         if start_in_logits < 0:
             raise RuntimeError("не выровнены логиты ученика и учителя")
-        count = min(int(teacher.size(0)), int(supervised.numel()),
+        topk = isinstance(teacher, dict)
+        teacher_rows = int(teacher["indices"].size(0)) if topk else int(teacher.size(0))
+        count = min(teacher_rows, int(supervised.numel()),
                     logits.size(1) - start_in_logits)
         if count <= 0:
             continue
-        if int(teacher.size(1)) != int(logits.size(-1)):
-            raise RuntimeError(
-                f"словарь учителя {teacher.size(1)} != словаря ученика {logits.size(-1)}"
-            )
-        for start in range(0, count, chunk_size):
-            stop = min(count, start + chunk_size)
-            student = logits[b, start_in_logits + start:start_in_logits + stop]
-            total = total + kl_div_sum_torch(
-                torch, student, teacher[start:stop], temperature,
-            )
+        if topk:
+            indices, values = teacher["indices"], teacher["logits"]
+            if indices.shape != values.shape:
+                raise RuntimeError(
+                    f"у учителя индексов {tuple(indices.shape)}, "
+                    f"логитов {tuple(values.shape)}"
+                )
+            if indices.numel() == 0:
+                raise RuntimeError("пустой top-k учителя: KL не из чего считать")
+            lowest = int(indices.min().item())
+            highest = int(indices.max().item())
+            if lowest < 0 or highest >= vocab:
+                raise RuntimeError(
+                    f"индекс учителя в [{lowest}, {highest}] вне словаря ученика {vocab}: "
+                    f"файл логитов собран под другой токенизатор"
+                )
+            for start in range(0, count, chunk_size):
+                stop = min(count, start + chunk_size)
+                student = logits[b, start_in_logits + start:start_in_logits + stop]
+                total = total + kl_div_sum_topk_torch(
+                    torch, student, indices[start:stop], values[start:stop], temperature,
+                )
+        else:
+            if int(teacher.size(1)) != vocab:
+                raise RuntimeError(
+                    f"словарь учителя {teacher.size(1)} != словаря ученика {vocab}"
+                )
+            for start in range(0, count, chunk_size):
+                stop = min(count, start + chunk_size)
+                student = logits[b, start_in_logits + start:start_in_logits + stop]
+                total = total + kl_div_sum_torch(
+                    torch, student, teacher[start:stop], temperature,
+                )
     return total
 
 
@@ -378,7 +409,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     import torch  # noqa: PLC0415
     from . import checkpoint as checkpoint_mod  # noqa: PLC0415
     from .data import (  # noqa: PLC0415
-        DataError, PairDataset, PairStream, RandomTokenStream, data_fingerprint, load_pairs,
+        DataError, PairDataset, PairStore, PairStream, RandomTokenStream, data_fingerprint,
     )
     from .model import (  # noqa: PLC0415
         apply_embedding_quant, apply_ternary, build_optimizer, load_model, load_tokenizer,
@@ -398,13 +429,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         torch.cuda.manual_seed_all(cfg.train.seed)
 
     # --- данные (до модели: битый JSONL должен падать за секунды) -----------
+    # PairStore: в RAM только question/answer и смещения строк, логиты (полный
+    # словарь — 116 МиБ на пару в fp16, top-k — десятки КиБ) читаются на
+    # каждый пример. load_pairs держал бы всё это Python-списками.
     data_path = resolve_data_path(cfg)
     fingerprint: dict[str, Any] | None = None
-    rows: list[dict[str, Any]] = []
+    pairs: PairStore | None = None
     if not args.dry_run:
         try:
-            rows = load_pairs(data_path, cfg.data.max_samples)
-            fingerprint = data_fingerprint(data_path, len(rows))
+            pairs = PairStore(data_path, cfg.data.max_samples)
+            fingerprint = data_fingerprint(data_path, len(pairs))
         except DataError as exc:
             print(f"[qat] ошибка данных: {exc}")
             return 2
@@ -452,7 +486,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[qat] конфиг: {Path(args.config).resolve()}")
     print(f"[qat] режим: {'dry-run (3 шага, случайные данные)' if args.dry_run else 'обучение'}")
     if fingerprint:
-        print(f"[qat] данные: {data_path} — {len(rows)} пар, "
+        print(f"[qat] данные: {data_path} — {len(pairs) if pairs is not None else 0} пар, "
               f"{human_bytes(fingerprint['bytes'])}, sha256 {fingerprint['sha256'][:12]}…")
     print(f"[qat] батч: микро {cfg.train.micro_batch_size} × накопление "
           f"{cfg.train.grad_accum_steps} = {cfg.train.micro_batch_size * cfg.train.grad_accum_steps} "
@@ -537,7 +571,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         else:
             dataset = PairDataset(
-                rows,
+                pairs,
                 tokenizer,
                 max_seq_len=cfg.data.max_seq_len,
                 long_pairs=cfg.data.long_pairs,

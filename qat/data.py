@@ -7,7 +7,19 @@
 Учим только на токенах ответа: вопрос и padding получают label = -100.
 Поле ``logits`` (или ``teacher_logits``) читается только при
 ``data.use_teacher_logits: true`` — это распределения учителя по токенам
-ответа для KL-лосса. Формат строк и допуски — ``qat.kl`` (модуль без torch).
+ответа для KL-лосса; вместо полного словаря допустим top-k формат
+``{"topk": {"k", "indices", "logits"}}`` (задача 0111). Формат строк и
+допуски — ``qat.kl`` (модуль без torch).
+
+Память
+======
+Полный словарь на паре — это ``A × V`` чисел: для Qwen (``V=151936``) пара из
+402 токенов занимает ~116 МиБ в fp16 и ~1,7 ГБ Python-списками, а 40 тыс. пар —
+это 4,9 ТБ. Поэтому на обучении файл читается **потоково**: ``PairStore``
+держит в памяти только ``question``/``answer`` и смещения строк, а логиты
+(``A × k`` у top-k) поднимаются из файла на каждый пример и живут до конца
+``encode``. ``load_pairs`` остаётся для маленьких файлов и тестов и умеет
+``with_logits=False`` — тогда логиты в RAM не копируются вообще.
 
 Поток данных детерминирован и возобновляем: позиция задаётся числом
 обработанных примеров ``samples_seen``; порядок внутри эпохи — перестановка
@@ -19,11 +31,11 @@ import json
 import random
 from collections import Counter
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import torch
 
-from .kl import LogitsFormatError, parse_teacher_logits
+from .kl import LogitsFormatError, parse_teacher_logits, parse_topk_logits, split_teacher_record
 from .util import file_fingerprint
 
 
@@ -31,8 +43,18 @@ class DataError(RuntimeError):
     """Данные не читаются или не подходят под формат."""
 
 
-def load_pairs(path: str | Path, max_samples: int = 0) -> list[dict[str, Any]]:
-    """Прочитать JSONL и оставить строки с непустыми question/answer."""
+def load_pairs(
+    path: str | Path,
+    max_samples: int = 0,
+    *,
+    with_logits: bool = True,
+) -> list[dict[str, Any]]:
+    """Прочитать JSONL и оставить строки с непустыми question/answer.
+
+    ``with_logits=False`` не кладёт логиты в RAM: для полного словаря это и
+    есть разница между «1,7 ГБ на пару» и парой строк текста. Обучение
+    логиты не теряет — оно читает их через ``PairStore`` по требованию.
+    """
     path = Path(path)
     if not path.exists():
         raise DataError(
@@ -59,11 +81,16 @@ def load_pairs(path: str | Path, max_samples: int = 0) -> list[dict[str, Any]]:
             if not isinstance(answer, str) or not answer.strip():
                 skipped += 1
                 continue
-            rows.append({
+            pair: dict[str, Any] = {
                 "question": question.strip(),
                 "answer": answer.strip(),
-                "logits": row.get("logits", row.get("teacher_logits")),
-            })
+                "logits": None,
+            }
+            if with_logits:
+                full, topk = split_teacher_record(row)
+                pair["logits"] = full
+                pair["topk"] = topk
+            rows.append(pair)
             if max_samples and len(rows) >= max_samples:
                 break
     if skipped:
@@ -71,6 +98,93 @@ def load_pairs(path: str | Path, max_samples: int = 0) -> list[dict[str, Any]]:
     if not rows:
         raise DataError(f"в {path} нет пригодных пар question/answer")
     return rows
+
+
+class PairStore:
+    """Потоковое чтение пар: в RAM только question/answer и смещения строк.
+
+    Один проход по файлу на старте запоминает смещение и текст вопроса/ответа
+    каждой пригодной строки; логиты читаются на каждый ``store[index]``
+    (seek + ``json.loads`` одной строки) и после ``encode`` выбрасываются.
+    Память не зависит от ширины логитов: 40 тыс. пар — это ~8 МБ смещений и
+    строк, а не 4,9 ТБ логитов.
+
+    Строка без ``question``/``answer`` пропускается (как в ``load_pairs``);
+    битый JSON — ``DataError`` с номером строки. Отсутствие ``logits``/``topk``
+    здесь не ошибка: ``PairDataset`` отбросит пару со счётчиком
+    ``dropped_no_logits`` — так же, как при чтении через ``load_pairs``.
+    """
+
+    def __init__(self, path: str | Path, max_samples: int = 0) -> None:
+        self.path = Path(path)
+        if not self.path.exists():
+            raise DataError(
+                f"файл данных не найден: {self.path}\n"
+                f"соберите пары: make distill-mock (проверка) или make distill (учитель)"
+            )
+        self._rows: list[tuple[int, int, str, str]] = []
+        skipped = 0
+        with self.path.open("rb") as handle:
+            offset = handle.tell()
+            lineno = 0
+            while True:
+                line = handle.readline()
+                if not line:
+                    break
+                lineno += 1
+                if line.strip():
+                    record = self._decode(line, lineno)
+                    question, answer = record.get("question"), record.get("answer")
+                    if (not isinstance(question, str) or not question.strip()
+                            or not isinstance(answer, str) or not answer.strip()):
+                        skipped += 1
+                    else:
+                        self._rows.append(
+                            (offset, lineno, question.strip(), answer.strip())
+                        )
+                        if max_samples and len(self._rows) >= max_samples:
+                            break
+                offset = handle.tell()
+        self.skipped = skipped
+        if skipped:
+            print(f"[qat] данных: пропущено {skipped} строк без question/answer")
+        if not self._rows:
+            raise DataError(f"в {self.path} нет пригодных пар question/answer")
+
+    def _decode(self, line: bytes, lineno: int) -> dict[str, Any]:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise DataError(f"{self.path}:{lineno}: битый JSON: {exc}") from exc
+        if not isinstance(record, dict):
+            raise DataError(f"{self.path}:{lineno}: ожидался объект JSON")
+        return record
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        for index in range(len(self._rows)):
+            yield self[index]
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        if index < 0:
+            index += len(self._rows)
+        if not 0 <= index < len(self._rows):
+            raise IndexError(f"пара {index} вне файла (пар {len(self._rows)})")
+        offset, lineno, question, answer = self._rows[index]
+        with self.path.open("rb") as handle:
+            handle.seek(offset)
+            line = handle.readline()
+        record = self._decode(line, lineno)
+        full, topk = split_teacher_record(record)
+        return {
+            "question": question,
+            "answer": answer,
+            "logits": full,
+            "topk": topk,
+            "lineno": lineno,
+        }
 
 
 def data_fingerprint(path: str | Path, rows: int) -> dict[str, Any]:
@@ -96,10 +210,19 @@ def collate_samples(samples: Sequence[dict[str, Any]], pad_token_id: int) -> dic
         labels[i, :length] = torch.tensor(sample["labels"], dtype=torch.long)
 
     teacher_logits = None
-    if any(s.get("teacher_logits") is not None for s in samples):
-        if not all(s.get("teacher_logits") is not None for s in samples):
+    # Элемент списка — либо тензор ``[A, vocab]`` (полный словарь), либо
+    # ``{"indices", "logits"}`` (top-k, задача 0111): ``train._kl_sum``
+    # разбирает формат по типу элемента.
+    present = [s.get("teacher_logits") is not None or s.get("teacher_topk") is not None
+               for s in samples]
+    if any(present):
+        if not all(present):
             raise DataError("в батче смешаны примеры с logits учителя и без них")
-        teacher_logits = [s["teacher_logits"] for s in samples]
+        teacher_logits = [
+            s["teacher_logits"] if s.get("teacher_logits") is not None
+            else s["teacher_topk"]
+            for s in samples
+        ]
 
     return {
         "input_ids": input_ids,
@@ -113,14 +236,16 @@ def collate_samples(samples: Sequence[dict[str, Any]], pad_token_id: int) -> dic
 class PairDataset:
     """Пары в токенах. Токенизация — лениво, в момент выборки.
 
-    Кеша нет осознанно: 30 млн токенов в Python-списках съедят гигабайты,
-    а быстрый токенизатор повторно разбирает эпоху за секунды-минуты на фоне
-    часов QAT.
+    ``rows`` — список записей (``load_pairs``) **или** ``PairStore``: нужны
+    только ``len()`` и ``rows[index]``, поэтому запись из файла не копируется
+    в RAM целиком. Кеша нет осознанно: 30 млн токенов в Python-списках съедят
+    гигабайты, а быстрый токенизатор повторно разбирает эпоху за
+    секунды-минуты на фоне часов QAT.
     """
 
     def __init__(
         self,
-        rows: Sequence[dict[str, Any]],
+        rows: Sequence[dict[str, Any]] | PairStore,
         tokenizer: Any,
         *,
         max_seq_len: int,
@@ -128,14 +253,20 @@ class PairDataset:
         min_answer_tokens: int = 1,
         use_teacher_logits: bool = False,
         vocab_size: int | None = None,
+        expected_top_k: int | None = None,
     ) -> None:
-        self.rows = list(rows)
+        # Без list(rows): у PairStore это значило бы прочитать и разобрать
+        # логиты всех пар сразу — ровно то, от чего задача 0111 уходит.
+        self.rows = rows
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.long_pairs = long_pairs
         self.min_answer_tokens = min_answer_tokens
         self.use_teacher_logits = use_teacher_logits
         self.vocab_size = vocab_size
+        # Ожидаемая ширина k: если задана, файл с другой шириной — ошибка, а не
+        # «пропустим примеры» (иначе прогон молча теряет KL-путь целиком).
+        self.expected_top_k = expected_top_k
         self.stats: Counter[str] = Counter()
 
     def __len__(self) -> int:
@@ -188,6 +319,50 @@ class PairDataset:
             return None
         return tensor
 
+    def _teacher_topk(self, raw: Any, answer_len: int) -> dict[str, Any] | None:
+        """top-k логиты учителя по токенам ответа → индексы/логиты тензорами.
+
+        ``indices`` — ``int64 [A, k]``, ``logits`` — ``float32 [A, k]``. Логиты
+        намеренно fp32, а не fp16, как у полного словаря: на ``k`` экономить
+        нечего (``A × k × 4`` байт), а ошибка приближения не складывается с
+        ошибкой округления. Позиции те же, что у полного формата (``P-1+t``),
+        иначе KL выровняется не на те токены — см. ``qat.kl``.
+        """
+        if raw is None:
+            self.stats["dropped_no_logits"] += 1
+            return None
+        try:
+            topk = parse_topk_logits(raw, answer_len, self.vocab_size)
+        except LogitsFormatError as exc:
+            raise DataError(str(exc)) from exc
+        if topk is None:
+            self.stats["dropped_bad_topk"] += 1
+            return None
+        if self.expected_top_k is not None and topk.k != self.expected_top_k:
+            # Ширина — часть интерфейса прогона: файл с другим k означает, что
+            # данные собраны не той командой, и молча учить на них нельзя.
+            raise DataError(
+                f"top-k ширины {topk.k}, а прогон ожидает k={self.expected_top_k}: "
+                f"пересоберите файл логитов с тем же k"
+            )
+        try:
+            indices = torch.tensor(topk.indices, dtype=torch.long)
+            logits = torch.tensor(topk.logits, dtype=torch.float32)
+        except (TypeError, ValueError):
+            self.stats["dropped_bad_topk"] += 1
+            return None
+        if (indices.ndim != 2 or logits.shape != indices.shape
+                or indices.size(1) != topk.k):
+            self.stats["dropped_bad_topk"] += 1
+            return None
+        # NaN/inf ловятся уже в парсере; повтор — потому что отравленный логит
+        # не видно по форме, а обучение им испортится молча.
+        if not bool(torch.isfinite(logits).all()):
+            self.stats["dropped_bad_topk"] += 1
+            return None
+        self.stats[f"topk_k_{topk.k}"] += 1
+        return {"indices": indices, "logits": logits}
+
     def encode(self, index: int) -> dict[str, Any] | None:
         """Пример в виде списков или None, если его надо выбросить."""
         row = self.rows[index]
@@ -222,15 +397,23 @@ class PairDataset:
             return None
 
         teacher = None
+        teacher_topk = None
         if self.use_teacher_logits:
-            teacher = self._teacher_logits(row.get("logits"), answer_tokens)
-            if teacher is None:
-                return None
+            raw_topk = row.get("topk")
+            if raw_topk is not None:
+                teacher_topk = self._teacher_topk(raw_topk, answer_tokens)
+                if teacher_topk is None:
+                    return None
+            else:
+                teacher = self._teacher_logits(row.get("logits"), answer_tokens)
+                if teacher is None:
+                    return None
         self.stats["encoded"] += 1
         return {
             "input_ids": prompt_ids + answer_ids,
             "labels": labels,
             "teacher_logits": teacher,
+            "teacher_topk": teacher_topk,
         }
 
     def stats_snapshot(self) -> dict[str, int]:
