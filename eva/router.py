@@ -52,8 +52,20 @@
 HTTP-клиент, а локальная ВТМ — запасной путь для него. Каждый ответ маршрута
 ``small`` помечается признаком ``local`` (``True`` — ответила ВТМ, ``False`` —
 HTTP), чтобы телеметрия могла их различить: признак лежит в
-``Answer.usage["local"]`` и в атрибуте ``Route.local``; для чтения из чужого
-кода есть :func:`route_is_local`.
+``Answer.usage["local"]`` и в поле ``Route.local``; для чтения из чужого
+кода есть :func:`route_is_local`. У ``skill``/``big`` поле остаётся ``None``
+(не применимо): там ``Route.source`` даёт ``skill``/``api``.
+
+Граница prefill (задача 0120)
+-----------------------------
+
+``Answer.prefill_ms`` и ``prefill_ms`` финального :class:`StreamChunk` — это
+prefill-часть ответа (время счёта промпта), если её сообщил клиент модели:
+поле ``prefill_ms`` в результате ``chat``/в куске потока, во вложенных
+``timings``/``usage``, либо атрибут ``last_prefill_ms``/``timings`` после
+генерации. Ничего из этого нет — ``None``: границу prefill роутер **не
+угадывает** (``VtmBackend`` сейчас её не отдаёт), и сервер оставляет
+``prefill_ms``/``ttft_after_prefill_ms`` в ``/metrics`` пустыми.
 
 Контекст каталога (``eva.rag``) подмешивается в сообщения для маршрутов
 ``small`` и ``big`` отдельным system-сообщением после уже имеющихся system;
@@ -66,6 +78,7 @@ HTTP), чтобы телеметрия могла их различить: пр�
 from __future__ import annotations
 
 import inspect
+import math
 import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -112,8 +125,9 @@ class StreamChunk(Mapping[str, Any]):
     * ``done=False`` — текст ответа (для модели — дельта от клиента;
       ``route`` пуст, потому что маршрут ещё не объявлен клиенту);
     * ``done=True`` — финальный чанк: ``route``, ``skill``, ``usage``,
-      ``cost_rub`` и ``latency_ms``. У скилла это единственный чанк: ответ
-      детерминирован, дробить его незачем.
+      ``cost_rub``, ``latency_ms`` и ``prefill_ms`` (граница prefill, если
+      клиент модели её сообщил; ``None`` — неизвестна). У скилла это
+      единственный чанк: ответ детерминирован, дробить его незачем.
 
     Форма совместима с сервером: у чанка есть ``text`` и (у финального)
     ``route`` — по ним ``eva.server`` собирает ``delta.content`` и ``eva``.
@@ -126,9 +140,19 @@ class StreamChunk(Mapping[str, Any]):
     usage: dict[str, Any] = field(default_factory=dict)
     cost_rub: float = 0.0
     latency_ms: int = 0
+    prefill_ms: float | None = None
     done: bool = False
 
-    _FIELDS = ("text", "route", "skill", "usage", "cost_rub", "latency_ms", "done")
+    _FIELDS = (
+        "text",
+        "route",
+        "skill",
+        "usage",
+        "cost_rub",
+        "latency_ms",
+        "prefill_ms",
+        "done",
+    )
 
     def __getitem__(self, key: str) -> Any:
         if key in self._FIELDS:
@@ -149,6 +173,7 @@ class StreamChunk(Mapping[str, Any]):
             "usage": dict(self.usage),
             "cost_rub": self.cost_rub,
             "latency_ms": self.latency_ms,
+            "prefill_ms": self.prefill_ms,
             "done": self.done,
         }
 
@@ -476,6 +501,7 @@ def _answer_with_models(
             usage=_usage_with_local(usage, local),
             cost_rub=cost,
             latency_ms=_elapsed_ms(started),
+            prefill_ms=_prefill_ms_of_result(result, client),
         )
 
     raise policy.ModelUnavailable(
@@ -562,12 +588,18 @@ def _stream_with_models(
         produced = 0
         completion_parts: list[str] = []
         usage_raw: Any = None
+        # Граница prefill: только то, что явно сообщил клиент модели (поле в
+        # куске/результате или атрибут после генерации). Не угадываем.
+        prefill: float | None = None
 
         try:
             for piece in _client_stream(client, messages, cfg.max_tokens_for(kind)):
                 piece_usage = _stream_piece_usage(piece)
                 if piece_usage is not None:
                     usage_raw = piece_usage
+                piece_prefill = _prefill_ms_of(piece)
+                if piece_prefill is not None:
+                    prefill = piece_prefill
                 text = _stream_piece_text(piece)
                 if not text:
                     continue
@@ -617,12 +649,15 @@ def _stream_with_models(
         local = _local_marker(client, kind)
         final_route = Route(kind=kind, reason=reason, confidence=route.confidence)
         _attach_local(final_route, local)
+        if prefill is None:
+            prefill = _client_prefill_ms(client)
         yield StreamChunk(
             text="",
             route=final_route,
             usage=_usage_with_local(usage, local),
             cost_rub=cost,
             latency_ms=_elapsed_ms(started),
+            prefill_ms=prefill,
             done=True,
         )
         return
@@ -868,9 +903,8 @@ def _usage_with_local(usage: dict[str, Any], local: bool | None) -> dict[str, An
 def _attach_local(route: Route, local: bool | None) -> Route:
     """Пометить маршрут признаком ``local`` (``None`` — маршрут не про малую).
 
-    Поле не добавляется в :class:`eva.types.Route` (это общий контракт, его
-    правят отдельной задачей): маркер — динамический атрибут ``route.local``,
-    читается через :func:`route_is_local` и не влияет на ``to_dict()``.
+    Поле :attr:`eva.types.Route.local` — часть общего контракта (задача 0109),
+    поэтому пишется прямо в поле; ``to_dict()`` и телеметрия его видят.
     """
     if local is not None:
         try:
@@ -878,6 +912,78 @@ def _attach_local(route: Route, local: bool | None) -> Route:
         except Exception:  # noqa: BLE001 — замороженный Route не должен ронять ответ
             pass
     return route
+
+
+# --------------------------------------------------------------------------- #
+# граница prefill (задача 0120)
+# --------------------------------------------------------------------------- #
+def _get_field(source: Any, name: str) -> Any:
+    """Поле словаря или объекта — клиент может прислать и то и другое."""
+    if isinstance(source, Mapping):
+        return source.get(name)
+    return getattr(source, name, None)
+
+
+def _prefill_value(value: Any) -> float | None:
+    """Миллисекунды prefill из явного значения; мусор/``bool`` — ``None``."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def _prefill_ms_of(source: Any) -> float | None:
+    """``prefill_ms`` из ответа/куска клиента: поле или вложенные timings/usage.
+
+    Понимает ``{"prefill_ms": 120}``, ``{"timings": {"prefill_ms": 120}}`` и
+    ``{"usage": {"prefill_ms": 120}}`` — у провайдеров с таймингами форма
+    разная. Нет поля — ``None`` (не догадка).
+    """
+    if source is None:
+        return None
+    value = _prefill_value(_get_field(source, "prefill_ms"))
+    if value is not None:
+        return value
+    for name in ("timings", "usage"):
+        nested = _get_field(source, name)
+        if isinstance(nested, Mapping):
+            value = _prefill_value(nested.get("prefill_ms"))
+            if value is not None:
+                return value
+    return None
+
+
+def _client_prefill_ms(client: Any) -> float | None:
+    """Последняя граница prefill у клиента после генерации; ``None`` — нет.
+
+    Мягкий контракт для будущих бэкендов (``VtmBackend`` пока границу не
+    отдаёт): ``last_prefill_ms``/``prefill_ms`` или ``last_timings``/
+    ``timings`` с ключом ``prefill_ms``.
+    """
+    for name in ("last_prefill_ms", "prefill_ms"):
+        value = _prefill_value(getattr(client, name, None))
+        if value is not None:
+            return value
+    for name in ("last_timings", "timings"):
+        timings = getattr(client, name, None)
+        if isinstance(timings, Mapping):
+            value = _prefill_value(timings.get("prefill_ms"))
+            if value is not None:
+                return value
+    return None
+
+
+def _prefill_ms_of_result(result: Any, client: Any) -> float | None:
+    """Граница prefill для не потокового ответа: результат, затем клиент."""
+    value = _prefill_ms_of(result)
+    if value is not None:
+        return value
+    return _client_prefill_ms(client)
 
 
 def _local_fallback_note(client: Any) -> str:
@@ -923,6 +1029,18 @@ class _SmallWithFallback:
     def local(self) -> bool:
         """Локальная ли модель выбрана первой (для :func:`is_local_model`)."""
         return self._primary_local
+
+    @property
+    def last_prefill_ms(self) -> float | None:
+        """Граница prefill того клиента, который реально ответил (0120).
+
+        Оборачиваемый клиент может её не отдавать — тогда ``None``; значение
+        берётся у первичного/запасного источника, смотря кто ответил.
+        """
+        answered = self._secondary if self.last_local is False else self._primary
+        if answered is None:
+            return None
+        return _client_prefill_ms(answered)
 
     def _failed(self, exc: BaseException) -> str:
         return f"{type(exc).__name__}: {exc}"

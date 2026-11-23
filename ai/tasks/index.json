@@ -716,7 +716,7 @@
   {
     "id": "0109",
     "title": "Телеметрия: маркер локальной модели в Route и JSONL",
-    "status": "in_progress",
+    "status": "done",
     "file": "0109-telemetry-local.md",
     "assignee": "agent:telemetry-local"
   },
@@ -793,7 +793,7 @@
   {
     "id": "0120",
     "title": "Роутер отдаёт границу prefill для метрик TTFT",
-    "status": "in_progress",
+    "status": "done",
     "file": "0120-router-prefill-ms.md",
     "assignee": "agent:prefill-ms"
   },
@@ -831,5 +831,12 @@
     "status": "in_progress",
     "file": "0126-rental-preflight.md",
     "assignee": "agent:preflight"
+  },
+  {
+    "id": "0127",
+    "title": "C-ABI: отдавать prefill_ms, чтобы TTFT делился на боевом пути",
+    "status": "pending",
+    "file": "0127-cabi-prefill-ms.md",
+    "assignee": ""
   }
 ]

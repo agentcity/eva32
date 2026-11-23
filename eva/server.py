@@ -684,6 +684,29 @@ def _prefill_ms_of(source: Any) -> float | None:
     return value
 
 
+def _answer_local(source: Any) -> bool | None:
+    """Маркер ``local`` ответа/куска: поле ``Route.local`` или ``usage["local"]``.
+
+    ``None`` — маршрут не про малую модель (``skill``/``big``) или
+    маршрутизатор признак не поставил. Нужен ``GET /metrics``: по нему
+    считаются ``small_local``/``small_http`` и доля ответов своей модели
+    (задача 0109).
+    """
+    if source is None:
+        return None
+    route = _field(source, "route")
+    if route is not None and not isinstance(route, str):
+        marker = _field(route, "local")
+        if isinstance(marker, bool):
+            return marker
+    usage = _field(source, "usage")
+    if isinstance(usage, Mapping):
+        marker = usage.get("local")
+        if isinstance(marker, bool):
+            return marker
+    return None
+
+
 def _eva_summary(answer: Any, latency_ms: int) -> dict[str, Any]:
     """Поле ``eva``: маршрут, скилл, цена и латентность ответа."""
     skill = _field(answer, "skill")
@@ -980,7 +1003,13 @@ def _client_answer(
 
     return Answer(
         text=text,
-        route=Route(kind=kind, reason=reason, confidence=0.5 if kind == "small" else 0.9),
+        # local: стадия local — своя модель (0109); big — заведомо API.
+        route=Route(
+            kind=kind,
+            reason=reason,
+            confidence=0.5 if kind == "small" else 0.9,
+            local=stage != "big",
+        ),
         skill=None,
         usage={
             "prompt_tokens": prompt_tokens,
@@ -1758,6 +1787,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
             total_tokens=usage.get("total_tokens"),
             prefill_ms=_prefill_ms_of(answer),
             prefill_tokens=prompt_tokens,
+            local=_answer_local(answer),
             stream=False,
         )
         self._send_json(
@@ -1812,6 +1842,8 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
         # Граница prefill: её сообщает маршрутизатор (``prefill_ms`` в мете или
         # ответе). Без цифры TTFT не делим и остаток не выдумываем.
         prefill_ms: float | None = None
+        # Ответила ли своя модель: маркер нужен /metrics (0109).
+        local: bool | None = None
         deadline = self._deadline()
 
         def mark_ttft() -> None:
@@ -1838,6 +1870,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                     first_meta = None
                     route = body["eva"]["route"]
                     prefill_ms = _prefill_ms_of(answer)
+                    local = _answer_local(answer)
                     self._bump_degraded(answer)
                 else:
                     if deadline is not None and not inspect.isgeneratorfunction(
@@ -1867,6 +1900,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                                 _field(first_meta, "route")
                             )["route"]
                             prefill_ms = _prefill_ms_of(first_meta)
+                            local = _answer_local(first_meta)
             except (_RequestTimeout, ServiceUnavailable):
                 raise
             except Exception:  # noqa: BLE001 - до первого чанка ещё можно ответить JSON
@@ -1899,6 +1933,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                 first_meta = None
                 route = body["eva"]["route"]
                 prefill_ms = _prefill_ms_of(answer)
+                local = _answer_local(answer)
 
             try:
                 self._open_sse(request_id, prefill_tokens=prompt_tokens)
@@ -1968,6 +2003,9 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                         reported = _prefill_ms_of(item_meta)
                         if reported is not None:
                             prefill_ms = reported
+                        marker = _answer_local(item_meta)
+                        if marker is not None:
+                            local = marker
                     if not text:
                         continue
                     delta: dict[str, Any] = {"content": text}
@@ -2070,6 +2108,7 @@ class EvaRequestHandler(BaseHTTPRequestHandler):
                 total_tokens=usage.get("total_tokens"),
                 prefill_ms=prefill_ms,
                 prefill_tokens=prompt_tokens,
+                local=local,
                 stream=True,
             )
 

@@ -95,6 +95,8 @@ class StubRoute:
     kind: str = "small"
     reason: str = "тест"
     confidence: float = 0.9
+    #: Маркер своей модели (задача 0109): True/False/None.
+    local: bool | None = None
 
 
 @dataclass
@@ -1222,6 +1224,182 @@ class TestServerPrefillReporting(unittest.TestCase):
         self.assertEqual(payload["prefill_ms"]["p50"], 250.0)
         self.assertEqual(payload["ttft_after_prefill_ms"]["p50"], 50.0)
         json.dumps(payload)
+
+
+# --------------------------------------------------------------------------- #
+# Своя модель в метриках (задача 0109) и реальный роутер (0109 + 0120)
+# --------------------------------------------------------------------------- #
+
+
+class TestLocalModelMetrics(unittest.TestCase):
+    """Сервер прокидывает маркер ``local`` в счётчики ``/metrics``."""
+
+    def test_non_stream_local_answer_is_counted(self):
+        clock = FakeClock()
+        router = StaticAnswerRouter(
+            StubAnswer(route=StubRoute(kind="small", local=True))
+        )
+        metrics = Metrics()
+
+        run_chat(router, metrics=metrics, clock=clock, payload={"stream": False})
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["small_local"], 1)
+        self.assertEqual(snapshot["small_http"], 0)
+        self.assertEqual(snapshot["local_requests"], 1)
+        self.assertEqual(snapshot["local_share"], 1.0)
+        self.assertEqual(snapshot["local_share_all"], 1.0)
+        self.assertEqual(snapshot["source"], {"skill": 0, "local": 1, "api": 0})
+
+    def test_stream_http_answer_is_counted(self):
+        clock = FakeClock()
+        meta = StubAnswer(
+            text="",
+            route=StubRoute(kind="small", local=False),
+            usage={"prompt_tokens": 4, "completion_tokens": 2},
+        )
+        router = ScriptedStreamRouter(clock, pieces=("http", "-ответ"), meta=meta)
+        metrics = Metrics()
+
+        run_chat(router, metrics=metrics, clock=clock, payload={"stream": True})
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["small_http"], 1)
+        self.assertEqual(snapshot["small_local"], 0)
+        self.assertEqual(snapshot["local_share"], 0.0)
+        self.assertEqual(snapshot["source"], {"skill": 0, "local": 0, "api": 1})
+
+    def test_answer_without_marker_is_not_counted_as_local(self):
+        clock = FakeClock()
+        router = StaticAnswerRouter(StubAnswer(route=StubRoute(kind="small")))
+        metrics = Metrics()
+
+        run_chat(router, metrics=metrics, clock=clock, payload={"stream": False})
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["small_local"], 0)
+        self.assertEqual(snapshot["small_http"], 0)
+        self.assertIsNone(snapshot["local_share"])
+        self.assertEqual(snapshot["routes"]["small"], 1)
+
+    def test_metrics_endpoint_exposes_local_share(self):
+        metrics = Metrics()
+        metrics.observe(route="small", finish="ok", local=True)
+        metrics.observe(route="small", finish="ok", local=False)
+
+        handler = run_get("/metrics", metrics=metrics, clock=FakeClock())
+        status, _, body = split_http(handler.wfile.raw)
+        payload = json.loads(body)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["small_local"], 1)
+        self.assertEqual(payload["small_http"], 1)
+        self.assertEqual(payload["local_share"], 0.5)
+        self.assertEqual(payload["source"]["local"], 1)
+        self.assertEqual(payload["source"]["api"], 1)
+
+
+class _LocalModelWithTimings:
+    """Локальная ВТМ для реального ``eva.router``: отдаёт prefill и local-маркер.
+
+    ``prefill_ms`` попадает в результат/кусок как ``timings.prefill_ms``;
+    ``clock`` двигает время между кусками, чтобы TTFT был ненулевым.
+    """
+
+    model_path = "/tmp/fake-model.vtm"
+
+    def __init__(self, *, prefill_ms=90, clock=None) -> None:
+        self.prefill_ms = prefill_ms
+        self.clock = clock
+        self.calls = 0
+
+    def generate(self, prompt_ids, **_kwargs):
+        return list(prompt_ids)
+
+    def chat(self, messages, max_tokens: int = 512):
+        self.calls += 1
+        return {
+            "text": "локальный ответ",
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "cost_rub": 0.0},
+            "timings": {"prefill_ms": self.prefill_ms},
+        }
+
+    def stream_chat(self, messages, max_tokens: int = 512):
+        self.calls += 1
+        if self.clock is not None:
+            self.clock.advance(0.125)
+        yield {"text": "лок", "timings": {"prefill_ms": self.prefill_ms}}
+        yield "альный"
+
+
+class TestRealRouterLocalAndPrefill(unittest.TestCase):
+    """Сквозь ``eva.router`` → сервер: local и prefill доходят до ``/metrics``."""
+
+    def _router(self, model):
+        """Объект-маршрутизатор с ``answer`` и ``stream`` — боевой ``eva.router``."""
+        from eva import router as eva_router
+        from eva.config import Config
+        from eva.types import Route
+
+        cfg = Config()
+        deps = {
+            "classifier": lambda text, _cfg: Route(
+                "small", "тест: малая модель", 0.8
+            ),
+            "small": model,
+        }
+
+        class Router:
+            def __call__(self, request):
+                return eva_router.answer(request, cfg, deps=deps)
+
+            def stream(self, request):
+                return eva_router.stream(request, cfg, deps=deps)
+
+        return Router()
+
+    def test_non_stream_answer_reports_local_and_prefill(self):
+        clock = FakeClock()
+        model = _LocalModelWithTimings(prefill_ms=120)
+        metrics = Metrics()
+
+        run_chat(
+            self._router(model), metrics=metrics, clock=clock, payload={"stream": False}
+        )
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["small_local"], 1)
+        self.assertEqual(snapshot["local_share"], 1.0)
+        self.assertEqual(snapshot["prefill_ms"]["p50"], 120.0)
+
+    def test_stream_answer_splits_ttft_by_reported_prefill(self):
+        clock = FakeClock()
+        model = _LocalModelWithTimings(prefill_ms=90, clock=clock)
+        metrics = Metrics()
+
+        run_chat(
+            self._router(model), metrics=metrics, clock=clock, payload={"stream": True}
+        )
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["small_local"], 1)
+        self.assertEqual(snapshot["prefill_ms"]["p50"], 90.0)
+        self.assertEqual(snapshot["ttft_ms"]["p50"], 125.0)
+        self.assertEqual(snapshot["ttft_after_prefill_ms"]["p50"], 35.0)
+
+    def test_stream_without_prefill_data_leaves_split_empty(self):
+        clock = FakeClock()
+        model = _LocalModelWithTimings(prefill_ms=None, clock=clock)
+        metrics = Metrics()
+
+        run_chat(
+            self._router(model), metrics=metrics, clock=clock, payload={"stream": True}
+        )
+
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["small_local"], 1)
+        self.assertEqual(snapshot["prefill_ms"]["count"], 0)
+        self.assertEqual(snapshot["ttft_after_prefill_ms"]["count"], 0)
 
 
 if __name__ == "__main__":

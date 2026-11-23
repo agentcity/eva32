@@ -30,13 +30,35 @@ scope:
 
 ## Критерии приёмки
 
-- [ ] `prefill_ms` появляется в `/metrics` по каждому запросу
-- [ ] потоковый путь тоже отдаёт границу
-- [ ] Python-набор зелёный
+- [x] `prefill_ms` появляется в `/metrics` по каждому запросу
+- [x] потоковый путь тоже отдаёт границу
+- [x] Python-набор зелёный
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: маркер своей модели и граница prefill — в контракте, логах и метриках.
+
+**0109:** `Route.local` и `Route.source` (skill|local|api) стали полями контракта и
+попадают в `to_dict()`. В JSONL: `"local": true, "source": "local"` для ВТМ,
+`"local": false, "source": "api"` для HTTP-клиента, у skill поля нет.
+В `/metrics` добавлены `small_local`, `small_http`, `local_requests`,
+`local_share` (доля среди размеченных small), `local_share_all`, `source`,
+`by_route.<route>.local`; `observe(local=...)`, `reset()` чистит.
+
+**0120:** `Answer.prefill_ms` и `StreamChunk.prefill_ms`; роутер берёт границу
+только если клиент её явно отдал (поле, `timings`/`usage`, `last_prefill_ms`),
+иначе `None` — не угадывает. `ttft_after_prefill_ms = TTFT − prefill`.
+
+**Числа демо-среза:** 3 local, 2 http, 1 big, 1 skill → `small_local=3`,
+`small_http=2`, `local_requests=3`, `local_share=0.6`, `local_share_all=0.4286`,
+`source={"skill":1,"local":3,"api":3}`, prefill p50=121 мс. Сквозной потоковый
+тест: TTFT 125 = prefill 90 + 35 после.
+
+Проверено: 36 новых тестов, полный набор **1689 OK**.
+
+Риск, который честно записан: реальный `VtmBackend` границу prefill не отдаёт —
+на боевом локальном пути `prefill_ms=None`. Нужен `timings`/`last_prefill_ms`
+в `eva/backends/vtm_backend.py` и в C-ABI (заведена 0127).
 
 ## Ссылки
 

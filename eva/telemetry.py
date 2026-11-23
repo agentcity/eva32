@@ -13,8 +13,18 @@
       "latency_ms": 420.0,
       "reason": "короткий вопрос",       # необязательно
       "confidence": 0.82,                # необязательно
+      "local": true,                     # ответила своя модель (0109)
+      "source": "local",                 # skill | local | api
+      "prefill_ms": 180.0,               # граница prefill, если известна (0120)
       "user_id": "u-1", "channel": "web" # прочие поля сохраняются
     }
+
+``local`` — маркер **своей** модели: ``true`` — ответила локальная ВТМ,
+``false`` — HTTP/API. У маршрута ``skill`` маркера нет (не применимо), у
+``big`` он тоже ``None``: там ``source`` = ``api``. ``source`` — грубая
+категория источника: ``skill`` (детерминированный ответ), ``local`` (своя
+модель), ``api`` (внешний провайдер). ``prefill_ms`` пишется, только если
+маршрутизатор сообщил границу prefill; иначе поля нет — сервер её не угадывает.
 
 Прочие поля (``user_id``, ``channel`` и т. п.) не выбрасываются: по ним видно
 канал и пользователя. Секреты в запись не передавайте — значения попадают в
@@ -68,6 +78,7 @@ __all__ = [
     "FINISH_CODES",
     "Metrics",
     "ROUTE_KINDS",
+    "SOURCE_KINDS",
     "iter_records",
     "log",
     "normalize_record",
@@ -88,7 +99,13 @@ _CONSUMED = {
     *_NUMBER_FIELDS,
     "reason",
     "confidence",
+    "local",
+    "source",
+    "prefill_ms",
 }
+
+#: Категории источника ответа (задача 0109): скилл, своя модель, API.
+SOURCE_KINDS = ("skill", "local", "api")
 
 
 def percentile(values: list[float] | tuple[float, ...], q: float) -> float | None:
@@ -129,6 +146,64 @@ def _to_float(value: Any) -> float | None:
 def _to_int(value: Any) -> int | None:
     number = _to_float(value)
     return None if number is None else int(round(number))
+
+
+def _flag(value: Any) -> bool | None:
+    """Булев маркер из значения; всё, что не ``bool``, — ``None``.
+
+    Строки и 0/1 намеренно не разбираются: маркер ``local`` ставит
+    маршрутизатор полем ``bool``, а «похожее на истину» из чужого кода
+    считать своим ответом нельзя.
+    """
+    return value if isinstance(value, bool) else None
+
+
+def _local_of(route: Any, usage: Any = None, explicit: Any = None) -> bool | None:
+    """Маркер «ответила своя модель» из записи, маршрута или ``usage``."""
+    marker = _flag(explicit)
+    if marker is not None:
+        return marker
+    if route is not None and not isinstance(route, str):
+        if isinstance(route, Mapping):
+            marker = _flag(route.get("local"))
+        else:
+            marker = _flag(getattr(route, "local", None))
+        if marker is not None:
+            return marker
+    if isinstance(usage, Mapping):
+        return _flag(usage.get("local"))
+    return None
+
+
+def _source_of(route: str, local: bool | None, explicit: Any = None) -> str | None:
+    """``skill`` | ``local`` | ``api`` по маршруту и маркеру ``local``."""
+    if isinstance(explicit, str) and explicit.strip().lower() in SOURCE_KINDS:
+        return explicit.strip().lower()
+    if route == "skill":
+        return "skill"
+    if local is True:
+        return "local"
+    if route == "big":
+        return "api"
+    if route == "small" and local is False:
+        return "api"
+    return None
+
+
+def _prefill_of(data: Mapping[str, Any]) -> float | None:
+    """Граница prefill из записи: поле или вложенные ``timings``/``usage``."""
+    raw = data.get("prefill_ms")
+    if raw is None:
+        for name in ("timings", "usage"):
+            nested = data.get(name)
+            if isinstance(nested, Mapping):
+                raw = nested.get("prefill_ms")
+                if raw is not None:
+                    break
+    number = _to_float(raw)
+    if number is None or number < 0:
+        return None
+    return round(number, 3)
 
 
 def _route_info(value: Any) -> tuple[str, str | None, float | None]:
@@ -204,7 +279,8 @@ def _as_mapping(record: Any) -> Mapping[str, Any]:
     fields = (
         "ts", "route", "skill", "usage", "cost_rub", "latency_ms",
         "prompt_tokens", "completion_tokens", "total_tokens",
-        "reason", "confidence", "user_id", "channel",
+        "reason", "confidence", "local", "source", "prefill_ms",
+        "user_id", "channel",
     )
     data = {}
     for name in fields:
@@ -255,6 +331,10 @@ def normalize_record(record: Any, *, default_ts: str | None = None) -> dict[str,
     if confidence is None:
         confidence = _to_float(data.get("confidence"))
 
+    local = _local_of(data.get("route"), usage, data.get("local"))
+    source_key = _source_of(route, local, data.get("source"))
+    prefill_ms = _prefill_of(data)
+
     prompt_tokens = _to_int(data.get("prompt_tokens")) or 0
     completion_tokens = _to_int(data.get("completion_tokens")) or 0
     total_tokens = _to_int(data.get("total_tokens"))
@@ -280,6 +360,13 @@ def normalize_record(record: Any, *, default_ts: str | None = None) -> dict[str,
         out["reason"] = reason
     if confidence is not None:
         out["confidence"] = confidence
+    # Маркер локальной модели: у скилла и big его нет — «не применимо».
+    if local is not None:
+        out["local"] = local
+    if source_key is not None:
+        out["source"] = source_key
+    if prefill_ms is not None:
+        out["prefill_ms"] = prefill_ms
 
     for key, value in source.items():
         if key not in _CONSUMED and value is not None:
@@ -372,6 +459,7 @@ def _new_stats() -> dict[str, Any]:
         "total_tokens": 0,
         "latency": [],
         "skills": Counter(),
+        "local": 0,
     }
 
 
@@ -385,12 +473,15 @@ def _add(stats: dict[str, Any], record: Mapping[str, Any]) -> None:
     skill = record.get("skill")
     if skill:
         stats["skills"][str(skill)] += 1
+    if record.get("local") is True:
+        stats["local"] += 1
 
 
 def _finish(stats: dict[str, Any]) -> dict[str, Any]:
     requests = stats["requests"]
     latencies = stats["latency"]
     cost = stats["cost_rub"]
+    local = stats["local"]
     return {
         "requests": requests,
         "cost_rub": cost,
@@ -404,6 +495,9 @@ def _finish(stats: dict[str, Any]) -> dict[str, Any]:
         "latency_ms_p50": percentile(latencies, 50),
         "latency_ms_p95": percentile(latencies, 95),
         "skills": dict(stats["skills"].most_common()),
+        # Доля ответов своей модели в агрегате лога (задача 0109).
+        "local_requests": local,
+        "local_share": local / requests if requests else 0.0,
     }
 
 
@@ -421,7 +515,8 @@ def summary(path: str | os.PathLike[str] = DEFAULT_PATH) -> dict[str, Any]:
     AGG: ``requests``, ``cost_rub`` (сумма), ``cost_rub_avg``,
     ``cost_rub_per_1000``, ``prompt_tokens``, ``completion_tokens``,
     ``total_tokens``, ``latency_ms_sum``, ``latency_ms_avg``,
-    ``latency_ms_p50``, ``latency_ms_p95``, ``skills`` (счётчик по именам).
+    ``latency_ms_p50``, ``latency_ms_p95``, ``skills`` (счётчик по именам),
+    ``local_requests`` и ``local_share`` (доля ответов своей модели, 0109).
 
     Битые строки не прерывают разбор: они попадают в ``skipped`` (число) и
     ``errors`` (первые 20 с номерами строк).
@@ -570,6 +665,11 @@ class Metrics:
           "prefill_ms": {...},              # только по замерам, где есть данные
           "ttft_after_prefill_ms": {...},   # TTFT минус prefill
           "latency_ms": {...},
+          "small_local": 4, "small_http": 2,   # своя модель vs HTTP (0109)
+          "local_requests": 4,
+          "local_share": 0.666...,          # доля своей модели среди small
+          "local_share_all": 0.333...,      # доля своей модели среди запросов
+          "source": {"skill": 1, "local": 4, "api": 3},
           "warmup_ms": 41.2, "warmup": {"count": 1, "ok": true, "warmup_ms": 41.2,
                                         "prefill_tokens": 3, "error": null,
                                         "model": "demo/model.vtm"},
@@ -587,6 +687,11 @@ class Metrics:
     границу prefill и оставляет ``None``. ``prefill_tokens`` сервер считает
     сам по длине промпта, поэтому счётчик есть у всех запросов.
 
+    ``local`` (0109) приходит из ответа маршрутизатора: ``True`` — своя ВТМ,
+    ``False`` — HTTP/API, ``None`` — неизвестно. Доля считается по размеченным
+    ответам ``small``: ответы без маркера в знаменатель не попадают, чтобы не
+    выдавать HTTP за свою модель.
+
     Замеры для перцентилей ограничены окном ``max_samples``; счётчики — нет.
     """
 
@@ -599,6 +704,11 @@ class Metrics:
         self._prefill_tokens = 0
         self._warmup_count = 0
         self._warmup: dict[str, Any] | None = None
+        # Ответы своей модели (задача 0109): по малой модели и по всем сразу.
+        self._small_local = 0
+        self._small_http = 0
+        self._local_requests = 0
+        self._source = {name: 0 for name in SOURCE_KINDS}
         self._finish = {code: 0 for code in FINISH_CODES}
         self._routes = {kind: 0 for kind in _ROUTE_KEYS}
         maxlen = self.max_samples
@@ -611,6 +721,7 @@ class Metrics:
                 "requests": 0,
                 "tokens": 0,
                 "prefill_tokens": 0,
+                "local": 0,
                 "finish": {code: 0 for code in FINISH_CODES},
                 "ttft": deque(maxlen=maxlen),
                 "prefill": deque(maxlen=maxlen),
@@ -635,6 +746,7 @@ class Metrics:
         stream: bool = False,
         prefill_ms: Any = None,
         prefill_tokens: Any = None,
+        local: Any = None,
     ) -> dict[str, Any]:
         """Учесть один запрос и вернуть его запись (для тестов и логов).
 
@@ -647,6 +759,11 @@ class Metrics:
         с ``prompt_tokens``: без usage промпт всё равно посчитан). Отдельный
         параметр нужен потому, что при обрыве потока usage неизвестен, а
         длина промпта известна.
+
+        ``local`` — ответила ли своя модель (0109): ``True``/``False``;
+        ``None`` — неизвестно (маршрут не про малую модель). По нему считаются
+        ``small_local``/``small_http``, доля локальных ответов и счётчики
+        ``source`` (``skill``/``local``/``api``).
         """
         route_key = _route_key(route)
         finish_key = _finish_key(finish)
@@ -667,6 +784,8 @@ class Metrics:
             if ttft is not None and prefill is not None and prefill <= ttft
             else None
         )
+        local_flag = _flag(local)
+        source = _source_of(route_key, local_flag)
 
         record = {
             "route": route_key,
@@ -682,6 +801,8 @@ class Metrics:
             "prefill_tokens": counted,
             "completion_tokens": completion,
             "total_tokens": total,
+            "local": local_flag,
+            "source": source,
         }
 
         with self._lock:
@@ -694,6 +815,15 @@ class Metrics:
             self._tokens["completion"] += completion
             self._tokens["total"] += total
             self._prefill_tokens += counted
+            if route_key == "small":
+                if local_flag is True:
+                    self._small_local += 1
+                elif local_flag is False:
+                    self._small_http += 1
+            if local_flag is True:
+                self._local_requests += 1
+            if source is not None:
+                self._source[source] += 1
             if ttft is not None:
                 self._ttft.append(ttft)
             if prefill is not None:
@@ -706,6 +836,8 @@ class Metrics:
             row["requests"] += 1
             row["tokens"] += total
             row["prefill_tokens"] += counted
+            if local_flag is True:
+                row["local"] += 1
             row["finish"][finish_key] += 1
             if ttft is not None:
                 row["ttft"].append(ttft)
@@ -748,7 +880,15 @@ class Metrics:
     # -- чтение ---------------------------------------------------------------
 
     def snapshot(self) -> dict[str, Any]:
-        """Срез счётчиков и перцентилей; словарь сериализуется в JSON как есть."""
+        """Срез счётчиков и перцентилей; словарь сериализуется в JSON как есть.
+
+        Блок локальной модели (задача 0109): ``small_local`` — ответы своей
+        ВТМ на маршруте ``small``, ``small_http`` — HTTP-клиент на том же
+        маршруте, ``local_share`` — доля своей модели среди размеченных
+        ответов ``small`` (``None``, пока их нет), ``local_share_all`` — доля
+        своей модели среди всех запросов. ``source`` — счётчики по категориям
+        ``skill``/``local``/``api``.
+        """
         with self._lock:
             requests = self._requests
             streams = self._streams
@@ -756,6 +896,10 @@ class Metrics:
             routes = dict(self._routes)
             tokens = dict(self._tokens)
             prefill_tokens = self._prefill_tokens
+            small_local = self._small_local
+            small_http = self._small_http
+            local_requests = self._local_requests
+            source = dict(self._source)
             ttft = _stats(self._ttft)
             prefill = _stats(self._prefill)
             ttft_after = _stats(self._ttft_after)
@@ -766,6 +910,7 @@ class Metrics:
                     "requests": row["requests"],
                     "tokens": row["tokens"],
                     "prefill_tokens": row["prefill_tokens"],
+                    "local": row["local"],
                     "finish": dict(row["finish"]),
                     "ttft_ms": _stats(row["ttft"]),
                     "prefill_ms": _stats(row["prefill"]),
@@ -774,6 +919,7 @@ class Metrics:
                 }
                 for name, row in self._by_route.items()
             }
+        small_marked = small_local + small_http
         return {
             "requests": requests,
             "streams": streams,
@@ -787,6 +933,15 @@ class Metrics:
             "prefill_ms": prefill,
             "ttft_after_prefill_ms": ttft_after,
             "latency_ms": latency,
+            # Своя модель vs API (0109): счётчики и доли.
+            "small_local": small_local,
+            "small_http": small_http,
+            "local_requests": local_requests,
+            "local_share": small_local / small_marked if small_marked else None,
+            "local_share_all": (
+                local_requests / requests if requests else None
+            ),
+            "source": source,
             "warmup_ms": warmup["warmup_ms"],
             "warmup": warmup,
             "by_route": by_route,
@@ -800,6 +955,11 @@ class Metrics:
             self._prefill_tokens = 0
             self._warmup_count = 0
             self._warmup = None
+            self._small_local = 0
+            self._small_http = 0
+            self._local_requests = 0
+            for name in self._source:
+                self._source[name] = 0
             for key in self._tokens:
                 self._tokens[key] = 0
             for code in self._finish:
@@ -814,6 +974,7 @@ class Metrics:
                 row["requests"] = 0
                 row["tokens"] = 0
                 row["prefill_tokens"] = 0
+                row["local"] = 0
                 row["finish"] = {code: 0 for code in FINISH_CODES}
                 row["ttft"].clear()
                 row["prefill"].clear()

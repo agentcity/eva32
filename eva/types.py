@@ -63,11 +63,21 @@ class Request:
 
 @dataclass
 class Route:
-    """Решение маршрутизатора: кто отвечает и почему."""
+    """Решение маршрутизатора: кто отвечает и почему.
+
+    ``local`` — ответила ли **своя** модель (задача 0109): ``True`` — локальная
+    ВТМ, ``False`` — HTTP/API, ``None`` — маршрут не про малую модель
+    (``skill``/``big``) или признак неизвестен. По нему телеметрия и
+    ``/metrics`` считают, сколько ответов дала своя модель.
+
+    ``source`` (вычисляемое свойство) — грубее: ``skill``, ``local`` или
+    ``api``; в ``to_dict()`` он попадает как отдельное поле.
+    """
 
     kind: str
     reason: str
     confidence: float = 1.0
+    local: bool | None = None
 
     def __post_init__(self) -> None:
         self.kind = str(self.kind).strip().lower()
@@ -76,14 +86,41 @@ class Route:
             self.confidence = max(0.0, min(1.0, float(self.confidence)))
         except (TypeError, ValueError):
             self.confidence = 0.0
+        # Только настоящий bool: 0/1 и «true» строкой — не маркер ответа.
+        self.local = self.local if isinstance(self.local, bool) else None
+
+    @property
+    def source(self) -> str | None:
+        """``skill`` | ``local`` | ``api``; ``None`` — источник неизвестен."""
+        if self.kind == "skill":
+            return "skill"
+        if self.local is True:
+            return "local"
+        if self.kind == "big":
+            return "api"
+        if self.kind == "small" and self.local is False:
+            return "api"
+        return None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"kind": self.kind, "reason": self.reason, "confidence": self.confidence}
+        return {
+            "kind": self.kind,
+            "reason": self.reason,
+            "confidence": self.confidence,
+            "local": self.local,
+            "source": self.source,
+        }
 
 
 @dataclass
 class Answer:
-    """Ответ ассистента вместе с маршрутом, ценой и латентностью."""
+    """Ответ ассистента вместе с маршрутом, ценой и латентностью.
+
+    ``prefill_ms`` — сколько заняла prefill-часть (счёт промпта), если
+    провайдер/локальный бэкенд сообщил эту границу (задача 0120). ``None`` —
+    граница неизвестна: сервер не угадывает её, а оставляет ``prefill_ms`` и
+    ``ttft_after_prefill_ms`` в ``/metrics`` пустыми.
+    """
 
     text: str
     route: Route
@@ -91,6 +128,18 @@ class Answer:
     usage: dict[str, Any] = field(default_factory=dict)
     cost_rub: float = 0.0
     latency_ms: int = 0
+    prefill_ms: float | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.prefill_ms, bool):
+            self.prefill_ms = None
+        elif self.prefill_ms is not None:
+            try:
+                value = float(self.prefill_ms)
+            except (TypeError, ValueError):
+                self.prefill_ms = None
+            else:
+                self.prefill_ms = value if value >= 0 else None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,4 +149,5 @@ class Answer:
             "usage": dict(self.usage),
             "cost_rub": self.cost_rub,
             "latency_ms": self.latency_ms,
+            "prefill_ms": self.prefill_ms,
         }
