@@ -4818,8 +4818,12 @@ static vtm_t *batch_model(const batch_cfg *cfg) {
 }
 
 
-// Побитовое сравнение всего наблюдаемого состояния двух машин.
-static void batch_check_same(vtm_t *want, vtm_t *got, const char *what) {
+// Сравнение всего наблюдаемого состояния двух машин. tol == 0 — строго
+// побитово (скалярный батч обязан совпадать с прогоном по токену точно),
+// tol > 0 — допуск на f32-тензоры (SIMD-батч 0122 считает с другим порядком
+// f32-сложения: расхождение ≤1e-5, зато выбор токена обязан остаться тем же).
+static void batch_check_same(vtm_t *want, vtm_t *got, const char *what,
+                             double tol) {
     uint32_t i, n = vtm_tensor_count(want);
     int bad = 0;
 
@@ -4850,11 +4854,48 @@ static void batch_check_same(vtm_t *want, vtm_t *got, const char *what) {
             continue;
         }
         if (!a->f32 || !b->f32 || a->n_elements == 0) continue;
-        if (memcmp(a->f32, b->f32, (size_t)a->n_elements * 4u) != 0) {
-            fprintf(stderr, "FAIL batch %s: тензор %s (%u эл.) расходится\n",
-                    what, a->name, a->n_elements);
+        if (tol <= 0.0) {
+            // Побитово: -0.0/0.0 и NaN тоже считаются расхождением.
+            if (memcmp(a->f32, b->f32, (size_t)a->n_elements * 4u) != 0) {
+                double d = 0.0;
+                uint32_t k;
+                for (k = 0; k < a->n_elements; k++) {
+                    double v = fabs((double)a->f32[k] - (double)b->f32[k]);
+                    if (v > d) d = v;
+                }
+                fprintf(stderr, "FAIL batch %s: тензор %s (%u эл.) не "
+                        "побитово, max|diff|=%.3e\n", what, a->name,
+                        a->n_elements, d);
+                g_fail++;
+                if (++bad >= 5) break;
+            }
+        } else {
+            double d = 0.0;
+            uint32_t k;
+            for (k = 0; k < a->n_elements; k++) {
+                double v = fabs((double)a->f32[k] - (double)b->f32[k]);
+                if (v > d) d = v;
+            }
+            if (d > tol) {
+                fprintf(stderr, "FAIL batch %s: тензор %s (%u эл.) "
+                        "max|diff|=%.3e > %.0e\n", what, a->name,
+                        a->n_elements, d, tol);
+                g_fail++;
+                if (++bad >= 5) break;
+            }
+        }
+    }
+    // Выбор токена важнее чисел: при любом допуске он должен совпасть точно
+    // (на этом держится «батч не меняет ответ»).
+    {
+        const vtm_tensor *ta = vtm_tensor_by_name(want, "token");
+        const vtm_tensor *tb = vtm_tensor_by_name(got, "token");
+        if (ta && tb && ta->f32 && tb->f32 && ta->n_elements > 0
+            && tb->n_elements > 0
+            && memcmp(ta->f32, tb->f32, sizeof(float)) != 0) {
+            fprintf(stderr, "FAIL batch %s: выбранный токен %.0f != %.0f\n",
+                    what, (double)ta->f32[0], (double)tb->f32[0]);
             g_fail++;
-            if (++bad >= 5) break;
         }
     }
 }
@@ -4888,7 +4929,9 @@ static void batch_case(const batch_cfg *cfg, int n, const char *what,
     // Батч не создаёт снимок кэша префикса: K/V он кладёт, но «это ровно
     // прогон ids[0..n)» машина не запоминает.
     CHECK(vtm_cache_prefix_len(got) == 0);
-    batch_check_same(want, got, what);
+    // Скалярный батч обязан совпасть побитово; на SIMD (ядра 0122) — 1e-5,
+    // выбор токена проверяется точно в batch_check_same.
+    batch_check_same(want, got, what, force_scalar ? 0.0 : 1e-5);
     vtm_free(want);
     vtm_free(got);
 }
@@ -4951,7 +4994,7 @@ static void batch_mm_case(int n, const char *what) {
     cache_run_plain(want, ids, n);
     vtm_set_position(got, 0);
     CHECK(vtm_run_batch(got, ids, n) == VTM_OK);
-    batch_check_same(want, got, what);
+    batch_check_same(want, got, what, 0.0);
     vtm_free(want);
     vtm_free(got);
 }
@@ -4974,8 +5017,10 @@ static void test_run_batch(void) {
     batch_case(&mha, 64, "MHA/causal 64", 1);
     batch_case(&ring, 64, "кольцо KV 64 (окно 32)", 1);
     batch_case(&ring, 128, "кольцо KV 128 (окно 32)", 1);
-    // Бэкенд по умолчанию (обычно SIMD): батчевых ядер там нет, вызов идёт
-    // по токену — состояние всё равно обязано совпасть побитово.
+    // Бэкенд по умолчанию (обычно SIMD): с задачей 0122 там есть батчевые
+    // ядра, и порядок f32-сложения у них другой — состояние совпадает в
+    // пределах 1e-5, а не побитово (побитовость остаётся на скаляре, её
+    // проверяют кейсы выше; выбор токена проверяется точно).
     batch_case(&gqa, 16, "бэкенд по умолчанию 16", 0);
 
     // MM-путь: tied lm_head (A — тритовая таблица эмбеддингов, B — столбец).
@@ -4997,7 +5042,7 @@ static void test_run_batch(void) {
             CHECK(vtm_run_batch(got, ids, 8) == VTM_OK);
             vtm_set_position(got, 8);
             CHECK(vtm_run_batch(got, ids + 8, 8) == VTM_OK);
-            batch_check_same(want, got, "две пачки по 8");
+            batch_check_same(want, got, "две пачки по 8", 0.0);
             vtm_free(want);
             vtm_free(got);
         }
@@ -5035,7 +5080,7 @@ static void test_run_batch(void) {
             cache_run_plain(want, ids, 1);
             vtm_set_position(got, 0);
             CHECK(vtm_run_batch(got, ids, 1) == VTM_OK);
-            batch_check_same(want, got, "n=1");
+            batch_check_same(want, got, "n=1", 0.0);
             vtm_free(want);
             vtm_free(got);
         }

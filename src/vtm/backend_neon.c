@@ -49,6 +49,13 @@ extern int vtm_avx2_mm_trit(float *y, const uint8_t *w, const float *scales,
                             int scale_block);
 extern int vtm_avx2_mm_f32(float *y, const float *a, const float *b,
                            int m, int k, int n);
+extern int vtm_avx2_tmv_blocks_batch(float *y, const uint8_t *w,
+                                     const float *scales, const float *x,
+                                     int rows, int cols, int n_tokens,
+                                     int scale_block);
+extern int vtm_avx2_mm_batch(float *y, const uint8_t *w, const float *scales,
+                             const float *b, int m, int k, int n_tokens,
+                             int scale_block);
 #define VTM_SIMD_X86 1
 #else
 #define VTM_SIMD_X86 0
@@ -209,6 +216,182 @@ static int mm_f32_scalar(float *y, const float *a, const float *b,
     job.n = n;
     vtm_parallel_rows(m, (double)m * (double)k * (double)n,
                       mm_f32_scalar_worker, &job);
+    return 0;
+}
+
+// --- батчевые скалярные откаты TMV/MM (задача 0122) -----------------------
+//
+// Батчевые ядра вне vtm_backend (см. vtm_backend.h): N токенов против одной
+// матрицы весов. Здесь — откат, который работает на любой сборке (в том числе
+// без SIMD) и повторяет арифметику батчевого скалярного пути interp.c:
+// сумма по блоку масштаба копится в double, затем умножается на масштаб
+// блока. Поэтому расхождение с interp.c — единицы ulp, а не «похожий
+// результат».
+//
+// Раскладка активаций: x[t*N + j], y[r*N + j] (токен — младший индекс).
+// Строки выхода делятся между потоками пула: каждая строка считается тем же
+// кодом в том же порядке, поэтому от числа потоков результат не зависит.
+
+typedef struct {
+    float *y;
+    const uint32_t *words;
+    const float *scales;
+    const float *x;
+    int cols;
+    int ntok;
+    int scale_block;
+    double *acc_all;   // vt * ntok
+} batch_scalar_job;
+
+// Триты одной строки [r0, r1) против ntok столбцов активаций.
+static void trit_batch_scalar_rows(batch_scalar_job *j, int tid, int r0,
+                                   int r1) {
+    const int cols = j->cols;
+    const int ntok = j->ntok;
+    const int64_t sb = (int64_t)j->scale_block;
+    const uint32_t *words = j->words;
+    const float *scales = j->scales;
+    const float *x = j->x;
+    double *acc = j->acc_all + (size_t)tid * (size_t)ntok;
+    int8_t buf[VTM_SCALE_BLOCK_160 + 64];
+    int8_t *tp = buf + 32;
+    int r, jj;
+
+    for (r = r0; r < r1; r++) {
+        const int64_t base = (int64_t)r * (int64_t)cols;
+        const int64_t end = base + (int64_t)cols;
+        int64_t s;
+
+        memset(acc, 0, (size_t)ntok * sizeof(double));
+        for (s = (base / sb) * sb; s < end; s += sb) {
+            int64_t e = s + sb;
+            int64_t st;
+            int64_t wi, wi_end;
+            int len, t;
+            int64_t lo;
+            double scale;
+
+            if (e > end) e = end;
+            st = s < base ? base : s;
+            wi = st / VTM_TRITS_PER_WORD;
+            wi_end = (e - 1) / VTM_TRITS_PER_WORD;
+            for (; wi <= wi_end; wi++)
+                vtm_trit_unpack20(load_u32_unaligned(words, wi),
+                                  tp + (ptrdiff_t)(wi * VTM_TRITS_PER_WORD
+                                                   - st));
+            len = (int)(e - st);
+            lo = st - base;
+            scale = (double)load_f32_unaligned(scales, s / sb);
+            for (jj = 0; jj < ntok; jj++) {
+                double part = 0.0;
+                for (t = 0; t < len; t++)
+                    part += (double)tp[t]
+                          * (double)x[(size_t)(lo + t) * (size_t)ntok
+                                      + (size_t)jj];
+                acc[jj] += part * scale;
+            }
+        }
+        for (jj = 0; jj < ntok; jj++)
+            j->y[(size_t)r * (size_t)ntok + (size_t)jj] = (float)acc[jj];
+    }
+}
+
+static void trit_batch_scalar_worker(void *p, int tid, int r0, int r1) {
+    trit_batch_scalar_rows((batch_scalar_job *)p, tid, r0, r1);
+}
+
+static int trit_batch_scalar(float *y, const uint8_t *w, const float *scales,
+                             const float *x, int rows, int cols, int ntok,
+                             int scale_block) {
+    batch_scalar_job job;
+    int vt;
+
+    if (!y || !w || !scales || !x) return -1;
+    if (rows < 0 || cols < 0 || ntok < 0) return -1;
+    if (scale_block != (int)VTM_SCALE_BLOCK_128 &&
+        scale_block != (int)VTM_SCALE_BLOCK_160) return -1;
+    if (rows == 0 || cols == 0 || ntok == 0) return 0;
+    vt = vtm_threads();
+    job.acc_all = (double *)calloc((size_t)vt * (size_t)ntok,
+                                   sizeof(double));
+    if (!job.acc_all) return -1;
+    job.y = y;
+    job.words = (const uint32_t *)w;
+    job.scales = scales;
+    job.x = x;
+    job.cols = cols;
+    job.ntok = ntok;
+    job.scale_block = scale_block;
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok,
+                      trit_batch_scalar_worker, &job);
+    free(job.acc_all);
+    return 0;
+}
+
+typedef struct {
+    float *y;
+    const float *w;
+    const float *x;
+    int rows;
+    int cols;
+    int ntok;
+    int transposed;
+    double *acc_all;
+} dense_batch_job;
+
+// Плотный батчевый TMV/MM: y[r*N+j] = sum_t W[r,t] * x[t*N+j] (W — fp32).
+// Считаем в double, как op_tmv/op_mm; порядок сложений — по t, поэтому
+// результат совпадает с батчевым скалярным путём interp.c.
+static void dense_batch_rows(dense_batch_job *j, int tid, int r0, int r1) {
+    const int cols = j->cols;
+    const int ntok = j->ntok;
+    const int rows = j->rows;
+    const float *w = j->w;
+    const float *x = j->x;
+    double *acc = j->acc_all + (size_t)tid * (size_t)ntok;
+    int r, t, jj;
+
+    for (r = r0; r < r1; r++) {
+        memset(acc, 0, (size_t)ntok * sizeof(double));
+        for (t = 0; t < cols; t++) {
+            double wv = j->transposed
+                      ? (double)w[(size_t)t * (size_t)rows + (size_t)r]
+                      : (double)w[(size_t)r * (size_t)cols + (size_t)t];
+            const float *xp = x + (size_t)t * (size_t)ntok;
+            for (jj = 0; jj < ntok; jj++)
+                acc[jj] += wv * (double)xp[jj];
+        }
+        for (jj = 0; jj < ntok; jj++)
+            j->y[(size_t)r * (size_t)ntok + (size_t)jj] = (float)acc[jj];
+    }
+}
+
+static void dense_batch_worker(void *p, int tid, int r0, int r1) {
+    dense_batch_rows((dense_batch_job *)p, tid, r0, r1);
+}
+
+static int dense_batch(float *y, const float *w, const float *x, int rows,
+                       int cols, int ntok, int transposed) {
+    dense_batch_job job;
+    int vt;
+
+    if (!y || !w || !x) return -1;
+    if (rows < 0 || cols < 0 || ntok < 0) return -1;
+    if (rows == 0 || cols == 0 || ntok == 0) return 0;
+    vt = vtm_threads();
+    job.acc_all = (double *)calloc((size_t)vt * (size_t)ntok,
+                                   sizeof(double));
+    if (!job.acc_all) return -1;
+    job.y = y;
+    job.w = w;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    job.ntok = ntok;
+    job.transposed = transposed;
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok,
+                      dense_batch_worker, &job);
+    free(job.acc_all);
     return 0;
 }
 
@@ -755,6 +938,263 @@ static int mm_f32_neon(float *y, const float *a, const float *b,
     return 0;
 }
 
+// --- NEON: батчевые TMV/MM (задача 0122) -----------------------------------
+//
+// y[r*N + j] = sum_t trit(W)[r,t] * x[t*N + j]. В отличие от row_dot_trit
+// (одна строка × один вектор) здесь по вектору идёт не строка весов, а N
+// токенов: трит W[r,t] — скаляр, x[t*N .. t*N+N) — N активаций. Поэтому
+// слово pack20 распаковывается и переводится в f32 один раз на строку и
+// блок (а не N раз), а веса читаются из памяти один раз на N токенов — это
+// и есть выигрыш батчевого prefill.
+//
+// Арифметика блока — как у скалярного батчевого пути: f32-аккумуляторы
+// (4 ленты на 4 токена, 4 независимых цепи по t), затем сумма блока в
+// double, умножение на масштаб блока и сложение блоков в double. От
+// одноколоночного row_dot_trit отличается только порядком f32-сложения
+// внутри блока — расхождение с батчевым скаляром ≤1e-5 (проверка в
+// tests/vtm/bench_backend.c).
+
+// len тритов (int8) -> f32. 16 за шаг: int8 -> int16 -> int32 -> f32.
+static inline void trits_to_f32(const int8_t *t, float *out, int len) {
+    int i = 0;
+    for (; i + 16 <= len; i += 16) {
+        int8x16_t b = vld1q_s8(t + i);
+        int16x8_t lo = vmovl_s8(vget_low_s8(b));
+        int16x8_t hi = vmovl_s8(vget_high_s8(b));
+        vst1q_f32(out + i + 0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))));
+        vst1q_f32(out + i + 4, vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))));
+        vst1q_f32(out + i + 8, vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))));
+        vst1q_f32(out + i + 12, vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))));
+    }
+    for (; i < len; i++) out[i] = (float)t[i];
+}
+
+// Точечное произведение f32 на f32 (4 ленты, 4 независимых аккумулятора):
+// хвост из 1-3 токенов считается по столбцам, а не по токенам. Вход хвоста
+// лежит отдельным буфером [ntail][cols] (см. trit_batch_neon), поэтому
+// обращение к нему contiguous — как у row_dot_trit.
+static inline double dot_f32_f32(const float *a, const float *b, int n) {
+    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+    double s;
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        a0 = vfmaq_f32(a0, vld1q_f32(a + i), vld1q_f32(b + i));
+        a1 = vfmaq_f32(a1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+        a2 = vfmaq_f32(a2, vld1q_f32(a + i + 8), vld1q_f32(b + i + 8));
+        a3 = vfmaq_f32(a3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+    }
+    s = statvq_acc_f64(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+    for (; i < n; i++) s += (double)a[i] * (double)b[i];
+    return s;
+}
+
+// Один блок масштаба: len тритов tp (начало блока — lo во входе x), ntok
+// токенов, масштаб scale. Результат копится в acc[0..ntok). xtail — хвост
+// 1-3 токенов, лежащий по столбцам (xtail[j*cols + lo ...]).
+static inline void trit_batch_neon_block(const int8_t *tp, float *fb, int len,
+                                         int64_t lo, const float *x, int ntok,
+                                         double *acc, double scale,
+                                         const float *xtail, int xtail_cols,
+                                         int ntail) {
+    int jj;
+
+    trits_to_f32(tp, fb, len);
+
+    // 8 токенов за шаг: две 4-ленточные группы, по 4 независимых
+    // аккумулятора на группу (t mod 4) — 8 цепей FMA, хватает, чтобы
+    // загрузить FP-конвейер.
+    for (jj = 0; jj + 8 <= ntok; jj += 8) {
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+        float32x4_t b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+        int t = 0;
+        for (; t + 4 <= len; t += 4) {
+            const float *xp = x + (size_t)(lo + t) * (size_t)ntok
+                            + (size_t)jj;
+            float32x4_t c0 = vdupq_n_f32(fb[t + 0]);
+            float32x4_t c1 = vdupq_n_f32(fb[t + 1]);
+            float32x4_t c2 = vdupq_n_f32(fb[t + 2]);
+            float32x4_t c3 = vdupq_n_f32(fb[t + 3]);
+            a0 = vfmaq_f32(a0, vld1q_f32(xp), c0);
+            b0 = vfmaq_f32(b0, vld1q_f32(xp + 4), c0);
+            a1 = vfmaq_f32(a1, vld1q_f32(xp + ntok), c1);
+            b1 = vfmaq_f32(b1, vld1q_f32(xp + ntok + 4), c1);
+            a2 = vfmaq_f32(a2, vld1q_f32(xp + 2 * ntok), c2);
+            b2 = vfmaq_f32(b2, vld1q_f32(xp + 2 * ntok + 4), c2);
+            a3 = vfmaq_f32(a3, vld1q_f32(xp + 3 * ntok), c3);
+            b3 = vfmaq_f32(b3, vld1q_f32(xp + 3 * ntok + 4), c3);
+        }
+        for (; t < len; t++) {
+            const float *xp = x + (size_t)(lo + t) * (size_t)ntok
+                            + (size_t)jj;
+            float tv = fb[t];
+            a0 = vfmaq_n_f32(a0, vld1q_f32(xp), tv);
+            b0 = vfmaq_n_f32(b0, vld1q_f32(xp + 4), tv);
+        }
+        {
+            float32x4_t sa = vaddq_f32(vaddq_f32(a0, a1),
+                                       vaddq_f32(a2, a3));
+            float32x4_t sb = vaddq_f32(vaddq_f32(b0, b1),
+                                       vaddq_f32(b2, b3));
+            acc[jj + 0] += (double)vgetq_lane_f32(sa, 0) * scale;
+            acc[jj + 1] += (double)vgetq_lane_f32(sa, 1) * scale;
+            acc[jj + 2] += (double)vgetq_lane_f32(sa, 2) * scale;
+            acc[jj + 3] += (double)vgetq_lane_f32(sa, 3) * scale;
+            acc[jj + 4] += (double)vgetq_lane_f32(sb, 0) * scale;
+            acc[jj + 5] += (double)vgetq_lane_f32(sb, 1) * scale;
+            acc[jj + 6] += (double)vgetq_lane_f32(sb, 2) * scale;
+            acc[jj + 7] += (double)vgetq_lane_f32(sb, 3) * scale;
+        }
+    }
+    for (; jj + 4 <= ntok; jj += 4) {
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+        int t = 0;
+        for (; t + 4 <= len; t += 4) {
+            const float *xp = x + (size_t)(lo + t) * (size_t)ntok
+                            + (size_t)jj;
+            a0 = vfmaq_n_f32(a0, vld1q_f32(xp),
+                             fb[t + 0]);
+            a1 = vfmaq_n_f32(a1, vld1q_f32(xp + ntok),
+                             fb[t + 1]);
+            a2 = vfmaq_n_f32(a2, vld1q_f32(xp + 2 * ntok),
+                             fb[t + 2]);
+            a3 = vfmaq_n_f32(a3, vld1q_f32(xp + 3 * ntok),
+                             fb[t + 3]);
+        }
+        for (; t < len; t++) {
+            const float *xp = x + (size_t)(lo + t) * (size_t)ntok
+                            + (size_t)jj;
+            a0 = vfmaq_n_f32(a0, vld1q_f32(xp), fb[t]);
+        }
+        {
+            float32x4_t a = vaddq_f32(vaddq_f32(a0, a1),
+                                      vaddq_f32(a2, a3));
+            acc[jj + 0] += (double)vgetq_lane_f32(a, 0) * scale;
+            acc[jj + 1] += (double)vgetq_lane_f32(a, 1) * scale;
+            acc[jj + 2] += (double)vgetq_lane_f32(a, 2) * scale;
+            acc[jj + 3] += (double)vgetq_lane_f32(a, 3) * scale;
+        }
+    }
+    // Хвост 1-3 токенов — по столбцам: fb и xtail contiguous, 4 FMA на 16.
+    for (jj = 0; jj < ntail; jj++)
+        acc[ntok - ntail + jj] += dot_f32_f32(fb, xtail + (size_t)jj
+                                               * (size_t)xtail_cols + lo,
+                                               len) * scale;
+}
+
+typedef struct {
+    float *y;
+    const uint32_t *words;
+    const float *scales;
+    const float *x;
+    int rows;
+    int cols;
+    int ntok;
+    int scale_block;
+    double *acc_all;     // vt * ntok
+    const float *xtail;  // [ntail][cols], хвост ntok % 4 токенов
+    int ntail;
+} trit_batch_neon_job;
+
+static void trit_batch_neon_rows(trit_batch_neon_job *j, int tid, int r0,
+                                 int r1) {
+    const int cols = j->cols;
+    const int ntok = j->ntok;
+    const int ntail = j->ntail;
+    const float *xtail = j->xtail;
+    const int64_t sb = (int64_t)j->scale_block;
+    const uint32_t *words = j->words;
+    const float *scales = j->scales;
+    const float *x = j->x;
+    double *acc = j->acc_all + (size_t)tid * (size_t)ntok;
+    int8_t buf[VTM_SCALE_BLOCK_160 + 64];
+    int8_t *tp = buf + 32;
+    float fb[VTM_SCALE_BLOCK_160];
+    int r, jj;
+
+    for (r = r0; r < r1; r++) {
+        const int64_t base = (int64_t)r * (int64_t)cols;
+        const int64_t end = base + (int64_t)cols;
+        int64_t s;
+
+        memset(acc, 0, (size_t)ntok * sizeof(double));
+        for (s = (base / sb) * sb; s < end; s += sb) {
+            int64_t e = s + sb;
+            int64_t st;
+            int64_t wi, wi_end;
+
+            if (e > end) e = end;
+            st = s < base ? base : s;
+            wi = st / VTM_TRITS_PER_WORD;
+            wi_end = (e - 1) / VTM_TRITS_PER_WORD;
+            for (; wi <= wi_end; wi++)
+                unpack20(load_u32_unaligned(words, wi),
+                         tp + (ptrdiff_t)(wi * VTM_TRITS_PER_WORD - st));
+            trit_batch_neon_block(tp, fb, (int)(e - st), st - base, x, ntok,
+                                  acc,
+                                  (double)load_f32_unaligned(scales, s / sb),
+                                  xtail, cols, ntail);
+        }
+        for (jj = 0; jj < ntok; jj++)
+            j->y[(size_t)r * (size_t)ntok + (size_t)jj] = (float)acc[jj];
+    }
+}
+
+static void trit_batch_neon_worker(void *p, int tid, int r0, int r1) {
+    trit_batch_neon_rows((trit_batch_neon_job *)p, tid, r0, r1);
+}
+
+// Общее ядро TMV и MM: у них одна и та же арифметика (триты [rows,cols]
+// против N столбцов активаций), различаются только имена аргументов.
+static int trit_batch_neon(float *y, const uint8_t *w, const float *scales,
+                           const float *x, int rows, int cols, int ntok,
+                           int scale_block) {
+    trit_batch_neon_job job;
+    int vt;
+
+    if (!y || !w || !scales || !x) return -1;
+    if (rows < 0 || cols < 0 || ntok < 0) return -1;
+    if (scale_block != (int)VTM_SCALE_BLOCK_128 &&
+        scale_block != (int)VTM_SCALE_BLOCK_160) return -1;
+    if (rows == 0 || cols == 0 || ntok == 0) return 0;
+    lut_init();   // до потоков: таблица пишется один раз, не в воркерах
+    vt = vtm_threads();
+    job.acc_all = (double *)calloc((size_t)vt * (size_t)ntok,
+                                   sizeof(double));
+    if (!job.acc_all) return -1;
+    job.y = y;
+    job.words = (const uint32_t *)w;
+    job.scales = scales;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    job.ntok = ntok;
+    job.scale_block = scale_block;
+    // Хвост 1-3 токенов (ntok % 4) kernel считает по столбцам: раскладываем
+    // его в contiguous [ntail][cols] один раз на вызов, а не на строку.
+    job.ntail = ntok % 4;
+    job.xtail = NULL;
+    if (job.ntail > 0) {
+        float *xt = (float *)malloc((size_t)job.ntail * (size_t)cols
+                                    * sizeof(float));
+        int j, t;
+        if (!xt) {
+            free(job.acc_all);
+            return -1;
+        }
+        for (j = 0; j < job.ntail; j++)
+            for (t = 0; t < cols; t++)
+                xt[(size_t)j * (size_t)cols + (size_t)t]
+                    = x[(size_t)t * (size_t)ntok
+                        + (size_t)(ntok - job.ntail + j)];
+        job.xtail = xt;
+    }
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok,
+                      trit_batch_neon_worker, &job);
+    free((void *)job.xtail);
+    free(job.acc_all);
+    return 0;
+}
+
 #endif // VTM_SIMD_NEON
 
 // --- выбор ядер и публичный контракт ---------------------------------------
@@ -766,6 +1206,12 @@ typedef struct {
     int (*mm_trit)(float *, const uint8_t *, const float *, const float *,
                    int, int, int, int);
     int (*mm_f32)(float *, const float *, const float *, int, int, int);
+    // Батчевые TMV/MM (задача 0122). NULL — публичные vtm_simd_*_batch
+    // уходят в скалярный откат (trit_batch_scalar / dense_batch).
+    int (*tmv_blocks_batch)(float *, const uint8_t *, const float *,
+                            const float *, int, int, int, int);
+    int (*mm_batch)(float *, const uint8_t *, const float *, const float *,
+                    int, int, int, int);
 } simd_kernels;
 
 static const simd_kernels g_simd = {
@@ -773,14 +1219,18 @@ static const simd_kernels g_simd = {
     tmv_neon_blocks,
     rmsnorm_neon,
     mm_trit_neon,
-    mm_f32_neon
+    mm_f32_neon,
+    trit_batch_neon,
+    trit_batch_neon
 #elif VTM_SIMD_X86
     vtm_avx2_tmv_blocks,
     vtm_avx2_rmsnorm,
     vtm_avx2_mm_trit,
-    vtm_avx2_mm_f32
+    vtm_avx2_mm_f32,
+    vtm_avx2_tmv_blocks_batch,
+    vtm_avx2_mm_batch
 #else
-    NULL, NULL, NULL, NULL
+    NULL, NULL, NULL, NULL, NULL, NULL
 #endif
 };
 
@@ -842,6 +1292,69 @@ int vtm_simd_mm_f32(float *y, const float *a, const float *b,
     if (vtm_simd_available() && g_simd.mm_f32)
         return g_simd.mm_f32(y, a, b, m, k, n);
     return mm_f32_scalar(y, a, b, m, k, n);
+}
+
+// --- батчевые TMV/MM: публичный контракт (задача 0122) ---------------------
+//
+// Общий вход в ядра. n_tokens == 1 — это обычный одноколоночный случай:
+// отдаём его прежнему ядру, чтобы батчевый путь не менял побитово результат
+// декола. Дальше — SIMD-ядро из g_simd, если оно собрано и доступно, иначе
+// скалярный откат. Валидация аргументов одна на все ветки.
+
+static int batch_args_ok(const void *y, const void *w, const void *scales,
+                         const void *x, int rows, int cols, int ntok,
+                         int scale_block) {
+    if (!y || !w || !scales || !x) return 0;
+    if (rows < 0 || cols < 0 || ntok < 0) return 0;
+    if (scale_block != (int)VTM_SCALE_BLOCK_128 &&
+        scale_block != (int)VTM_SCALE_BLOCK_160) return 0;
+    return 1;
+}
+
+int vtm_simd_tmv_blocks_batch(float *y, const uint8_t *w, const float *scales,
+                              const float *x, int rows, int cols,
+                              int n_tokens, int scale_block) {
+    if (!batch_args_ok(y, w, scales, x, rows, cols, n_tokens, scale_block))
+        return -1;
+    if (rows == 0 || cols == 0 || n_tokens == 0) return 0;
+    if (n_tokens == 1)
+        return simd_tmv_blocks(y, w, scales, x, rows, cols, scale_block);
+    if (vtm_simd_available() && g_simd.tmv_blocks_batch)
+        return g_simd.tmv_blocks_batch(y, w, scales, x, rows, cols, n_tokens,
+                                       scale_block);
+    return trit_batch_scalar(y, w, scales, x, rows, cols, n_tokens,
+                             scale_block);
+}
+
+int vtm_simd_mm_batch(float *y, const uint8_t *w, const float *scales,
+                      const float *b, int m, int k, int n_tokens,
+                      int scale_block) {
+    // Арифметика тритовой MM и TMV одна и та же (W[m,k] против N столбцов),
+    // поэтому и ядро одно; имена аргументов разные ради читаемости вызова.
+    if (!batch_args_ok(y, w, scales, b, m, k, n_tokens, scale_block))
+        return -1;
+    if (m == 0 || k == 0 || n_tokens == 0) return 0;
+    if (n_tokens == 1)
+        return vtm_simd_mm_trit(y, w, scales, b, m, k, 1, scale_block);
+    if (vtm_simd_available() && g_simd.mm_batch)
+        return g_simd.mm_batch(y, w, scales, b, m, k, n_tokens, scale_block);
+    return trit_batch_scalar(y, w, scales, b, m, k, n_tokens, scale_block);
+}
+
+int vtm_simd_tmv_f32_batch(float *y, const float *w, const float *x,
+                           int rows, int cols, int n_tokens, int transposed) {
+    if (!y || !w || !x) return -1;
+    if (rows < 0 || cols < 0 || n_tokens < 0) return -1;
+    if (rows == 0 || cols == 0 || n_tokens == 0) return 0;
+    return dense_batch(y, w, x, rows, cols, n_tokens, transposed != 0);
+}
+
+int vtm_simd_mm_f32_batch(float *y, const float *a, const float *b,
+                          int m, int k, int n_tokens) {
+    if (!y || !a || !b) return -1;
+    if (m < 0 || k < 0 || n_tokens < 0) return -1;
+    if (m == 0 || k == 0 || n_tokens == 0) return 0;
+    return dense_batch(y, a, b, m, k, n_tokens, 0);
 }
 
 #if VTM_SIMD_NEON

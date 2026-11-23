@@ -1784,6 +1784,21 @@ void vtm_cache_stats(const vtm_t *m, uint64_t *hits, uint64_t *misses) {
     if (misses) *misses = m ? m->cache_misses : 0;
 }
 
+// Кэш префикса (0081) требует, чтобы снимок состояния совпадал с прогоном
+// по токену побитово. Скалярные батчевые ядра этому соответствуют, а
+// SIMD-ядра 0122 — нет (у них другой порядок f32-сложения, расхождение
+// ≤1e-5), поэтому на SIMD кэш идёт прежним путём по токену. Это и обещает
+// контракт vtm_run_batch в vtm.h («на SIMD — прежний путь по токену»).
+static vtm_status batch_sequential(vtm_t *m, const int32_t *ids, int n,
+                                   int pos0);
+static int batch_use_simd(const vtm_t *m);
+
+static vtm_status cache_run_tokens(vtm_t *m, const int32_t *ids, int n,
+                                   int pos0) {
+    if (batch_use_simd(m)) return batch_sequential(m, ids, n, pos0);
+    return vtm_run_batch(m, ids, n);
+}
+
 vtm_status vtm_cache_prefix(vtm_t *m, const int32_t *ids, int n) {
     vtm_status st;
 
@@ -1796,10 +1811,8 @@ vtm_status vtm_cache_prefix(vtm_t *m, const int32_t *ids, int n) {
     vtm_reset(m);
     m->cache_valid = 0;
     // Прогон префикса пачкой (0112): на скалярном бэкенде это в разы
-    // быстрее, на SIMD vtm_run_batch сам идёт по токену. Состояние после
-    // вызова то же, что у цикла по токену (контракт vtm_run_batch), поэтому
-    // снимок кэша и тесты побитовости не меняются.
-    st = vtm_run_batch(m, ids, n);
+    // быстрее, на SIMD — прежний путь по токену (см. cache_run_tokens).
+    st = cache_run_tokens(m, ids, n, 0);
     if (st != VTM_OK) return st;
     cache_store(m, ids, n);
     return VTM_OK;
@@ -1828,11 +1841,10 @@ vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
         m->cache_misses++;
     }
     // Хвост после префикса (или весь прогон при промахе) — одной пачкой
-    // (0112); на SIMD vtm_run_batch внутри идёт по токену, так что прежняя
-    // побитовость сохраняется.
+    // (0112); на SIMD — по токену, чтобы снимок кэша остался побитовым.
     if (start < n) {
         vtm_set_position(m, start);
-        st = vtm_run_batch(m, ids + start, n - start);
+        st = cache_run_tokens(m, ids + start, n - start, start);
         if (st != VTM_OK) return st;
     }
     // При попадании кэш остаётся префиксом: запросы с тем же префиксом и
@@ -1865,17 +1877,19 @@ vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
 // токены считаются по одному — результат тот же.
 //
 // Что ускоряется. Только TMV и MM — они и есть 98% времени на форме 1.5B.
-// Их батчевые ядра повторяют арифметику скалярного бэкенда (double,
-// накопитель block_acc на блок масштаба), поэтому равенство с n прогонами
-// vtm_run побитовое. Остальные операции (EMB/ROPE/KVW/ATTN/RMSN/SAMP/...)
-// дешёвые и считаются по токену прежними функциями: это сохраняет их
-// семантику (позиция, окно, эмбеддинг) без дублирования кода.
+// На скалярном бэкенде их батчевые ядра повторяют арифметику скалярных
+// (double, накопитель block_acc на блок масштаба), поэтому равенство с n
+// прогонами vtm_run побитовое. На SIMD ту же работу делают батчевые ядра
+// 0122 (vtm_simd_tmv_blocks_batch/vtm_simd_mm_batch, backend_neon.c/
+// backend_avx2.c): вес читается и распаковывается один раз на пачку,
+// расхождение с батчевым скаляром ≤1e-5 (проверяет bench_backend --check).
+// Остальные операции (EMB/ROPE/KVW/ATTN/RMSN/SAMP/...) дешёвые и считаются
+// по токену прежними функциями: это сохраняет их семантику (позиция, окно,
+// эмбеддинг) без дублирования кода.
 //
-// SIMD-бэкенд. Батчевых SIMD-ядер в interp.c нет (они вынесены в задачу
-// 0122 — батчевые NEON/AVX2 TMV/MM), поэтому на нескалярном бэкенде
-// vtm_run_batch идёт прежним путём по токену: побитово то же состояние, без
-// выигрыша. Так же поступает трассировка: записи vtm_set_trace остаются
-// «инструкция на токен».
+// Если батчевых ядер 0122 в сборке нет (или бэкенд кастомный), SIMD идёт
+// прежним путём по токену: побитово то же состояние, без выигрыша. Так же
+// поступает трассировка: записи vtm_set_trace остаются «инструкция на токен».
 
 #define VTM_BATCH_TOKENS        16
 #define VTM_BATCH_SCRATCH_BYTES ((size_t)96u << 20)
@@ -2037,14 +2051,31 @@ static void batch_store_last(vtm_t *m, const batch_scratch *b) {
     (void)m;
 }
 
-// Батчевые ядра дают то же, что скалярные ядра бэкенда, поэтому включаются
-// только на скалярном бэкенде; на SIMD/кастомном vtm_run_batch идёт по токену.
-static int batch_scalar_backend(const vtm_t *m) {
+// Батчевый путь включается для скалярных бэкендов (батчевые ядра interp.c
+// повторяют их арифметику побитово) и для SIMD, если собраны батчевые ядра
+// 0122 (vtm_simd_tmv_blocks_batch/vtm_simd_mm_batch): там арифметика та же
+// по смыслу, расхождение с батчевым скаляром ≤1e-5. Кастомный бэкенд, для
+// которого неизвестно, чему равны его ядра, идёт прежним путём по токену —
+// это консервативно и ничего не ломает.
+static int batch_backend_enabled(const vtm_t *m) {
     const vtm_backend *be = m->backend;
     if (!be) return 1;
     if (be == &vtm_backend_scalar_lut || be == &vtm_backend_scalar_direct)
         return 1;
-    return be->name && strncmp(be->name, "scalar", 6) == 0;
+    if (be->name && strncmp(be->name, "scalar", 6) == 0) return 1;
+    if (be->name && strncmp(be->name, "simd", 4) == 0)
+        return vtm_simd_available();
+    return 0;
+}
+
+// 1 — TMV/MM в пачке считает SIMD-ядро 0122, 0 — батчевые ядра interp.c
+// (скалярный бэкенд) или путь по токену. Решение принимается на каждую
+// инструкцию: если ядро вернёт -1 (неверные аргументы), batch_tmv_kernel/
+// batch_mm_kernel тихо уходят в батчевые скалярные строки ниже.
+static int batch_use_simd(const vtm_t *m) {
+    const vtm_backend *be = m->backend;
+    return be && be->name && strncmp(be->name, "simd", 4) == 0
+        && vtm_simd_available();
 }
 
 // Наименьшее окно KV-кэша (INT_MAX — 2-D кэшей нет). Пачка не должна
@@ -2235,8 +2266,18 @@ static void batch_mm_worker(void *p, int tid, int r0, int r1) {
 }
 
 static void batch_tmv_kernel(const vtm_tensor *w, const float *xt, int C,
-                             int rows, int cols, int transposed, float *yt) {
+                             int rows, int cols, int transposed, float *yt,
+                             int use_simd) {
     batch_mm_job job;
+
+    // Тритовые веса на SIMD — ядро 0122: вес читается и распаковывается
+    // один раз на пачку. Плотные (fp32) остаются на скалярных батчевых
+    // строках ниже: в Qwen-форме их нет, а порядок сложений там уже double.
+    if (use_simd && w->kind == VTM_TENSOR_TRIT
+        && vtm_simd_tmv_blocks_batch(yt, (const uint8_t *)w->words,
+                                     w->scales, xt, rows, cols, C,
+                                     (int)w->scale_block) == 0)
+        return;
     job.w = w;
     job.xt = xt;
     job.C = C;
@@ -2249,8 +2290,13 @@ static void batch_tmv_kernel(const vtm_tensor *w, const float *xt, int C,
 }
 
 static void batch_mm_kernel(const vtm_tensor *a, const float *bt, int C,
-                            int mm, int kk, float *yt) {
+                            int mm, int kk, float *yt, int use_simd) {
     batch_mm_job job;
+
+    if (use_simd && a->kind == VTM_TENSOR_TRIT
+        && vtm_simd_mm_batch(yt, (const uint8_t *)a->words, a->scales, bt,
+                             mm, kk, C, (int)a->scale_block) == 0)
+        return;
     job.w = a;
     job.xt = bt;
     job.C = C;
@@ -2288,7 +2334,7 @@ static int batch_tmv_ready(vtm_t *m, const vtm_instr *in,
     const vtm_tensor *w, *x, *y;
     int tr = 0;
 
-    if (!batch_scalar_backend(m)) return 0;
+    if (!batch_backend_enabled(m)) return 0;
     if (in->a == VTM_NO_TENSOR || in->b == VTM_NO_TENSOR
         || in->dst == VTM_NO_TENSOR)
         return 0;
@@ -2343,7 +2389,8 @@ static vtm_status batch_tmv_apply(vtm_t *m, uint32_t pc,
         const float *xs = batch_src(m, b, in->b, j);
         for (t = 0; t < cols; t++) b->xt[(size_t)t * b->C + j] = xs[t];
     }
-    batch_tmv_kernel(w, b->xt, b->C, rows, cols, tr, b->yt);
+    batch_tmv_kernel(w, b->xt, b->C, rows, cols, tr, b->yt,
+                     batch_use_simd(m));
 
     for (j = 0; j < b->C; j++) {
         float *ys = b->mem + (size_t)j * b->slot + b->off[in->dst];
@@ -2359,7 +2406,7 @@ static int batch_mm_ready(vtm_t *m, const vtm_instr *in,
                           const batch_scratch *b, int *mm, int *kk) {
     const vtm_tensor *a, *bv, *y;
 
-    if (!batch_scalar_backend(m)) return 0;
+    if (!batch_backend_enabled(m)) return 0;
     if (in->a == VTM_NO_TENSOR || in->b == VTM_NO_TENSOR
         || in->dst == VTM_NO_TENSOR)
         return 0;
@@ -2414,7 +2461,8 @@ static vtm_status batch_mm_apply(vtm_t *m, uint32_t pc,
         const float *bs = batch_src(m, b, in->b, j);
         for (t = 0; t < kk; t++) b->xt[(size_t)t * b->C + j] = bs[t];
     }
-    batch_mm_kernel(a, b->xt, b->C, mm, kk, b->yt);
+    batch_mm_kernel(a, b->xt, b->C, mm, kk, b->yt,
+                    batch_use_simd(m));
 
     for (j = 0; j < b->C; j++) {
         float *ys = b->mem + (size_t)j * b->slot + b->off[in->dst];
@@ -2554,9 +2602,9 @@ vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
     start = (int64_t)m->position;
     if (start + (int64_t)n - 1 > (int64_t)INT_MAX) return VTM_E_BOUNDS;
 
-    // Трассировка (0082) и нескалярный бэкенд идут прежним путём по токену:
-    // записи трассы остаются прежними, а SIMD-ядер для пачки пока нет.
-    if (m->trace_cb || !batch_scalar_backend(m))
+    // Трассировка (0082) и бэкенды без батчевых ядер идут прежним путём по
+    // токену: записи трассы остаются прежними.
+    if (m->trace_cb || !batch_backend_enabled(m))
         return batch_sequential(m, ids, n, (int)start);
     if (!batch_classify(m, &b)) {
         batch_free(&b);

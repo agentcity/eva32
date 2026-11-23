@@ -807,7 +807,7 @@
   {
     "id": "0122",
     "title": "Батчевые SIMD-ядра TMV/MM — цель ≤2x, не 10x",
-    "status": "in_progress",
+    "status": "done",
     "file": "0122-batched-simd.md",
     "assignee": "agent:simd-batch"
   },

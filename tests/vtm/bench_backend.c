@@ -10,7 +10,10 @@
 //   VTM_BACKEND=simd ./bench_backend --logits ../../demo/model.vtm
 //                                   — прогон настоящей модели: логиты
 //                                     скалярного и выбранного бэкенда, их
-//                                     max|diff| и argmax-токен.
+//                                     max|diff| и argmax-токен;
+//   ./bench_backend --batch         — батчевые TMV/MM (0122) на формах
+//                                     1.5B: «по токену» против пачки и
+//                                     оценка prefill 32/128.
 //
 // Бэкенд «кандидат» берётся из --backend или VTM_BACKEND (vtm_backend_from_env),
 // по умолчанию — simd, если он доступен.
@@ -167,6 +170,99 @@ static void mm_f32_ref(float *y, const float *a, const float *b,
         }
 }
 
+// --- батчевые эталоны TMV/MM (задача 0122) ---------------------------------
+//
+// Повторяют батчевые ядра interp.c (batch_tmv_trit_rows/batch_mm_trit_rows),
+// но независимо от них: сравнение «SIMD-батч == скалярный батч» не должно
+// быть сравнением кода с самим собой. Раскладка та же: x[t*N + j], y[r*N + j].
+
+// Распаковать строку тритов base..base+cols-1 в row[0..cols).
+static void unpack_row(const uint32_t *words, int64_t base, int cols,
+                       int8_t *row) {
+    int64_t wi = base / VTM_TRITS_PER_WORD;
+    int64_t wi_end = (base + (int64_t)cols - 1) / VTM_TRITS_PER_WORD;
+    for (; wi <= wi_end; wi++) {
+        int8_t trits[VTM_TRITS_PER_WORD];
+        int k;
+        vtm_trit_unpack20(words[wi], trits);
+        for (k = 0; k < VTM_TRITS_PER_WORD; k++) {
+            int64_t idx = wi * VTM_TRITS_PER_WORD + k - base;
+            if (idx >= 0 && idx < (int64_t)cols) row[idx] = trits[k];
+        }
+    }
+}
+
+// TMV-эталон: масштаб применяется к сумме блока (double), как в scalar TMV.
+static void batch_tmv_ref(float *y, const uint32_t *words, const float *scales,
+                          const float *x, int rows, int cols, int ntok,
+                          int scale_block) {
+    int8_t *row = (int8_t *)malloc((size_t)(cols > 0 ? cols : 1));
+    int r, j;
+    for (r = 0; r < rows; r++) {
+        int64_t base = (int64_t)r * (int64_t)cols;
+        int t = 0;
+        unpack_row(words, base, cols, row);
+        for (j = 0; j < ntok; j++) {
+            double acc = 0.0;
+            t = 0;
+            while (t < cols) {
+                int64_t blk = (base + t) / (int64_t)scale_block;
+                int64_t e = (blk + 1) * (int64_t)scale_block - base;
+                double block_acc = 0.0;
+                if (e > (int64_t)cols) e = (int64_t)cols;
+                for (; t < (int)e; t++)
+                    block_acc += (double)row[t]
+                               * (double)x[(size_t)t * (size_t)ntok
+                                           + (size_t)j];
+                acc += block_acc * (double)scales[(size_t)blk];
+            }
+            y[(size_t)r * (size_t)ntok + (size_t)j] = (float)acc;
+        }
+    }
+    free(row);
+}
+
+// MM-эталон: масштаб у каждого элемента (trit_weight_at), double по t — как в
+// batch_mm_trit_rows.
+static void batch_mm_ref(float *y, const uint32_t *words, const float *scales,
+                         const float *x, int mm, int kk, int ntok,
+                         int scale_block) {
+    int8_t *row = (int8_t *)malloc((size_t)(kk > 0 ? kk : 1));
+    int r, j, t;
+    for (r = 0; r < mm; r++) {
+        int64_t base = (int64_t)r * (int64_t)kk;
+        unpack_row(words, base, kk, row);
+        for (j = 0; j < ntok; j++) {
+            double acc = 0.0;
+            for (t = 0; t < kk; t++) {
+                float wv = (float)row[t]
+                         * scales[(size_t)((base + t)
+                                           / (int64_t)scale_block)];
+                acc += (double)wv
+                     * (double)x[(size_t)t * (size_t)ntok + (size_t)j];
+            }
+            y[(size_t)r * (size_t)ntok + (size_t)j] = (float)acc;
+        }
+    }
+    free(row);
+}
+
+static void batch_f32_ref(float *y, const float *w, const float *x, int rows,
+                          int cols, int ntok, int transposed) {
+    int r, t, j;
+    for (r = 0; r < rows; r++)
+        for (j = 0; j < ntok; j++) {
+            double acc = 0.0;
+            for (t = 0; t < cols; t++) {
+                double wv = transposed
+                          ? (double)w[(size_t)t * (size_t)rows + (size_t)r]
+                          : (double)w[(size_t)r * (size_t)cols + (size_t)t];
+                acc += wv * (double)x[(size_t)t * (size_t)ntok + (size_t)j];
+            }
+            y[(size_t)r * (size_t)ntok + (size_t)j] = (float)acc;
+        }
+}
+
 // --- проверки --------------------------------------------------------------
 
 static int failures;
@@ -312,6 +408,116 @@ done:
     free(y_cand);
 }
 
+static void check_batch_case(int rows, int cols, int ntok, int scale_block,
+                             float scale) {
+    int n_trits = rows * cols;
+    uint32_t seed = 0x2b47u + (uint32_t)rows * 131u + (uint32_t)cols
+                  + (uint32_t)ntok * 7u;
+    uint32_t *words = make_words(n_trits, seed);
+    float *scales = make_scales(n_trits, scale_block, scale, seed ^ 0x5a5au);
+    float *x = make_vec((size_t)cols * (size_t)ntok, seed ^ 0x51u);
+    float *y_ref = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    float *y_cand = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    char label[128];
+    double ref = 0.0;
+
+    if (!words || !scales || !x || !y_ref || !y_cand) {
+        fprintf(stderr, "check_batch_case: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    batch_tmv_ref(y_ref, words, scales, x, rows, cols, ntok, scale_block);
+    if (vtm_simd_tmv_blocks_batch(y_cand, (const uint8_t *)words, scales, x,
+                                  rows, cols, ntok, scale_block) != 0) {
+        fprintf(stderr, "check_batch_case: TMV-батч вернул ошибку\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "TMV batch %dx%dxN%d блок %d scale %.2f",
+             rows, cols, ntok, scale_block, (double)scale);
+    report(label, max_diff(y_cand, y_ref, (size_t)rows * (size_t)ntok, &ref),
+           ref, CHECK_TOL);
+
+    batch_mm_ref(y_ref, words, scales, x, rows, cols, ntok, scale_block);
+    if (vtm_simd_mm_batch(y_cand, (const uint8_t *)words, scales, x, rows,
+                          cols, ntok, scale_block) != 0) {
+        fprintf(stderr, "check_batch_case: MM-батч вернул ошибку\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "MM batch %dx%dxN%d блок %d scale %.2f",
+             rows, cols, ntok, scale_block, (double)scale);
+    report(label, max_diff(y_cand, y_ref, (size_t)rows * (size_t)ntok, &ref),
+           ref, CHECK_TOL);
+done:
+    free(words);
+    free(scales);
+    free(x);
+    free(y_ref);
+    free(y_cand);
+}
+
+static void check_batch_f32_case(int rows, int cols, int ntok) {
+    uint32_t seed = 0x7f00u + (uint32_t)rows * 31u + (uint32_t)cols
+                  + (uint32_t)ntok;
+    float *w = make_vec((size_t)rows * (size_t)cols, seed);
+    float *wt = make_vec((size_t)rows * (size_t)cols, seed ^ 0x1f1fu);
+    float *x = make_vec((size_t)cols * (size_t)ntok, seed ^ 0x51u);
+    float *y_ref = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    float *y_cand = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    char label[128];
+    double ref = 0.0;
+    int r, t;
+
+    if (!w || !wt || !x || !y_ref || !y_cand) {
+        fprintf(stderr, "check_batch_f32_case: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    for (r = 0; r < rows; r++)
+        for (t = 0; t < cols; t++)
+            wt[(size_t)t * (size_t)rows + (size_t)r]
+                = w[(size_t)r * (size_t)cols + (size_t)t];
+
+    batch_f32_ref(y_ref, w, x, rows, cols, ntok, 0);
+    if (vtm_simd_tmv_f32_batch(y_cand, w, x, rows, cols, ntok, 0) != 0) {
+        fprintf(stderr, "check_batch_f32_case: ядро вернуло ошибку\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "TMV f32 batch %dx%dxN%d", rows, cols, ntok);
+    report(label, max_diff(y_cand, y_ref, (size_t)rows * (size_t)ntok, &ref),
+           ref, CHECK_TOL);
+
+    batch_f32_ref(y_ref, wt, x, rows, cols, ntok, 1);
+    if (vtm_simd_tmv_f32_batch(y_cand, wt, x, rows, cols, ntok, 1) != 0) {
+        fprintf(stderr, "check_batch_f32_case: transposed вернул ошибку\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "TMV f32 batch T %dx%dxN%d", rows, cols,
+             ntok);
+    report(label, max_diff(y_cand, y_ref, (size_t)rows * (size_t)ntok, &ref),
+           ref, CHECK_TOL);
+
+    // MM f32 батч — тот же dense-путь (a [m,k] * b [k,N]).
+    batch_f32_ref(y_ref, w, x, rows, cols, ntok, 0);
+    if (vtm_simd_mm_f32_batch(y_cand, w, x, rows, cols, ntok) != 0) {
+        fprintf(stderr, "check_batch_f32_case: MM вернул ошибку\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "MM f32 batch %dx%dxN%d", rows, cols, ntok);
+    report(label, max_diff(y_cand, y_ref, (size_t)rows * (size_t)ntok, &ref),
+           ref, CHECK_TOL);
+done:
+    free(w);
+    free(wt);
+    free(x);
+    free(y_ref);
+    free(y_cand);
+}
+
 static int run_checks(const vtm_backend *cand) {
     static const int shapes[][2] = {
         {1, 1}, {1, 20}, {7, 37}, {5, 53}, {17, 128}, {33, 41}, {64, 160},
@@ -343,6 +549,28 @@ static int run_checks(const vtm_backend *cand) {
     check_rmsnorm_case(7, cand);
     check_rmsnorm_case(129, cand);
     check_rmsnorm_case(1000, cand);
+
+    // Батчевые ядра 0122: N токенов против одной матрицы. Малые формы
+    // проверяют все ветки (1/4/8/16 токенов, хвосты блоков), большие —
+    // реальные формы 1.5B (hidden 1536, intermediate 8960).
+    {
+        static const int bshapes[][3] = {
+            {1, 1, 1}, {7, 37, 5}, {17, 128, 1}, {17, 128, 16},
+            {128, 128, 32}, {128, 128, 128}, {64, 160, 3},
+            {1536, 1536, 16}, {8960, 1536, 8}, {1536, 8960, 8}
+        };
+        size_t bi;
+        for (bi = 0; bi < sizeof(bshapes) / sizeof(bshapes[0]); bi++) {
+            int bn = bshapes[bi][0] * bshapes[bi][1];
+            float bs = bn > 65536 ? 0.02f : 1.0f;
+            check_batch_case(bshapes[bi][0], bshapes[bi][1], bshapes[bi][2],
+                             128, bs);
+            check_batch_case(bshapes[bi][0], bshapes[bi][1], bshapes[bi][2],
+                             160, bs);
+        }
+        check_batch_f32_case(7, 13, 5);
+        check_batch_f32_case(64, 37, 16);
+    }
 
     if (failures) {
         printf("simd == scalar: FAIL (%d случаев > %.0e)\n", failures,
@@ -818,6 +1046,162 @@ static int run_threads(int iters) {
     return 0;
 }
 
+// --- батчевый prefill 1.5B-формы: по токену против пачки (задача 0122) -----
+//
+// «До» — то, как SIMD-бэкенд считал prefill до 0122: N отдельных вызовов
+// одноколоночного tmv_blocks. «После» — vtm_simd_tmv_blocks_batch на те же N
+// токенов (вес читается и распаковывается один раз). Формы — реальный граф
+// Qwen2.5-1.5B: hidden 1536, intermediate 8960, vocab 151936, 28 слоёв;
+// на слой 4 матрицы hidden² и 3 hidden×intermediate, плюс lm_head.
+//
+// TMV/MM — 98% времени графа 1.5B (docs/vtm-perf.md), поэтому сумма по этим
+// формам и есть оценка prefill. Живой замер CLI (`vtm run --prefill-batch`)
+// идёт через interp.c поверх этих же ядер — см. отчёт задачи.
+
+#define PREFILL_HIDDEN 1536
+#define PREFILL_INTER  8960
+#define PREFILL_VOCAB  151936
+#define PREFILL_LAYERS 28
+
+typedef struct {
+    int rows;
+    int cols;
+    int count;        // сколько таких матриц в графе (на 1.5B-форму)
+    const char *name;
+} pref_shape;
+
+// Время одной формы: N одноколоночных вызовов против одного батчевого.
+static int bench_batch_one(const pref_shape *s, int ntok, int iters,
+                           double *ms_single, double *ms_batch) {
+    int n_trits = s->rows * s->cols;
+    uint32_t seed = 0x51deu + (uint32_t)s->rows * 13u + (uint32_t)s->cols;
+    uint32_t *words = make_words(n_trits, seed);
+    float *scales = make_scales(n_trits, 160, 0.02f, seed ^ 0x77u);
+    float *xrow = make_vec((size_t)ntok * (size_t)s->cols, seed ^ 0x11u);
+    float *xcol = (float *)malloc((size_t)ntok * (size_t)s->cols
+                                  * sizeof(float));
+    float *y1 = (float *)calloc((size_t)s->rows, sizeof(float));
+    float *yb = (float *)calloc((size_t)s->rows * (size_t)ntok,
+                                sizeof(float));
+    double t0, t1;
+    int it, j, t;
+    int rc = -1;
+
+    if (!words || !scales || !xrow || !xcol || !y1 || !yb) {
+        fprintf(stderr, "bench_batch_one: нет памяти\n");
+        goto done;
+    }
+    for (j = 0; j < ntok; j++)
+        for (t = 0; t < s->cols; t++)
+            xcol[(size_t)t * (size_t)ntok + (size_t)j]
+                = xrow[(size_t)j * (size_t)s->cols + (size_t)t];
+
+    // Прогрев: страницы, LUT, пул потоков.
+    if (vtm_backend_simd.tmv_blocks(y1, (const uint8_t *)words, scales, xrow,
+                                    s->rows, s->cols,
+                                    (int)VTM_SCALE_BLOCK_160) != 0
+        || vtm_simd_tmv_blocks_batch(yb, (const uint8_t *)words, scales, xcol,
+                                     s->rows, s->cols, ntok,
+                                     (int)VTM_SCALE_BLOCK_160) != 0) {
+        fprintf(stderr, "bench_batch_one: ядро вернуло ошибку\n");
+        goto done;
+    }
+    t0 = now_ms();
+    for (it = 0; it < iters; it++)
+        for (j = 0; j < ntok; j++)
+            vtm_backend_simd.tmv_blocks(
+                y1, (const uint8_t *)words, scales,
+                xrow + (size_t)j * (size_t)s->cols, s->rows, s->cols,
+                (int)VTM_SCALE_BLOCK_160);
+    t1 = now_ms();
+    *ms_single = (t1 - t0) / (double)iters;
+    t0 = now_ms();
+    for (it = 0; it < iters; it++)
+        vtm_simd_tmv_blocks_batch(yb, (const uint8_t *)words, scales, xcol,
+                                  s->rows, s->cols, ntok,
+                                  (int)VTM_SCALE_BLOCK_160);
+    t1 = now_ms();
+    *ms_batch = (t1 - t0) / (double)iters;
+    rc = 0;
+done:
+    free(words);
+    free(scales);
+    free(xrow);
+    free(xcol);
+    free(y1);
+    free(yb);
+    return rc;
+}
+
+static int run_batch_bench(int ntok, int iters) {
+    // count — сколько таких матриц во всей 1.5B-форме: на слой 4+2+1, слоёв 28.
+    static const pref_shape shapes[] = {
+        {PREFILL_HIDDEN, PREFILL_HIDDEN, 4 * PREFILL_LAYERS, "q/k/v/o"},
+        {PREFILL_INTER, PREFILL_HIDDEN, 2 * PREFILL_LAYERS, "gate/up"},
+        {PREFILL_HIDDEN, PREFILL_INTER, 1 * PREFILL_LAYERS, "down"},
+        {PREFILL_VOCAB, PREFILL_HIDDEN, 1, "lm_head"}
+    };
+    const size_t n_shapes = sizeof(shapes) / sizeof(shapes[0]);
+    double single_total = 0.0, batch_total = 0.0, mac_total = 0.0;
+    size_t i;
+
+    if (ntok < 1) ntok = 1;
+    vtm_threads_set(4);   // цель 0122 — 4 потока; вернём ниже env-дефолт
+    printf("Батчевый prefill 1.5B-формы: N=%d токенов на пачку, 4 потока, "
+           "блок 160\n", ntok);
+    printf("«до» — N вызовов одноколоночного SIMD-ядра (путь до 0122), "
+           "«после» — батчевое ядро\n");
+    printf("  %-10s %14s %12s %12s %12s   %s\n", "матрица", "MAC/пачку",
+           "до, мс", "после, мс", "x", "GFLOP/s после");
+    for (i = 0; i < n_shapes; i++) {
+        double ms_single = 0.0, ms_batch = 0.0;
+        double mac = 2.0 * (double)shapes[i].rows * (double)shapes[i].cols
+                   * (double)ntok * (double)shapes[i].count;
+        int its = iters;
+        if ((double)shapes[i].rows * (double)shapes[i].cols > 4.0e6)
+            its = 1;
+        if (bench_batch_one(&shapes[i], ntok, its, &ms_single, &ms_batch)
+            != 0) {
+            vtm_threads_set(0);
+            return 1;
+        }
+        single_total += (double)shapes[i].count * ms_single;
+        batch_total += (double)shapes[i].count * ms_batch;
+        mac_total += mac;
+        printf("  %-10s %14.1f %12.2f %12.2f %11.2fx   %8.1f\n",
+               shapes[i].name,
+               (double)shapes[i].rows * (double)shapes[i].cols * (double)ntok,
+               ms_single, ms_batch, ms_single / ms_batch,
+               mac / (ms_batch * (double)shapes[i].count * 1e6));
+    }
+    printf("\nИтого %d токенов (28 слоёв + lm_head, TMV/MM — 98%% графа):\n",
+           ntok);
+    printf("  до    %9.1f мс   (%.1f GFLOP/s)\n", single_total,
+           mac_total / (single_total * 1e6));
+    printf("  после %9.1f мс   (%.1f GFLOP/s)   ускорение %.2fx\n",
+           batch_total, mac_total / (batch_total * 1e6),
+           single_total / batch_total);
+
+    // Проекция prefill 32/128 токенов: пачки по ntok, «до» — по токену.
+    {
+        static const int ns[] = {32, 128};
+        size_t k;
+        printf("\nПроекция prefill (пачки по %d, последняя может быть "
+               "неполной):\n", ntok);
+        for (k = 0; k < sizeof ns / sizeof ns[0]; k++) {
+            double n_chunks = (double)((ns[k] + ntok - 1) / ntok);
+            double before = single_total * (double)ns[k] / (double)ntok;
+            double after = batch_total * n_chunks;
+            printf("  N=%3d: до %8.1f мс, после %8.1f мс, %.2fx\n", ns[k],
+                   before, after, before / after);
+        }
+    }
+    printf("\nФизический потолок: вес читается N раз -> 1 раз, но арифметика "
+           "та же;\nожидаемо ~2x, не 10x (docs/vtm-perf.md).\n");
+    vtm_threads_set(0);
+    return 0;
+}
+
 // --- логиты модели ---------------------------------------------------------
 
 static int emit_first(void *user, int token, int position) {
@@ -937,6 +1321,7 @@ static void usage(const char *prog) {
     printf("usage: %s [--rows N] [--cols N] [--iters N] [--scale-block 128|160]\n"
            "          [--backend auto|scalar|simd|direct] [--check] "
            "[--threads] [--pool] [--logits PATH] [--no-mm]\n"
+           "          [--batch] [--batch-tokens N]\n"
            "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
            "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8)\n",
            prog);
@@ -944,7 +1329,8 @@ static void usage(const char *prog) {
 
 int main(int argc, char **argv) {
     int rows = 1024, cols = 1024, iters = 50, scale_block = 160;
-    int check = 0, no_mm = 0, threads = 0, pool = 0;
+    int check = 0, no_mm = 0, threads = 0, pool = 0, batch = 0;
+    int batch_tokens = 16;
     const char *logits_path = NULL;
     const char *backend_name = NULL;
     const vtm_backend *cand;
@@ -969,6 +1355,10 @@ int main(int argc, char **argv) {
             pool = 1;
         } else if (strcmp(argv[i], "--no-mm") == 0) {
             no_mm = 1;
+        } else if (strcmp(argv[i], "--batch") == 0) {
+            batch = 1;
+        } else if (strcmp(argv[i], "--batch-tokens") == 0 && i + 1 < argc) {
+            batch_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--logits") == 0) {
             logits_path = (i + 1 < argc) ? argv[++i] : "";
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -1002,6 +1392,13 @@ int main(int argc, char **argv) {
 
     if (pool)
         return run_pool(iters);
+    if (batch) {
+        if (batch_tokens < 1 || batch_tokens > 128) {
+            fprintf(stderr, "--batch-tokens должен быть 1..128\n");
+            return 2;
+        }
+        return run_batch_bench(batch_tokens, iters);
+    }
     if (threads)
         return run_threads(iters);
     if (logits_path)

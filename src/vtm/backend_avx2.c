@@ -603,6 +603,274 @@ VTM_AVX2 int vtm_avx2_mm_f32(float *y, const float *a, const float *b,
     return 0;
 }
 
+// --- батчевые TMV/MM (задача 0122) -----------------------------------------
+//
+// y[r*N + j] = sum_t trit(W)[r,t] * x[t*N + j]. Как в NEON-версии
+// (backend_neon.c): по вектору идут N токенов, трит W[r,t] — скаляр, поэтому
+// слово pack20 распаковывается и переводится в f32 один раз на строку и
+// блок, а веса читаются один раз на N токенов.
+//
+// Арифметика блока та же, что у батчевого скалярного пути: f32-аккумуляторы
+// (8 лент на 8 токенов), затем сумма блока в double, умножение на масштаб
+// блока и сложение блоков в double.
+
+VTM_AVX2 static inline void trits_to_f32_avx2(const int8_t *t, float *out,
+                                              int len) {
+    int i = 0;
+    for (; i + 16 <= len; i += 16) {
+        __m128i b = _mm_loadu_si128((const __m128i *)(const void *)(t + i));
+        __m256i lo = _mm256_cvtepi8_epi32(b);
+        __m256i hi = _mm256_cvtepi8_epi32(_mm_srli_si128(b, 8));
+        _mm256_storeu_ps(out + i, _mm256_cvtepi32_ps(lo));
+        _mm256_storeu_ps(out + i + 8, _mm256_cvtepi32_ps(hi));
+    }
+    for (; i < len; i++) out[i] = (float)t[i];
+}
+
+// Начать/добавить сумму блока: 8 f32-лент s -> acc[jj..jj+8) в double.
+VTM_AVX2 static inline void acc_add8(double *acc, int jj, __m256 s,
+                                     double scale) {
+    __m256d d0 = _mm256_cvtps_pd(_mm256_castps256_ps128(s));
+    __m256d d1 = _mm256_cvtps_pd(_mm256_extractf128_ps(s, 1));
+    __m256d sc = _mm256_set1_pd(scale);
+    _mm256_storeu_pd(acc + jj,
+                     _mm256_add_pd(_mm256_loadu_pd(acc + jj),
+                                   _mm256_mul_pd(d0, sc)));
+    _mm256_storeu_pd(acc + jj + 4,
+                     _mm256_add_pd(_mm256_loadu_pd(acc + jj + 4),
+                                   _mm256_mul_pd(d1, sc)));
+}
+
+VTM_AVX2 static inline void acc_add4(double *acc, int jj, __m128 s,
+                                     double scale) {
+    __m256d d = _mm256_cvtps_pd(s);
+    _mm256_storeu_pd(acc + jj,
+                     _mm256_add_pd(_mm256_loadu_pd(acc + jj),
+                                   _mm256_mul_pd(d, _mm256_set1_pd(scale))));
+}
+
+// Точечное произведение f32 на f32 (8 лент, 4 независимых аккумулятора):
+// хвост из 1-3 токенов считается по столбцам (см. dot_f32_f32 в
+// backend_neon.c), вход хвоста лежит contiguous [ntail][cols].
+VTM_AVX2 static inline double dot_f32_f32_avx2(const float *a, const float *b,
+                                               int n) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    double s;
+    int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),
+                             _mm256_loadu_ps(b + i), a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),
+                             _mm256_loadu_ps(b + i + 8), a1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16),
+                             _mm256_loadu_ps(b + i + 16), a2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24),
+                             _mm256_loadu_ps(b + i + 24), a3);
+    }
+    s = acc_f64(_mm256_add_ps(_mm256_add_ps(a0, a1),
+                              _mm256_add_ps(a2, a3)));
+    for (; i < n; i++) s += (double)a[i] * (double)b[i];
+    return s;
+}
+
+// Один блок масштаба: len тритов tp (начало блока — lo во входе x), ntok
+// токенов, масштаб scale. Результат копится в acc[0..ntok). xtail — хвост
+// 1-3 токенов, лежащий по столбцам (xtail[j*cols + lo ...]).
+VTM_AVX2 static inline void trit_batch_avx2_block(const int8_t *tp, float *fb,
+                                                  int len, int64_t lo,
+                                                  const float *x, int ntok,
+                                                  double *acc, double scale,
+                                                  const float *xtail,
+                                                  int xtail_cols, int ntail) {
+    int jj;
+
+    trits_to_f32_avx2(tp, fb, len);
+
+    // 8 токенов за шаг, 4 независимых аккумулятора (t mod 4).
+    for (jj = 0; jj + 8 <= ntok; jj += 8) {
+        __m256 a0 = _mm256_setzero_ps();
+        __m256 a1 = a0, a2 = a0, a3 = a0;
+        int t = 0;
+        for (; t + 4 <= len; t += 4) {
+            const float *xp = x + (size_t)(lo + t) * (size_t)ntok
+                            + (size_t)jj;
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xp),
+                                 _mm256_set1_ps(fb[t + 0]), a0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(xp + ntok),
+                                 _mm256_set1_ps(fb[t + 1]), a1);
+            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(xp + 2 * ntok),
+                                 _mm256_set1_ps(fb[t + 2]), a2);
+            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(xp + 3 * ntok),
+                                 _mm256_set1_ps(fb[t + 3]), a3);
+        }
+        for (; t < len; t++) {
+            const float *xp = x + (size_t)(lo + t) * (size_t)ntok
+                            + (size_t)jj;
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xp),
+                                 _mm256_set1_ps(fb[t]), a0);
+        }
+        acc_add8(acc, jj,
+                 _mm256_add_ps(_mm256_add_ps(a0, a1),
+                               _mm256_add_ps(a2, a3)), scale);
+    }
+    // Хвост 4..7 токенов — 4-ленточное ядро.
+    for (; jj + 4 <= ntok; jj += 4) {
+        __m128 a0 = _mm_setzero_ps();
+        __m128 a1 = a0, a2 = a0, a3 = a0;
+        int t = 0;
+        for (; t + 4 <= len; t += 4) {
+            const float *xp = x + (size_t)(lo + t) * (size_t)ntok
+                            + (size_t)jj;
+            a0 = _mm_fmadd_ps(_mm_loadu_ps(xp), _mm_set1_ps(fb[t + 0]), a0);
+            a1 = _mm_fmadd_ps(_mm_loadu_ps(xp + ntok),
+                              _mm_set1_ps(fb[t + 1]), a1);
+            a2 = _mm_fmadd_ps(_mm_loadu_ps(xp + 2 * ntok),
+                              _mm_set1_ps(fb[t + 2]), a2);
+            a3 = _mm_fmadd_ps(_mm_loadu_ps(xp + 3 * ntok),
+                              _mm_set1_ps(fb[t + 3]), a3);
+        }
+        for (; t < len; t++) {
+            const float *xp = x + (size_t)(lo + t) * (size_t)ntok
+                            + (size_t)jj;
+            a0 = _mm_fmadd_ps(_mm_loadu_ps(xp), _mm_set1_ps(fb[t]), a0);
+        }
+        acc_add4(acc, jj, _mm_add_ps(_mm_add_ps(a0, a1),
+                                     _mm_add_ps(a2, a3)), scale);
+    }
+    // Хвост 1-3 токенов — по столбцам: fb и xtail contiguous.
+    for (jj = 0; jj < ntail; jj++)
+        acc[ntok - ntail + jj] += dot_f32_f32_avx2(
+            fb, xtail + (size_t)jj * (size_t)xtail_cols + lo, len) * scale;
+}
+
+typedef struct {
+    float *y;
+    const uint32_t *words;
+    const float *scales;
+    const float *x;
+    int rows;
+    int cols;
+    int ntok;
+    int scale_block;
+    double *acc_all;     // vt * ntok
+    const float *xtail;  // [ntail][cols], хвост ntok % 4 токенов
+    int ntail;
+} trit_batch_avx2_job;
+
+VTM_AVX2 static void trit_batch_avx2_rows(trit_batch_avx2_job *j, int tid,
+                                          int r0, int r1) {
+    const int cols = j->cols;
+    const int ntok = j->ntok;
+    const int ntail = j->ntail;
+    const float *xtail = j->xtail;
+    const int64_t sb = (int64_t)j->scale_block;
+    const uint32_t *words = j->words;
+    const float *scales = j->scales;
+    const float *x = j->x;
+    double *acc = j->acc_all + (size_t)tid * (size_t)ntok;
+    int8_t buf[VTM_SCALE_BLOCK_160 + 64];
+    int8_t *tp = buf + 32;
+    float fb[VTM_SCALE_BLOCK_160];
+    int r, jj;
+
+    for (r = r0; r < r1; r++) {
+        const int64_t base = (int64_t)r * (int64_t)cols;
+        const int64_t end = base + (int64_t)cols;
+        int64_t s;
+
+        memset(acc, 0, (size_t)ntok * sizeof(double));
+        for (s = (base / sb) * sb; s < end; s += sb) {
+            int64_t e = s + sb;
+            int64_t st;
+            int64_t wi, wi_end;
+
+            if (e > end) e = end;
+            st = s < base ? base : s;
+            wi = st / VTM_TRITS_PER_WORD;
+            wi_end = (e - 1) / VTM_TRITS_PER_WORD;
+            for (; wi <= wi_end; wi++)
+                unpack20(load_u32_unaligned(words, wi),
+                         tp + (ptrdiff_t)(wi * VTM_TRITS_PER_WORD - st));
+            trit_batch_avx2_block(tp, fb, (int)(e - st), st - base, x, ntok,
+                                  acc,
+                                  (double)load_f32_unaligned(scales, s / sb),
+                                  xtail, cols, ntail);
+        }
+        for (jj = 0; jj < ntok; jj++)
+            j->y[(size_t)r * (size_t)ntok + (size_t)jj] = (float)acc[jj];
+    }
+}
+
+// Колбэк пула — без target-атрибута (его тип общий vtm_rows_fn).
+static void trit_batch_avx2_worker(void *p, int tid, int r0, int r1) {
+    trit_batch_avx2_rows((trit_batch_avx2_job *)p, tid, r0, r1);
+}
+
+static int trit_batch_avx2(float *y, const uint8_t *w, const float *scales,
+                           const float *x, int rows, int cols, int ntok,
+                           int scale_block) {
+    trit_batch_avx2_job job;
+    int vt;
+
+    if (!y || !w || !scales || !x) return -1;
+    if (rows < 0 || cols < 0 || ntok < 0) return -1;
+    if (scale_block != (int)VTM_SCALE_BLOCK_128 &&
+        scale_block != (int)VTM_SCALE_BLOCK_160) return -1;
+    if (rows == 0 || cols == 0 || ntok == 0) return 0;
+    lut_init();
+    vt = vtm_threads();
+    job.acc_all = (double *)calloc((size_t)vt * (size_t)ntok,
+                                   sizeof(double));
+    if (!job.acc_all) return -1;
+    job.y = y;
+    job.words = (const uint32_t *)w;
+    job.scales = scales;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    job.ntok = ntok;
+    job.scale_block = scale_block;
+    // Хвост 1-3 токенов (ntok % 4) kernel считает по столбцам: раскладываем
+    // его в contiguous [ntail][cols] один раз на вызов, а не на строку.
+    job.ntail = ntok % 4;
+    job.xtail = NULL;
+    if (job.ntail > 0) {
+        float *xt = (float *)malloc((size_t)job.ntail * (size_t)cols
+                                    * sizeof(float));
+        int j, t;
+        if (!xt) {
+            free(job.acc_all);
+            return -1;
+        }
+        for (j = 0; j < job.ntail; j++)
+            for (t = 0; t < cols; t++)
+                xt[(size_t)j * (size_t)cols + (size_t)t]
+                    = x[(size_t)t * (size_t)ntok
+                        + (size_t)(ntok - job.ntail + j)];
+        job.xtail = xt;
+    }
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok,
+                      trit_batch_avx2_worker, &job);
+    free((void *)job.xtail);
+    free(job.acc_all);
+    return 0;
+}
+
+// TMV и MM тритовой матрицы — одна арифметика (различаются имена аргументов).
+VTM_AVX2 int vtm_avx2_tmv_blocks_batch(float *y, const uint8_t *w,
+                                       const float *scales, const float *x,
+                                       int rows, int cols, int n_tokens,
+                                       int scale_block) {
+    return trit_batch_avx2(y, w, scales, x, rows, cols, n_tokens,
+                           scale_block);
+}
+
+VTM_AVX2 int vtm_avx2_mm_batch(float *y, const uint8_t *w,
+                               const float *scales, const float *b, int m,
+                               int k, int n_tokens, int scale_block) {
+    return trit_batch_avx2(y, w, scales, b, m, k, n_tokens, scale_block);
+}
+
 int vtm_avx2_available(void) {
     static int cached = -1;
     if (cached < 0) {

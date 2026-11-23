@@ -41,6 +41,46 @@ const vtm_backend *vtm_backend_by_name(const char *name);
 // Неизвестное значение -> scalar-lut243 + предупреждение в stderr.
 const vtm_backend *vtm_backend_from_env(void);
 
+// --- батчевые ядра TMV/MM (задача 0122) ------------------------------------
+//
+// N токенов против одной матрицы весов: вес читается и распаковывается один
+// раз на блок, поэтому N токенов дешевле N отдельных вызовов ядра (это и
+// ускоряет батчевый prefill 0112 на SIMD). Раскладка активаций — как у
+// батчевого пути interp.c (токен — младший индекс):
+//
+//   x[t * N + j] — вход токена j по индексу t (t = 0..cols-1 / 0..k-1);
+//   y[r * N + j] — выход токена j по индексу r (r = 0..rows-1 / 0..m-1).
+//
+// Арифметика — как у батчевого скалярного ядра: сумма по блоку масштаба
+// (128/160) копится в double и умножается на масштаб блока, внешние блоки
+// складываются в double. Расхождение с батчевым скалярным путём — единицы
+// ulp (проверяется tests/vtm/bench_backend.c, порог 1e-5).
+//
+// 0 — успех, -1 — неверные аргументы (NULL, отрицательные размеры, чужой
+// scale_block). Ядра не роняют прогон: при отсутствии SIMD/собранного ядра
+// диспетчер backend_neon.c зовёт скалярный откат (тот же результат по смыслу,
+// медленнее), при n_tokens == 1 — обычное одноколоночное ядро.
+//
+// TMV: W[rows, cols] (триты pack20 + масштабы) * X[cols, N] -> Y[rows, N].
+int vtm_simd_tmv_blocks_batch(float *y, const uint8_t *w, const float *scales,
+                              const float *x, int rows, int cols,
+                              int n_tokens, int scale_block);
+// MM: A[m, k] (триты pack20 + масштабы) * B[k, N] -> Y[m, N]. Для тритовой A
+// это та же арифметика, что у TMV (отдельное имя — ради читаемости вызова).
+int vtm_simd_mm_batch(float *y, const uint8_t *w, const float *scales,
+                      const float *b, int m, int k, int n_tokens,
+                      int scale_block);
+
+// Плотные (fp32) варианты — интерфейс батчевого пути interp.c: он батчит и
+// нетернарные TMV/MM (эмбеддинги, tied lm_head). Сейчас это скалярный
+// double-эталон без SIMD-ускорения: в графе Qwen-формы плотных матриц нет,
+// а трогать горячий путь ради редкого случая — лишний риск.
+// transposed != 0 — W хранится как [cols, rows] (VTM_FLAG_TMV_TRANSPOSED).
+int vtm_simd_tmv_f32_batch(float *y, const float *w, const float *x,
+                           int rows, int cols, int n_tokens, int transposed);
+int vtm_simd_mm_f32_batch(float *y, const float *a, const float *b,
+                          int m, int k, int n_tokens);
+
 // --- MM: SIMD-ядра вне `vtm_backend` ---------------------------------------
 //
 // В `vtm_backend` (vtm.h) поля MM нет, а op_mm() в interp.c сейчас считает
