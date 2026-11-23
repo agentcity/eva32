@@ -303,9 +303,9 @@
   {
     "id": "0044",
     "title": "Kind 4 — int8-тензоры в контейнере",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0044-kind4-int8.md",
-    "assignee": ""
+    "assignee": "agent:int8-tensor"
   },
   {
     "id": "0050",
@@ -373,9 +373,9 @@
   {
     "id": "0057",
     "title": "Абстракция хранения тритов: packed20 и native",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0057-trit-storage-abstraction.md",
-    "assignee": ""
+    "assignee": "agent:trit-storage"
   },
   {
     "id": "0058",
@@ -716,9 +716,9 @@
   {
     "id": "0109",
     "title": "Телеметрия: маркер локальной модели в Route и JSONL",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0109-telemetry-local.md",
-    "assignee": ""
+    "assignee": "agent:telemetry-local"
   },
   {
     "id": "0110",
@@ -730,9 +730,9 @@
   {
     "id": "0111",
     "title": "Логиты учителя: top-k формат и потоковое чтение",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0111-topk-logits.md",
-    "assignee": ""
+    "assignee": "agent:topk"
   },
   {
     "id": "0112",
@@ -793,23 +793,23 @@
   {
     "id": "0120",
     "title": "Роутер отдаёт границу prefill для метрик TTFT",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0120-router-prefill-ms.md",
-    "assignee": ""
+    "assignee": "agent:prefill-ms"
   },
   {
     "id": "0121",
     "title": "TSan для пула потоков: безмьютексный горячий путь",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0121-tsan-pool.md",
-    "assignee": ""
+    "assignee": "agent:tsan"
   },
   {
     "id": "0122",
     "title": "Батчевые SIMD-ядра TMV/MM — цель ≤2x, не 10x",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0122-batched-simd.md",
-    "assignee": ""
+    "assignee": "agent:simd-batch"
   },
   {
     "id": "0124",
@@ -824,5 +824,12 @@
     "status": "done",
     "file": "0125-ci-ubuntu-green.md",
     "assignee": "architect"
+  },
+  {
+    "id": "0126",
+    "title": "Преflight аренды GPU: одна команда проверки и запуска",
+    "status": "in_progress",
+    "file": "0126-rental-preflight.md",
+    "assignee": "agent:preflight"
   }
 ]
