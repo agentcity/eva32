@@ -800,7 +800,7 @@
   {
     "id": "0121",
     "title": "TSan для пула потоков: безмьютексный горячий путь",
-    "status": "in_progress",
+    "status": "done",
     "file": "0121-tsan-pool.md",
     "assignee": "agent:tsan"
   },

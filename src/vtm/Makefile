@@ -51,8 +51,12 @@ TEST_SESSION_SRC = ../../tests/test_vtm_session.c
 TEST_SESSION_BIN = test_vtm_session
 BENCH_SRC = ../../tests/vtm/bench_backend.c
 BENCH_BIN = bench_backend
+# Стресс пула для TSan (задача 0121): одновременные отправители,
+# vtm_threads_set, LUT243, пробуждение из cond_wait.
+TSAN_SRC = ../../tests/vtm/tsan_pool.c
+TSAN_BIN = tsan_pool
 
-.PHONY: all test test-all ci bench bench-backend bench-sha clean
+.PHONY: all test test-all ci tsan bench bench-backend bench-sha clean
 
 all: $(BIN)
 
@@ -98,6 +102,10 @@ $(TEST_API_BIN): $(TEST_API_SRC) $(LIB)
 # что и библиотека, поэтому видит тот же SIMD.
 $(BENCH_BIN): $(BENCH_SRC) $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -I../.. -o $@ $(BENCH_SRC) $(LIB) $(LDLIBS) $(THREAD_LIBS)
+
+# Стресс пула для TSan: обычная сборка тоже проходит, но смысл — в `make tsan`.
+$(TSAN_BIN): $(TSAN_SRC) $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -I../.. -o $@ $(TSAN_SRC) $(LIB) $(LDLIBS) $(THREAD_LIBS)
 
 # Сессии KV (задача 0079): save/load/continue, обрыв и порча файла.
 $(TEST_SESSION_BIN): $(TEST_SESSION_SRC) $(LIB)
@@ -187,6 +195,53 @@ ci:
 	echo; \
 	echo "== ci: OK — оба прогона зелёные, $$((t2 - t0))s =="
 
+# --- tsan: ThreadSanitizer по пулу потоков (задача 0121) ------------------
+# Пул ядер — lock-free горячий путь (слот команды, release/gen, монотонный
+# done); обычные тесты гонки не ловят, а 0113 дважды ловила дедлоки руками.
+# `make tsan` собирает с -fsanitize=thread то же, что `make test` (плюс
+# tests/vtm/tsan_pool.c) и гоняет те же бинарники: отчёт TSan — это падение,
+# а не строчка в логе.
+#
+# -Werror из обычных CFLAGS снят: сборка под санитайзером проверяет гонки,
+#   а предупреждения уже ловит обычная сборка/CI; иначе чужое WIP-предупреждение
+#   в тестовом файле валит TSan-прогон не по делу.
+# TSAN_RUN — переносимый таймаут: perl's alarm переживает exec, поэтому
+# зависший бинарник умирает по SIGALRM через TSAN_TIMEOUT секунд (на macOS
+# нет coreutils timeout). `make tsan TSAN_RUN=` отключает таймаут.
+# TSAN_OPTIONS можно переопределить, например halt_on_error=0 для сбора всех
+# отчётов (тогда падение проверяется по коду возврата).
+TSAN_FLAGS    ?= -fsanitize=thread -g -O1
+TSAN_CFLAGS   ?= $(filter-out -Werror,$(CFLAGS)) $(TSAN_FLAGS)
+TSAN_CXXFLAGS ?= $(filter-out -Werror,$(CXXFLAGS)) $(TSAN_FLAGS)
+TSAN_LDFLAGS  ?= -fsanitize=thread
+TSAN_TIMEOUT  ?= 600
+TSAN_RUN      ?= perl -e 'alarm shift; exec @ARGV' $(TSAN_TIMEOUT)
+TSAN_OPTIONS  ?= halt_on_error=1
+
+tsan:
+	@set -e; \
+	t0=$$(date +%s); \
+	echo "== tsan[1/2]: сборка с $(TSAN_FLAGS) =="; \
+	$(MAKE) clean >/dev/null; \
+	$(MAKE) $(BIN) $(TEST_BIN) $(TEST_API_BIN) $(TEST_SESSION_BIN) \
+	    $(TEST_SHA_BIN) $(BENCH_BIN) $(TSAN_BIN) $(DEMO_MODEL) \
+	    CFLAGS='$(TSAN_CFLAGS)' CXXFLAGS='$(TSAN_CXXFLAGS)' \
+	    LDFLAGS='$(TSAN_LDFLAGS)'; \
+	t1=$$(date +%s); \
+	echo; echo "OK: TSan-сборка — $$((t1 - t0))s"; \
+	echo; \
+	echo "== tsan[2/2]: прогон, таймаут $(TSAN_TIMEOUT)с на бинарник =="; \
+	TSAN_OPTIONS='$(TSAN_OPTIONS)' $(TSAN_RUN) ./$(TEST_SHA_BIN); \
+	TSAN_OPTIONS='$(TSAN_OPTIONS)' $(TSAN_RUN) ./$(TEST_SESSION_BIN); \
+	TSAN_OPTIONS='$(TSAN_OPTIONS)' $(TSAN_RUN) ./$(TEST_API_BIN); \
+	TSAN_OPTIONS='$(TSAN_OPTIONS)' $(TSAN_RUN) ./$(TEST_BIN); \
+	TSAN_OPTIONS='$(TSAN_OPTIONS)' $(TSAN_RUN) ./$(BENCH_BIN) --check; \
+	TSAN_OPTIONS='$(TSAN_OPTIONS)' $(TSAN_RUN) ./$(BENCH_BIN) --threads --iters 3; \
+	TSAN_OPTIONS='$(TSAN_OPTIONS)' $(TSAN_RUN) ./$(TSAN_BIN); \
+	t2=$$(date +%s); \
+	$(MAKE) clean >/dev/null; \
+	echo; echo "OK: tsan — отчётов нет, $$((t2 - t0))s"
+
 bench: $(BIN)
 	./$(BIN) bench --rows 512 --cols 512 --iters 200
 
@@ -205,4 +260,5 @@ bench-sha: $(TEST_SHA_BIN)
 # токенизатора (vtm-tok, test_tokenizer) убирает `make -f Makefile.tok clean-tok`.
 clean:
 	rm -f *.o $(LIB) $(BIN) $(TEST_BIN) \
-		$(TEST_API_BIN) $(TEST_SESSION_BIN) $(TEST_SHA_BIN) $(BENCH_BIN)
+		$(TEST_API_BIN) $(TEST_SESSION_BIN) $(TEST_SHA_BIN) $(BENCH_BIN) \
+		$(TSAN_BIN)

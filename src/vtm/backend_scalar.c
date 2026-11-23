@@ -43,9 +43,13 @@
 // порядке, что и при одном потоке, поэтому результат побитово не зависит ни
 // от числа потоков, ни от того, кому достался диапазон.
 //
-// Вызовы из разных потоков сериализуются: задание одно на пул. Вложенный
-// вызов из колбэка (сейчас таких нет) привёл бы к взаимной блокировке —
-// поэтому в ядрах ровно один уровень параллелизма.
+// Вызовы из разных потоков сериализуются: задание одно на пул, и вход в
+// pool_run() закрыт мьютексом submit_mu (задача 0121: без него два
+// отправителя одновременно проходили wait_prev_done(), писали одни и те же
+// total/chunk/cmd и получали один и тот же gen — TSan показывал гонки, а
+// workers_left уходил в underflow). Вложенный вызов из колбэка (сейчас таких
+// нет) привёл бы к взаимной блокировке — поэтому в ядрах ровно один уровень
+// параллелизма.
 
 #if VTM_HAVE_PTHREAD
 
@@ -81,6 +85,7 @@ typedef struct {
 } vtm_cmd;
 
 typedef struct {
+    pthread_mutex_t submit_mu; // один отправитель задания (см. pool_run)
     pthread_mutex_t mu;
     pthread_cond_t work_cv;   // воркеры ждут новое задание
     pthread_cond_t done_cv;   // вызвавший ждёт, пока досчитают диапазоны
@@ -99,8 +104,9 @@ typedef struct {
 } vtm_pool;
 
 static vtm_pool g_pool = {
-    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER,
-    PTHREAD_COND_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
+    PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     {{0, NULL, 0}}
 };
 
@@ -282,7 +288,21 @@ static void wait_prev_done(void) {
 // (tid 0), остальные — воркеры 1..N-1. Создаёт недостающих воркеров (до
 // nthreads-1) под мьютексом; если создать не удалось — считает тем, что
 // есть, вплоть до одного потока.
+static void pool_run_locked(int n, int nthreads, vtm_rows_fn fn, void *ctx);
+
+// Вход держит submit_mu всё задание: поля total/chunk/next_row и слоты
+// cmd[] — общие для пула, и второй отправитель не должен их трогать, пока
+// первый не закрыл задание. Раньше здесь была только проверка done == sub,
+// но она не резервирует задание: два потока одновременно видели её
+// выполненной и оба публиковали gen = sub + 1 (гонки и underflow
+// workers_left; ловится tests/vtm/tsan_pool.c под TSan).
 static void pool_run(int n, int nthreads, vtm_rows_fn fn, void *ctx) {
+    pthread_mutex_lock(&g_pool.submit_mu);
+    pool_run_locked(n, nthreads, fn, ctx);
+    pthread_mutex_unlock(&g_pool.submit_mu);
+}
+
+static void pool_run_locked(int n, int nthreads, vtm_rows_fn fn, void *ctx) {
     unsigned mygen;
     int i, chunk;
 
@@ -374,6 +394,27 @@ static pthread_once_t g_cfg_once = PTHREAD_ONCE_INIT;
 static int g_cfg_threads = 1;    // из VTM_THREADS или по числу ядер
 static int g_cfg_override;       // 0 — переопределения нет (тест-хук)
 
+// Переопределение читает каждое задание (vtm_parallel_rows), а пишет тест-хук
+// vtm_threads_set(). Контракт API просит не звать их одновременно, но гонка
+// на простом int — это UB, и TSan её видит (tests/vtm/tsan_pool.c): держим
+// поле атомарным. Значение — только снимок «сколько потоков хотят сейчас»;
+// задание всё равно использует одно число на весь вызов.
+static int cfg_override_get(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __atomic_load_n(&g_cfg_override, __ATOMIC_ACQUIRE);
+#else
+    return g_cfg_override;
+#endif
+}
+
+static void cfg_override_set(int n) {
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_store_n(&g_cfg_override, n, __ATOMIC_RELEASE);
+#else
+    g_cfg_override = n;
+#endif
+}
+
 static void cfg_init(void) {
     const char *env = getenv("VTM_THREADS");
     long n = 0, cores;
@@ -401,15 +442,17 @@ static void cfg_init(void) {
 }
 
 int vtm_threads(void) {
+    int ov;
     pthread_once(&g_cfg_once, cfg_init);
-    return g_cfg_override > 0 ? g_cfg_override : g_cfg_threads;
+    ov = cfg_override_get();
+    return ov > 0 ? ov : g_cfg_threads;
 }
 
 int vtm_threads_set(int n) {
     pthread_once(&g_cfg_once, cfg_init);
     if (n <= 0) n = g_cfg_threads;
     if (n > VTM_THREADS_MAX) n = VTM_THREADS_MAX;
-    g_cfg_override = n;
+    cfg_override_set(n);
     return n;
 }
 
@@ -471,11 +514,9 @@ void vtm_parallel_rows(int n, double work, vtm_rows_fn fn, void *ctx) {
 // --- LUT на 5 тритов -------------------------------------------------------
 
 static int8_t  LUT243[243][5];
-static int     lut_ready;
 
-static void lut_init(void) {
+static void lut_fill(void) {
     unsigned v;
-    if (lut_ready) return;
     for (v = 0; v < 243; v++) {
         unsigned t = v;
         int k;
@@ -485,7 +526,22 @@ static void lut_init(void) {
             LUT243[v][k] = (int8_t)(d == 2u ? 1 : (d == 0u ? -1 : 0));
         }
     }
-    lut_ready = 1;
+}
+
+// Таблицу читают и воркеры, и любой вызвавший tmv_lut(); заполнять её надо
+// ровно один раз и до чтения, иначе два потока одновременно пишут LUT243
+// (гонка, TSan; tests/vtm/tsan_pool.c). pthread_once даёт и единственность,
+// и синхронизацию «заполнено → видно всем». Без pthread потоков нет.
+static void lut_init(void) {
+#if VTM_HAVE_PTHREAD
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, lut_fill);
+#else
+    static int filled;
+    if (filled) return;
+    lut_fill();
+    filled = 1;
+#endif
 }
 
 // --- TMV -------------------------------------------------------------------
