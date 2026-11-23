@@ -13,6 +13,7 @@
 // Big-endian проверяется один раз в load_core() (VTM_HOST_BIG_ENDIAN).
 #include "vtm_internal.h"
 #include "vtm_backend.h"
+#include "trit.h"
 #include "sha256.h"
 
 #include <math.h>
@@ -450,10 +451,25 @@ static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
     }
 
     if (t->kind == VTM_TENSOR_F32) return 0; // отображение читается как float
-    if (t->kind == VTM_TENSOR_F16 || t->kind == VTM_TENSOR_BF16) {
+    // int8 (0044) разворачивается в fp32 при загрузке — mmap не годится.
+    if (t->kind == VTM_TENSOR_F16 || t->kind == VTM_TENSOR_BF16 ||
+        t->kind == VTM_TENSOR_INT8) {
         if (tensor_arena_size(t, &sz) != 0) return -1;
         p->arena_size = sz;
         p->copy_data = 1;
+        return 0;
+    }
+
+    // Триты в native-хранении (задача 0057): ядра читают только pack20,
+    // поэтому такой тензор всегда переупаковывается в арену. Выигрыша mmap
+    // для него нет, зато интерпретатор о хранении не знает.
+    if (t->kind == VTM_TENSOR_TRIT &&
+        vtm_trit_storage_from_flags(t->flags) != VTM_TRIT_STORAGE_PACKED20) {
+        if (tensor_arena_size(t, &sz) != 0) return -1;
+        p->arena_size = sz;
+        p->copy_data = 1;
+        p->copy_words = 1;
+        p->copy_scales = 1;
         return 0;
     }
 
@@ -494,30 +510,48 @@ static const uint8_t *trit_scales_ptr(const vtm_tensor *t, const uint8_t *data) 
 // Разложить тензор по арене (copy_*) или выставить указатели в отображение.
 // data — начало секции данных (data_start уже прибавлен вызывающим).
 // Для тритов слова идут первыми (выровнены на 64), затем масштабы.
-static void fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
-                                uint8_t *dst, const tensor_plan *p) {
+// 0 — успех; -1 — данные не сошлись с проверенным при разборе заголовком
+// (native-трит вне -1..1 и т. п.); вызывающий обязан вернуть ошибку, а не
+// молча отдать интерпретатору мусор.
+static int fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
+                               uint8_t *dst, const tensor_plan *p) {
     if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) {
         // Копировать нечего: буфер уже в арене и обнулён calloc'ом (см.
         // выделение арены). Нули — это и есть «пустой кэш»: ровно то же
         // состояние, что давал старый контейнер, где в файле лежали нули.
         t->f32 = (float *)(void *)dst;
-        return;
+        return 0;
     }
     if (t->kind == VTM_TENSOR_TRIT) {
         uint32_t nb = t->n_blocks;
         uint32_t ns = t->n_scales;
         uint32_t i;
+        unsigned storage = vtm_trit_storage_from_flags(t->flags);
         const uint8_t *sp = trit_scales_ptr(t, data);
         const uint8_t *wp = trit_words_ptr(t, data);
 
         if (p->copy_words) {
             uint32_t *words = (uint32_t *)(void *)dst;
-            for (i = 0; i < nb; i++) {
+            if (storage == VTM_TRIT_STORAGE_PACKED20) {
                 uint32_t w;
-                for (w = 0; w < VTM_WORDS_PER_BLOCK; w++) {
-                    words[i * VTM_WORDS_PER_BLOCK + w] =
-                        rd32(wp + ((size_t)i * VTM_WORDS_PER_BLOCK + w) * 4u);
+                for (i = 0; i < nb; i++) {
+                    for (w = 0; w < VTM_WORDS_PER_BLOCK; w++) {
+                        words[i * VTM_WORDS_PER_BLOCK + w] =
+                            rd32(wp + ((size_t)i * VTM_WORDS_PER_BLOCK + w) * 4u);
+                    }
                 }
+            } else {
+                // native: байты -> слова pack20. Размер выхода — nb блоков
+                // по 8 слов, вход — ceil(n/4) слов хранения.
+                vtm_trit_store store;
+                uint32_t src_words = vtm_trit_storage_words(
+                    t->n_elements, VTM_TRIT_STORAGE_NATIVE);
+                uint32_t dst_words = nb * VTM_WORDS_PER_BLOCK;
+                if (vtm_trit_store_init(&store, storage, wp, src_words,
+                                        t->n_elements, NULL, 0, 0) != 0)
+                    return -1;
+                if (vtm_trit_store_to_packed20(&store, words, dst_words) != 0)
+                    return -1;
             }
             t->words = words;
         } else {
@@ -556,6 +590,28 @@ static void fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
         for (i = 0; i < t->n_elements; i++)
             y[i] = vtm_half_to_float(rd16(src + (size_t)i * 2u));
         t->f32 = y;
+    } else if (t->kind == VTM_TENSOR_INT8) {
+        // kind 4: расквантовать в fp32. Интерпретатор знает только kind 0..3
+        // и требует t->f32, поэтому в памяти тензор становится fp32, а
+        // источник помечается флагом VTM_TENSOR_FLAG_INT8_SOURCE (в файл он
+        // не пишется). Ленивое чтение int8 в EMB — отдельная задача: она
+        // меняет горячий цикл interp.c.
+        float *y = (float *)(void *)dst;
+        const uint8_t *src = data + t->offset;
+        const uint8_t *sp = src + 18u;
+        size_t ss = t->scale_is_f32 ? 4u : 2u;
+        const uint8_t *qp = sp + (size_t)t->n_scales * ss;
+        uint32_t i;
+        for (i = 0; i < t->n_elements; i++) {
+            uint32_t block = i / t->scale_block;
+            float scale = t->scale_is_f32
+                        ? rd_f32(sp + (size_t)block * 4u)
+                        : vtm_half_to_float(rd16(sp + (size_t)block * 2u));
+            y[i] = (float)((int)(int8_t)qp[i] * scale);
+        }
+        t->f32 = y;
+        t->flags |= VTM_TENSOR_FLAG_INT8_SOURCE;
+        t->kind = VTM_TENSOR_F32;
     } else { // BF16
         float *y = (float *)(void *)dst;
         uint32_t i;
@@ -564,6 +620,7 @@ static void fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
             y[i] = vtm_bf16_to_float(rd16(src + (size_t)i * 2u));
         t->f32 = y;
     }
+    return 0;
 }
 
 // --- метаданные: минимальный разбор JSON -----------------------------------
@@ -1068,7 +1125,8 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         memcpy(t->name, e, 24);
         t->kind = e[24];
         t->ndim = e[25];
-        if (t->kind > VTM_TENSOR_BF16)
+        // kind 4 (int8 + масштабы, задача 0044) — последний известный вид.
+        if (t->kind != VTM_TENSOR_INT8 && t->kind > VTM_TENSOR_BF16)
             FAIL(VTM_E_FORMAT, "тензор %u (%s): неизвестный kind %u",
                  i, t->name, (unsigned)t->kind);
         if (t->ndim < 1 || t->ndim > VTM_MAX_DIMS)
@@ -1115,7 +1173,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         // старее) принимаем прежний offset=0.
         if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) {
             uint64_t bytes;
-            if (t->kind == VTM_TENSOR_TRIT)
+            if (t->kind == VTM_TENSOR_TRIT || t->kind == VTM_TENSOR_INT8)
                 FAIL(VTM_E_FORMAT,
                      "тензор %u (%s): KV-кэш обязан быть fp-тензором (kind %u)",
                      i, t->name, (unsigned)t->kind);
@@ -1160,11 +1218,19 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
 
         if (t->kind == VTM_TENSOR_TRIT) {
             uint64_t need;
+            // Хранение тритов (задача 0057) продублировано в flags записи:
+            // биты 1..2. У всех контейнеров до 0057 там 0 — packed20.
+            unsigned entry_storage = vtm_trit_storage_from_flags(t->flags);
+            if (entry_storage > VTM_TRIT_STORAGE_MAX)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): неизвестное хранение тритов %u в flags",
+                     i, t->name, entry_storage);
             if (t->scale_offset == VTM_NO_OFFSET) {
                 const uint8_t *seg = p + data_start + t->offset;
                 uint64_t n_trits;
-                uint32_t n_scales, storage_blocks, n128, n160;
+                uint32_t n_scales, storage_blocks, n128, n160, n_words;
                 uint32_t scale_block;
+                unsigned storage = VTM_TRIT_STORAGE_PACKED20;
                 size_t ss, seg_bytes;
                 char werr[160];
 
@@ -1176,10 +1242,31 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                     FAIL(VTM_E_FORMAT,
                          "тензор %u (%s): kind=TRIT без TRT1 и без scale_offset",
                          i, t->name);
-                if (seg[4] != 1)
+                // v1 — только packed20 (так писали все контейнеры до 0057).
+                // v2 — хранение в битах 1..2 flags. Отдельная версия нужна,
+                // чтобы загрузчик до 0057 отверг native с VTM_E_VERSION, а не
+                // прочитал байты как слова pack20 (тихая порча весов).
+                if (seg[4] != 1 && seg[4] != 2)
                     FAIL(VTM_E_VERSION,
                          "тензор %u (%s): версия TRT1 %u", i, t->name,
                          (unsigned)seg[4]);
+                if (seg[4] == 2) {
+                    unsigned bits;
+                    if ((seg[5] & (uint8_t)~0x07u) != 0)
+                        FAIL(VTM_E_FORMAT,
+                             "тензор %u (%s): неизвестные флаги TRT1 0x%02x",
+                             i, t->name, (unsigned)seg[5]);
+                    bits = (unsigned)((seg[5] >> 1) & 0x03u);
+                    if (bits > VTM_TRIT_STORAGE_MAX)
+                        FAIL(VTM_E_FORMAT,
+                             "тензор %u (%s): неизвестное хранение тритов %u",
+                             i, t->name, bits);
+                    storage = bits;
+                }
+                if (entry_storage != storage)
+                    FAIL(VTM_E_FORMAT,
+                         "тензор %u (%s): хранение в flags (%u) не совпадает "
+                         "с TRT1 (%u)", i, t->name, entry_storage, storage);
                 n_trits = rd64(seg + 6);
                 n_scales = rd32(seg + 14);
                 if (n_trits != (uint64_t)t->n_elements)
@@ -1216,10 +1303,13 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                          i, t->name, n_scales, n128, n160);
                 }
                 ss = (seg[5] & 1u) ? 4u : 2u;
+                // Длина массива тритов зависит от хранения: pack20 округляет
+                // до 160 тритов (32 байта), native — до 4 тритов (слово).
+                n_words = vtm_trit_storage_words((uint32_t)n_trits, storage);
                 {
                     uint64_t part1, part2;
                     if (mul_u64(n_scales, ss, &part1) != 0 ||
-                        mul_u64(storage_blocks, 32u, &part2) != 0 ||
+                        mul_u64(n_words, 4u, &part2) != 0 ||
                         add_u64(part1, part2, &need) != 0 ||
                         add_u64(need, 18u, &need) != 0 ||
                         fits_size_t(need, &seg_bytes) != 0)
@@ -1230,11 +1320,23 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                     FAIL(VTM_E_BOUNDS,
                          "тензор %u (%s): TRT1-сегмент (%zu байт) за границей",
                          i, t->name, seg_bytes);
-                if (validate_words(seg + 18u + (size_t)n_scales * ss,
-                                   storage_blocks * VTM_WORDS_PER_BLOCK,
-                                   werr, sizeof werr) != 0)
-                    FAIL(VTM_E_SCALE, "тензор %u (%s): %s",
-                         i, t->name, werr);
+                if (storage == VTM_TRIT_STORAGE_PACKED20) {
+                    if (validate_words(seg + 18u + (size_t)n_scales * ss,
+                                       n_words, werr, sizeof werr) != 0)
+                        FAIL(VTM_E_SCALE, "тензор %u (%s): %s",
+                             i, t->name, werr);
+                } else {
+                    uint32_t bad = 0;
+                    // Проверяем ровно n_trits байт: хвост последнего слова —
+                    // выравнивающий padding, ядра его не читают (Python-
+                    // эталон проверяет так же).
+                    if (vtm_trit_validate_native(
+                            seg + 18u + (size_t)n_scales * ss,
+                            (uint32_t)n_trits, &bad) != 0)
+                        FAIL(VTM_E_SCALE,
+                             "тензор %u (%s): native-трит #%u вне -1..1",
+                             i, t->name, bad);
+                }
                 t->n_blocks = storage_blocks;
                 t->n_scales = n_scales;
                 t->scale_block = scale_block;
@@ -1245,6 +1347,10 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                 uint32_t scale_block = VTM_SCALE_BLOCK_160;
                 size_t ss;
                 char werr[160];
+                if (entry_storage != VTM_TRIT_STORAGE_PACKED20)
+                    FAIL(VTM_E_FORMAT,
+                         "тензор %u (%s): raw-раскладка несёт только packed20 "
+                         "(flags=%u)", i, t->name, entry_storage);
                 storage_blocks = (uint32_t)(((uint64_t)t->n_elements
                                              + VTM_TRITS_PER_BLOCK - 1u)
                                             / VTM_TRITS_PER_BLOCK);
@@ -1281,6 +1387,85 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                               ? 1u : 0u);
                 t->layout = VTM_LAYOUT_RAW;
             }
+        } else if (t->kind == VTM_TENSOR_INT8) {
+            // Самодостаточный сегмент kind 4 (задача 0044): 18-байтовый
+            // заголовок "INT8" (как у TRT1), масштабы, затем n_elements
+            // знаковых байт q. w = q · scale, масштаб на блок 128.
+            const uint8_t *seg = p + data_start + t->offset;
+            uint64_t n_values;
+            uint32_t n_scales, expected_scales, k;
+            size_t ss, seg_bytes;
+            if (t->scale_offset != VTM_NO_OFFSET)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): kind=int8 требует scale_offset=0x%08X "
+                     "(масштабы внутри сегмента), а пришло %u",
+                     i, t->name, (unsigned)VTM_NO_OFFSET, t->scale_offset);
+            if (!range_ok(t->offset, 18u, data_size))
+                FAIL(VTM_E_BOUNDS,
+                     "тензор %u (%s): INT8-заголовок за границей данных",
+                     i, t->name);
+            if (memcmp(seg, "INT8", 4) != 0)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): kind=int8 без сегмента INT8", i, t->name);
+            if (seg[4] != 1)
+                FAIL(VTM_E_VERSION,
+                     "тензор %u (%s): версия INT8-сегмента %u", i, t->name,
+                     (unsigned)seg[4]);
+            if ((seg[5] & (uint8_t)~0x01u) != 0)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): неизвестные флаги INT8 0x%02x", i,
+                     t->name, (unsigned)seg[5]);
+            n_values = rd64(seg + 6);
+            n_scales = rd32(seg + 14);
+            if (n_values != (uint64_t)t->n_elements)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): INT8 n_values=%llu, dims дают %u",
+                     i, t->name, (unsigned long long)n_values, t->n_elements);
+            expected_scales = (uint32_t)((n_values + VTM_SCALE_BLOCK_128 - 1u)
+                                         / VTM_SCALE_BLOCK_128);
+            if (n_scales != expected_scales)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): INT8 n_scale=%u, ожидали %u (блок %u)",
+                     i, t->name, n_scales, expected_scales,
+                     (unsigned)VTM_SCALE_BLOCK_128);
+            ss = (seg[5] & 1u) ? 4u : 2u;
+            {
+                uint64_t part1, part2;
+                if (mul_u64(n_scales, ss, &part1) != 0 ||
+                    mul_u64(n_values, 1u, &part2) != 0 ||
+                    add_u64(part1, part2, &part2) != 0 ||
+                    add_u64(part2, 18u, &part2) != 0 ||
+                    fits_size_t(part2, &seg_bytes) != 0)
+                    FAIL(VTM_E_BOUNDS, "тензор %u (%s): INT8 слишком велик",
+                         i, t->name);
+            }
+            if (!range_ok(t->offset, (uint64_t)seg_bytes, data_size))
+                FAIL(VTM_E_BOUNDS,
+                     "тензор %u (%s): INT8-сегмент (%zu байт) за границей",
+                     i, t->name, seg_bytes);
+            for (k = 0; k < n_scales; k++) {
+                float scale = (seg[5] & 1u)
+                            ? rd_f32(seg + 18u + (size_t)k * 4u)
+                            : vtm_half_to_float(rd16(seg + 18u + (size_t)k * 2u));
+                if (!isfinite(scale) || scale < 0.0f)
+                    FAIL(VTM_E_SCALE,
+                         "тензор %u (%s): масштаб #%u не конечный/отрицательный",
+                         i, t->name, k);
+            }
+            {
+                const uint8_t *q = seg + 18u + (size_t)n_scales * ss;
+                for (k = 0; k < t->n_elements; k++) {
+                    if (q[k] == 0x80u)
+                        FAIL(VTM_E_SCALE,
+                             "тензор %u (%s): int8 q #%u = -128 вне -127..127",
+                             i, t->name, k);
+                }
+            }
+            t->n_blocks = 0;
+            t->n_scales = n_scales;
+            t->scale_block = VTM_SCALE_BLOCK_128;
+            t->scale_is_f32 = (uint8_t)((seg[5] & 1u) ? 1u : 0u);
+            t->layout = VTM_LAYOUT_RAW;
         } else {
             size_t esize = (t->kind == VTM_TENSOR_F32) ? 4u : 2u;
             uint64_t bytes = (uint64_t)t->n_elements * esize;
@@ -1414,8 +1599,12 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
             size_t off;
             if (align_up(used, VTM_ARENA_ALIGN, &off) != 0)
                 FAIL(VTM_E_NOMEM, "арена: переполнение смещения");
-            fill_tensor_planned(&m->tensors[i], p + data_start,
-                                m->arena ? m->arena + off : NULL, &plans[i]);
+            if (fill_tensor_planned(&m->tensors[i], p + data_start,
+                                    m->arena ? m->arena + off : NULL,
+                                    &plans[i]) != 0)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): данные не сошлись с заголовком при "
+                     "раскладке", i, m->tensors[i].name);
             used = off + plans[i].arena_size;
         }
     }

@@ -24,7 +24,8 @@
  28  meta_len u32                  4   длина JSON-метаданных в байтах (без padding)
 32                       таблица тензоров: n_tensors * 52 байта
   0  name[24]  UTF-8, NUL-дополнение
- 24  kind u8                        0 триты (TRT1), 1 fp32, 2 fp16, 3 bf16
+ 24  kind u8                        0 триты (TRT1), 1 fp32, 2 fp16, 3 bf16,
+                                    4 int8 + масштабы (INT8-сегмент)
  25  ndim u8                        1..4
  26  dims u32[4]                    недостающие измерения = 0
  42  offset u32                     смещение ОТ НАЧАЛА СЕКЦИИ ДАННЫХ, кратно 32
@@ -34,7 +35,9 @@
                                     внутри TRT1-сегмента по offset; для fp — 0
                                     (читатель принимает и offset+18 как синоним)
  50  flags/резерв u16              0 — обычный тензор; бит 0 — KV-кэш
-                                    (VTM_TENSOR_FLAG_KV_CACHE, payload'а нет)
+                                    (VTM_TENSOR_FLAG_KV_CACHE, payload'а нет);
+                                    биты 1..2 — хранение тритов (0 packed20,
+                                    1 native; задача 0057)
      (20 из 32 байт заголовка — это поля спеки; 12 байт «резерва» заняты
       program_offset/meta_offset/meta_len, что обратно совместимо: C может
       игнорировать эти три слова и читать программу с конца файла.)
@@ -85,9 +88,33 @@ KV-кэши вне контейнера (задачи 0101, 0118). Поле по
 
 `n_scale = ceil(n_trits/128)` — масштаб на **128** тритов (блок квантования
 QAT), хотя упаковочный блок — 160 тритов (8 слов = 32 байта). Это сознательное
-расширение `docs/trit-format.md` §2 (там масштаб на 160; вопрос открыт в §8):
+расширение `docs/trit-format.md` §2 (там масштаб на 160; вопрос открыт в §9):
 VTM фиксирует 128. Пересечение границ строки блоком 128 невозможно, если
 `cols` кратно 128, — компилятор всегда порождает такие матрицы.
+
+Хранение тритов (задача 0057). У TRT1 есть version 2: биты 1..2 байта `flags`
+задают хранение — `0` `packed20` (20 тритов в u32, как version 1) или `1`
+`native` (1 знаковый байт на трит, 4 трита в слове). Массив слов/байтов
+занимает `storage_words(n, storage) · 4` байт: для `packed20` —
+`ceil(n/160)·8` слов, для `native` — `ceil(n/4)` слов. Version 1 всегда
+`packed20`; так писали все контейнеры до 0057, и байты не меняются. Тот же
+идентификатор дублируется в битах 1..2 `flags` записи тензора; читатель
+сверяет дубликаты. `native` в 5 раз больше `packed20` (32 → 160 байт на 160
+тритов), зато читается без делений на 3. C-загрузчик нормализует оба хранения
+в `packed20` в арене (`src/vtm/trit.h`, `vtm_trit_store`), поэтому
+интерпретатор о хранении не знает.
+
+Тензор int8 (kind 4, задача 0044) — сегмент с тем же 18-байтовым заголовком:
+
+```
+"INT8" | version u8 (=1) | flags u8 (бит0: 1=f32 масштабы, 0=f16)
+       | n_values u64 | n_scale u32
+масштабы: n_scale * (4 или 2) байта
+q:        n_values знаковых байт (q в -127..127)
+```
+
+`n_scale = ceil(n_values/128)`, `scale_offset = NO_OFFSET`, `w = q · scale`.
+`-128` запрещён: диапазон симметричный, как у `Int8Embedding` из QAT.
 
 **Расхождение с `src/vtm/` на 2026-11-18**: C-загрузчик ждёт `n_blocks` в
 TRT1 как число 160-тритовых блоков и один масштаб на 160 тритов
@@ -253,7 +280,12 @@ VTM_MAGIC = b"VTM1"
 VTM_VERSION = 2
 VTM_VERSION_V01 = 1
 TRT1_MAGIC = b"TRT1"
+#: Версия TRT1 по умолчанию: только pack20, так писали контейнеры до 0057.
 TRT1_VERSION = 1
+#: Версия TRT1 с явным хранением тритов: биты 1..2 flags (задача 0057).
+#: Отдельная версия — чтобы читатель до 0057 отверг native с понятной ошибкой
+#: версии, а не прочитал байты как слова pack20.
+TRT1_VERSION_STORAGE = 2
 TRT1_HEADER_SIZE = 18
 
 HEADER_SIZE = 32
@@ -271,6 +303,17 @@ TRITS_PER_STORAGE_BLOCK = 160
 WORDS_PER_STORAGE_BLOCK = TRITS_PER_STORAGE_BLOCK // TRITS_PER_WORD  # 8
 SCALE_BLOCK = 128
 
+#: Хранение тритов (задача 0057): pack20 — 20 тритов в u32 (как раньше);
+#: native — 1 знаковый байт на трит. Идентификатор дублируется в flags записи
+#: тензора (биты 1..2; бит 0 — KV_CACHE) и в TRT1 version 2 (биты 1..2 flags).
+STORAGE_PACKED20 = "packed20"
+STORAGE_NATIVE = "native"
+TRIT_STORAGE_IDS = {STORAGE_PACKED20: 0, STORAGE_NATIVE: 1}
+TRIT_STORAGE_NAMES = {0: STORAGE_PACKED20, 1: STORAGE_NATIVE}
+TFLAG_STORAGE_SHIFT = 1
+TFLAG_STORAGE_MASK = 0x0006
+NATIVE_TRITS_PER_WORD = 4
+
 #: scale_offset тритов: масштабы лежат внутри TRT1-сегмента (как в C).
 NO_OFFSET = 0xFFFFFFFF
 
@@ -278,12 +321,25 @@ KIND_TRITS = 0
 KIND_F32 = 1
 KIND_F16 = 2
 KIND_BF16 = 3
+#: kind 4: знаковый int8 (-127..127) + масштабы блока 128 (задача 0044).
+KIND_INT8 = 4
 KIND_NAMES = {
     KIND_TRITS: "trits",
     KIND_F32: "fp32",
     KIND_F16: "fp16",
     KIND_BF16: "bf16",
+    KIND_INT8: "int8",
 }
+
+#: Сегмент int8-тензора (kind 4): тот же 18-байтовый заголовок, что у TRT1,
+#: но magic "INT8". По offset: заголовок, масштабы, n_elements байт q.
+#: w = q · scale, масштаб на блок 128, q в -127..127 (симметрично, zero-point 0).
+INT8_MAGIC = b"INT8"
+INT8_VERSION = 1
+INT8_HEADER_SIZE = 18
+INT8_SCALE_BLOCK = 128
+INT8_MIN = -127
+INT8_MAX = 127
 
 #: Флаги записи таблицы тензоров (поле по смещению 50, бывший «резерв»).
 #: TFLAG_KV_CACHE — K/V-кэш внимания: содержимого в файле нет (offset=0),
@@ -404,11 +460,20 @@ def n_scale_blocks(n_values: int, block_size: int = SCALE_BLOCK) -> int:
     return (n_values + block_size - 1) // block_size
 
 
-def storage_words(n_trits: int) -> int:
-    """Слов pack20 с округлением до 160-тритовых (32-байтовых) блоков."""
+def storage_words(n_trits: int, storage: str = STORAGE_PACKED20) -> int:
+    """Сколько 4-байтовых слов занимает массив тритов в хранении `storage`.
+
+    packed20 округляет до 160-тритовых (32-байтовых) блоков, native — до слова
+    (4 трита). Формулы обязаны совпадать с `vtm_trit_storage_words()` в
+    `src/vtm/trit.c`.
+    """
     if n_trits < 0:
         raise ValueError("число тритов не может быть отрицательным")
-    return (n_trits + TRITS_PER_STORAGE_BLOCK - 1) // TRITS_PER_STORAGE_BLOCK * WORDS_PER_STORAGE_BLOCK
+    if storage == STORAGE_PACKED20:
+        return (n_trits + TRITS_PER_STORAGE_BLOCK - 1) // TRITS_PER_STORAGE_BLOCK * WORDS_PER_STORAGE_BLOCK
+    if storage == STORAGE_NATIVE:
+        return (n_trits + NATIVE_TRITS_PER_WORD - 1) // NATIVE_TRITS_PER_WORD
+    raise ValueError(f"неизвестное хранение тритов: {storage!r}")
 
 
 def prod(values: Iterable[int]) -> int:
@@ -480,6 +545,13 @@ class Tensor:
     scale_offset: int = 0
     #: Флаги записи таблицы (поле 50 в файле), см. TFLAG_KV_CACHE.
     flags: int = 0
+    #: Хранение тритов (задача 0057): `packed20` (по умолчанию) или `native`.
+    #: Осмысленно только для kind 0 (иначе — ошибка): у native TRT1 пишется
+    #: version 2, а идентификатор дублируется в flags записи (биты 1..2).
+    storage: str = STORAGE_PACKED20
+    #: kind 4: знаковые значения int8 (-127..127). В файл идут байтами,
+    #: в памяти плотные значения считаются как q · scale (`dense()`).
+    qdata: list[int] | None = None
 
     def __post_init__(self) -> None:
         self.dims = tuple(int(d) for d in self.dims)
@@ -501,6 +573,16 @@ class Tensor:
             )
         if self.kind not in KIND_NAMES:
             raise ValueError(f"тензор {self.name!r}: неизвестный kind={self.kind}")
+        if self.storage not in TRIT_STORAGE_IDS:
+            raise ValueError(
+                f"тензор {self.name!r}: неизвестное хранение тритов "
+                f"{self.storage!r}, допустимо packed20|native"
+            )
+        if self.kind != KIND_TRITS and self.storage != STORAGE_PACKED20:
+            raise ValueError(
+                f"тензор {self.name!r}: хранение {self.storage!r} осмысленно "
+                "только для тритов (kind 0)"
+            )
         if self.scale_dtype not in ("float32", "float16"):
             raise ValueError(f"тензор {self.name!r}: scale_dtype={self.scale_dtype!r}")
         if not 0 <= int(self.flags) <= 0xFFFF:
@@ -511,7 +593,7 @@ class Tensor:
             # Кэш существует только в таблице: содержимое не пишется и не
             # читается (его создаёт исполнитель), поэтому данные запрещены —
             # иначе легко решить, что они попадут в файл.
-            if self.kind == KIND_TRITS:
+            if self.kind in (KIND_TRITS, KIND_INT8):
                 raise ValueError(
                     f"тензор {self.name!r}: KV-кэш обязан быть fp-тензором (kind {self.kind})"
                 )
@@ -547,9 +629,50 @@ class Tensor:
                 _check_finite(self.scales, f"тензор {self.name!r}: масштаб")
                 if any(s < 0 for s in self.scales):
                     raise ValueError(f"тензор {self.name!r}: масштаб не может быть отрицательным")
+        elif self.kind == KIND_INT8:
+            if self.block_size != SCALE_BLOCK:
+                raise ValueError(
+                    f"тензор {self.name!r}: int8 хранит масштаб только на "
+                    f"{SCALE_BLOCK} элементов"
+                )
+            if self.data is not None or self.trits is not None:
+                raise ValueError(
+                    f"тензор {self.name!r}: int8-тензор не имеет fp-данных/тритов"
+                )
+            if self.qdata is not None:
+                if len(self.qdata) != self.n_elements:
+                    raise ValueError(
+                        f"тензор {self.name!r}: {len(self.qdata)} int8-значений, "
+                        f"а dims дают {self.n_elements}"
+                    )
+                for value in self.qdata:
+                    if not INT8_MIN <= int(value) <= INT8_MAX:
+                        raise ValueError(
+                            f"тензор {self.name!r}: int8-значение {value!r} "
+                            f"вне {INT8_MIN}..{INT8_MAX}"
+                        )
+                if self.scales is None:
+                    raise ValueError(f"тензор {self.name!r}: int8 без масштабов")
+                expected = n_scale_blocks(self.n_elements, self.block_size)
+                if len(self.scales) != expected:
+                    raise ValueError(
+                        f"тензор {self.name!r}: масштабов {len(self.scales)}, "
+                        f"ожидалось {expected}"
+                    )
+                _check_finite(self.scales, f"тензор {self.name!r}: масштаб")
+                if any(s < 0 for s in self.scales):
+                    raise ValueError(
+                        f"тензор {self.name!r}: масштаб не может быть отрицательным"
+                    )
+            elif self.scales is not None:
+                raise ValueError(
+                    f"тензор {self.name!r}: int8-масштабы без qdata"
+                )
         else:
-            if self.trits is not None or self.scales is not None:
-                raise ValueError(f"тензор {self.name!r}: fp-тензор не имеет тритов")
+            if self.trits is not None or self.scales is not None or self.qdata is not None:
+                raise ValueError(
+                    f"тензор {self.name!r}: fp-тензор не имеет тритов/int8"
+                )
             if self.data is not None:
                 if len(self.data) != self.n_elements:
                     raise ValueError(
@@ -604,8 +727,13 @@ class Tensor:
         trits: Iterable[int],
         scales: Sequence[float] | None = None,
         scale_dtype: str = "float32",
+        storage: str = STORAGE_PACKED20,
     ) -> "Tensor":
-        """Тритовый тензор. Без масштабов — absmax по тритам (0 или 1)."""
+        """Тритовый тензор. Без масштабов — absmax по тритам (0 или 1).
+
+        `storage` — физическое хранение (задача 0057): `packed20` или `native`
+        (1 знаковый байт на трит). Логические триты и результаты одни и те же.
+        """
         trits_list = [int(t) for t in trits]
         n_values = prod(dims)
         if len(trits_list) != n_values:
@@ -624,6 +752,26 @@ class Tensor:
             trits=trits_list,
             scales=scales_list,
             scale_dtype=scale_dtype,
+            storage=storage,
+        )
+
+    @classmethod
+    def int8(
+        cls,
+        name: str,
+        dims: Sequence[int],
+        qdata: Iterable[int],
+        scales: Sequence[float],
+        scale_dtype: str = "float32",
+    ) -> "Tensor":
+        """int8-тензор (kind 4): q в -127..127, один масштаб на блок 128."""
+        return cls(
+            name=name,
+            kind=KIND_INT8,
+            dims=tuple(dims),
+            qdata=[int(value) for value in qdata],
+            scales=[_f32(float(value)) for value in scales],
+            scale_dtype=scale_dtype,
         )
 
     @classmethod
@@ -634,16 +782,50 @@ class Tensor:
     # -- данные --------------------------------------------------------------
 
     def dense(self) -> list[float]:
-        """Плотные значения: для тритов — `trit * scale`, для fp — как есть."""
+        """Плотные значения: триты — `trit·scale`, int8 — `q·scale`, fp — как есть."""
         if self.kind == KIND_TRITS:
             if self.trits is None or self.scales is None:
                 raise ValueError(f"тензор {self.name!r}: нет данных тритов")
             block = self.block_size
             scales = self.scales
             return [trit * scales[i // block] for i, trit in enumerate(self.trits)]
+        if self.kind == KIND_INT8:
+            if self.qdata is None or self.scales is None:
+                raise ValueError(f"тензор {self.name!r}: нет int8-данных")
+            block = self.block_size
+            scales = self.scales
+            # _f32(...) — та же единственная операция float32, что в C
+            # (int8 → float, умножение на float32-масштаб).
+            return [_f32(value * scales[i // block])
+                    for i, value in enumerate(self.qdata)]
         if self.data is None:
             raise ValueError(f"тензор {self.name!r}: нет данных")
         return list(self.data)
+
+
+def quantize_int8(
+    values: Iterable[float], block_size: int = SCALE_BLOCK
+) -> tuple[list[int], list[float]]:
+    """Квантовать веса в (int8, масштабы по 128) — правило `Int8Embedding`.
+
+    `scale = absmax(блок) / 127`, `q = clamp(round(w/scale), -127, 127)`;
+    у нулевого блока масштаб `1e-8/127` и все q = 0 (так делает QAT:
+    `qat/model.py:Int8Embedding`). Округление — к ближайшему чётному, как
+    `torch.round`; отношение считается в float32, чтобы совпасть с QAT.
+    """
+    vals = [_f32(float(v)) for v in values]
+    _check_finite(vals, "quantize_int8")
+    scales: list[float] = []
+    for start in range(0, len(vals), block_size):
+        block = vals[start:start + block_size]
+        absmax = max(abs(v) for v in block) if block else 0.0
+        scales.append(_f32(absmax / 127.0) if absmax > 0 else _f32(1e-8 / 127.0))
+    qdata: list[int] = []
+    for i, value in enumerate(vals):
+        scale = scales[i // block_size]
+        ratio = _f32(value / scale) if scale else 0.0
+        qdata.append(max(INT8_MIN, min(INT8_MAX, int(round(ratio)))))
+    return qdata, scales
 
 
 def quantize_trits(
@@ -738,7 +920,15 @@ def tensor_payload_size(tensor: Tensor) -> int:
         return (
             TRT1_HEADER_SIZE
             + n_scale_blocks(n_values, tensor.block_size) * scale_bytes
-            + storage_words(n_values) * 4
+            + storage_words(n_values, tensor.storage) * 4
+        )
+    if tensor.kind == KIND_INT8:
+        n_values = tensor.n_elements
+        scale_bytes = 4 if tensor.scale_dtype == "float32" else 2
+        return (
+            INT8_HEADER_SIZE
+            + n_scale_blocks(n_values, INT8_SCALE_BLOCK) * scale_bytes
+            + n_values
         )
     if tensor.kind == KIND_F32:
         return tensor.n_elements * 4
@@ -747,8 +937,87 @@ def tensor_payload_size(tensor: Tensor) -> int:
     raise ValueError(f"тензор {tensor.name!r}: неизвестный kind={tensor.kind}")
 
 
+def encode_int8_segment(tensor: Tensor) -> bytes:
+    """Собрать INT8-сегмент: 18-байтовый заголовок + масштабы + q-байты."""
+    if tensor.kind != KIND_INT8:
+        raise ValueError(f"тензор {tensor.name!r}: это не int8")
+    if tensor.qdata is None or tensor.scales is None:
+        raise ValueError(
+            f"тензор {tensor.name!r}: нет int8-данных — граф собран без весов, "
+            "записывать в контейнер нечего"
+        )
+    n_values = tensor.n_elements
+    n_scales = n_scale_blocks(n_values, INT8_SCALE_BLOCK)
+    if len(tensor.scales) != n_scales:
+        raise ValueError(
+            f"тензор {tensor.name!r}: масштабов {len(tensor.scales)}, ожидалось {n_scales}"
+        )
+    if len(tensor.qdata) != n_values:
+        raise ValueError(
+            f"тензор {tensor.name!r}: {len(tensor.qdata)} int8-значений, "
+            f"а dims дают {n_values}"
+        )
+    flags = 0x01 if tensor.scale_dtype == "float32" else 0x00
+    header = _TRT1_STRUCT.pack(INT8_MAGIC, INT8_VERSION, flags, n_values, n_scales)
+    scale_code = "f" if tensor.scale_dtype == "float32" else "e"
+    try:
+        scales_bytes = struct.pack(f"<{n_scales}{scale_code}", *tensor.scales)
+    except (struct.error, OverflowError) as exc:
+        raise ValueError(
+            f"тензор {tensor.name!r}: масштаб не влезает в {tensor.scale_dtype}"
+        ) from exc
+    # q — знаковые байты: -1 -> 0xFF, 127 -> 0x7F.
+    q_bytes = bytes(value & 0xFF for value in tensor.qdata)
+    return header + scales_bytes + q_bytes
+
+
+def decode_int8_segment(data: bytes) -> tuple[list[int], list[float], str]:
+    """Разобрать INT8-сегмент; лишние байты в конце (padding) игнорируются."""
+    if len(data) < INT8_HEADER_SIZE:
+        raise ValueError(
+            f"INT8-сегмент короче заголовка: {len(data)} < {INT8_HEADER_SIZE}"
+        )
+    magic, version, flags, n_values, n_scales = _TRT1_STRUCT.unpack_from(data, 0)
+    if magic != INT8_MAGIC:
+        raise ValueError(f"чужой magic INT8-сегмента: {magic!r}")
+    if version != INT8_VERSION:
+        raise ValueError(f"неизвестная версия INT8-сегмента: {version}")
+    if flags & ~0x01:
+        raise ValueError(f"неизвестные флаги INT8-сегмента: 0x{flags:02x}")
+    expected_scales = n_scale_blocks(n_values, INT8_SCALE_BLOCK)
+    if n_scales != expected_scales:
+        raise ValueError(
+            f"в заголовке INT8 {n_scales} масштабов, ожидалось {expected_scales} "
+            f"для {n_values} элементов"
+        )
+    scale_dtype = "float32" if flags & 0x01 else "float16"
+    scale_size = 4 if scale_dtype == "float32" else 2
+    expected_len = INT8_HEADER_SIZE + n_scales * scale_size + n_values
+    if len(data) < expected_len:
+        raise ValueError(
+            f"INT8-сегмент обрезан: {len(data)} байт, ожидалось {expected_len}"
+        )
+    scale_code = "f" if scale_dtype == "float32" else "e"
+    scales = list(
+        struct.unpack_from(f"<{n_scales}{scale_code}", data, INT8_HEADER_SIZE)
+    )
+    q_offset = INT8_HEADER_SIZE + n_scales * scale_size
+    qdata = list(struct.unpack_from(f"<{n_values}b", data, q_offset))
+    for index, value in enumerate(qdata):
+        if value < INT8_MIN:
+            raise ValueError(
+                f"INT8-сегмент: q #{index} = {value} меньше {INT8_MIN}"
+            )
+    return qdata, [float(s) for s in scales], scale_dtype
+
+
 def encode_trit_segment(tensor: Tensor) -> bytes:
-    """Собрать TRT1-сегмент: заголовок + масштабы + слова pack20."""
+    """Собрать TRT1-сегмент: заголовок + масштабы + триты в его хранении.
+
+    `packed20` пишется TRT1 version 1 (байт-в-байт как до 0057), `native` —
+    version 2 с идентификатором хранения в битах 1..2 flags. Байт-в-байт
+    совместимость важна: старые контейнеры и старые читатели не меняются.
+    """
     if tensor.kind != KIND_TRITS:
         raise ValueError(f"тензор {tensor.name!r}: это не триты")
     if tensor.trits is None or tensor.scales is None:
@@ -756,21 +1025,30 @@ def encode_trit_segment(tensor: Tensor) -> bytes:
             f"тензор {tensor.name!r}: нет тритов — граф собран без весов, "
             "записывать в контейнер нечего"
         )
+    storage = tensor.storage
+    if storage not in TRIT_STORAGE_IDS:  # pragma: no cover - проверено в Tensor
+        raise ValueError(f"тензор {tensor.name!r}: хранение {storage!r}")
     n_trits = tensor.n_elements
     n_scales = n_scale_blocks(n_trits, tensor.block_size)
     if len(tensor.scales) != n_scales:
         raise ValueError(
             f"тензор {tensor.name!r}: масштабов {len(tensor.scales)}, ожидалось {n_scales}"
         )
+    version = TRT1_VERSION if storage == STORAGE_PACKED20 else TRT1_VERSION_STORAGE
     flags = 0x01 if tensor.scale_dtype == "float32" else 0x00
-    header = _TRT1_STRUCT.pack(TRT1_MAGIC, TRT1_VERSION, flags, n_trits, n_scales)
+    flags |= TRIT_STORAGE_IDS[storage] << TFLAG_STORAGE_SHIFT
+    header = _TRT1_STRUCT.pack(TRT1_MAGIC, version, flags, n_trits, n_scales)
     scale_code = "f" if tensor.scale_dtype == "float32" else "e"
     try:
         scales_bytes = struct.pack(f"<{n_scales}{scale_code}", *tensor.scales)
     except (struct.error, OverflowError) as exc:
         raise ValueError(f"тензор {tensor.name!r}: масштаб не влезает в {tensor.scale_dtype}") from exc
-    words = pack20(tensor.trits)
-    expected = storage_words(n_trits) * 4
+    expected = storage_words(n_trits, storage) * 4
+    if storage == STORAGE_PACKED20:
+        words = pack20(tensor.trits)
+    else:
+        # 1 трит = 1 знаковый байт: -1 -> 0xFF, 0 -> 0x00, +1 -> 0x01.
+        words = bytes(trit & 0xFF for trit in tensor.trits)
     if len(words) > expected:  # pragma: no cover - защита от рассинхрона констант
         raise ValueError(
             f"тензор {tensor.name!r}: упаковано {len(words)} байт при лимите {expected}"
@@ -779,26 +1057,51 @@ def encode_trit_segment(tensor: Tensor) -> bytes:
     return header + scales_bytes + words
 
 
-def decode_trit_segment(data: bytes) -> tuple[list[int], list[float], str]:
-    """Разобрать TRT1-сегмент; лишние байты в конце (padding) игнорируются."""
+def _trit_segment_header(
+    data: bytes, where: str = "TRT1-сегмент"
+) -> tuple[str, int, int, int, int]:
+    """Проверить заголовок TRT1 и вернуть (storage, flags, n_trits, n_scales, scale_size)."""
     if len(data) < TRT1_HEADER_SIZE:
-        raise ValueError(f"TRT1-сегмент короче заголовка: {len(data)} < {TRT1_HEADER_SIZE}")
+        raise ValueError(f"{where} короче заголовка: {len(data)} < {TRT1_HEADER_SIZE}")
     magic, version, flags, n_trits, n_scales = _TRT1_STRUCT.unpack_from(data, 0)
     if magic != TRT1_MAGIC:
-        raise ValueError(f"чужой magic TRT1-сегмента: {magic!r}")
-    if version != TRT1_VERSION:
-        raise ValueError(f"неизвестная версия TRT1-сегмента: {version}")
-    if flags & ~0x01:
-        raise ValueError(f"неизвестные флаги TRT1-сегмента: 0x{flags:02x}")
+        raise ValueError(f"чужой magic {where}: {magic!r}")
+    if version == TRT1_VERSION:
+        # До 0057: только pack20, бит 0 — fp32-масштабы.
+        if flags & ~0x01:
+            raise ValueError(f"неизвестные флаги {where}: 0x{flags:02x}")
+        storage = STORAGE_PACKED20
+    elif version == TRT1_VERSION_STORAGE:
+        if flags & ~0x07:
+            raise ValueError(f"неизвестные флаги {where}: 0x{flags:02x}")
+        storage = TRIT_STORAGE_NAMES.get((flags >> TFLAG_STORAGE_SHIFT) & 0x03)
+        if storage is None:
+            raise ValueError(
+                f"{where}: неизвестное хранение тритов "
+                f"{(flags >> TFLAG_STORAGE_SHIFT) & 0x03}"
+            )
+    else:
+        raise ValueError(f"неизвестная версия {where}: {version}")
     expected_scales = n_scale_blocks(n_trits, SCALE_BLOCK)
     if n_scales != expected_scales:
         raise ValueError(
-            f"в заголовке TRT1 {n_scales} масштабов, ожидалось {expected_scales} "
+            f"в заголовке {where} {n_scales} масштабов, ожидалось {expected_scales} "
             f"для {n_trits} тритов"
         )
+    scale_size = 4 if flags & 0x01 else 2
+    return storage, flags, n_trits, n_scales, scale_size
+
+
+def decode_trit_segment_ex(
+    data: bytes,
+) -> tuple[list[int], list[float], str, str]:
+    """Разобрать TRT1-сегмент: триты, масштабы, dtype масштабов, хранение.
+
+    Лишние байты в конце (padding) игнорируются.
+    """
+    storage, flags, n_trits, n_scales, scale_size = _trit_segment_header(data)
     scale_dtype = "float32" if flags & 0x01 else "float16"
-    scale_size = 4 if scale_dtype == "float32" else 2
-    n_words = storage_words(n_trits)
+    n_words = storage_words(n_trits, storage)
     expected_len = TRT1_HEADER_SIZE + n_scales * scale_size + n_words * 4
     if len(data) < expected_len:
         raise ValueError(
@@ -808,8 +1111,23 @@ def decode_trit_segment(data: bytes) -> tuple[list[int], list[float], str]:
     scales = list(struct.unpack_from(f"<{n_scales}{scale_code}", data, TRT1_HEADER_SIZE))
     words_offset = TRT1_HEADER_SIZE + n_scales * scale_size
     words = data[words_offset:words_offset + n_words * 4]
-    trits = unpack20(words, n_trits)
-    return trits, [float(s) for s in scales], scale_dtype
+    if storage == STORAGE_PACKED20:
+        trits = unpack20(words, n_trits)
+    else:
+        raw = struct.unpack(f"<{n_words * 4}b", words)
+        for index in range(n_trits):
+            if raw[index] not in (-1, 0, 1):
+                raise ValueError(
+                    f"TRT1-сегмент: native-трит #{index} = {raw[index]} вне -1..1"
+                )
+        trits = list(raw[:n_trits])
+    return trits, [float(s) for s in scales], scale_dtype, storage
+
+
+def decode_trit_segment(data: bytes) -> tuple[list[int], list[float], str]:
+    """Разобрать TRT1-сегмент (совместимый вид: без хранения)."""
+    trits, scales, scale_dtype, _storage = decode_trit_segment_ex(data)
+    return trits, scales, scale_dtype
 
 
 def encode_tensor_payload(tensor: Tensor) -> bytes:
@@ -819,6 +1137,8 @@ def encode_tensor_payload(tensor: Tensor) -> bytes:
         return b""
     if tensor.kind == KIND_TRITS:
         return encode_trit_segment(tensor)
+    if tensor.kind == KIND_INT8:
+        return encode_int8_segment(tensor)
     if tensor.data is None:
         raise ValueError(
             f"тензор {tensor.name!r}: нет данных — граф собран без весов, "
@@ -841,13 +1161,25 @@ def encode_tensor_payload(tensor: Tensor) -> bytes:
 def decode_tensor_values(tensor: Tensor, payload: bytes) -> None:
     """Заполнить `tensor` значениями из payload'а (payload уже отрезан по размеру)."""
     if tensor.kind == KIND_TRITS:
-        trits, scales, scale_dtype = decode_trit_segment(payload)
+        trits, scales, scale_dtype, storage = decode_trit_segment_ex(payload)
         if len(trits) != tensor.n_elements:
             raise ValueError(
                 f"тензор {tensor.name!r}: в сегменте {len(trits)} тритов, "
                 f"а dims дают {tensor.n_elements}"
             )
         tensor.trits = trits
+        tensor.scales = scales
+        tensor.scale_dtype = scale_dtype
+        tensor.storage = storage
+        return
+    if tensor.kind == KIND_INT8:
+        qdata, scales, scale_dtype = decode_int8_segment(payload)
+        if len(qdata) != tensor.n_elements:
+            raise ValueError(
+                f"тензор {tensor.name!r}: в сегменте {len(qdata)} int8-значений, "
+                f"а dims дают {tensor.n_elements}"
+            )
+        tensor.qdata = qdata
         tensor.scales = scales
         tensor.scale_dtype = scale_dtype
         return
@@ -1177,7 +1509,9 @@ def write_vtm(
             tensor.scale_offset = 0
             continue
         tensor.offset = data_size
-        tensor.scale_offset = NO_OFFSET if tensor.kind == KIND_TRITS else 0
+        tensor.scale_offset = (
+            NO_OFFSET if tensor.kind in (KIND_TRITS, KIND_INT8) else 0
+        )
         if tensor.offset % ALIGNMENT:
             raise RuntimeError(  # pragma: no cover - защита от ошибки в align_up
                 f"тензор {tensor.name!r}: offset не выровнен"
@@ -1232,10 +1566,16 @@ def write_vtm(
     for tensor in tensor_list:
         name_bytes = tensor.name.encode("utf-8")
         dims = list(tensor.dims) + [0] * (MAX_DIMS - len(tensor.dims))
+        tflags = int(getattr(tensor, "flags", 0))
+        if tensor.kind == KIND_TRITS:
+            # Хранение дублируется в flags записи (биты 1..2): читателю, который
+            # не разбирает TRT1, видно, что payload — не pack20.
+            tflags = (tflags & ~TFLAG_STORAGE_MASK) | (
+                TRIT_STORAGE_IDS[tensor.storage] << TFLAG_STORAGE_SHIFT
+            )
         table += _TENSOR_STRUCT.pack(
             name_bytes, tensor.kind, len(tensor.dims), *dims,
-            tensor.offset, tensor.scale_offset,
-            int(getattr(tensor, "flags", 0)),
+            tensor.offset, tensor.scale_offset, tflags,
         )
 
     with open(path, "wb") as handle:
@@ -1277,32 +1617,50 @@ def _payload_extent(
     У KV-кэша (flags & TFLAG_KV_CACHE) payload'а нет: 0 байт, читать нечего.
     """
     if flags & TFLAG_KV_CACHE:
-        if kind == KIND_TRITS:
-            raise ValueError("KV-кэш обязан быть fp-тензором, а запись говорит kind=0")
+        if kind in (KIND_TRITS, KIND_INT8):
+            raise ValueError(
+                f"KV-кэш обязан быть fp-тензором, а запись говорит kind={kind}"
+            )
         return 0, None
     if kind == KIND_TRITS:
         if start + TRT1_HEADER_SIZE > len(data):
             raise ValueError("TRT1-сегмент выходит за конец файла")
-        magic, version, flags, n_trits, n_scales = _TRT1_STRUCT.unpack_from(data, start)
-        if magic != TRT1_MAGIC:
-            raise ValueError(f"чужой magic TRT1-сегмента: {magic!r}")
-        if version != TRT1_VERSION:
-            raise ValueError(f"неизвестная версия TRT1-сегмента: {version}")
-        if flags & ~0x01:
-            raise ValueError(f"неизвестные флаги TRT1-сегмента: 0x{flags:02x}")
+        header = data[start:start + TRT1_HEADER_SIZE]
+        storage, flags, n_trits, n_scales, scale_bytes = _trit_segment_header(header)
         if n_trits != n_elements:
             raise ValueError(
                 f"в TRT1-сегменте {n_trits} тритов, а dims дают {n_elements}"
             )
-        expected_scales = n_scale_blocks(n_trits, SCALE_BLOCK)
+        scale_dtype = "float32" if flags & 0x01 else "float16"
+        size = (
+            TRT1_HEADER_SIZE
+            + n_scales * scale_bytes
+            + storage_words(n_trits, storage) * 4
+        )
+        return size, scale_dtype
+    if kind == KIND_INT8:
+        if start + INT8_HEADER_SIZE > len(data):
+            raise ValueError("INT8-сегмент выходит за конец файла")
+        magic, version, flags, n_values, n_scales = _TRT1_STRUCT.unpack_from(data, start)
+        if magic != INT8_MAGIC:
+            raise ValueError(f"чужой magic INT8-сегмента: {magic!r}")
+        if version != INT8_VERSION:
+            raise ValueError(f"неизвестная версия INT8-сегмента: {version}")
+        if flags & ~0x01:
+            raise ValueError(f"неизвестные флаги INT8-сегмента: 0x{flags:02x}")
+        if n_values != n_elements:
+            raise ValueError(
+                f"в INT8-сегменте {n_values} значений, а dims дают {n_elements}"
+            )
+        expected_scales = n_scale_blocks(n_values, INT8_SCALE_BLOCK)
         if n_scales != expected_scales:
             raise ValueError(
-                f"в TRT1-сегменте {n_scales} масштабов, ожидалось {expected_scales}"
+                f"в INT8-сегменте {n_scales} масштабов, ожидалось "
+                f"{expected_scales}"
             )
         scale_dtype = "float32" if flags & 0x01 else "float16"
-        scale_bytes = 4 if scale_dtype == "float32" else 2
-        size = TRT1_HEADER_SIZE + n_scales * scale_bytes + storage_words(n_trits) * 4
-        return size, scale_dtype
+        scale_size = 4 if scale_dtype == "float32" else 2
+        return INT8_HEADER_SIZE + n_scales * scale_size + n_values, scale_dtype
     if kind == KIND_F32:
         return n_elements * 4, None
     if kind in (KIND_F16, KIND_BF16):
@@ -1442,9 +1800,20 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
         if offset % ALIGNMENT:
             raise ValueError(f"тензор {name!r}: offset={offset} не выровнен на {ALIGNMENT}")
 
+        entry_storage = (tflags >> TFLAG_STORAGE_SHIFT) & 0x03
+        if kind == KIND_TRITS and entry_storage not in TRIT_STORAGE_NAMES:
+            raise ValueError(
+                f"тензор {name!r}: неизвестное хранение тритов "
+                f"{entry_storage} в flags"
+            )
         tensor = Tensor(
             name=name, kind=kind, dims=dims, offset=offset,
             scale_offset=scale_offset, flags=tflags,
+            storage=(
+                TRIT_STORAGE_NAMES.get(entry_storage, STORAGE_PACKED20)
+                if kind == KIND_TRITS
+                else STORAGE_PACKED20
+            ),
         )
         size, scale_dtype = _payload_extent(
             data, data_start + offset, kind, tensor.n_elements, tflags
@@ -1464,9 +1833,25 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
                 )
             tensor.scale_offset = NO_OFFSET
             tensor.scale_dtype = scale_dtype or "float32"
+        elif kind == KIND_INT8:
+            if scale_offset != NO_OFFSET:
+                raise ValueError(
+                    f"тензор {name!r}: scale_offset={scale_offset}, ожидалось "
+                    f"{NO_OFFSET} (масштабы внутри INT8-сегмента)"
+                )
+            tensor.scale_offset = NO_OFFSET
+            tensor.scale_dtype = scale_dtype or "float32"
         elif scale_offset != 0:
-            raise ValueError(f"тензор {name!r}: scale_offset должен быть 0 для fp-тензора")
+            raise ValueError(
+                f"тензор {name!r}: scale_offset должен быть 0 для fp-тензора"
+            )
+        expected_storage = tensor.storage
         decode_tensor_values(tensor, data[start:end])
+        if kind == KIND_TRITS and tensor.storage != expected_storage:
+            raise ValueError(
+                f"тензор {name!r}: хранение в flags ({expected_storage}) не "
+                f"совпадает с TRT1 ({tensor.storage})"
+            )
         ranges.append((start, end, name))
         tensors.append(tensor)
 

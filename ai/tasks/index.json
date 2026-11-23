@@ -303,7 +303,7 @@
   {
     "id": "0044",
     "title": "Kind 4 — int8-тензоры в контейнере",
-    "status": "in_progress",
+    "status": "done",
     "file": "0044-kind4-int8.md",
     "assignee": "agent:int8-tensor"
   },
@@ -373,7 +373,7 @@
   {
     "id": "0057",
     "title": "Абстракция хранения тритов: packed20 и native",
-    "status": "in_progress",
+    "status": "done",
     "file": "0057-trit-storage-abstraction.md",
     "assignee": "agent:trit-storage"
   },
@@ -837,6 +837,27 @@
     "title": "C-ABI: отдавать prefill_ms, чтобы TTFT делился на боевом пути",
     "status": "pending",
     "file": "0127-cabi-prefill-ms.md",
+    "assignee": ""
+  },
+  {
+    "id": "0128",
+    "title": "Ядра читают триты через trit_store (native в горячем цикле)",
+    "status": "pending",
+    "file": "0128-cores-trit-store.md",
+    "assignee": ""
+  },
+  {
+    "id": "0129",
+    "title": "int8-эмбеддинг без материализации в fp32",
+    "status": "pending",
+    "file": "0129-int8-lazy-emb.md",
+    "assignee": ""
+  },
+  {
+    "id": "0130",
+    "title": "qat/export.py: экспорт int8-эмбеддинга end-to-end",
+    "status": "pending",
+    "file": "0130-export-int8.md",
     "assignee": ""
   }
 ]

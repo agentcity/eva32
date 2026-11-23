@@ -33,10 +33,10 @@ scope:
 
 ## Критерии приёмки
 
-- [ ] экспорт `int8` даёт int8-тензор таблицы и манифест с `kind: int8`
-- [ ] `EMB` из int8 = расквантование в Python (1e-6)
-- [ ] размер экспорта int8 меньше fp16 и больше trit (числа в отчёте)
-- [ ] `python3 -m unittest discover -s tests` и `cd src/vtm && make test` зелёные
+- [x] экспорт `int8` даёт int8-тензор таблицы и манифест с `kind: int8`
+- [x] `EMB` из int8 = расквантование в Python (1e-6)
+- [x] размер экспорта int8 меньше fp16 и больше trit (числа в отчёте)
+- [x] `python3 -m unittest discover -s tests` и `cd src/vtm && make test` зелёные
 
 ## Контекст и ограничения
 
@@ -46,7 +46,23 @@ scope:
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+Сделано: kind 4 = сегмент «INT8» (18-байтный заголовок как TRT1: version 1,
+flags бит0 = f32-масштабы, n_values u64, n_scale u32), масштабы на блок 128,
+q ∈ −127..127, `w = q·scale`. `loader.c` валидирует (magic/version/flags/n_values/
+n_scale/границы/q ≠ −128/масштабы) и **материализует в fp32 в арене**, ставя
+provenance-флаг `VTM_TENSOR_FLAG_INT8_SOURCE`; KV-кэш с kind 4 отвергается.
+`tools/vtm_ref.py` — `KIND_INT8`, `quantize_int8` (absmax/127, half-even), encode/decode,
+`dense()`. `vtm_compile.py` принимает `embed_quant="int8"` и собирает EMB по int8-тензору,
+tied MM по нему же; `load_export` читает `dtype: "int8"`.
+
+**Числа:** 128×128 — trit 3 826 Б < int8 16 914 Б < fp16 32 768 Б. 1.5B-таблица:
+54,0 МБ < 240,7 МБ < 466,7 МБ (int8/fp16 = 0,516; int8/trit = 4,46).
+Паритет C↔Python: int8 4,14e-6, native-демо побитово равно packed-демо.
+
+**Честно (что не сделано):** ленивого EMB из int8 нет — материализация в fp32 даёт
++4× памяти к файлу (~233 МиБ для таблицы 1.5B), нужны правки `interp.c` (0129).
+`qat/export.py` по-прежнему отказывает `quantize_embeddings: int8` — end-to-end
+«экспорт → int8-тензор» не выполнен (0130).
 
 ## Ссылки
 

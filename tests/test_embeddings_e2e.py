@@ -25,6 +25,7 @@ C-часть собирается из `src/vtm/libvtm.a`; если компил
 import json
 import os
 import random
+import struct
 import subprocess
 import sys
 import tempfile
@@ -277,7 +278,9 @@ class TestTritEmbeddingExport(_TmpCase):
         self.assertLess(trit_total, none_total)
         self.assertEqual(none_total - trit_total, embed_fp32 - embed_trit)
 
-    def test_int8_is_deferred_with_reason(self):
+    def test_int8_is_deferred_by_exporter(self):
+        # qat/export.py (вне зоны 0044) пока int8 не пишет: честный отказ с
+        # объяснением, а не молчаливый fp32.
         with self.assertRaisesRegex(RuntimeError, "отложен"):
             qat_export.write_weight_files(
                 self.path("int8"), _state_dict(trit_embed=True),
@@ -286,8 +289,25 @@ class TestTritEmbeddingExport(_TmpCase):
             )
         self.assertIn("kind 4", qat_export.EMBED_INT8_DEFERRED)
         self.assertIn("loader.c", qat_export.EMBED_INT8_DEFERRED)
-        with self.assertRaisesRegex(ValueError, "int8"):
-            vtm_compile.ModelConfig(embed_quant="int8")
+
+    def test_compiler_accepts_int8_table(self):
+        # Контейнер/компилятор int8 уже умеют (kind 4): ModelConfig не
+        # отвергает режим, а compile_model собирает EMB по int8-тензору.
+        cfg = vtm_compile.ModelConfig(embed_quant="int8")
+        self.assertEqual(cfg.embed_quant, "int8")
+        cfg = vtm_compile.ModelConfig(
+            vocab=8, hidden=8, n_heads=1, n_kv_heads=1, head_dim=8,
+            intermediate=16, n_layers=1, context_len=4, embed_quant="int8",
+        )
+        values = [((i * 37) % 29) * 0.25 - 3.0 for i in range(8 * 8)]
+        qdata, scales = vtm_ref.quantize_int8(values)
+        embed = vtm_ref.Tensor.int8("embed_tokens", (8, 8), qdata, scales)
+        model = vtm_compile.compile_model(cfg, {"embed": embed})
+        emb = next(t for t in model.tensors if t.name == "emb.w")
+        self.assertEqual(emb.kind, vtm_ref.KIND_INT8)
+        self.assertEqual(model.meta["embed"], "int8")
+        self.assertEqual(model.meta["quantize_embeddings"], "int8")
+        self.assertEqual(vtm_ref.tensor_payload_size(emb), 18 + 4 + 64)
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +530,156 @@ class TestEmbTritInC(_CHarness, _TmpCase):
         got = self.dump(model_path, "logits", tokens[-1])
         self.assertEqual(len(got), VOCAB)
         self.assertLessEqual(max(abs(a - b) for a, b in zip(got, want)), 1e-4)
+
+
+class TestInt8Container(_TmpCase):
+    """kind 4 (int8 + масштабы) в контейнере: запись, чтение, размеры."""
+
+    def _model(self):
+        rng = random.Random(23)
+        values = [rng.uniform(-4.0, 4.0) for _ in range(VOCAB * HIDDEN)]
+        qdata, scales = vtm_ref.quantize_int8(values)
+        emb = vtm_ref.Tensor.int8(
+            "emb.w", (VOCAB, HIDDEN), qdata, scales, scale_dtype="float32"
+        )
+        return emb, qdata, scales, values
+
+    def test_roundtrip_keeps_q_and_scales(self):
+        emb, qdata, scales, _values = self._model()
+        os.makedirs(self.path("int8"), exist_ok=True)
+        path = self.path("int8", "model.vtm")
+        x = vtm_ref.Tensor.f32("x", (HIDDEN,), [0.0] * HIDDEN)
+        program = [
+            vtm_ref.Instr(
+                op=int(vtm_ref.Op.EMB), flags=vtm_ref.IFLAG_EMB_INPUT,
+                dst=1, a=0, b=0, c=0, imm=0,
+            ),
+            vtm_ref.Instr(op=int(vtm_ref.Op.HALT)),
+        ]
+        vtm_ref.write_vtm(path, [emb, x], program, {"embed": "int8"})
+        back = vtm_ref.read_vtm(path)
+        got = back.by_name("emb.w")
+        self.assertEqual(got.kind, vtm_ref.KIND_INT8)
+        self.assertEqual(got.qdata, qdata)
+        self.assertEqual(got.scales, scales)
+        self.assertEqual(got.scale_dtype, "float32")
+        self.assertEqual(got.scale_offset, vtm_ref.NO_OFFSET)
+        # dense() — ровно q·scale (float32), без похода в файл.
+        self.assertEqual(got.dense(), emb.dense())
+
+    def test_int8_size_between_trit_and_fp16(self):
+        """Размер: trit < int8 < fp16 (числа — в отчёте 0044)."""
+        _emb, _q, _scales, values = self._model()
+        n_values = VOCAB * HIDDEN
+        trits, tscales = vtm_ref.quantize_trits(values)
+        trit = vtm_ref.Tensor.ternary("w.trit", (VOCAB, HIDDEN), trits, tscales)
+        int8, _vals, _q, _sc = self._model()
+        fp16 = vtm_ref.Tensor.fp16("w.fp16", (VOCAB, HIDDEN), values)
+        sizes = {
+            "trit": vtm_ref.tensor_payload_size(trit),
+            "int8": vtm_ref.tensor_payload_size(int8),
+            "fp16": vtm_ref.tensor_payload_size(fp16),
+        }
+        print(
+            f"\n[0044] {VOCAB}×{HIDDEN} = {n_values} элементов: "
+            f"trit {sizes['trit']} Б < int8 {sizes['int8']} Б < "
+            f"fp16 {sizes['fp16']} Б"
+        )
+        self.assertLess(sizes["trit"], sizes["int8"])
+        self.assertLess(sizes["int8"], sizes["fp16"])
+        self.assertEqual(sizes["fp16"], n_values * 2)
+        self.assertEqual(
+            sizes["int8"],
+            vtm_ref.INT8_HEADER_SIZE
+            + vtm_ref.n_scale_blocks(n_values, vtm_ref.INT8_SCALE_BLOCK) * 4
+            + n_values,
+        )
+
+    def test_manifest_with_int8_table_loads(self):
+        """Манифест с dtype: int8 читается компилятором (kind 4).
+
+        qat/export.py int8 пока не пишет (вне зоны 0044), поэтому сегмент
+        собираем кодеком vtm_ref и дописываем в non_ternary.bin — проверяем
+        именно чтение манифеста и сборку EMB.
+        """
+        directory = self.path("int8_manifest")
+        manifest_path, manifest, _sizes = write_export(directory, "none")
+        non_path = os.path.join(directory, "non_ternary.bin")
+        with open(non_path, "rb") as handle:
+            blob = bytearray(handle.read())
+        entry = next(
+            item for item in manifest["non_ternary"]["tensors"]
+            if item["name"] == "model.embed_tokens.weight"
+        )
+        raw = blob[entry["offset"]:entry["offset"] + entry["length"]]
+        values = struct.unpack(f"<{VOCAB * HIDDEN}f", raw)
+        qdata, scales = vtm_ref.quantize_int8(values)
+        segment = vtm_ref.encode_int8_segment(
+            vtm_ref.Tensor.int8("emb", (VOCAB, HIDDEN), qdata, scales)
+        )
+        entry["offset"] = len(blob)
+        entry["length"] = len(segment)
+        entry["dtype"] = "int8"
+        entry["n_scale_blocks"] = len(scales)
+        blob += segment
+        with open(non_path, "wb") as handle:
+            handle.write(bytes(blob))
+        manifest["architecture"]["embed"] = "int8"
+        manifest["embeddings"]["mode"] = "int8"
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, indent=2)
+
+        export = vtm_compile.load_export(manifest_path, verify=False)
+        self.assertEqual(export.cfg.embed_quant, "int8")
+        emb = export.weights["embed"]
+        self.assertEqual(emb.kind, vtm_ref.KIND_INT8)
+        self.assertEqual(emb.qdata, qdata)
+        model = vtm_compile.compile_model(export.cfg, export.weights)
+        self.assertEqual(model.by_name("emb.w").kind, vtm_ref.KIND_INT8)
+        self.assertEqual(model.meta["embed"], "int8")
+        self.assertEqual(model.meta["quantize_embeddings"], "int8")
+
+    def test_minus_128_is_rejected(self):
+        _emb, qdata, scales, _values = self._model()
+        bad = list(qdata)
+        bad[0] = -128
+        with self.assertRaisesRegex(ValueError, "int8"):
+            vtm_ref.Tensor.int8("bad", (VOCAB, HIDDEN), bad, scales)
+
+
+class TestEmbInt8InC(_CHarness, _TmpCase):
+    """EMB из int8-таблицы в C = расквантование в Python (1e-6)."""
+
+    def _prepared(self):
+        rng = random.Random(29)
+        values = [rng.uniform(-4.0, 4.0) for _ in range(VOCAB * HIDDEN)]
+        qdata, scales = vtm_ref.quantize_int8(values)
+        emb = vtm_ref.Tensor.int8(
+            "emb.w", (VOCAB, HIDDEN), qdata, scales, scale_dtype="float32"
+        )
+        x = vtm_ref.Tensor.f32("x", (HIDDEN,), [0.0] * HIDDEN)
+        program = [
+            vtm_ref.Instr(
+                op=int(vtm_ref.Op.EMB), flags=vtm_ref.IFLAG_EMB_INPUT,
+                dst=1, a=0, b=0, c=0, imm=0,
+            ),
+            vtm_ref.Instr(op=int(vtm_ref.Op.HALT)),
+        ]
+        os.makedirs(self.path("int8"), exist_ok=True)
+        path = self.path("int8", "emb_only.vtm")
+        vtm_ref.write_vtm(path, [emb, x], program, {"embed": "int8"})
+        return path, emb.dense()
+
+    def test_emb_from_int8_equals_python_dequant(self):
+        path, dense = self._prepared()
+        for token in (0, 7, 42):
+            with self.subTest(token=token):
+                got = self.dump(path, "x", token)
+                want = dense[token * HIDDEN:(token + 1) * HIDDEN]
+                self.assertEqual(len(got), HIDDEN)
+                self.assertLessEqual(
+                    max(abs(a - b) for a, b in zip(got, want)), 1e-6
+                )
 
 
 if __name__ == "__main__":

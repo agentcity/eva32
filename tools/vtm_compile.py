@@ -94,8 +94,14 @@ python3 tools/vtm_compile.py --qwen-config qat/configs/qwen1.5b.yaml
 Если в манифесте `architecture.embed == "trit"` (задача 0043), таблица словаря
 лежит не в `non_ternary.bin`, а тритовым сегментом `model.embed_tokens.weight`
 в `ternary.trit`: `EMB` читает её как kind 0 (C — через LUT243), а tied lm_head
-по-прежнему считается `MM` по `emb.w`, только A уже тритовая. `embed == "int8"`
-компилятор отвергает: kind 4 в контейнере пока не реализован.
+по-прежнему считается `MM` по `emb.w`, только A уже тритовая.
+
+Если `architecture.embed == "int8"` (задача 0044), таблица словаря — int8-сегмент
+(kind 4): `dtype: "int8"` в записи `non_ternary.bin`, payload — ровно
+`INT8`-сегмент (`"INT8"`, version, flags, n_values, n_scales, масштабы, q-байты;
+см. `vtm_ref.decode_int8_segment`). `EMB` в Python читает `q · scale`, C-загрузчик
+материализует сегмент в fp32 в арене. `tied lm_head` в этом режиме тоже работает:
+`MM` получает ту же dequantized-таблицу.
 
 `--qwen-config` — только каркас: реальные веса не читаются, файл не пишется,
 печатается план (число тензоров/инструкций и оценка размера). Запись
@@ -204,8 +210,8 @@ class ModelConfig(LayerConfig):
     #: `emb.w`; экономия vocab × hidden × 4 байт.
     tie_word_embeddings: bool = False
     #: Где лежит таблица словаря: "none" — fp32 в non_ternary.bin,
-    #: "trit" — сегмент ternary.trit (kind: trit, задача 0043).
-    #: "int8" в контейнере пока не поддержан (нужен kind 4).
+    #: "trit" — сегмент ternary.trit (kind: trit, задача 0043),
+    #: "int8" — INT8-сегмент в non_ternary.bin (kind 4, задача 0044).
     embed_quant: str = "none"
 
     def __post_init__(self) -> None:
@@ -214,12 +220,6 @@ class ModelConfig(LayerConfig):
         if self.embed_quant not in ("none", "trit", "int8"):
             raise ValueError(
                 f"embed_quant={self.embed_quant!r}, допустимо none|trit|int8"
-            )
-        if self.embed_quant == "int8":
-            raise ValueError(
-                "int8-эмбеддинги в контейнере отложены: нужен kind 4 "
-                "(int8 + масштабы) и его чтение в src/vtm/loader.c и "
-                "tools/vtm_ref.py; пока поддержаны none и trit"
             )
         if self.vocab <= 0:
             raise ValueError("vocab должен быть > 0")
@@ -568,15 +568,20 @@ def compile_model(
     # при quantize_embeddings: trit экспорт кладёт её сегментом в
     # ternary.trit, и EMB читает триты (C — через LUT243, задача 0043).
     embed_spec = w.get("embed")
-    if isinstance(embed_spec, vtm_ref.Tensor) and embed_spec.kind == vtm_ref.KIND_TRITS:
+    if isinstance(embed_spec, vtm_ref.Tensor) and embed_spec.kind in (
+        vtm_ref.KIND_TRITS,
+        vtm_ref.KIND_INT8,
+    ):
         if tuple(embed_spec.dims) != (cfg.vocab, hidden):
             raise ValueError(
                 f"emb.w: форма {tuple(embed_spec.dims)}, ожидалась "
-                f"{(cfg.vocab, hidden)} (тритовая таблица словаря)"
+                f"{(cfg.vocab, hidden)} (квантованная таблица словаря)"
             )
         embed_spec.name = "emb.w"
         embed = g.add(embed_spec)
-        embed_storage = "trit"
+        embed_storage = (
+            "trit" if embed_spec.kind == vtm_ref.KIND_TRITS else "int8"
+        )
     else:
         embed = matrix_tensor(g, "emb.w", cfg.vocab, hidden, embed_spec, dense=True)
         embed_storage = "fp32"
@@ -585,6 +590,13 @@ def compile_model(
             "в architecture embed='trit', а таблица словаря плотная: "
             "экспорт должен положить model.embed_tokens.weight в ternary.trit "
             "(kind: trit), либо уберите embed=trit из манифеста"
+        )
+    if cfg.embed_quant == "int8" and embed_storage != "int8":
+        raise ValueError(
+            "в architecture embed='int8', а таблица словаря не int8: "
+            "экспорт должен положить model.embed_tokens.weight сегментом "
+            "INT8 (dtype: int8) в non_ternary.bin, либо уберите embed=int8 "
+            "из манифеста"
         )
     x = g.act("x", (hidden,))
     g.emit(Op.EMB, dst=x, a=embed, flags=vtm_ref.IFLAG_EMB_INPUT, imm=0)
@@ -644,7 +656,9 @@ def compile_model(
         # Где лежит таблица словаря: по этому ключу C/B-код и отладка
         # понимают, что EMB читает триты (kind 0), а не fp32.
         "embed": embed_storage,
-        "quantize_embeddings": "trit" if embed_storage == "trit" else "none",
+        "quantize_embeddings": (
+            embed_storage if embed_storage in ("trit", "int8") else "none"
+        ),
         "rms_norm_eps": cfg.eps,
         "context_len": cfg.context_len,
         "scale_block": vtm_ref.SCALE_BLOCK,
@@ -844,6 +858,22 @@ def _non_ternary_tensor(
     if not shape or any(x <= 0 for x in shape):
         raise ValueError(f"{name}: плохая shape={entry.get('shape')!r}")
     dtype = str(entry.get("dtype") or "float32")
+    if dtype == "int8":
+        # Таблица словаря (kind 4, задача 0044): payload — INT8-сегмент.
+        qdata, scales, scale_dtype = vtm_ref.decode_int8_segment(payload)
+        if len(qdata) != vtm_ref.prod(shape):
+            raise ValueError(
+                f"{name}: в INT8-сегменте {len(qdata)} значений, а shape даёт "
+                f"{vtm_ref.prod(shape)}"
+            )
+        return vtm_ref.Tensor(
+            name=short_name,
+            kind=vtm_ref.KIND_INT8,
+            dims=shape,
+            qdata=qdata,
+            scales=scales,
+            scale_dtype=scale_dtype,
+        )
     kind = {
         "float32": vtm_ref.KIND_F32,
         "float16": vtm_ref.KIND_F16,
@@ -1097,12 +1127,21 @@ def load_export(
                     f"{name}: в architecture embed='trit', а в "
                     f"{non_file} лежит плотная таблица; манифест противоречив"
                 )
+            if tensor.kind == vtm_ref.KIND_INT8 and cfg.embed_quant != "int8":
+                raise ValueError(
+                    f"{name}: int8-таблица словаря, а в architecture "
+                    f"embed={cfg.embed_quant!r}; переэкспортируйте чекпоинт "
+                    "с quantize_embeddings: int8"
+                )
             _expect_shape(shape, (cfg.vocab, cfg.hidden), name)
-            if cfg.tie_word_embeddings and tensor.kind != vtm_ref.KIND_F32:
+            if cfg.tie_word_embeddings and tensor.kind not in (
+                vtm_ref.KIND_F32,
+                vtm_ref.KIND_INT8,
+            ):
                 raise ValueError(
                     f"{name}: tied lm_head считается через MM по этой же "
-                    f"таблице; нужен fp32 или тритовая таблица (embed=trit), "
-                    f"а пришёл {tensor.kind_name}"
+                    f"таблице; нужен fp32, int8 (embed=int8) или тритовая "
+                    f"таблица (embed=trit), а пришёл {tensor.kind_name}"
                 )
             weights["embed"] = tensor
         elif kind == "final_norm":
@@ -1147,6 +1186,12 @@ def load_export(
                 "в экспорте нет тритовой таблицы словаря: architecture "
                 "embed='trit', но сегмента model.embed_tokens.weight нет в "
                 "ternary.trit и записи с kind: trit в манифесте тоже нет"
+            )
+        if cfg.embed_quant == "int8":
+            raise ValueError(
+                "в экспорте нет int8-таблицы словаря: architecture "
+                "embed='int8', но записи model.embed_tokens.weight с "
+                "dtype: int8 в non_ternary.bin нет"
             )
         raise ValueError(
             "в экспорте нет эмбеддингов (model.embed_tokens.weight): "
@@ -1517,7 +1562,9 @@ def _print_manifest(
     if embed is not None:
         payload = (
             vtm_ref.tensor_payload_size(embed)
-            if embed.trits is not None or embed.data is not None
+            if embed.trits is not None
+            or embed.data is not None
+            or embed.qdata is not None
             else 0
         )
         fp32_bytes = cfg.vocab * cfg.hidden * 4
@@ -1526,6 +1573,14 @@ def _print_manifest(
                 f"эмбеддинги: trit, сегмент ternary.trit "
                 f"({_human_bytes(payload)} против {_human_bytes(fp32_bytes)} fp32, "
                 f"EMB читает триты через LUT243"
+                + ("; tied lm_head — MM по той же таблице)" if export.tied else ")")
+            )
+        elif embed.kind == vtm_ref.KIND_INT8:
+            print(
+                f"эмбеддинги: int8 (kind 4), сегмент non_ternary.bin "
+                f"({_human_bytes(payload)} против {_human_bytes(fp32_bytes)} fp32, "
+                f"масштабы на блок {vtm_ref.INT8_SCALE_BLOCK}; загрузчик "
+                f"материализует fp32 в арене"
                 + ("; tied lm_head — MM по той же таблице)" if export.tied else ")")
             )
         else:
