@@ -1045,8 +1045,15 @@
   {
     "id": "0158",
     "title": "Плотный fp32 lm_head через SIMD",
-    "status": "in_progress",
+    "status": "done",
     "file": "0158-dense-mm-simd.md",
     "assignee": "agent:dense-mm"
+  },
+  {
+    "id": "0159",
+    "title": "dense_gemv в backend_neon.c + AVX2 + батчевый путь",
+    "status": "in_progress",
+    "file": "0159-gemv-to-backend.md",
+    "assignee": "agent:gemv-backend"
   }
 ]

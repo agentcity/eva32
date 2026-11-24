@@ -23,6 +23,15 @@
 #include <string.h>
 #include <time.h>
 
+// Плотный GEMV для одного столбца (tied lm_head) — см. dense_gemv().
+// На ARM64 это NEON; на остальных арх — переносимый double-путь.
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#define VTM_GEMV_NEON 1
+#else
+#define VTM_GEMV_NEON 0
+#endif
+
 // --- диагностика -----------------------------------------------------------
 
 static vtm_status fail(vtm_t *m, uint32_t idx, vtm_status st,
@@ -157,6 +166,197 @@ static int trit_weight_at(const vtm_tensor *t, size_t index, float *out) {
     return 0;
 }
 
+// --- плотный GEMV fp32 (один столбец), задача 0158 -------------------------
+//
+// SIMD-ядра MM подключаются, только если выбран SIMD-бэкенд и он доступен.
+// Но `vtm_simd_mm_f32` (backend_neon.c) векторизует MM блоками по 4 столбца:
+// при n == 1 цикл `for (c = 0; c + 4 <= n; ...)` не выполняется ни разу, и
+// ядро уходит в скалярный double-хвост — побитово тот же цикл, что был в
+// op_mm. А n == 1 — это tied lm_head: A = emb.w [vocab, hidden], B = [hidden,1];
+// на 3B Q4 это 311М MAC и ~33% времени декода. То есть подключение уже есть
+// (78c0552), а на lm_head оно не даёт ничего.
+//
+// Поэтому один столбец считаем здесь, в зоне interp.c: 4 f32-ленты по блоку
+// VTM_GEMV_CHUNK элементов, блок сворачивается в double. Порядок сложений
+// иной, чем у скалярного double-цикла, поэтому результат не побитовый:
+// расхождение на logits 3B Q4 ≤ 2e-6 (порог 1e-5), см. отчёт задачи.
+// Скалярный бэкенд сюда не заходит вовсе — у него остаётся прежний цикл
+// (побитовость скалярного пути сохраняется). На не-ARM — переносимый путь
+// с 4 double-аккумуляторами: он снимает цепочку зависимостей FMA и даёт
+// ~2,5x без изменения точности.
+//
+// Строки делятся пулом vtm_parallel_rows: каждая строка (для
+// транспонированной раскладки — каждая группа из 4 строк) считается одним
+// и тем же кодом, поэтому результат не зависит от числа потоков (побитово).
+
+#define VTM_GEMV_CHUNK 64
+
+static int simd_mm_enabled(const vtm_t *m) {
+    return m && m->backend && m->backend->name
+        && strncmp(m->backend->name, "simd", 4) == 0
+        && vtm_simd_available();
+}
+
+#if VTM_GEMV_NEON
+// a·b: внутри блока — f32-ленты (4 аккумулятора), блок в double. Длина блока
+// ограничена, чтобы f32-ошибка не накапливалась на всей строке 2048.
+static double dense_dot_f32(const float *a, const float *b, int n) {
+    double sum = 0.0;
+    int i = 0;
+
+    for (; i + 4 <= n; ) {
+        float32x4_t a0 = vdupq_n_f32(0.0f);
+        float32x4_t a1 = a0, a2 = a0, a3 = a0;
+        int len = n - i;
+        int j = 0;
+
+        if (len > VTM_GEMV_CHUNK) len = VTM_GEMV_CHUNK;
+        for (; j + 16 <= len; j += 16) {
+            a0 = vfmaq_f32(a0, vld1q_f32(a + i + j),
+                           vld1q_f32(b + i + j));
+            a1 = vfmaq_f32(a1, vld1q_f32(a + i + j + 4),
+                           vld1q_f32(b + i + j + 4));
+            a2 = vfmaq_f32(a2, vld1q_f32(a + i + j + 8),
+                           vld1q_f32(b + i + j + 8));
+            a3 = vfmaq_f32(a3, vld1q_f32(a + i + j + 12),
+                           vld1q_f32(b + i + j + 12));
+        }
+        for (; j + 4 <= len; j += 4)
+            a0 = vfmaq_f32(a0, vld1q_f32(a + i + j),
+                           vld1q_f32(b + i + j));
+        {
+            float64x2_t lo = vaddq_f64(vcvt_f64_f32(vget_low_f32(a0)),
+                                       vcvt_f64_f32(vget_low_f32(a1)));
+            float64x2_t hi = vaddq_f64(vcvt_f64_f32(vget_high_f32(a0)),
+                                       vcvt_f64_f32(vget_high_f32(a1)));
+            float64x2_t lo2 = vaddq_f64(vcvt_f64_f32(vget_low_f32(a2)),
+                                        vcvt_f64_f32(vget_low_f32(a3)));
+            float64x2_t hi2 = vaddq_f64(vcvt_f64_f32(vget_high_f32(a2)),
+                                        vcvt_f64_f32(vget_high_f32(a3)));
+            sum += vgetq_lane_f64(lo, 0) + vgetq_lane_f64(lo, 1)
+                 + vgetq_lane_f64(hi, 0) + vgetq_lane_f64(hi, 1)
+                 + vgetq_lane_f64(lo2, 0) + vgetq_lane_f64(lo2, 1)
+                 + vgetq_lane_f64(hi2, 0) + vgetq_lane_f64(hi2, 1);
+        }
+        for (; j < len; j++)
+            sum += (double)a[i + j] * (double)b[i + j];
+        i += len;
+    }
+    for (; i < n; i++)
+        sum += (double)a[i] * (double)b[i];
+    return sum;
+}
+#else
+// Без SIMD: 4 независимых double-аккумулятора вместо одной цепочки FMA.
+static double dense_dot_f32(const float *a, const float *b, int n) {
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    int i = 0;
+
+    for (; i + 4 <= n; i += 4) {
+        s0 += (double)a[i] * (double)b[i];
+        s1 += (double)a[i + 1] * (double)b[i + 1];
+        s2 += (double)a[i + 2] * (double)b[i + 2];
+        s3 += (double)a[i + 3] * (double)b[i + 3];
+    }
+    for (; i < n; i++) s0 += (double)a[i] * (double)b[i];
+    return (s0 + s1) + (s2 + s3);
+}
+#endif
+
+// y[r] = sum_t Wᵀ[r,t]·x[t] при W, хранящейся как [cols, rows]: r — младший
+// индекс, поэтому строки выхода читаются подряд и складываются в f32-ленты
+// (4 выхода за шаг), блок по t — в double.
+static void dense_gemv_transposed_rows(const float *w, const float *x, float *y,
+                                       int rows, int cols, int r0, int r1) {
+    int r = r0, t;
+
+#if VTM_GEMV_NEON
+    for (; r + 4 <= r1; r += 4) {
+        double acc[4] = {0.0, 0.0, 0.0, 0.0};
+        int c;
+
+        for (c = 0; c < cols; c += VTM_GEMV_CHUNK) {
+            float32x4_t part = vdupq_n_f32(0.0f);
+            int end = c + VTM_GEMV_CHUNK;
+
+            if (end > cols) end = cols;
+            for (t = c; t < end; t++)
+                part = vfmaq_n_f32(part,
+                                   vld1q_f32(w + (size_t)t * (size_t)rows
+                                             + (size_t)r),
+                                   x[t]);
+            {
+                float64x2_t lo = vcvt_f64_f32(vget_low_f32(part));
+                float64x2_t hi = vcvt_f64_f32(vget_high_f32(part));
+                acc[0] += vgetq_lane_f64(lo, 0);
+                acc[1] += vgetq_lane_f64(lo, 1);
+                acc[2] += vgetq_lane_f64(hi, 0);
+                acc[3] += vgetq_lane_f64(hi, 1);
+            }
+        }
+        y[r] = (float)acc[0];
+        y[r + 1] = (float)acc[1];
+        y[r + 2] = (float)acc[2];
+        y[r + 3] = (float)acc[3];
+    }
+#endif
+    for (; r < r1; r++) {
+        double sum = 0.0;
+        for (t = 0; t < cols; t++)
+            sum += (double)w[(size_t)t * (size_t)rows + (size_t)r]
+                 * (double)x[t];
+        y[r] = (float)sum;
+    }
+}
+
+typedef struct {
+    const float *w;
+    const float *x;
+    float       *y;
+    int          rows;
+    int          cols;
+    int          transposed;
+} dense_gemv_job;
+
+static void dense_gemv_worker(void *p, int tid, int r0, int r1) {
+    dense_gemv_job *j = (dense_gemv_job *)p;
+    int r;
+
+    (void)tid;
+    if (j->transposed) {
+        dense_gemv_transposed_rows(j->w, j->x, j->y, j->rows, j->cols,
+                                   r0, r1);
+        return;
+    }
+    for (r = r0; r < r1; r++)
+        j->y[r] = (float)dense_dot_f32(j->w + (size_t)r * (size_t)j->cols,
+                                       j->x, j->cols);
+}
+
+// y = W·x (transposed == 0, W — [rows, cols]) или Wᵀ·x (transposed != 0,
+// W — [cols, rows]). 0 — успех, -1 — неверные аргументы.
+static int dense_gemv(float *y, const float *w, const float *x,
+                      int rows, int cols, int transposed) {
+    dense_gemv_job job;
+
+    if (!y || !w || !x) return -1;
+    if (rows < 0 || cols < 0) return -1;
+    if (rows == 0) return 0;
+    if (cols == 0) {
+        memset(y, 0, (size_t)rows * sizeof(float));
+        return 0;
+    }
+    job.w = w;
+    job.x = x;
+    job.y = y;
+    job.rows = rows;
+    job.cols = cols;
+    job.transposed = transposed;
+    vtm_parallel_rows(rows, (double)rows * (double)cols,
+                      dense_gemv_worker, &job);
+    return 0;
+}
+
 // --- TMV -------------------------------------------------------------------
 
 static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
@@ -224,6 +424,14 @@ static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         if (y->n_elements != (uint32_t)rows)
             return fail(m, ins, VTM_E_SHAPE,
                         "y: элементов %u, у W rows=%d", y->n_elements, rows);
+
+        // SIMD-бэкенд: одно-столбцовый GEMV через dense_gemv (см. комментарий
+        // выше). Точность — не побитовая, ≤2e-6 на logits 3B Q4; на скалярном
+        // бэкенде ниже остаётся прежний double-цикл.
+        if (simd_mm_enabled(m) &&
+            dense_gemv(y->f32, w->f32, x->f32, rows, cols, transposed) == 0)
+            return VTM_OK;
+
         for (r = 0; r < rows; r++) {
             double sum = 0.0;
             for (t = 0; t < cols; t++) {
@@ -278,12 +486,8 @@ static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 // матрицы в fp32 не делаем — у словаря Qwen это 233 М элементов.
 // SIMD-ядра MM подключаются, только если выбран SIMD-бэкенд и он доступен:
 // результат тот же (порядок сложения иной, расхождение ~1e-7), но в 6–15 раз быстрее.
-static int simd_mm_enabled(const vtm_t *m) {
-    return m && m->backend && m->backend->name
-        && strncmp(m->backend->name, "simd", 4) == 0
-        && vtm_simd_available();
-}
-
+// Для n == 1 (tied lm_head) зовём dense_gemv(): vtm_simd_mm_f32 на одном
+// столбце векторизации не имеет (см. комментарий у dense_gemv).
 static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     vtm_status st;
     const vtm_tensor *a = need(m, in->a, ins, "a (A)", &st);
@@ -366,9 +570,15 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         return VTM_OK;
     }
 
-    if (simd_mm_enabled(m) &&
-        vtm_simd_mm_f32(y->f32, a->f32, b->f32, mm, kk, nn) == 0)
-        return VTM_OK;
+    if (simd_mm_enabled(m)) {
+        if (nn == 1) {
+            // tied lm_head: один столбец, у vtm_simd_mm_f32 нет векторизации.
+            if (dense_gemv(y->f32, a->f32, b->f32, mm, kk, 0) == 0)
+                return VTM_OK;
+        } else if (vtm_simd_mm_f32(y->f32, a->f32, b->f32, mm, kk, nn) == 0) {
+            return VTM_OK;
+        }
+    }
 
     for (r = 0; r < mm; r++) {
         for (c = 0; c < nn; c++) {
