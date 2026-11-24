@@ -992,5 +992,26 @@
     "status": "in_progress",
     "file": "0149-sparse-trit.md",
     "assignee": "agent:sparse-trit"
+  },
+  {
+    "id": "0151",
+    "title": "Формат: 4-битный тензор (Q4) с масштабами",
+    "status": "in_progress",
+    "file": "0151-fmt-q4.md",
+    "assignee": "agent:fmt-q4"
+  },
+  {
+    "id": "0152",
+    "title": "Ядра: ленивая деквантизация Q4 на лету (без fp32-арены)",
+    "status": "in_progress",
+    "file": "0152-kernel-q4.md",
+    "assignee": "agent:kernel-q4"
+  },
+  {
+    "id": "0153",
+    "title": "Импорт GGUF: Q4_0/Q4_1/Q8_0 → наш контейнер",
+    "status": "in_progress",
+    "file": "0153-gguf-import.md",
+    "assignee": "agent:gguf-import"
   }
 ]
