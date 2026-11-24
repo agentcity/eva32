@@ -929,5 +929,12 @@
     "status": "done",
     "file": "0140-checker-morphology.md",
     "assignee": "architect"
+  },
+  {
+    "id": "0141",
+    "title": "u64-смещения или шардинг — ВТМ за пределом 4 ГиБ",
+    "status": "pending",
+    "file": "0141-vtm-u64-offsets.md",
+    "assignee": ""
   }
 ]

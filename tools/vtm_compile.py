@@ -80,8 +80,34 @@ CLI:
 ```
 python3 tools/vtm_compile.py --synthetic --out /tmp/synth.vtm
 python3 tools/vtm_compile.py --synthetic --mode mlp --size 128 --seed 1 --out /tmp/synth_mlp.vtm
+python3 tools/vtm_compile.py --synthetic --shape 7b --out /tmp/synth_7b.vtm
+python3 tools/vtm_compile.py --synthetic --shape 32b --out /tmp/synth_32b.vtm
 python3 tools/vtm_compile.py --manifest export/manifest.json --out model.vtm
 python3 tools/vtm_compile.py --qwen-config qat/configs/qwen1.5b.yaml
+```
+
+Большие формы и KV-бюджет (задача 0135)
+========================================
+
+KV-кэш (`2 × слоёв × ctx × kv_dim × 4` байт) живёт в арене, а не в файле, но
+загрузчик ограничивает его сумму `VTM_MAX_KV_BYTES` = 512 МиБ (в C задаётся
+`-D`). Компилятор считает то же число и **сам урезает `context_len`**
+(2048 → 1024 → 512), печатая в stderr предупреждение с числами; решение
+пишется в `meta["kv_cache"]`, а фактическое окно — в `meta["context_window"]`.
+Полный контекст возвращается пересборкой рантайма с
+`-DVTM_MAX_KV_BYTES=...` (команда печатается). Если не влезает даже 512 —
+`ValueError` с этой командой: молча не отказываем.
+
+`--synthetic --shape 1.5b|7b|14b|32b` собирает настоящий граф формы (те же
+тензоры/инструкции/KV-кэши, что у обученной модели) с нулевыми весами:
+`vtm_ref.write_vtm_stream` пишет payload нулями, поэтому 32B не требует ни HF,
+ни миллиардов тритов в памяти. Файл пишется для 1.5B (~0,34 ГиБ), 7B (~1,5 ГиБ)
+и 14B (~3,0 ГиБ); 32B-раскладка — ~6,9 ГиБ, а формат v0.2 адресует файл
+u32-смещениями (предел 4 ГиБ), поэтому `--out` для 32B даёт внятную ошибку, а
+`--shape 32b` без `--out` печатает план и KV-бюджет. Проверка C-рантаймом:
+
+```
+src/vtm/vtm run /tmp/synth_14b.vtm --tokens 1 --max-new 1
 ```
 
 `--manifest` — единственный путь собрать настоящую модель: он читает
@@ -120,6 +146,7 @@ import random
 import re
 import struct
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -529,6 +556,8 @@ def compile_model(
     cfg: ModelConfig | str | os.PathLike[str] | dict[str, Any],
     weights: dict[str, Any] | None = None,
     meta_extra: dict[str, Any] | None = None,
+    *,
+    max_kv_bytes: int | None = None,
 ) -> vtm_ref.VTM:
     """Собрать программу всей модели: EMB -> N слоёв -> RMSN -> lm_head.
 
@@ -545,6 +574,12 @@ def compile_model(
     ту же таблицу, что `EMB` (отдельного тензора в контейнере нет).
     Без весов получается каркас: его нельзя записать в файл, но можно оценить
     по размеру.
+
+    `max_kv_bytes` — кэп KV-кэшей (по умолчанию `vtm_ref.MAX_KV_BYTES`, то же,
+    что `VTM_MAX_KV_BYTES` в C). Если кэш при `context_len` не влезает,
+    компилятор сам урезает контекст (2048 → 1024 → 512), печатает
+    предупреждение с числами в stderr и пишет решение в `meta["kv_cache"]`;
+    если не влезает даже 512 — `ValueError` с командой пересборки `-D`.
     """
     if not isinstance(cfg, ModelConfig):
         if weights is not None:
@@ -558,6 +593,10 @@ def compile_model(
         merged = dict(export.meta)
         merged.update(meta_extra or {})
         meta_extra = merged
+
+    cfg, kv_info = fit_context_window(cfg, max_bytes=max_kv_bytes)
+    if kv_info["reduced"]:
+        print(kv_warning_message(kv_info), file=sys.stderr)
 
     g = Graph(cfg)
     w = weights or {}
@@ -664,7 +703,21 @@ def compile_model(
         "scale_block": vtm_ref.SCALE_BLOCK,
         "model": dataclasses.asdict(cfg),
         "sampling": "greedy",
+        # Решение по KV-бюджету видно без чтения stderr: сколько байт кэш,
+        # какой кэп и что было запрошено. Ключ context_window появляется
+        # только при урезании — кольцо KV равно длине буфера, поведение
+        # исполнения не меняется, но потребитель меты видит фактическое окно.
+        "kv_cache": {
+            "bytes": int(kv_info["kv_bytes"]),
+            "max_bytes": int(kv_info["max_bytes"]),
+            "requested_context": int(kv_info["requested_context"]),
+            "requested_kv_bytes": int(kv_info["requested_kv_bytes"]),
+            "context_len": int(cfg.context_len),
+            "reduced": bool(kv_info["reduced"]),
+        },
     }
+    if kv_info["reduced"]:
+        meta["context_window"] = cfg.context_len
     if meta_extra:
         meta.update(meta_extra)
     return vtm_ref.VTM(tensors=g.tensors, program=g.program, meta=meta)
@@ -677,6 +730,108 @@ def compile_model(
 MANIFEST_FORMAT = "eva32.ternary.manifest"
 MANIFEST_VERSION = 2
 DEFAULT_CONTEXT_LEN = 2048
+
+#: Контексты, между которыми компилятор урезает `context_len`, когда KV-кэш
+#: не влезает в кэп загрузчика (`MAX_KV_BYTES`, в C — `VTM_MAX_KV_BYTES`).
+#: 2048 — рабочая длина, на которой валидированы 1.5B/3B; 1024/512 — шаги
+#: урезания (задача 0135). Дальше 512 не идём: 1.5B-форма на 512 занимает
+#: 28 МиБ, и контекст короче 512 для чата уже не полезен — тогда честная
+#: ошибка с командой пересборки, а не молчание.
+CONTEXT_STEPS: tuple[int, ...] = (2048, 1024, 512)
+
+
+def kv_cache_bytes(cfg: LayerConfig, context_len: int | None = None) -> int:
+    """Байты KV-кэшей в арене: `2 × n_layers × ctx × kv_dim × 4` (K и V).
+
+    В контейнер кэши не пишутся (задача 0101), но загрузчик выделяет под них
+    буфер в арене и проверяет сумму по `VTM_MAX_KV_BYTES`; компилятор обязан
+    считать ровно то же число, иначе запишет нечитаемый файл.
+    """
+    ctx = int(cfg.context_len if context_len is None else context_len)
+    n_layers = int(getattr(cfg, "n_layers", 1))
+    return 2 * n_layers * ctx * cfg.kv_dim * 4
+
+
+def kv_warning_message(info: dict[str, Any]) -> str:
+    """Предупреждение «ctx урезан» с числами (печатает компилятор)."""
+    return (
+        "предупреждение: KV-кэш при context_len="
+        f"{info['requested_context']} — "
+        f"{_human_bytes(info['requested_kv_bytes'])} "
+        f"({info['n_layers']} слоёв × 2 × {info['requested_context']} × "
+        f"{info['kv_dim']} × 4 Б), кэп загрузчика VTM_MAX_KV_BYTES = "
+        f"{_human_bytes(info['max_bytes'])}; context_len уменьшен до "
+        f"{info['chosen']} ({_human_bytes(info['kv_bytes'])}). "
+        "Полный контекст — только с поднятым кэпом: "
+        + vtm_ref.kv_rebuild_hint(info["requested_kv_bytes"])
+    )
+
+
+def kv_cap_error_message(info: dict[str, Any]) -> str:
+    """Ошибка «не влезает даже минимальный ctx»: числа и команда пересборки."""
+    smallest = info["candidates"][-1]
+    return (
+        "KV-кэш не влезает в кэп загрузчика VTM_MAX_KV_BYTES = "
+        f"{_human_bytes(info['max_bytes'])}: при context_len="
+        f"{info['requested_context']} он равен "
+        f"{_human_bytes(info['requested_kv_bytes'])} "
+        f"({info['n_layers']} слоёв × 2 × {info['requested_context']} × "
+        f"{info['kv_dim']} × 4 Б), а при минимальном context_len={smallest} — "
+        f"{_human_bytes(info['kv_bytes'])}. Соберите рантайм с бо́льшим кэпом: "
+        + vtm_ref.kv_rebuild_hint(info["requested_kv_bytes"])
+    )
+
+
+def fit_context_window(
+    cfg: ModelConfig,
+    *,
+    max_bytes: int | None = None,
+    steps: Sequence[int] = CONTEXT_STEPS,
+) -> tuple[ModelConfig, dict[str, Any]]:
+    """Вписать KV-кэш в кэп загрузчика, при необходимости уменьшив `ctx`.
+
+    Кандидаты — запрошенный `context_len` и шаги `steps` меньше него, по
+    убыванию (2048 → 1024 → 512). Берётся первый, чей KV-кэш не больше
+    `max_bytes` (по умолчанию `vtm_ref.MAX_KV_BYTES` = 512 МиБ — то же число,
+    что `VTM_MAX_KV_BYTES` в `src/vtm/loader.c`). Кэп инклюзивный: ровно
+    512 МиБ (32B при ctx 1024) влезает.
+
+    Возвращает `(конфиг с финальным context_len, сводка)`; сводка попадает в
+    мету контейнера (`meta["kv_cache"]`), чтобы урезание было видно без
+    чтения stderr. Если не влезает ни один кандидат — `ValueError` с числами
+    и командой пересборки `-DVTM_MAX_KV_BYTES=...` (молча не отказываем).
+    """
+    budget = vtm_ref.MAX_KV_BYTES if max_bytes is None else int(max_bytes)
+    if budget <= 0:
+        raise ValueError(f"бюджет KV должен быть > 0, получено {budget}")
+    requested = int(cfg.context_len)
+    candidates: list[int] = [requested]
+    seen = {requested}
+    for step in steps:
+        step = int(step)
+        if 0 < step < requested and step not in seen:
+            seen.add(step)
+            candidates.append(step)
+    candidates.sort(reverse=True)
+    values = {ctx: kv_cache_bytes(cfg, ctx) for ctx in candidates}
+    chosen = next((ctx for ctx in candidates if values[ctx] <= budget), None)
+    info: dict[str, Any] = {
+        "requested_context": requested,
+        "candidates": candidates,
+        "kv_bytes_by_context": values,
+        "requested_kv_bytes": values[requested],
+        "max_bytes": budget,
+        "n_layers": int(getattr(cfg, "n_layers", 1)),
+        "kv_dim": int(cfg.kv_dim),
+        "chosen": chosen,
+        "kv_bytes": values[chosen if chosen is not None else candidates[-1]],
+        "reduced": chosen is not None and chosen != requested,
+    }
+    if chosen is None:
+        raise ValueError(kv_cap_error_message(info))
+    if chosen == requested:
+        return cfg, info
+    return dataclasses.replace(cfg, context_len=chosen), info
 
 _LAYER_RE = re.compile(r"(?:^|\.)(?:layers|h)\.(\d+)\.")
 _MATRIX_KEYS = {
@@ -1411,6 +1566,142 @@ def make_synthetic(seed: int = 1, size: int = 128, mode: str = "attn") -> vtm_re
 
 
 # ---------------------------------------------------------------------------
+# Большие формы: синтетика без HF
+# ---------------------------------------------------------------------------
+
+#: Формы Qwen2.5, которые компилятор собирает в режиме `--synthetic --shape`
+#: (и узнаёт по имени в `--qwen-config`). Значения — из HF-конфигов; словарь
+#: 152064, tied lm_head (MM по тритовой таблице), eps 1e-6.
+#:
+#: KV-кэш при ctx 2048 (2 × слоёв × ctx × kv_dim × 4 Б): 1.5B — 112 МиБ,
+#: 7B — 224 МиБ, 14B — 768 МиБ, 32B — 1024 МиБ. Кэп загрузчика 512 МиБ,
+#: поэтому `fit_context_window` урежет 14B и 32B до ctx 1024 (384/512 МиБ);
+#: 7B и 1.5B остаются на 2048.
+#:
+#: 32B-раскладка в packed20 — ~6,9 ГиБ, а контейнер v0.2 адресует файл
+#: u32-смещениями (предел 4 ГиБ): граф и KV-бюджет поддержаны, но записать
+#: такой файл формат не может — `write_vtm_stream` откажет с числами и
+#: вариантами (u64-смещения/шардирование). 7B (~1,5 ГиБ) и 14B (~3,0 ГиБ)
+#: пишутся и запускаются C-рантаймом.
+SYNTHETIC_SHAPES: dict[str, dict[str, Any]] = {
+    "1.5b": {
+        "hidden": 1536,
+        "n_heads": 12,
+        "n_kv_heads": 2,
+        "head_dim": 128,
+        "intermediate": 8960,
+        "vocab": 151936,
+        "n_layers": 28,
+        "context_len": 2048,
+        "rope_theta": 1_000_000.0,
+        "eps": 1e-6,
+        "lm_head": "mm",
+        "tie_word_embeddings": True,
+    },
+    "7b": {
+        "hidden": 3584,
+        "n_heads": 28,
+        "n_kv_heads": 4,
+        "head_dim": 128,
+        "intermediate": 18944,
+        "vocab": 152064,
+        "n_layers": 28,
+        "context_len": 2048,
+        "rope_theta": 1_000_000.0,
+        "eps": 1e-6,
+        "lm_head": "mm",
+        "tie_word_embeddings": True,
+    },
+    "14b": {
+        "hidden": 5120,
+        "n_heads": 40,
+        "n_kv_heads": 8,
+        "head_dim": 128,
+        "intermediate": 13824,
+        "vocab": 152064,
+        "n_layers": 48,
+        "context_len": 2048,
+        "rope_theta": 1_000_000.0,
+        "eps": 1e-6,
+        "lm_head": "mm",
+        "tie_word_embeddings": True,
+    },
+    "32b": {
+        "hidden": 5120,
+        "n_heads": 40,
+        "n_kv_heads": 8,
+        "head_dim": 128,
+        "intermediate": 27648,
+        "vocab": 152064,
+        "n_layers": 64,
+        "context_len": 2048,
+        "rope_theta": 1_000_000.0,
+        "eps": 1e-6,
+        "lm_head": "mm",
+        "tie_word_embeddings": True,
+    },
+}
+
+
+def make_synthetic_shape(
+    shape: str,
+    *,
+    seed: int = 7,
+    context_len: int | None = None,
+    max_kv_bytes: int | None = None,
+) -> vtm_ref.VTM:
+    """Синтетическая модель большой формы (1.5B/7B/14B/32B) без весов и HF.
+
+    Граф — настоящий: `compile_model` строит те же тензоры, инструкции и
+    KV-кэши, что у обученной модели формы. Значений нет: все веса — заглушки,
+    а `vtm_ref.write_vtm_stream` пишет вместо payload'ов нули. Этого хватает,
+    чтобы проверить сборку, загрузку C-рантаймом и проход по 1 токену на
+    реальных размерностях (7B — ~1,5 ГиБ файла, 14B — ~3,0 ГиБ), не поднимая
+    в памяти списки на миллиарды тритов и не качая HF. 32B (~6,9 ГиБ) в
+    контейнер v0.2 не влезает (u32-смещения, предел 4 ГиБ): для него доступен
+    граф/план без записи и честная ошибка при `--out`.
+
+    `context_len` переопределяет форму; KV-бюджет (`max_kv_bytes`) передаётся
+    в `compile_model`, который сам урежет ctx и напечатает предупреждение.
+
+    eps=1e-3, а не 1e-6 из HF: `imm` в RMSN — тысячные, 1e-6 честно
+    округляется до 0, а при нулевых весах это 0/0 = NaN. На форму eps не
+    влияет (как в `make_synthetic`).
+    """
+    key = str(shape).strip().lower()
+    arch = SYNTHETIC_SHAPES.get(key)
+    if arch is None:
+        known = ", ".join(sorted(SYNTHETIC_SHAPES))
+        raise ValueError(f"форма {shape!r} неизвестна; известны: {known}")
+    params = dict(arch)
+    params["eps"] = 1e-3
+    if context_len is not None:
+        params["context_len"] = int(context_len)
+    cfg = ModelConfig(**params)
+    embed = vtm_ref.Tensor.placeholder(
+        "emb.w", (cfg.vocab, cfg.hidden), vtm_ref.KIND_TRITS
+    )
+    vtm = compile_model(cfg, weights={"embed": embed}, max_kv_bytes=max_kv_bytes)
+    # Активации `Graph.act` создаются нулями; потоковому писателю они не нужны,
+    # а на 32B это ~60 МиБ списков.
+    for tensor in vtm.tensors:
+        if tensor.data is not None:
+            tensor.data = None
+    vtm.meta["generator"] = "tools/vtm_compile.py"
+    vtm.meta["synthetic"] = {
+        "kind": "shape",
+        "shape": key,
+        "seed": int(seed),
+        "tokens": [1, 2, 3],
+        "max_new": 0,
+        "inputs_tensor": "emb.w",
+        # Явно: контейнер без значений, проверяются форма/загрузка/проход.
+        "weights": "zeros",
+    }
+    return vtm
+
+
+# ---------------------------------------------------------------------------
 # Qwen-каркас: только план, без весов
 # ---------------------------------------------------------------------------
 
@@ -1420,33 +1711,16 @@ def make_synthetic(seed: int = 1, size: int = 128, mode: str = "attn") -> vtm_re
 #: он больше не пишется (задача 0101, VTM_TENSOR_FLAG_KV_CACHE), поэтому
 #: контейнер не растёт от ctx; но буфер в арене всё равно 112 МиБ на 1.5B, так
 #: что 32768 по-прежнему не берём — это рабочая длина VTM, а не максимум Qwen.
+#: Сами формы — в `SYNTHETIC_SHAPES` (один источник чисел для --shape и плана).
 _KNOWN_ARCH: dict[str, dict[str, Any]] = {
-    "Qwen/Qwen2.5-1.5B-Instruct": {
-        "hidden": 1536,
-        "n_heads": 12,
-        "n_kv_heads": 2,
-        "head_dim": 128,
-        "intermediate": 8960,
-        "vocab": 151936,
-        "n_layers": 28,
-        "rope_theta": 1_000_000.0,
-        "eps": 1e-6,
-        "tie_word_embeddings": True,
-        "context_len": 2048,
-    },
-    "Qwen/Qwen2.5-1.5B": {
-        "hidden": 1536,
-        "n_heads": 12,
-        "n_kv_heads": 2,
-        "head_dim": 128,
-        "intermediate": 8960,
-        "vocab": 151936,
-        "n_layers": 28,
-        "rope_theta": 1_000_000.0,
-        "eps": 1e-6,
-        "tie_word_embeddings": True,
-        "context_len": 2048,
-    },
+    "Qwen/Qwen2.5-1.5B-Instruct": dict(SYNTHETIC_SHAPES["1.5b"]),
+    "Qwen/Qwen2.5-1.5B": dict(SYNTHETIC_SHAPES["1.5b"]),
+    "Qwen/Qwen2.5-7B-Instruct": dict(SYNTHETIC_SHAPES["7b"]),
+    "Qwen/Qwen2.5-7B": dict(SYNTHETIC_SHAPES["7b"]),
+    "Qwen/Qwen2.5-14B-Instruct": dict(SYNTHETIC_SHAPES["14b"]),
+    "Qwen/Qwen2.5-14B": dict(SYNTHETIC_SHAPES["14b"]),
+    "Qwen/Qwen2.5-32B-Instruct": dict(SYNTHETIC_SHAPES["32b"]),
+    "Qwen/Qwen2.5-32B": dict(SYNTHETIC_SHAPES["32b"]),
 }
 
 
@@ -1460,7 +1734,11 @@ def read_model_name(config_path: str | os.PathLike[str]) -> str:
     return match.group(1)
 
 
-def qwen_plan(config_path: str | os.PathLike[str]) -> tuple[str, ModelConfig, vtm_ref.VTM]:
+def qwen_plan(
+    config_path: str | os.PathLike[str],
+    *,
+    max_kv_bytes: int | None = None,
+) -> tuple[str, ModelConfig, vtm_ref.VTM]:
     """Собрать каркас модели по Qwen-конфигу (веса не читаются)."""
     name = read_model_name(config_path)
     arch = _KNOWN_ARCH.get(name)
@@ -1470,7 +1748,7 @@ def qwen_plan(config_path: str | os.PathLike[str]) -> tuple[str, ModelConfig, vt
             f"архитектура {name!r} неизвестна компилятору v0.1; известны: {known}"
         )
     cfg = ModelConfig(**arch)
-    vtm = compile_model(cfg)
+    vtm = compile_model(cfg, max_kv_bytes=max_kv_bytes)
     return name, cfg, vtm
 
 
@@ -1507,16 +1785,40 @@ def _print_synthetic(vtm: vtm_ref.VTM, path: str | None) -> None:
     print("сверка C: логиты последнего прохода против meta.expected.logits, допуск 1e-4")
 
 
+def kv_budget_lines(vtm: vtm_ref.VTM) -> list[str]:
+    """Строки отчёта о KV-бюджете из `meta["kv_cache"]` (пусто — меты нет)."""
+    kv = vtm.meta.get("kv_cache") or {}
+    if not kv:
+        return []
+    context = int(kv.get("context_len") or vtm.meta.get("context_len") or 0)
+    lines = [
+        f"KV-кэш: {_human_bytes(int(kv['bytes']))} при context_len={context} "
+        f"(кэп {_human_bytes(int(kv['max_bytes']))})"
+    ]
+    if kv.get("reduced"):
+        lines.append(
+            f"  урезано с context_len={kv['requested_context']} "
+            f"({_human_bytes(int(kv['requested_kv_bytes']))} не влезало); "
+            "полный контекст — пересборка: "
+            + vtm_ref.kv_rebuild_hint(int(kv["requested_kv_bytes"]))
+        )
+    return lines
+
+
 def _print_plan(name: str, cfg: ModelConfig, vtm: vtm_ref.VTM) -> None:
     ops = vtm.op_counts()
+    context = int(vtm.meta.get("context_len") or cfg.context_len)
     print(f"каркас: {name}")
     print(
         f"hidden={cfg.hidden} heads={cfg.n_heads}/{cfg.n_kv_heads} "
         f"head_dim={cfg.head_dim} intermediate={cfg.intermediate} "
-        f"vocab={cfg.vocab} layers={cfg.n_layers} rope_theta={cfg.rope_theta:g}"
+        f"vocab={cfg.vocab} layers={cfg.n_layers} context={context} "
+        f"rope_theta={cfg.rope_theta:g}"
     )
     print(f"тензоров: {len(vtm.tensors)}, инструкций: {len(vtm.program)}")
     print("операции слоя×N: " + ", ".join(f"{k}×{v}" for k, v in sorted(ops.items())))
+    for line in kv_budget_lines(vtm):
+        print(line)
     weight_bytes = sum(
         vtm_ref.align_up(vtm_ref.tensor_payload_size(t))
         for t in vtm.tensors
@@ -1537,6 +1839,7 @@ def _print_manifest(
 ) -> None:
     cfg = export.cfg
     ops = vtm.op_counts()
+    context = int(vtm.meta.get("context_len") or cfg.context_len)
     base = export.manifest.get("base_model") or {}
     print(f"манифест: {export.path}")
     print(
@@ -1547,7 +1850,7 @@ def _print_manifest(
     print(
         f"архитектура: hidden={cfg.hidden} heads={cfg.n_heads}/{cfg.n_kv_heads} "
         f"head_dim={cfg.head_dim} intermediate={cfg.intermediate} "
-        f"vocab={cfg.vocab} layers={cfg.n_layers} context={cfg.context_len} "
+        f"vocab={cfg.vocab} layers={cfg.n_layers} context={context} "
         f"rope_theta={cfg.rope_theta:g} eps={cfg.eps:g}"
     )
     if export.tied:
@@ -1590,11 +1893,13 @@ def _print_manifest(
             )
     print(f"тензоров: {len(vtm.tensors)}, инструкций: {len(vtm.program)}")
     print("операции: " + ", ".join(f"{name}×{count}" for name, count in sorted(ops.items())))
-    cache_bytes = cfg.n_layers * cfg.context_len * cfg.kv_dim * 2 * 4
+    cache_bytes = kv_cache_bytes(cfg, context)
     print(
         f"параметры: тритов {export.trit_params:,}, fp {export.fp_params:,}; "
         f"KV-кэш {_human_bytes(cache_bytes)} в арене, в контейнере его нет"
     )
+    for line in kv_budget_lines(vtm):
+        print(line)
     if path:
         print(f"файл: {path} ({_human_bytes(os.path.getsize(path))})")
         print(
@@ -1602,6 +1907,55 @@ def _print_manifest(
             "логиты сверять с meta.expected больше нечем — контейнер "
             "собран из чекпоинта, эталона HF в нём нет"
         )
+    else:
+        print("файл не записан (--out не задан)")
+
+
+def _print_shape(
+    vtm: vtm_ref.VTM,
+    path: str | None,
+    *,
+    build_s: float,
+    write_s: float | None = None,
+    integrity: bool = False,
+) -> None:
+    """Отчёт по большой синтетической форме: размеры, KV, время сборки."""
+    synthetic = vtm.meta.get("synthetic") or {}
+    model = vtm.meta.get("model") or {}
+    ops = vtm.op_counts()
+    print(
+        f"VTM синтетика формы {synthetic.get('shape', '?')}: "
+        f"hidden={model.get('hidden')} "
+        f"heads={model.get('n_heads')}/{model.get('n_kv_heads')} "
+        f"head_dim={model.get('head_dim')} "
+        f"intermediate={model.get('intermediate')} "
+        f"vocab={model.get('vocab')} layers={model.get('n_layers')}"
+    )
+    print(
+        f"тензоров: {len(vtm.tensors)} (предел таблицы {vtm_ref.MAX_TENSORS}), "
+        f"инструкций: {len(vtm.program)}"
+    )
+    print("операции: " + ", ".join(f"{name}×{count}" for name, count in sorted(ops.items())))
+    for line in kv_budget_lines(vtm):
+        print(line)
+    estimated = vtm.estimated_file_size()
+    print(f"оценка размера: {_human_bytes(estimated)}")
+    if estimated >= 2 ** 32:
+        print(
+            "файл не влезет в контейнер v0.2: смещения u32 (предел 4 ГиБ); "
+            "нужен формат с u64-смещениями (ADR) или шардирование модели"
+        )
+    print(f"сборка графа: {build_s:.2f} с")
+    if path:
+        actual = os.path.getsize(path)
+        print(
+            f"файл: {path} ({_human_bytes(actual)}), запись "
+            f"{write_s if write_s is not None else 0.0:.2f} с"
+        )
+        print("веса — нули (vtm_ref.write_vtm_stream): для проверки C: "
+              f"src/vtm/vtm run {path} --tokens 1 --max-new 1")
+        print("целостность: " + ("sha256 записан" if integrity else
+                                "не пишется (VTM_WRITE_HASH=1 включит)"))
     else:
         print("файл не записан (--out не задан)")
 
@@ -1615,6 +1969,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--size", type=int, default=128, help="hidden синтетики (128)")
     parser.add_argument("--mode", choices=("mlp", "attn"), default="attn",
                         help="mlp — без внимания, attn — полный слой (по умолчанию)")
+    parser.add_argument(
+        "--shape",
+        choices=tuple(sorted(SYNTHETIC_SHAPES)),
+        help="полная форма для --synthetic: 1.5b/7b/14b/32b (без HF; --size/--mode "
+             "не используются)",
+    )
+    parser.add_argument(
+        "--ctx",
+        type=int,
+        help="context_len для --shape (по умолчанию из формы: 2048)",
+    )
+    parser.add_argument(
+        "--max-kv-bytes",
+        type=int,
+        help="кэп KV-кэшей в байтах (по умолчанию vtm_ref.MAX_KV_BYTES = 512 МиБ, "
+             "как VTM_MAX_KV_BYTES в C)",
+    )
+    parser.add_argument(
+        "--integrity",
+        action="store_true",
+        help="считать sha256 при записи --shape (по умолчанию решает VTM_WRITE_HASH)",
+    )
     parser.add_argument("--out", help="куда записать .vtm (--synthetic/--manifest)")
     parser.add_argument("--qwen-config", help="YAML Qwen-конфига (только план, без весов)")
     parser.add_argument(
@@ -1628,10 +2004,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("нужен ровно один режим: --synthetic, --qwen-config или --manifest")
     if args.manifest and not args.out:
         parser.error("--manifest требует --out: контейнер нужно куда-то записать")
+    if args.shape and not args.synthetic:
+        parser.error("--shape работает только с --synthetic")
+    if args.ctx is not None and not (args.synthetic and args.shape):
+        parser.error("--ctx работает только с --synthetic --shape")
 
     try:
         if args.qwen_config:
-            name, cfg, plan = qwen_plan(args.qwen_config)
+            name, cfg, plan = qwen_plan(args.qwen_config, max_kv_bytes=args.max_kv_bytes)
             _print_plan(name, cfg, plan)
             if args.out:
                 print(f"--out {args.out} проигнорирован: контейнер без весов не пишется.")
@@ -1639,12 +2019,41 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.manifest:
             export = load_export(args.manifest)
-            vtm = compile_model(export.cfg, export.weights, export.meta)
+            vtm = compile_model(
+                export.cfg, export.weights, export.meta,
+                max_kv_bytes=args.max_kv_bytes,
+            )
             out_dir = os.path.dirname(os.path.abspath(args.out))
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
             vtm_ref.write_vtm(args.out, vtm.tensors, vtm.program, vtm.meta, integrity=True)
             _print_manifest(export, vtm, args.out)
+            return 0
+
+        if args.shape:
+            started = time.perf_counter()
+            vtm = make_synthetic_shape(
+                args.shape,
+                seed=args.seed,
+                context_len=args.ctx,
+                max_kv_bytes=args.max_kv_bytes,
+            )
+            build_s = time.perf_counter() - started
+            write_s: float | None = None
+            if args.out:
+                out_dir = os.path.dirname(os.path.abspath(args.out))
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                started = time.perf_counter()
+                vtm_ref.write_vtm_stream(
+                    args.out, vtm.tensors, vtm.program, vtm.meta,
+                    integrity=True if args.integrity else None,
+                )
+                write_s = time.perf_counter() - started
+            _print_shape(
+                vtm, args.out, build_s=build_s, write_s=write_s,
+                integrity=bool(args.integrity),
+            )
             return 0
 
         vtm = make_synthetic(seed=args.seed, size=args.size, mode=args.mode)

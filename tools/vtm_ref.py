@@ -1444,6 +1444,39 @@ def _verify_integrity(meta_bytes: bytes, data: bytes) -> None:
         )
 
 
+def file_size_limit_error(file_size: int) -> str:
+    """Ошибка «контейнер больше 4 ГиБ»: VTM адресует файл u32-смещениями.
+
+    Формат v0.2 не представляет модель, у которой секция данных больше 4 ГиБ:
+    32B-раскладка Qwen2.5 (64 слоя, hidden 5120, intermediate 27648) — это
+    ~6,9 ГиБ тритов в packed20. Ошибка называет числа и варианты, чтобы не
+    выглядеть загадочным «не влезает».
+    """
+    return (
+        "VTM адресует файл 32-битными смещениями: "
+        f"{file_size} байт ({file_size / 2 ** 30:.2f} ГиБ) не влезает в "
+        "контейнер (предел 4 ГиБ). Раскладка 32B (64 слоя, hidden 5120, "
+        "intermediate 27648) — это ~6,9 ГиБ тритов, формат v0.2 её не "
+        "представляет; 7B (~1,5 ГиБ) и 14B (~3,0 ГиБ) влезают. Для 32B нужен "
+        "формат с u64-смещениями (ADR) или шардирование модели."
+    )
+
+
+def kv_rebuild_hint(required_bytes: int) -> str:
+    """Команда пересборки C-рантайма с поднятым кэпом KV (`VTM_MAX_KV_BYTES`).
+
+    Кэп `MAX_KV_BYTES` — предел загрузчика (`src/vtm/loader.c`), а не формата:
+    он задаётся на сборке через `-D`. Компилятор называет точное число байт,
+    которого хватает форме, чтобы сообщение можно было скопировать в шелл.
+    `CPPFLAGS` передаётся переменной окружения (а не аргументом `make`), чтобы
+    `Makefile` дописал к нему свои `-D` (например, `-DVTM_NO_AVX2`).
+    """
+    return (
+        'cd src/vtm && make clean && '
+        f'CPPFLAGS="-D_POSIX_C_SOURCE=200809L -DVTM_MAX_KV_BYTES={int(required_bytes)}" make'
+    )
+
+
 def write_vtm(
     path: str | os.PathLike[str],
     tensors: Sequence[Tensor | dict[str, Any]],
@@ -1485,7 +1518,9 @@ def write_vtm(
     if kv_bytes > MAX_KV_BYTES:
         raise ValueError(
             f"KV-кэши: суммарный размер {kv_bytes} байт больше предела "
-            f"{MAX_KV_BYTES} (MAX_KV_BYTES); уменьшите ctx или kv_dim"
+            f"{MAX_KV_BYTES} (MAX_KV_BYTES); уменьшите ctx или kv_dim. "
+            "Если контекст нужен целиком, кэп поднимается на сборке рантайма: "
+            + kv_rebuild_hint(kv_bytes)
         )
 
     payloads = [encode_tensor_payload(tensor) for tensor in tensor_list]
@@ -1544,10 +1579,7 @@ def write_vtm(
     program_bytes = b"".join(instr.pack() for instr in program_list)
     file_size = program_offset + len(program_bytes)
     if file_size >= 2 ** 32:
-        raise ValueError(
-            f"VTM адресует файл 32-битными смещениями: {file_size} байт "
-            "не влезает в контейнер"
-        )
+        raise ValueError(file_size_limit_error(file_size))
 
     flags = VFLAG_CAUSAL
     if all(t.kind != KIND_TRITS or t.scale_dtype == "float32" for t in tensor_list):
@@ -1607,6 +1639,241 @@ def write_vtm(
         path=os.fspath(path),
     )
     return vtm
+
+
+def _empty_payload_prefix(tensor: Tensor) -> tuple[bytes, int]:
+    """Заголовок payload'а «без данных» и полный размер payload'а.
+
+    Для тритов это TRT1-заголовок с нулевыми масштабами (веса 0, слова
+    pack20 тоже нулевые), для int8 — INT8-заголовок с нулевыми q, для fp —
+    ничего. Так
+    потоковый писатель (`write_vtm_stream`) отдаёт контейнер нужной формы,
+    не материализуя веса: 7B-раскладка — это ~1,5 ГиБ тритов, а 32B — ~7 ГиБ.
+    """
+    if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+        return b"", 0
+    size = tensor_payload_size(tensor)
+    if tensor.kind == KIND_TRITS:
+        storage = tensor.storage
+        version = (
+            TRT1_VERSION if storage == STORAGE_PACKED20 else TRT1_VERSION_STORAGE
+        )
+        flags = 0x01 if tensor.scale_dtype == "float32" else 0x00
+        flags |= TRIT_STORAGE_IDS[storage] << TFLAG_STORAGE_SHIFT
+        n_scales = n_scale_blocks(tensor.n_elements, tensor.block_size)
+        header = _TRT1_STRUCT.pack(
+            TRT1_MAGIC, version, flags, tensor.n_elements, n_scales
+        )
+        return header, size
+    if tensor.kind == KIND_INT8:
+        flags = 0x01 if tensor.scale_dtype == "float32" else 0x00
+        n_scales = n_scale_blocks(tensor.n_elements, tensor.block_size)
+        header = _TRT1_STRUCT.pack(
+            INT8_MAGIC, INT8_VERSION, flags, tensor.n_elements, n_scales
+        )
+        return header, size
+    return b"", size
+
+
+#: Порция нулей при потоковой записи (байт); 1 МиБ — компромисс между числом
+#: системных вызовов и лишней памятью.
+STREAM_CHUNK = 1 << 20
+_ZEROS = bytes(STREAM_CHUNK)
+
+
+def write_vtm_stream(
+    path: str | os.PathLike[str],
+    tensors: Sequence[Tensor | dict[str, Any]],
+    program: Sequence[Instr | tuple[Any, ...] | dict[str, Any]],
+    meta: dict[str, Any] | None = None,
+    *,
+    integrity: bool | None = None,
+    chunk: int = STREAM_CHUNK,
+) -> VTM:
+    """Записать контейнер потоком, не держа payload'ы весов в памяти.
+
+    Раскладка байт-в-байт та же, что у `write_vtm` (заголовок, таблица,
+    выровненная секция данных, мета, программа), но вместо значений тензоров
+    в секцию данных идут нули: fp-тензоры — 4/2 нулевых байта на элемент, у
+    тритов — валидный TRT1 с нулевыми масштабами (это триты 0), у int8 —
+    нулевые q. Контейнер читается `read_vtm` и C-загрузчиком, но модель в нём
+    «пустая»: логиты нулевые, argmax = 0.
+
+    Зачем: синтетика больших форм (7B/14B/32B) нужна, чтобы проверить сборку,
+    загрузку и проход на реальных размерностях, а не значениях. `write_vtm`
+    требует данных в каждом тензоре и на 32B съел бы ~7 ГиБ списков Python;
+    здесь память — один буфер `chunk` байт, а файл пишется последовательно.
+
+    KV-кэши, как и в `write_vtm`, в файл не пишутся (флаг
+    `VFLAG_KV_OUT_OF_FILE`, offset `KV_NO_OFFSET`), а их суммарный размер
+    проверяется по `MAX_KV_BYTES` — ровно так же, как это сделает загрузчик.
+    """
+    tensor_list = [_as_tensor(item) for item in tensors]
+    program_list = [_as_instr(item) for item in program]
+    meta_dict: dict[str, Any] = dict(meta or {})
+    _validate_names(tensor_list)
+    _validate_program(program_list, len(tensor_list))
+    if len(tensor_list) > MAX_TENSORS:
+        raise ValueError(f"тензоров {len(tensor_list)}, максимум {MAX_TENSORS}")
+    if chunk <= 0:
+        raise ValueError(f"chunk={chunk} должен быть > 0")
+    for tensor in tensor_list:
+        if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+            continue
+        if (
+            tensor.data is not None
+            or tensor.trits is not None
+            or tensor.scales is not None
+            or tensor.qdata is not None
+        ):
+            # Иначе явные веса молча превратились бы в нули — это потеря
+            # данных, а не оптимизация.
+            raise ValueError(
+                f"тензор {tensor.name!r}: write_vtm_stream пишет нули, а у "
+                "тензора уже есть данные; обнулите data/trits/scales или "
+                "пишите контейнер через write_vtm"
+            )
+
+    kv_caches = [t for t in tensor_list if getattr(t, "flags", 0) & TFLAG_KV_CACHE]
+    kv_bytes = sum(t.n_elements * 4 for t in kv_caches)
+    if kv_bytes > MAX_KV_BYTES:
+        raise ValueError(
+            f"KV-кэши: суммарный размер {kv_bytes} байт больше предела "
+            f"{MAX_KV_BYTES} (MAX_KV_BYTES); уменьшите ctx или kv_dim. "
+            "Если контекст нужен целиком, кэп поднимается на сборке рантайма: "
+            + kv_rebuild_hint(kv_bytes)
+        )
+
+    write_integrity = _integrity_requested(integrity)
+    n_tensors = len(tensor_list)
+    table_end = HEADER_SIZE + TENSOR_ENTRY_SIZE * n_tensors
+    data_start = align_up(table_end)
+    has_kv = bool(kv_caches)
+
+    digest = hashlib.sha256() if write_integrity else None
+    layout: list[tuple[Tensor, bytes, int]] = []
+    data_size = 0
+    for tensor in tensor_list:
+        if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+            tensor.offset = KV_NO_OFFSET if has_kv else 0
+            tensor.scale_offset = 0
+            layout.append((tensor, b"", 0))
+            continue
+        prefix, size = _empty_payload_prefix(tensor)
+        tensor.offset = data_size
+        tensor.scale_offset = (
+            NO_OFFSET if tensor.kind in (KIND_TRITS, KIND_INT8) else 0
+        )
+        if tensor.offset % ALIGNMENT:  # pragma: no cover - защита от align_up
+            raise RuntimeError(
+                f"тензор {tensor.name!r}: offset не выровнен"
+            )
+        layout.append((tensor, prefix, size))
+        data_size = align_up(data_size + size)
+
+    if digest is not None:
+        # Плейсхолдеры той же длины, что настоящие хеши (64 hex-символа):
+        # длина меты не должна зависеть от момента, когда data_sha256 станет
+        # известен, иначе program_offset разойдётся с записанными байтами.
+        block = {
+            "algo": INTEGRITY_ALGO,
+            "data_sha256": "0" * 64,
+            INTEGRITY_META_FIELD: "0" * 64,
+        }
+        meta_dict.pop(INTEGRITY_KEY, None)
+        meta_dict[INTEGRITY_KEY] = block
+
+    meta_bytes = _encode_meta(meta_dict) if meta_dict else b""
+    meta_offset = data_start + data_size if meta_bytes else 0
+    program_offset = data_start + data_size + align_up(len(meta_bytes))
+    program_bytes = b"".join(instr.pack() for instr in program_list)
+    file_size = program_offset + len(program_bytes)
+    if file_size >= 2 ** 32:
+        raise ValueError(file_size_limit_error(file_size))
+
+    flags = VFLAG_CAUSAL
+    if all(t.kind != KIND_TRITS or t.scale_dtype == "float32" for t in tensor_list):
+        flags |= VFLAG_F32_SCALES
+    if has_kv:
+        flags |= VFLAG_KV_OUT_OF_FILE
+
+    header = _HEADER_STRUCT.pack(
+        VTM_MAGIC, VTM_VERSION, flags, len(program_list), n_tensors,
+        len(program_bytes),
+    ) + _RESERVED_STRUCT.pack(program_offset, meta_offset, len(meta_bytes))
+
+    table = bytearray()
+    for tensor in tensor_list:
+        name_bytes = tensor.name.encode("utf-8")
+        dims = list(tensor.dims) + [0] * (MAX_DIMS - len(tensor.dims))
+        tflags = int(getattr(tensor, "flags", 0))
+        if tensor.kind == KIND_TRITS:
+            tflags = (tflags & ~TFLAG_STORAGE_MASK) | (
+                TRIT_STORAGE_IDS[tensor.storage] << TFLAG_STORAGE_SHIFT
+            )
+        table += _TENSOR_STRUCT.pack(
+            name_bytes, tensor.kind, len(tensor.dims), *dims,
+            tensor.offset, tensor.scale_offset, tflags,
+        )
+
+    def _write_zeros(handle: Any, count: int) -> None:
+        remaining = int(count)
+        while remaining > 0:
+            piece = _ZEROS[: min(chunk, remaining)]
+            handle.write(piece)
+            if digest is not None:
+                digest.update(piece)
+            remaining -= len(piece)
+
+    with open(path, "wb") as handle:
+        handle.write(header)
+        handle.write(bytes(table))
+        handle.write(b"\x00" * (data_start - table_end))
+        # Секция данных начинается после выравнивания таблицы: её ведущие
+        # нули в хеш не входят (в `write_vtm` хешируются только payload'ы
+        # и их выравнивание).
+        for _tensor, prefix, size in layout:
+            if prefix:
+                handle.write(prefix)
+                if digest is not None:
+                    digest.update(prefix)
+            _write_zeros(handle, size - len(prefix))
+            tail = align_up(size) - size
+            if tail:
+                handle.write(b"\x00" * tail)
+                if digest is not None:
+                    digest.update(b"\x00" * tail)
+        if meta_bytes:
+            if digest is not None:
+                # data_sha256 известен только после данных. Сначала пишем его
+                # в мету и пере-сериализуем (длина та же: 64 hex), затем
+                # считаем meta_sha256 по сериализации, где это поле — нули,
+                # как в `write_vtm` и в проверке `_verify_integrity`.
+                block[INTEGRITY_DATA_FIELD] = digest.hexdigest()
+                block[INTEGRITY_META_FIELD] = "0" * 64
+                meta_bytes = _encode_meta(meta_dict)
+                block[INTEGRITY_META_FIELD] = hashlib.sha256(meta_bytes).hexdigest()
+                meta_bytes = _encode_meta(meta_dict)
+            handle.write(meta_bytes)
+            handle.write(b"\x00" * (align_up(len(meta_bytes)) - len(meta_bytes)))
+        handle.write(program_bytes)
+
+    written = os.path.getsize(path)
+    if written != file_size:  # pragma: no cover - защита от рассинхрона раскладки
+        raise RuntimeError(f"записано {written} байт, ожидалось {file_size}")
+
+    return VTM(
+        tensors=tensor_list,
+        program=program_list,
+        meta=meta_dict,
+        version=VTM_VERSION,
+        flags=flags,
+        data_offset=data_start,
+        program_offset=program_offset,
+        meta_offset=meta_offset,
+        meta_len=len(meta_bytes),
+        path=os.fspath(path),
+    )
 
 
 def _payload_extent(
