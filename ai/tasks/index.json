@@ -1076,5 +1076,12 @@
     "status": "done",
     "file": "0162-q4-prefill-batch.md",
     "assignee": "agent:q4-prefill"
+  },
+  {
+    "id": "0163",
+    "title": "int8-dot (SDOT/VNNI) — путь к 10x prefill",
+    "status": "in_progress",
+    "file": "0163-int8-dot-prefill.md",
+    "assignee": "agent:int8-dot"
   }
 ]
