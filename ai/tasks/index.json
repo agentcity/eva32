@@ -884,14 +884,14 @@
   {
     "id": "0134",
     "title": "Холодный экспорт: HF-веса → .trit без обучения",
-    "status": "in_progress",
+    "status": "done",
     "file": "0134-cold-export.md",
     "assignee": "agent:cold-export"
   },
   {
     "id": "0135",
     "title": "Компилятор: большие формы (7B/14B/32B) и KV-кэп",
-    "status": "in_progress",
+    "status": "done",
     "file": "0135-compile-large.md",
     "assignee": "agent:compile-large"
   },
@@ -905,22 +905,29 @@
   {
     "id": "0137",
     "title": "Чат-адаптер: реплика с историей и стримингом для любых бэкендов",
-    "status": "in_progress",
+    "status": "done",
     "file": "0137-chat-cli.md",
     "assignee": "agent:chat-cli"
   },
   {
     "id": "0138",
     "title": "Веб-адаптер: сравнение двух моделей рядом",
-    "status": "in_progress",
+    "status": "done",
     "file": "0138-chat-web.md",
     "assignee": "agent:chat-web"
   },
   {
     "id": "0139",
     "title": "Прогон golden через бэкенд: уровень ума числом",
-    "status": "in_progress",
+    "status": "done",
     "file": "0139-eval-runner.md",
     "assignee": "agent:eval-runner"
+  },
+  {
+    "id": "0140",
+    "title": "Чекер golden: морфология и «уточни/сообщите» — занижает оценку",
+    "status": "done",
+    "file": "0140-checker-morphology.md",
+    "assignee": "architect"
   }
 ]

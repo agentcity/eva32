@@ -390,6 +390,10 @@ def mock_answer(row: dict) -> str:
             tail.append("Пункт 1.")
             continue
         tail.append(f"Отмечу: {token}.")
+    # Синонимы: берём первое слово из каждой группы, чтобы мок проходил проверку.
+    for group in checks.get("must_contain_any", []):
+        if group:
+            tail.append(f"Отмечу: {group[0]}.")
     if checks.get("asks_question"):
         tail.append("Уточните, пожалуйста: для какой аудитории и какая цель?")
     elif "?" in checks.get("must_contain", []):

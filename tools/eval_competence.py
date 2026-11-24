@@ -27,15 +27,25 @@ _CYR = re.compile(r"[а-яА-ЯёЁ]")
 _NUM = re.compile(r"\d[\d\s]{0,9}")
 #: Уточнение не обязано заканчиваться «?»: «Уточните тему и объём» — тоже вопрос.
 _QUESTION = re.compile(
-    r"\?|\b(?:уточните|уточнить|какой|какая|какие|каком|что именно|"
+    r"\?|\b(?:уточнит[еь]|уточни|сообщит[еь]|сообщи|скажит[еь]|скажи|"
+    r"подскажит[еь]|подскажи|назови|назовите|опиши|опишите|"
+    r"какой|какая|какие|каком|что именно|"
     r"для какой|на какую|сколько|где|когда|кто|зачем|почему)\b",
     re.I,
 )
 
+#: Как сравнивать «обязательное слово»: по основе, а не буквально — иначе
+#: «вакансия» не совпадает с «вакансии», а «приказ» с «приказу».
+_STEM_MIN = 4
+
+
+def _stem(text: str) -> str:
+    return text[: max(_STEM_MIN, len(text) - 2)]
+
 #: Допустимые названия проверок — опечатка в golden должна падать, а не молча игнорироваться.
 KNOWN_CHECKS = {
     "russian", "min_words", "max_words", "asks_question",
-    "must_contain", "must_not_contain", "no_invented_prices",
+    "must_contain", "must_contain_any", "must_not_contain", "no_invented_prices",
     "forbid_numbers_from_catalog", "forbid",
 }
 
@@ -72,8 +82,12 @@ def check_row(row: dict, answer: str, *, numbers: set[str] | None = None) -> lis
     if checks.get("asks_question") and not _QUESTION.search(answer):
         failures.append("не задан уточняющий вопрос")
     for token in checks.get("must_contain", []):
-        if token.lower() not in low:
+        if not re.search(rf"\b{re.escape(_stem(token.lower()))}", low):
             failures.append(f"нет «{token}»")
+    # Синонимы: «врач» или «доктор» или «специалист» — смысл один, требуем любой.
+    for group in checks.get("must_contain_any", []):
+        if not any(re.search(rf"\b{re.escape(_stem(alt.lower()))}", low) for alt in group):
+            failures.append("нет ни одного из: " + ", ".join(group))
     for token in checks.get("must_not_contain", []):
         if token.lower() in low:
             failures.append(f"есть запрещённое «{token}»")
