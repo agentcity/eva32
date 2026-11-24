@@ -1453,6 +1453,20 @@ static void samp_state_begin(vtm_t *m) {
         return;
     }
     samp_params_from_meta(m, &p);
+    // Рантайм-переопределение сэмплинга: параметры обычно зашиты в мету при
+    // компиляции, но для экспериментов с температурой пересобирать 3B-контейнер
+    // (2,2 ГиБ) каждой попыткой — минуты. Переменные окружения дают ручку без
+    // пересборки: VTM_TEMPERATURE, VTM_TOP_P, VTM_REP_PENALTY, VTM_TOP_K.
+    {
+        const char *env = getenv("VTM_TEMPERATURE");
+        if (env && *env) p.temperature = atof(env);
+        env = getenv("VTM_TOP_P");
+        if (env && *env) p.top_p = atof(env);
+        env = getenv("VTM_TOP_K");
+        if (env && *env) p.top_k = atoi(env);
+        env = getenv("VTM_REP_PENALTY");
+        if (env && *env) p.repetition_penalty = atof(env);
+    }
     m->samp_temperature = p.temperature;
     m->samp_top_k = p.top_k;
     m->samp_top_p = p.top_p;
