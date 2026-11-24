@@ -964,5 +964,26 @@
     "status": "done",
     "file": "0145-chat-stats-panel.md",
     "assignee": "agent:chat-stats"
+  },
+  {
+    "id": "0146",
+    "title": "Смешанная точность: FFN в тритах, чувствительное — в int8/fp16",
+    "status": "in_progress",
+    "file": "0146-exp-mixed.md",
+    "assignee": "agent:exp-mixed"
+  },
+  {
+    "id": "0147",
+    "title": "AWQ + GPTQ-округление вместо наивного квантования",
+    "status": "in_progress",
+    "file": "0147-exp-smart.md",
+    "assignee": "agent:exp-smart"
+  },
+  {
+    "id": "0148",
+    "title": "Два трита на вес (≈2 бита): стоит ли овчинка",
+    "status": "in_progress",
+    "file": "0148-exp-2bit.md",
+    "assignee": "agent:exp-2bit"
   }
 ]
