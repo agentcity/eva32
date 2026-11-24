@@ -1066,7 +1066,7 @@
   {
     "id": "0161",
     "title": "7B Q4 в 33 раза медленнее 3B — найти причину",
-    "status": "in_progress",
+    "status": "done",
     "file": "0161-q4-7b-slow.md",
     "assignee": "agent:q4-7b-speed"
   }

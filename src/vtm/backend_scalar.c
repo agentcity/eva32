@@ -998,6 +998,102 @@ typedef struct {
     float *wbuf;      // vt*k f32: NEON-путь (строка в точных целых f32)
 } q4_mm_job;
 
+// --- Q4: упреждающая подкачка (задача 0161) --------------------------------
+//
+// Q4-веса живут в mmap контейнера, и холодная страница отдаётся по одному
+// 16-КиБ фолту. Замер на 7B (4,1 ГБ весов): фолты дают 0,26 ГБ/с, т. е.
+// 15–33 с на токен; madvise(MADV_WILLNEED) кластерами и в несколько потоков —
+// 2,6 ГБ/с на свободной машине и ~1,2 ГБ/с под нагрузкой (16 ГиБ, рядом идут
+// другие модели). Ядро на тёплых страницах считает 4,5 ток/с, поэтому
+// подкачка не заменяет вычисление, а убирает обрыв 33× на холодном проходе:
+// замер под нагрузкой — 17,5 → 6,5 с на токен 7B (1 поток), 10–13 → 0,6–1,5 с
+// на 3B.
+//
+// Окно: дойдя до Q4-тензора за пределами уже запрошенного окна, просим
+// подтянуть Q4_PF_WINDOW байт вперёд. Тензоры одного прохода идут по
+// возрастанию адреса (как и в файле), поэтому «падение» адреса означает
+// новый проход (новый токен) — окно сбрасывается, и на машине, где кэш не
+// держит 4 ГиБ, подкачка повторяется на каждом токене; на машине, где
+// страницы остаются в кэше, madvise по ним стоит доли миллисекунды.
+// Повторный вызов того же тензора окно не двигает: страницы уже запрошены.
+// VTM_Q4_PREFETCH=0 отключает (A/B и машины, где madvise мешает).
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#define VTM_Q4_PF 1
+#else
+#define VTM_Q4_PF 0
+#endif
+
+#define Q4_PF_CHUNKS 32                    // кусков в окне: пул режет по потокам
+#define Q4_PF_WINDOW ((size_t)256u << 20)  // байт вперёд за один запрос
+
+typedef struct {
+    const uint8_t *p;
+    size_t bytes;
+} q4_pf_job;
+
+static void q4_pf_worker(void *ctx, int tid, int r0, int r1) {
+    q4_pf_job *j = (q4_pf_job *)ctx;
+    int i;
+    (void)tid;
+    for (i = r0; i < r1; i++) {
+        size_t lo = (size_t)i * j->bytes / Q4_PF_CHUNKS;
+        size_t hi = (size_t)(i + 1) * j->bytes / Q4_PF_CHUNKS;
+        uintptr_t a = ((uintptr_t)j->p + lo) & ~(uintptr_t)4095u;
+        uintptr_t b = ((uintptr_t)j->p + hi + 4095u) & ~(uintptr_t)4095u;
+#if VTM_Q4_PF
+        (void)madvise((void *)a, (size_t)(b - a), MADV_WILLNEED);
+#else
+        (void)a;
+        (void)b;
+#endif
+    }
+}
+
+// p — начало Q4-тензора, bytes — его упакованные байты (не меньше окна, если
+// тензор больше окна). Окно запрашивается один раз, а дальше все тензоры
+// внутри него считаются по уже подтянутым страницам.
+static void q4_prefetch(const void *p, size_t bytes) {
+#if VTM_Q4_PF
+    // Состояние окна — на поток: vtm_q4_* может звать разные модели из разных
+    // потоков (у каждой свой vtm_t), и общий указатель дал бы гонку.
+#if defined(__GNUC__) || defined(__clang__)
+    static __thread const uint8_t *last_p;
+    static __thread const uint8_t *win_end;
+#else
+    static const uint8_t *last_p;
+    static const uint8_t *win_end;
+#endif
+#if defined(__GNUC__) || defined(__clang__)
+    static __thread int enabled = -1;
+#else
+    static int enabled = -1;
+#endif
+    const uint8_t *b = (const uint8_t *)p;
+    q4_pf_job job;
+    size_t len;
+
+    if (enabled < 0) {
+        const char *e = getenv("VTM_Q4_PREFETCH");
+        enabled = !(e && *e && *e == '0');
+    }
+    if (!enabled || !b) return;
+    if (b < last_p) win_end = NULL;      // новый проход по программе
+    last_p = b;
+    if (win_end && b < win_end) return;  // окно уже запрошено
+    len = bytes > Q4_PF_WINDOW ? bytes : Q4_PF_WINDOW;
+    job.p = b;
+    job.bytes = len;
+    win_end = b + len;
+    // work — байты: пул сам выберет число потоков по объёму, а «строки» здесь
+    // — куски байтов, не строки матрицы.
+    vtm_parallel_rows(Q4_PF_CHUNKS, (double)len, q4_pf_worker, &job);
+#else
+    (void)p;
+    (void)bytes;
+#endif
+}
+
 // --- выбор Q4-ядра: NEON, если TU собран с NEON (задача 0157) --------------
 //
 // Публичный контракт vtm_q4_* остаётся здесь, и здесь же — скалярный эталон
@@ -1195,6 +1291,12 @@ int vtm_q4_tmv(float *y, const uint8_t *q, const float *scales,
     if (rows < 0 || cols < 0) return -1;
     if (asym && !mins) return -1;
     if (rows == 0 || cols == 0) return 0;
+    {
+        // Окно подкачки нибблов (см. «Q4: упреждающая подкачка» выше): без
+        // него 4,1 ГБ 7B читаются по 16-КиБ фолтам со скоростью ~0,26 ГБ/с.
+        uint64_t groups = ((uint64_t)rows * (uint64_t)cols + 31u) / 32u;
+        q4_prefetch(q, (size_t)groups * (VTM_Q4_GROUP_SIZE / 2));
+    }
     job.y = y;
     job.q = q;
     job.scales = scales;
@@ -1275,6 +1377,10 @@ int vtm_q4_mm(float *y, const uint8_t *q, const float *scales,
     if (m == 0 || k == 0 || n == 0) return 0;
     // n == 1 — это TMV по строке (tied lm_head): общий путь, без буфера строки.
     if (n == 1) return vtm_q4_tmv(y, q, scales, mins, b, m, k, asym);
+    {
+        uint64_t groups = ((uint64_t)m * (uint64_t)k + 31u) / 32u;
+        q4_prefetch(q, (size_t)groups * (VTM_Q4_GROUP_SIZE / 2));
+    }
     job.y = y;
     job.q = q;
     job.scales = scales;
