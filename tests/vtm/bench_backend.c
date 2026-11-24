@@ -634,6 +634,153 @@ done:
     free(y_q4);
 }
 
+// Q4-батч против поштучного пути (задача 0162). Это ровно критерий приёмки:
+// y[r*N+j] пачки должен совпасть с N вызовами vtm_q4_tmv/vtm_q4_mm на
+// собранный contiguous вход токена j. Отдельно (check_q4_tmv_case выше)
+// поштучное ядро уже сверено с независимой double-деквантизацией, поэтому
+// здесь проверяется именно батчевая проводка и её арифметика.
+static void check_q4_batch_case(int rows, int cols, int ntok, int asym,
+                                float scale) {
+    int n = rows * cols;
+    uint32_t seed = 0x6200u + (uint32_t)rows * 29u + (uint32_t)cols * 7u
+                  + (uint32_t)ntok + (uint32_t)asym * 3u;
+    uint8_t *q = make_q4(n, seed);
+    float *scales = make_q4_scales(n, scale, seed ^ 0x5bu);
+    float *mins = asym ? make_q4_mins(n, seed ^ 0x1du) : NULL;
+    float *x = make_vec((size_t)cols * (size_t)ntok, seed ^ 0x71u);
+    float *y_ref = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    float *y_bat = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    float *xt = (float *)malloc((size_t)cols * sizeof(float));
+    float *yt = (float *)malloc((size_t)rows * sizeof(float));
+    char label[112];
+    double ref = 0.0;
+    int j, r, t;
+
+    if (!q || !scales || (asym && !mins) || !x || !y_ref || !y_bat || !xt
+        || !yt) {
+        fprintf(stderr, "check_q4_batch_case: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    for (j = 0; j < ntok; j++) {
+        for (t = 0; t < cols; t++)
+            xt[t] = x[(size_t)t * (size_t)ntok + (size_t)j];
+        if (vtm_q4_tmv(yt, q, scales, mins, xt, rows, cols, asym) != 0) {
+            fprintf(stderr, "check_q4_batch_case: поштучное ядро вернуло "
+                            "ошибку\n");
+            failures++;
+            goto done;
+        }
+        for (r = 0; r < rows; r++)
+            y_ref[(size_t)r * (size_t)ntok + (size_t)j] = yt[r];
+    }
+    if (vtm_q4_tmv_batch(y_bat, q, scales, mins, x, rows, cols, ntok,
+                         asym) != 0) {
+        fprintf(stderr, "check_q4_batch_case: батчевое ядро вернуло ошибку\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "Q4%s TMV-батч %dx%dx%d scale %.2f",
+             asym ? "1" : "0", rows, cols, ntok, (double)scale);
+    report(label, max_diff(y_bat, y_ref, (size_t)rows * (size_t)ntok, &ref),
+           ref, CHECK_TOL);
+done:
+    free(q);
+    free(scales);
+    free(mins);
+    free(x);
+    free(y_ref);
+    free(y_bat);
+    free(xt);
+    free(yt);
+}
+
+static void check_q4_mm_batch_case(int m, int k, int ntok, int asym,
+                                   float scale) {
+    int n_el = m * k;
+    uint32_t seed = 0x6d00u + (uint32_t)m * 13u + (uint32_t)k * 5u
+                  + (uint32_t)ntok + (uint32_t)asym * 23u;
+    uint8_t *q = make_q4(n_el, seed);
+    float *scales = make_q4_scales(n_el, scale, seed ^ 0x37u);
+    float *mins = asym ? make_q4_mins(n_el, seed ^ 0x09u) : NULL;
+    float *b = make_vec((size_t)k * (size_t)ntok, seed ^ 0x4fu);
+    float *y_ref = (float *)calloc((size_t)m * (size_t)ntok, sizeof(float));
+    float *y_bat = (float *)calloc((size_t)m * (size_t)ntok, sizeof(float));
+    float *bt = (float *)malloc((size_t)k * sizeof(float));
+    float *yt = (float *)malloc((size_t)m * sizeof(float));
+    char label[112];
+    double ref = 0.0;
+    int j, r, t;
+
+    if (!q || !scales || (asym && !mins) || !b || !y_ref || !y_bat || !bt
+        || !yt) {
+        fprintf(stderr, "check_q4_mm_batch_case: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    for (j = 0; j < ntok; j++) {
+        for (t = 0; t < k; t++)
+            bt[t] = b[(size_t)t * (size_t)ntok + (size_t)j];
+        // n == 1 у vtm_q4_mm — это одноколоночный путь (vtm_q4_tmv), ровно
+        // то, что даёт поштучный prefill на lm_head.
+        if (vtm_q4_mm(yt, q, scales, mins, bt, m, k, 1, asym) != 0) {
+            fprintf(stderr, "check_q4_mm_batch_case: поштучное ядро вернуло "
+                            "ошибку\n");
+            failures++;
+            goto done;
+        }
+        for (r = 0; r < m; r++)
+            y_ref[(size_t)r * (size_t)ntok + (size_t)j] = yt[r];
+    }
+    if (vtm_q4_mm_batch(y_bat, q, scales, mins, b, m, k, ntok, asym) != 0) {
+        fprintf(stderr, "check_q4_mm_batch_case: батчевое ядро вернуло "
+                        "ошибку\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "Q4%s MM-батч %dx%dx%d scale %.2f",
+             asym ? "1" : "0", m, k, ntok, (double)scale);
+    report(label, max_diff(y_bat, y_ref, (size_t)m * (size_t)ntok, &ref), ref,
+           CHECK_TOL);
+done:
+    free(q);
+    free(scales);
+    free(mins);
+    free(b);
+    free(y_ref);
+    free(y_bat);
+    free(bt);
+    free(yt);
+}
+
+// Контракт батчевых Q4-ядер: NULL/отрицательные размеры — -1, пустая
+// размерность — 0; N == 1 — прежний одноколоночный путь (тот же результат).
+static void check_q4_batch_args(void) {
+    float x[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float y1[2] = {0.0f, 0.0f};
+    float y2[2] = {0.0f, 0.0f};
+    float scales[1] = {1.0f};
+    uint8_t q[16] = {0};
+    int bad = 0;
+
+    if (vtm_q4_tmv_batch(NULL, q, scales, NULL, x, 1, 2, 2, 0) != -1) bad = 1;
+    if (vtm_q4_tmv_batch(y1, NULL, scales, NULL, x, 1, 2, 2, 0) != -1) bad = 1;
+    if (vtm_q4_tmv_batch(y1, q, NULL, NULL, x, 1, 2, 2, 0) != -1) bad = 1;
+    if (vtm_q4_tmv_batch(y1, q, scales, NULL, NULL, 1, 2, 2, 0) != -1) bad = 1;
+    if (vtm_q4_tmv_batch(y1, q, scales, NULL, x, -1, 2, 2, 0) != -1) bad = 1;
+    if (vtm_q4_tmv_batch(y1, q, scales, NULL, x, 1, 2, 2, 1) != -1) bad = 1;
+    if (vtm_q4_tmv_batch(y1, q, scales, NULL, x, 0, 2, 2, 0) != 0) bad = 1;
+    if (vtm_q4_mm_batch(NULL, q, scales, NULL, x, 1, 2, 2, 0) != -1) bad = 1;
+    if (vtm_q4_mm_batch(y1, q, scales, NULL, x, -1, 2, 2, 0) != -1) bad = 1;
+    if (vtm_q4_mm_batch(y1, q, scales, NULL, x, 0, 2, 2, 0) != 0) bad = 1;
+    // N == 1 — делегирование одноколоночному ядру, результат тот же.
+    if (vtm_q4_tmv(y2, q, scales, NULL, x, 1, 2, 0) != 0) bad = 1;
+    if (vtm_q4_tmv_batch(y1, q, scales, NULL, x, 1, 2, 1, 0) != 0) bad = 1;
+    if (memcmp(y1, y2, sizeof y1) != 0) bad = 1;
+    printf("  %-34s %s\n", "Q4-батч аргументы/N==1", bad ? "FAIL" : "ok");
+    if (bad) failures++;
+}
+
 // Контракт аргументов: NULL/отрицательные размеры — -1; asym без mins — -1;
 // нулевая размерность — 0 и никакого обращения к буферам.
 static void check_q4_args(void) {
@@ -1209,6 +1356,36 @@ static int run_checks(const vtm_backend *cand) {
         }
         check_q4_args();
         check_q4_interp();
+    }
+
+    // Q4-батч (0162): пачка против поштучного пути — критерий приёмки.
+    // Формы: реальные (hidden 2048, intermediate 11008/2048), хвост 1-3
+    // токена, cols не кратные 32 (группа через границу строк) и N == 1.
+    {
+        static const int q4bshapes[][3] = {
+            {7, 37, 5}, {1, 32, 16}, {1, 33, 3}, {64, 96, 16},
+            {128, 128, 2}, {128, 128, 3}, {2048, 2048, 16},
+            {11008, 2048, 8}, {2048, 11008, 4}
+        };
+        static const int q4bmmshapes[][3] = {
+            {5, 7, 3}, {16, 32, 16}, {2048, 2048, 16}, {11008, 2048, 8}
+        };
+        size_t bi;
+        for (bi = 0; bi < sizeof(q4bshapes) / sizeof(q4bshapes[0]); bi++) {
+            int els = q4bshapes[bi][0] * q4bshapes[bi][1];
+            float qs = els > 65536 ? 0.02f : 1.0f;
+            check_q4_batch_case(q4bshapes[bi][0], q4bshapes[bi][1],
+                                q4bshapes[bi][2], 0, qs);
+            check_q4_batch_case(q4bshapes[bi][0], q4bshapes[bi][1],
+                                q4bshapes[bi][2], 1, qs);
+        }
+        for (bi = 0; bi < sizeof(q4bmmshapes) / sizeof(q4bmmshapes[0]); bi++) {
+            check_q4_mm_batch_case(q4bmmshapes[bi][0], q4bmmshapes[bi][1],
+                                   q4bmmshapes[bi][2], 0, 0.02f);
+            check_q4_mm_batch_case(q4bmmshapes[bi][0], q4bmmshapes[bi][1],
+                                   q4bmmshapes[bi][2], 1, 0.02f);
+        }
+        check_q4_batch_args();
     }
 
     if (failures) {
@@ -2195,6 +2372,109 @@ done:
     return failures ? 1 : 0;
 }
 
+// Q4-батч prefill (задача 0162): пачка N токенов против N поштучных вызовов
+// ядра на той же матрице. Замер — только ядро (активации токенов разложены
+// заранее), поэтому это верхняя оценка выигрыша prefill: в графе к нему
+// добавляются дешёвые EMB/ROPE/ATTN/RMSN и lm_head.
+static int run_q4_batch_bench(int rows, int cols, int ntok, int iters) {
+    int n64 = rows * cols;
+    int n = n64;
+    uint8_t *q = NULL;
+    float *scales = NULL, *mins = NULL, *x = NULL, *xtok = NULL;
+    float *y_bat = NULL, *y_tok = NULL, *yt = NULL;
+    double t_tok = 1e300, t_bat = 1e300, d, ref = 0.0;
+    int it, j, r, t;
+
+    failures = 0;
+    if (n64 <= 0 || (int64_t)ntok * n64 > (int64_t)8000000000 || ntok < 1) {
+        fprintf(stderr, "Q4-батч: слишком большая форма %dx%dx%d\n", rows,
+                cols, ntok);
+        return 2;
+    }
+    q = make_q4(n, 0x1620u);
+    // Масштабы как у настоящей Q4_1-модели (0.005..0.035), Q4_1 (asym).
+    scales = make_q4_scales(n, 0.0f, 0x77u);
+    mins = make_q4_mins(n, 0x33u);
+    x = make_vec((size_t)cols * (size_t)ntok, 0x5au);
+    xtok = (float *)malloc((size_t)cols * (size_t)ntok * sizeof(float));
+    y_bat = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    y_tok = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    yt = (float *)malloc((size_t)rows * sizeof(float));
+    if (!q || !scales || !mins || !x || !xtok || !y_bat || !y_tok || !yt) {
+        fprintf(stderr, "Q4-батч: нет памяти на форму %dx%dx%d\n", rows, cols,
+                ntok);
+        goto done;
+    }
+    // Раскладка x[t*ntok + j] -> contiguous вход токена j (поштучный путь).
+    for (j = 0; j < ntok; j++)
+        for (t = 0; t < cols; t++)
+            xtok[(size_t)j * (size_t)cols + (size_t)t]
+                = x[(size_t)t * (size_t)ntok + (size_t)j];
+
+    for (it = 0; it < iters + 1; it++) {   // первый прогон — прогрев
+        double t0 = now_ms(), dt;
+        for (j = 0; j < ntok; j++) {
+            if (vtm_q4_tmv(yt, q, scales, mins,
+                           xtok + (size_t)j * (size_t)cols, rows, cols,
+                           1) != 0) {
+                fprintf(stderr, "Q4-батч: поштучное ядро вернуло ошибку\n");
+                goto done;
+            }
+            if (it > 0)
+                for (r = 0; r < rows; r++)
+                    y_tok[(size_t)r * (size_t)ntok + (size_t)j] = yt[r];
+        }
+        dt = now_ms() - t0;
+        if (it > 0 && dt < t_tok) t_tok = dt;
+    }
+    for (it = 0; it < iters + 1; it++) {
+        double t0 = now_ms(), dt;
+        if (vtm_q4_tmv_batch(y_bat, q, scales, mins, x, rows, cols, ntok,
+                             1) != 0) {
+            fprintf(stderr, "Q4-батч: батчевое ядро вернуло ошибку\n");
+            goto done;
+        }
+        dt = now_ms() - t0;
+        if (it > 0 && dt < t_bat) t_bat = dt;
+    }
+    d = max_diff(y_bat, y_tok, (size_t)rows * (size_t)ntok, &ref);
+
+    printf("Q4_1 батч prefill: %dx%d x %d токен(ов), %d итераций (мин)\n",
+           rows, cols, ntok, iters);
+    printf("  поштучно: %9.2f мс  (%7.2f мс/токен, %6.2f GFLOP/s)\n",
+           t_tok, t_tok / (double)ntok,
+           2.0 * (double)n64 * (double)ntok / (t_tok * 1e6));
+    printf("  пачкой:   %9.2f мс  (%7.2f мс/токен, %6.2f GFLOP/s)  "
+           "ускорение %.2fx\n", t_bat, t_bat / (double)ntok,
+           2.0 * (double)n64 * (double)ntok / (t_bat * 1e6), t_tok / t_bat);
+    {
+        int ns[] = {64, 256, 512};
+        size_t k;
+        printf("  проекция prefill (эта матрица, пачки по %d):\n", ntok);
+        for (k = 0; k < sizeof ns / sizeof ns[0]; k++) {
+            double nchunk = (double)((ns[k] + ntok - 1) / ntok);
+            double before = t_tok * (double)ns[k] / (double)ntok;
+            double after = t_bat * nchunk;
+            printf("    N=%3d: до %9.2f мс, после %9.2f мс, %.2fx\n", ns[k],
+                   before, after, before / after);
+        }
+    }
+    printf("  точность пачки против поштучного пути: max|diff|=%.3e "
+           "(max|ref|=%.3e) %s\n", d, ref,
+           d <= CHECK_TOL ? "ok" : "FAIL");
+    if (d > CHECK_TOL) failures++;
+done:
+    free(q);
+    free(scales);
+    free(mins);
+    free(x);
+    free(xtok);
+    free(y_bat);
+    free(y_tok);
+    free(yt);
+    return failures ? 1 : 0;
+}
+
 static int emit_first(void *user, int token, int position) {
     int *out = (int *)user;
     (void)position;
@@ -2306,6 +2586,209 @@ static int run_logits(const char *explicit_path, const vtm_backend *cand) {
     return 0;
 }
 
+// --- prefill-проверка на настоящей модели (задача 0162) --------------------
+//
+// Сквозной критерий приёмки: состояние после одной пачки vtm_run_batch должно
+// совпасть с состоянием после N последовательных vtm_run. Сравниваются логиты
+// последнего токена (max|diff|) и argmax. В графе 3B Q4 участвуют и Q4
+// TMV/MM (батчевое ядро 0162), и плотный lm_head (ядро 0159), поэтому это
+// проверка всей проводки, а не одного ядра.
+static float *copy_logits(vtm_t *m, int *n_out, int *argmax) {
+    const vtm_tensor *lg = vtm_tensor_by_name(m, "logits");
+    float *out;
+    int i;
+
+    if (!lg || !lg->f32 || lg->n_elements == 0) return NULL;
+    out = (float *)malloc((size_t)lg->n_elements * sizeof(float));
+    if (!out) return NULL;
+    memcpy(out, lg->f32, (size_t)lg->n_elements * sizeof(float));
+    *n_out = (int)lg->n_elements;
+    *argmax = 0;
+    for (i = 1; i < *n_out; i++)
+        if (out[i] > out[*argmax]) *argmax = i;
+    return out;
+}
+
+static int run_prefill_check(const char *explicit_path, int ntok) {
+    const char *path = find_model(explicit_path);
+    int32_t *ids = NULL;
+    float *y_ref = NULL, *y_bat = NULL;
+    int n_ref = 0, n_bat = 0, tok_ref = -1, tok_bat = -1;
+    vtm_t *m;
+    vtm_status st;
+    double t0, t_tok, t_bat, d, ref = 0.0;
+    int i;
+
+    if (!path) {
+        fprintf(stderr, "модель не найдена (--prefill-check PATH)\n");
+        return 2;
+    }
+    if (ntok < 2) ntok = 2;
+    if (ntok > 64) ntok = 64;
+    printf("модель: %s\n", path);
+    printf("prefill-check: %d токенов, эталон — по токену, затем пачка\n",
+           ntok);
+    m = vtm_load(path);
+    if (!m) {
+        fprintf(stderr, "vtm_load(%s): %s\n", path, vtm_last_error());
+        return 1;
+    }
+    vtm_set_backend(m, &vtm_backend_simd);
+    ids = (int32_t *)malloc((size_t)ntok * sizeof(int32_t));
+    if (!ids) {
+        vtm_free(m);
+        return 1;
+    }
+    for (i = 0; i < ntok; i++) ids[i] = 1000 + i * 7;
+
+    t0 = now_ms();
+    for (i = 0; i < ntok; i++) {
+        vtm_set_position(m, i);
+        vtm_set_token(m, ids[i]);
+        st = vtm_run(m, NULL, NULL);
+        if (st != VTM_OK) {
+            fprintf(stderr, "vtm_run: %s (%s)\n", vtm_strerror(st),
+                    vtm_error_message(m));
+            goto fail;
+        }
+    }
+    t_tok = now_ms() - t0;
+    y_ref = copy_logits(m, &n_ref, &tok_ref);
+    if (!y_ref) {
+        fprintf(stderr, "в модели нет тензора logits\n");
+        goto fail;
+    }
+
+    // Чистое состояние, как у хоста между запросами (api.c): KV-кэш
+    // перезаписывается теми же токенами с тех же позиций.
+    vtm_reset(m);
+    vtm_set_position(m, 0);
+    t0 = now_ms();
+    st = vtm_run_batch(m, ids, ntok);
+    t_bat = now_ms() - t0;
+    if (st != VTM_OK) {
+        fprintf(stderr, "vtm_run_batch: %s (%s)\n", vtm_strerror(st),
+                vtm_error_message(m));
+        goto fail;
+    }
+    y_bat = copy_logits(m, &n_bat, &tok_bat);
+    if (!y_bat) {
+        fprintf(stderr, "в модели нет тензора logits после пачки\n");
+        goto fail;
+    }
+    if (n_ref != n_bat) {
+        fprintf(stderr, "разное число логитов: %d vs %d\n", n_ref, n_bat);
+        goto fail;
+    }
+    d = max_diff(y_bat, y_ref, (size_t)n_ref, &ref);
+    printf("  по токену: %9.2f мс (%.2f мс/токен)\n", t_tok,
+           t_tok / (double)ntok);
+    printf("  пачкой:    %9.2f мс (%.2f мс/токен), ускорение %.2fx\n", t_bat,
+           t_bat / (double)ntok, t_tok / t_bat);
+    printf("  max|logits(пачка) - logits(по токену)| = %.3e (max|ref|=%.2f) "
+           "%s\n", d, ref, d <= CHECK_TOL ? "ok" : "FAIL");
+    printf("  argmax: по токену=%d пачка=%d %s\n", tok_ref, tok_bat,
+           tok_ref == tok_bat ? "(совпал)" : "(РАЗОШЁЛСЯ)");
+    free(ids);
+    free(y_ref);
+    free(y_bat);
+    vtm_free(m);
+    if (d > CHECK_TOL || tok_ref != tok_bat) {
+        printf("prefill-check: FAIL (> %.0e или argmax разошёлся)\n",
+               CHECK_TOL);
+        return 1;
+    }
+    printf("prefill-check: ok (в пределах %.0e)\n", CHECK_TOL);
+    return 0;
+fail:
+    free(ids);
+    free(y_ref);
+    free(y_bat);
+    vtm_free(m);
+    return 1;
+}
+
+// --- TTFT prefill на настоящей модели: по токену против пачки (0162) --------
+//
+// Один процесс, чередование: для каждой длины промпта сначала один путь,
+// потом другой, и порядок меняется от повтора к повтору. Так дрейф нагрузки
+// и состояние page cache бьют по обоим путям одинаково — на общей машине
+// одиночные прогоны CLI расходятся в 2-3 раза.
+//
+// Считается только prefill (последний токен промпта включён): ровно то, что
+// ждёт хост до первого токена ответа. ids синтетические (одинаковый поток для
+// обоих путей), модель настоящая.
+static double prefill_token(vtm_t *m, const int32_t *ids, int n) {
+    double t0 = now_ms();
+    int i;
+    for (i = 0; i < n; i++) {
+        vtm_set_position(m, i);
+        vtm_set_token(m, ids[i]);
+        if (vtm_run(m, NULL, NULL) != VTM_OK) return -1.0;
+    }
+    return now_ms() - t0;
+}
+
+static double prefill_batch(vtm_t *m, const int32_t *ids, int n) {
+    double t0;
+    vtm_reset(m);
+    vtm_set_position(m, 0);
+    t0 = now_ms();
+    if (vtm_run_batch(m, ids, n) != VTM_OK) return -1.0;
+    return now_ms() - t0;
+}
+
+static int run_prefill_ttft(const char *explicit_path) {
+    static const int lens[] = {64, 256, 512};
+    const char *path = find_model(explicit_path);
+    int32_t ids[512];
+    vtm_t *m;
+    size_t li;
+    int i;
+
+    if (!path) {
+        fprintf(stderr, "модель не найдена (--prefill-ttft PATH)\n");
+        return 2;
+    }
+    m = vtm_load(path);
+    if (!m) {
+        fprintf(stderr, "vtm_load(%s): %s\n", path, vtm_last_error());
+        return 1;
+    }
+    vtm_set_backend(m, &vtm_backend_simd);
+    for (i = 0; i < 512; i++) ids[i] = 1000 + (i * 37) % 150000;
+    printf("модель: %s\nTTFT prefill (один процесс, по токену против пачки; "
+           "пачка режется ядром по VTM_BATCH_TOKENS):\n", path);
+    printf("  %6s %12s %12s %9s\n", "токенов", "по токену, с", "пачкой, с",
+           "ускорение");
+    for (li = 0; li < sizeof lens / sizeof lens[0]; li++) {
+        const int n = lens[li];
+        double t_tok = 1e300, t_bat = 1e300;
+        int rep;
+        for (rep = 0; rep < 2; rep++) {
+            double a, b;
+            if (rep == 0) {
+                a = prefill_token(m, ids, n);
+                b = prefill_batch(m, ids, n);
+            } else {
+                b = prefill_batch(m, ids, n);
+                a = prefill_token(m, ids, n);
+            }
+            if (a < 0.0 || b < 0.0) {
+                fprintf(stderr, "prefill-ttft: прогон вернул ошибку\n");
+                vtm_free(m);
+                return 1;
+            }
+            if (a < t_tok) t_tok = a;
+            if (b < t_bat) t_bat = b;
+        }
+        printf("  %6d %12.2f %12.2f %8.2fx\n", n, t_tok / 1e3, t_bat / 1e3,
+               t_tok / t_bat);
+    }
+    vtm_free(m);
+    return 0;
+}
+
 // --- main ------------------------------------------------------------------
 
 static void usage(const char *prog) {
@@ -2314,7 +2797,9 @@ static void usage(const char *prog) {
            "[--threads] [--pool] [--logits PATH] [--no-mm]\n"
            "          [--gemv-rows N] [--gemv-cols N]\n"
            "          [--batch] [--batch-tokens N] "
-           "[--q4 [--q4-rows N] [--q4-cols N] [--q4-iters N]]\n"
+           "[--q4 [--q4-rows N] [--q4-cols N] [--q4-iters N] "
+           "[--q4-batch]]\n"
+           "          [--prefill-check PATH] [--prefill-ttft PATH]\n"
            "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
            "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8)\n",
            prog);
@@ -2324,11 +2809,13 @@ int main(int argc, char **argv) {
     int rows = 1024, cols = 1024, iters = 50, scale_block = 160;
     int check = 0, no_mm = 0, threads = 0, pool = 0, batch = 0;
     int batch_tokens = 16;
-    int q4 = 0, q4_rows = 151936, q4_cols = 896, q4_iters = 3;
+    int q4 = 0, q4_batch = 0, q4_rows = 151936, q4_cols = 896, q4_iters = 3;
     // Форма плотного GEMV (f32 n == 1): по умолчанию — уменьшенный аналог
     // tied lm_head 3B Q4 ([151936, 2048]); реальную задают флагами.
     int gemv_rows = 16384, gemv_cols = 2048;
     const char *logits_path = NULL;
+    const char *prefill_check_path = NULL;
+    const char *prefill_ttft_path = NULL;
     const char *backend_name = NULL;
     const vtm_backend *cand;
     int i;
@@ -2352,6 +2839,8 @@ int main(int argc, char **argv) {
             q4_cols = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--q4-iters") == 0 && i + 1 < argc) {
             q4_iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--q4-batch") == 0) {
+            q4_batch = 1;
         } else if (strcmp(argv[i], "--scale-block") == 0 && i + 1 < argc) {
             scale_block = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
@@ -2370,6 +2859,10 @@ int main(int argc, char **argv) {
             batch_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--logits") == 0) {
             logits_path = (i + 1 < argc) ? argv[++i] : "";
+        } else if (strcmp(argv[i], "--prefill-check") == 0) {
+            prefill_check_path = (i + 1 < argc) ? argv[++i] : "";
+        } else if (strcmp(argv[i], "--prefill-ttft") == 0) {
+            prefill_ttft_path = (i + 1 < argc) ? argv[++i] : "";
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
@@ -2409,8 +2902,16 @@ int main(int argc, char **argv) {
     if (!backend_name && (!getenv("VTM_BACKEND") || !*getenv("VTM_BACKEND")))
         cand = &vtm_backend_simd;  // бенчмарк по умолчанию меряет SIMD
 
+    if (prefill_ttft_path)
+        return run_prefill_ttft(*prefill_ttft_path ? prefill_ttft_path
+                                                   : NULL);
+    if (prefill_check_path)
+        return run_prefill_check(*prefill_check_path ? prefill_check_path
+                                                     : NULL, batch_tokens);
     if (q4)
-        return run_q4_bench(q4_rows, q4_cols, q4_iters);
+        return q4_batch ? run_q4_batch_bench(q4_rows, q4_cols, batch_tokens,
+                                             q4_iters)
+                        : run_q4_bench(q4_rows, q4_cols, q4_iters);
     if (pool)
         return run_pool(iters);
     if (batch) {

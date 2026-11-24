@@ -1410,6 +1410,133 @@ int vtm_q4_mm(float *y, const uint8_t *q, const float *scales,
     return 0;
 }
 
+// --- Q4: батчевый prefill (задача 0162) ------------------------------------
+//
+// y[r*N + j] = sum_t W[r,t] * x[t*N + j] — N токенов против одной упакованной
+// матрицы. Раскладка — как у батчевых ядер 0122/0159 (токен — младший индекс),
+// см. vtm_backend.h.
+//
+// Смысл: поштучный prefill прогоняет по строке W на каждый токен, то есть
+// N раз читает и распаковывает одни и те же нибблы. Здесь строка
+// разворачивается в double ОДИН раз на пачку (q4_row_double) и умножается на
+// N столбцов активаций. Порядок сложений для каждого (r,j) — тот же, что у
+// q4_dot_row (по t, в double), поэтому скалярный результат побитово равен N
+// вызовам vtm_q4_tmv/vtm_q4_mm; NEON-ядро (backend_neon.c) считает группу в
+// f32 и сворачивает в double, как одноколоночные ядра 0157.
+//
+// Память — одна строка в double на поток (для 3B: 2048*8 = 16 КБ, для
+// down_proj 11008*8 = 88 КБ); копии матрицы нет. Нет памяти — -1, и
+// вызывающий (interp.c) идёт поштучным путём, как и раньше.
+typedef struct {
+    float *y;
+    const uint8_t *q;
+    const float *scales;
+    const float *mins;
+    const float *x;
+    int rows;
+    int cols;
+    int ntok;
+    int asym;
+    double *rowbuf;   // vt * cols
+} q4_batch_job;
+
+static void q4_batch_rows(q4_batch_job *j, int tid, int r0, int r1) {
+    double *wrow = j->rowbuf + (size_t)tid * (size_t)j->cols;
+    int r, t, c;
+
+    for (r = r0; r < r1; r++) {
+        const int64_t base = (int64_t)r * (int64_t)j->cols;
+        float *yrow = j->y + (size_t)r * (size_t)j->ntok;
+
+        q4_row_double(wrow, j->q, j->scales, j->mins, base, j->cols, j->asym);
+        for (c = 0; c < j->ntok; c++) {
+            double acc = 0.0;
+            for (t = 0; t < j->cols; t++)
+                acc += wrow[t] * (double)j->x[(size_t)t * (size_t)j->ntok
+                                             + (size_t)c];
+            yrow[c] = (float)acc;
+        }
+    }
+}
+
+static void q4_batch_worker(void *p, int tid, int r0, int r1) {
+    q4_batch_rows((q4_batch_job *)p, tid, r0, r1);
+}
+
+static int q4_batch_impl(float *y, const uint8_t *q, const float *scales,
+                         const float *mins, const float *x, int rows,
+                         int cols, int ntok, int asym) {
+    q4_batch_job job;
+    int vt;
+
+    if (!y || !q || !scales || !x) return -1;
+    if (rows < 0 || cols < 0 || ntok < 0) return -1;
+    if (asym && !mins) return -1;
+    if (rows == 0 || cols == 0 || ntok == 0) return 0;
+    {
+        // То же окно упреждающей подкачки, что у поштучных ядер: батч читает
+        // тензор один раз, поэтому окно (256 МиБ вперёд) покрывает больше
+        // строк за тот же madvise.
+        uint64_t groups = ((uint64_t)rows * (uint64_t)cols + 31u) / 32u;
+        q4_prefetch(q, (size_t)groups * (VTM_Q4_GROUP_SIZE / 2));
+    }
+    vt = vtm_threads();
+    job.y = y;
+    job.q = q;
+    job.scales = scales;
+    job.mins = mins;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    job.ntok = ntok;
+    job.asym = asym;
+    job.rowbuf = (double *)malloc((size_t)vt * (size_t)cols * sizeof(double));
+    if (!job.rowbuf) return -1;   // вызывающий уйдёт на поштучный путь
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok,
+                      q4_batch_worker, &job);
+    free(job.rowbuf);
+    return 0;
+}
+
+#if VTM_Q4_NEON
+// NEON-ядро (backend_neon.c). Отказ (-1) — не ошибка прогона: как и у
+// одноколоночных ядер 0157, ниже работает скалярный эталон.
+extern int vtm_neon_q4_batch(float *y, const uint8_t *q,
+                                 const float *scales, const float *mins,
+                                 const float *x, int rows, int cols,
+                                 int ntok, int asym);
+#endif
+
+int vtm_q4_tmv_batch(float *y, const uint8_t *q, const float *scales,
+                     const float *mins, const float *x, int rows, int cols,
+                     int n_tokens, int asym) {
+    if (rows < 0 || cols < 0 || n_tokens < 0) return -1;
+    if (n_tokens == 1)   // одна колонка — прежнее одноколоночное ядро
+        return vtm_q4_tmv(y, q, scales, mins, x, rows, cols, asym);
+#if VTM_Q4_NEON
+    if (q4_simd_enabled() && vtm_simd_available()
+        && vtm_neon_q4_batch(y, q, scales, mins, x, rows, cols, n_tokens,
+                                 asym) == 0)
+        return 0;
+#endif
+    return q4_batch_impl(y, q, scales, mins, x, rows, cols, n_tokens, asym);
+}
+
+int vtm_q4_mm_batch(float *y, const uint8_t *q, const float *scales,
+                    const float *mins, const float *b, int m, int k,
+                    int n_tokens, int asym) {
+    if (m < 0 || k < 0 || n_tokens < 0) return -1;
+    // Арифметика та же, что у TMV: Q4-матрица [m,k] против N столбцов.
+    if (n_tokens == 1) return vtm_q4_mm(y, q, scales, mins, b, m, k, 1, asym);
+#if VTM_Q4_NEON
+    if (q4_simd_enabled() && vtm_simd_available()
+        && vtm_neon_q4_batch(y, q, scales, mins, b, m, k, n_tokens,
+                                 asym) == 0)
+        return 0;
+#endif
+    return q4_batch_impl(y, q, scales, mins, b, m, k, n_tokens, asym);
+}
+
 // --- остальные ядра --------------------------------------------------------
 
 // Однопоточный RMSN — прежний код без изменений: при VTM_THREADS=1 и на

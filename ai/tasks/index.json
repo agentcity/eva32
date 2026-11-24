@@ -1073,7 +1073,7 @@
   {
     "id": "0162",
     "title": "Батчевый Q4 prefill — TTFT 50 с",
-    "status": "in_progress",
+    "status": "done",
     "file": "0162-q4-prefill-batch.md",
     "assignee": "agent:q4-prefill"
   }

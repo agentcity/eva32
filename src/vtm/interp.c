@@ -2003,6 +2003,12 @@ vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
 // (вектор по токенам пачки), а на скалярном бэкенде — в
 // vtm_scalar_dense_batch: тот повторяет double-цикл скалярного пути, поэтому
 // побитовость там сохраняется.
+// Q4 (kind 5) — в батчевое ядро 0162 vtm_q4_tmv_batch/vtm_q4_mm_batch: оно
+// разворачивает строку из нибблов один раз на пачку и умножает на N токенов,
+// поэтому поштучный prefill 3B Q4 перестаёт читать и распаковывать одни и те
+// же 2,2 ГиБ весов на каждый токен промпта. Скалярный эталон ядра битово
+// равен N вызовам vtm_q4_*, NEON — доли 1e-6 (проверяет bench_backend
+// --check и --prefill-check). Отказ ядра (нет памяти) — на поштучный путь.
 // Остальные операции (EMB/ROPE/KVW/ATTN/RMSN/SAMP/...) дешёвые и считаются
 // по токену прежними функциями: это сохраняет их семантику (позиция, окно,
 // эмбеддинг) без дублирования кода.
@@ -2349,22 +2355,32 @@ static void batch_mm_worker(void *p, int tid, int r0, int r1) {
 
 // Батчевый TMV. Тритовые веса на SIMD — ядро 0122 (вес читается и
 // распаковывается один раз на пачку), иначе — батчевые скалярные строки.
-// Плотные (fp32) — ядро 0159 vtm_simd_tmv_f32_batch (вектор по токенам
-// пачки), а на скалярном бэкенде — vtm_scalar_dense_batch: там побитовость с
-// прогоном по токену — контракт, и это прежний double-цикл interp.c,
-// перенесённый в бэкенд. Аргументы уже проверены batch_tmv_ready(), поэтому
-// отказ ядра здесь — только NULL/отрицательные размеры, которых нет.
-static void batch_tmv_kernel(const vtm_tensor *w, const float *xt, int C,
-                             int rows, int cols, int transposed, float *yt,
-                             int use_simd) {
+// Q4 (kind 5) — ядро 0162 vtm_q4_tmv_batch (строка разворачивается один раз
+// на пачку): 0 — посчитано, -1 — нет памяти/форма не та, и вызывающий
+// уходит на поштучный путь (batch_token_op → op_tmv). Плотные (fp32) — ядро
+// 0159 vtm_simd_tmv_f32_batch (вектор по токенам пачки), а на скалярном
+// бэкенде — vtm_scalar_dense_batch: там побитовость с прогоном по токену —
+// контракт, и это прежний double-цикл interp.c, перенесённый в бэкенд.
+// Аргументы уже проверены batch_tmv_ready(), поэтому отказ ядер тритов/
+// плотных здесь — только NULL/отрицательные размеры, которых нет.
+static int batch_tmv_kernel(const vtm_tensor *w, const float *xt, int C,
+                            int rows, int cols, int transposed, float *yt,
+                            int use_simd) {
     batch_mm_job job;
 
+    if (w->kind == VTM_TENSOR_Q4) {
+        if (vtm_q4_tmv_batch(yt, q4_bytes(w), w->scales,
+                             w->q4_is_asym ? w->q4_mins : NULL, xt, rows, cols,
+                             C, w->q4_is_asym ? 1 : 0) != 0)
+            return -1;
+        return 0;
+    }
     if (w->kind == VTM_TENSOR_TRIT) {
         if (use_simd && vtm_simd_tmv_blocks_batch(yt,
                                                   (const uint8_t *)w->words,
                                                   w->scales, xt, rows, cols,
                                                   C, (int)w->scale_block) == 0)
-            return;
+            return 0;
         job.w = w;
         job.xt = xt;
         job.C = C;
@@ -2374,28 +2390,37 @@ static void batch_tmv_kernel(const vtm_tensor *w, const float *xt, int C,
         job.yt = yt;
         vtm_parallel_rows(rows, (double)rows * (double)cols * (double)C,
                           batch_tmv_worker, &job);
-        return;
+        return 0;
     }
     if (use_simd
         && vtm_simd_tmv_f32_batch(yt, w->f32, xt, rows, cols, C,
                                   transposed) == 0)
-        return;
+        return 0;
     // Сюда попадаем и при нехватке памяти в SIMD-ядре: скалярный эталон
     // даёт тот же результат по смыслу (double-порядок) и доводит пачку.
     (void)vtm_scalar_dense_batch(yt, w->f32, xt, rows, cols, C, transposed);
+    return 0;
 }
 
 // Батчевый MM: тритовая A — ядро 0122 или батчевые скалярные строки;
-// плотная A — ядро 0159 (vtm_simd_mm_f32_batch) или скалярный эталон.
-static void batch_mm_kernel(const vtm_tensor *a, const float *bt, int C,
-                            int mm, int kk, float *yt, int use_simd) {
+// Q4 A — ядро 0162 (0/-1, отказ — на поштучный путь); плотная A — ядро 0159
+// (vtm_simd_mm_f32_batch) или скалярный эталон.
+static int batch_mm_kernel(const vtm_tensor *a, const float *bt, int C,
+                           int mm, int kk, float *yt, int use_simd) {
     batch_mm_job job;
 
+    if (a->kind == VTM_TENSOR_Q4) {
+        if (vtm_q4_mm_batch(yt, q4_bytes(a), a->scales,
+                            a->q4_is_asym ? a->q4_mins : NULL, bt, mm, kk, C,
+                            a->q4_is_asym ? 1 : 0) != 0)
+            return -1;
+        return 0;
+    }
     if (a->kind == VTM_TENSOR_TRIT) {
         if (use_simd && vtm_simd_mm_batch(yt, (const uint8_t *)a->words,
                                           a->scales, bt, mm, kk, C,
                                           (int)a->scale_block) == 0)
-            return;
+            return 0;
         job.w = a;
         job.xt = bt;
         job.C = C;
@@ -2405,12 +2430,13 @@ static void batch_mm_kernel(const vtm_tensor *a, const float *bt, int C,
         job.yt = yt;
         vtm_parallel_rows(mm, (double)mm * (double)kk * (double)C,
                           batch_mm_worker, &job);
-        return;
+        return 0;
     }
     if (use_simd
         && vtm_simd_mm_f32_batch(yt, a->f32, bt, mm, kk, C) == 0)
-        return;
+        return 0;
     (void)vtm_scalar_dense_batch(yt, a->f32, bt, mm, kk, C, 0);
+    return 0;
 }
 
 static int batch_buf(float **p, size_t *cap, size_t need) {
@@ -2453,7 +2479,22 @@ static int batch_tmv_ready(vtm_t *m, const vtm_instr *in,
     y = &m->tensors[in->dst];
     if (w->ndim != 2) return 0;
     if (!x->f32 || !y->f32) return 0;
-    if (w->kind == VTM_TENSOR_TRIT) {
+    if (w->kind == VTM_TENSOR_Q4) {
+        uint64_t ng;
+        // Q4 (kind 5) остаётся упакованным и в пачке: ядро 0162 разворачивает
+        // строку один раз на пачку. Условия — те же, что у поштучного op_tmv:
+        // транспонирование не поддержано, нужны байты, масштабы и (для Q4_1)
+        // минимумы; блок масштаба — 32.
+        if ((in->flags & VTM_FLAG_TMV_TRANSPOSED) != 0) return 0;
+        if (!w->scales || !q4_bytes(w)) return 0;
+        if (w->q4_is_asym && !w->q4_mins) return 0;
+        if (w->scale_block != VTM_Q4_GROUP_SIZE) return 0;
+        ng = ((uint64_t)w->n_elements + VTM_Q4_GROUP_SIZE - 1u)
+           / VTM_Q4_GROUP_SIZE;
+        if ((uint64_t)w->n_scales < ng) return 0;
+        *rows = (int)w->dims[0];
+        *cols = (int)w->dims[1];
+    } else if (w->kind == VTM_TENSOR_TRIT) {
         if (!w->words || !w->scales) return 0;
         if (w->scale_block != VTM_SCALE_BLOCK_128
             && w->scale_block != VTM_SCALE_BLOCK_160)
@@ -2499,8 +2540,9 @@ static vtm_status batch_tmv_apply(vtm_t *m, uint32_t pc,
         const float *xs = batch_src(m, b, in->b, j);
         for (t = 0; t < cols; t++) b->xt[(size_t)t * b->C + j] = xs[t];
     }
-    batch_tmv_kernel(w, b->xt, b->C, rows, cols, tr, b->yt,
-                     batch_use_simd(m));
+    if (batch_tmv_kernel(w, b->xt, b->C, rows, cols, tr, b->yt,
+                         batch_use_simd(m)) != 0)
+        return VTM_OK;   // handled == 0: batch_token_op пойдёт по токену
 
     for (j = 0; j < b->C; j++) {
         float *ys = b->mem + (size_t)j * b->slot + b->off[in->dst];
@@ -2536,7 +2578,17 @@ static int batch_mm_ready(vtm_t *m, const vtm_instr *in,
     if (bv->dims[0] != (uint32_t)*kk || y->dims[0] != (uint32_t)*mm)
         return 0;
     if (!bv->f32 || !y->f32) return 0;
-    if (a->kind == VTM_TENSOR_TRIT) {
+    if (a->kind == VTM_TENSOR_Q4) {
+        uint64_t n = (uint64_t)*mm * (uint64_t)*kk;
+        // Q4 A в пачке — ядро 0162; условия те же, что у op_mm: упакованные
+        // байты, масштабы, минимумы для Q4_1, блок 32.
+        if (!a->scales || !q4_bytes(a)) return 0;
+        if (a->q4_is_asym && !a->q4_mins) return 0;
+        if (a->scale_block != VTM_Q4_GROUP_SIZE) return 0;
+        if ((uint64_t)a->n_elements < n) return 0;
+        if ((uint64_t)a->n_scales
+            < (n + VTM_Q4_GROUP_SIZE - 1u) / VTM_Q4_GROUP_SIZE) return 0;
+    } else if (a->kind == VTM_TENSOR_TRIT) {
         uint64_t n = (uint64_t)*mm * (uint64_t)*kk;
         if (!a->words || !a->scales) return 0;
         if (a->scale_block != VTM_SCALE_BLOCK_128
@@ -2575,8 +2627,9 @@ static vtm_status batch_mm_apply(vtm_t *m, uint32_t pc,
         const float *bs = batch_src(m, b, in->b, j);
         for (t = 0; t < kk; t++) b->xt[(size_t)t * b->C + j] = bs[t];
     }
-    batch_mm_kernel(a, b->xt, b->C, mm, kk, b->yt,
-                    batch_use_simd(m));
+    if (batch_mm_kernel(a, b->xt, b->C, mm, kk, b->yt,
+                        batch_use_simd(m)) != 0)
+        return VTM_OK;   // handled == 0: batch_token_op пойдёт по токену
 
     for (j = 0; j < b->C; j++) {
         float *ys = b->mem + (size_t)j * b->slot + b->off[in->dst];

@@ -156,6 +156,33 @@ int vtm_q4_mm(float *y, const uint8_t *q, const float *scales,
 int vtm_q4_dequant_row(float *y, const uint8_t *q, const float *scales,
                        const float *mins, int64_t base, int cols, int asym);
 
+// Батчевые Q4 TMV/MM (задача 0162): N токенов против одной Q4-матрицы.
+//
+// Раскладка — как у прочих батчевых ядер (см. vtm_simd_*_batch выше):
+//   x[t * N + j] — вход токена j по индексу t (t = 0..cols-1 / 0..k-1);
+//   y[r * N + j] — выход токена j по индексу r.
+//
+// Строка W разворачивается из нибблов один раз на пачку (а не N раз), поэтому
+// N токенов prefill'а дешевле N отдельных вызовов vtm_q4_tmv: вес читается из
+// памяти один раз. Память ядра — буфер строки на поток (cols f32), без копии
+// всей матрицы.
+//
+// Арифметика — как у NEON-ядра 0157: целые s = q - 8 (в f32 точно), 4
+// независимых f32-аккумулятора по t внутри группы 32, свёртка и масштаб
+// группы — в double. Расхождение с поштучным vtm_q4_* — единицы ulp на
+// группу (на logits 3B Q4 — доли 1e-6, порог 1e-5; проверяет
+// tests/vtm/bench_backend.c). При N == 1 уходит в vtm_q4_tmv/vtm_q4_mm.
+//
+// 0 — успех, -1 — неверные аргументы/NULL/отрицательные размеры/нет памяти.
+// На -1 вызывающий обязан откатиться на поштучный путь: так же, как
+// vtm_q4_tmv на нехватку памяти не роняет прогон.
+int vtm_q4_tmv_batch(float *y, const uint8_t *q, const float *scales,
+                     const float *mins, const float *x, int rows, int cols,
+                     int n_tokens, int asym);
+int vtm_q4_mm_batch(float *y, const uint8_t *q, const float *scales,
+                    const float *mins, const float *b, int m, int k,
+                    int n_tokens, int asym);
+
 // --- MM: SIMD-ядра вне `vtm_backend` ---------------------------------------
 //
 // В `vtm_backend` (vtm.h) поля MM нет, поэтому ядра MM — отдельные функции.

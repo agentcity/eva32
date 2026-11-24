@@ -1135,6 +1135,223 @@ int vtm_neon_q4_dequant_row(float *y, const uint8_t *q, const float *scales,
     return 0;
 }
 
+// --- NEON: батчевый Q4 TMV/MM (задача 0162) --------------------------------
+//
+// y[r*N + j] = sum_t W[r,t]*x[t*N + j]. Строка W разворачивается из нибблов
+// один раз на пачку (q4_row_weights_f32 — те же точные целые s = q-8, что у
+// одноколоночного ядра), а не N раз, и сразу умножается на N токенов: вес —
+// скаляр, активации токенов лежат подряд, поэтому на один t уходит один
+// broadcast и N/4 FMA. Это и есть выигрыш prefill: вес читается один раз.
+//
+// Арифметика группы — как у q4_row_dot_neon: 4 независимых f32-аккумулятора
+// по t (по 8 слагаемых в каждом), свёртка в f32, затем в double применяется
+// масштаб группы и (для Q4_1) cg*Σx. Порядок f32-сложения внутри группы
+// иной, чем у поштучного ядра (там ленты — по t, здесь — по токенам), поэтому
+// результат не побитовый; на logits 3B Q4 расхождение — доли 1e-6 (порог
+// 1e-5, проверяет bench_backend).
+//
+// Σx по группе НЕ зависит от строки, когда cols кратен 32 (группы идут по
+// плоской матрице с одинаковыми границами): он считается один раз на пачку,
+// а не на каждую строку. Иначе (cols % 32 != 0) группа пересекает границу
+// строк и Σx берётся в строке — в скалярной ветке ниже.
+//
+// Хвост ntok % 4 (1-3 токена) считается по t в double — как скалярный
+// эталон backend_scalar.c: батчевые вызовы с 1-3 токенами редки.
+
+typedef struct {
+    float *y;
+    const uint8_t *q;
+    const float *scales;
+    const float *mins;
+    const float *x;
+    int rows;
+    int cols;
+    int ntok;
+    int asym;
+    int aligned;       // cols % VTM_Q4_GROUP_SIZE == 0
+    float *wrow_all;   // vt * cols: развёрнутая строка на поток
+    double *xsum;      // aligned: (cols/32) * ntok, Σx группы по токенам
+} q4_batch_neon_job;
+
+static void q4_batch_neon_rows(q4_batch_neon_job *j, int tid, int r0, int r1) {
+    const int ntok = j->ntok;
+    const int cols = j->cols;
+    float *wrow = j->wrow_all + (size_t)tid * (size_t)cols;
+    int r, jj;
+
+    for (r = r0; r < r1; r++) {
+        const int64_t base = (int64_t)r * (int64_t)cols;
+        float *yrow = j->y + (size_t)r * (size_t)ntok;
+
+        q4_row_weights_f32(wrow, j->q, base, cols);
+        for (jj = 0; jj + 4 <= ntok; jj += 4) {
+            double acc[4];
+            int j0 = 0, g = 0;
+
+            acc[0] = acc[1] = acc[2] = acc[3] = 0.0;
+            while (j0 < cols) {
+                const int64_t idx = base + (int64_t)j0;
+                const unsigned off = (unsigned)idx & 31u;
+                // Масштаб/минимум — по ГЛОБАЛЬНОМУ номеру группы в плоской
+                // матрице (как у q4_dot_row), а не по локальному: строка r
+                // начинается с группы (r*cols)/32.
+                const int64_t gidx = idx >> 5;
+                const double scale = (double)load_f32_unaligned(j->scales,
+                                                               gidx);
+                const double minv = j->asym
+                    ? (double)load_f32_unaligned(j->mins, gidx) : 0.0;
+                const double cg = j->asym ? minv + 8.0 * scale : 0.0;
+                int cnt = VTM_Q4_GROUP_SIZE - (int)off;
+
+                if (cnt > cols - j0) cnt = cols - j0;
+                if (j->aligned && cnt == VTM_Q4_GROUP_SIZE) {
+                    const float *xp = j->x + (size_t)j0 * (size_t)ntok
+                                    + (size_t)jj;
+                    float32x4_t a0 = vdupq_n_f32(0.0f);
+                    float32x4_t a1 = a0, a2 = a0, a3 = a0;
+                    float32x4_t s;
+                    int t;
+
+                    for (t = 0; t < VTM_Q4_GROUP_SIZE; t += 4) {
+                        const float *p = xp + (size_t)t * (size_t)ntok;
+                        a0 = vfmaq_n_f32(a0, vld1q_f32(p), wrow[j0 + t + 0]);
+                        a1 = vfmaq_n_f32(a1, vld1q_f32(p + ntok),
+                                         wrow[j0 + t + 1]);
+                        a2 = vfmaq_n_f32(a2, vld1q_f32(p + 2 * ntok),
+                                         wrow[j0 + t + 2]);
+                        a3 = vfmaq_n_f32(a3, vld1q_f32(p + 3 * ntok),
+                                         wrow[j0 + t + 3]);
+                    }
+                    s = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+                    if (j->asym) {
+                        const double *xs = j->xsum
+                            + (size_t)g * (size_t)ntok + (size_t)jj;
+                        acc[0] += (double)vgetq_lane_f32(s, 0) * scale
+                                + xs[0] * cg;
+                        acc[1] += (double)vgetq_lane_f32(s, 1) * scale
+                                + xs[1] * cg;
+                        acc[2] += (double)vgetq_lane_f32(s, 2) * scale
+                                + xs[2] * cg;
+                        acc[3] += (double)vgetq_lane_f32(s, 3) * scale
+                                + xs[3] * cg;
+                    } else {
+                        acc[0] += (double)vgetq_lane_f32(s, 0) * scale;
+                        acc[1] += (double)vgetq_lane_f32(s, 1) * scale;
+                        acc[2] += (double)vgetq_lane_f32(s, 2) * scale;
+                        acc[3] += (double)vgetq_lane_f32(s, 3) * scale;
+                    }
+                } else {
+                    int k;
+                    for (k = 0; k < 4; k++) {
+                        double p = 0.0, sx = 0.0;
+                        int t;
+                        for (t = 0; t < cnt; t++) {
+                            const double bx = (double)j->x[
+                                (size_t)(j0 + t) * (size_t)ntok
+                                + (size_t)jj + (size_t)k];
+                            p += (double)wrow[j0 + t] * bx;
+                            if (j->asym) sx += bx;
+                        }
+                        acc[k] += p * scale + (j->asym ? sx * cg : 0.0);
+                    }
+                }
+                j0 += cnt;
+                g++;
+            }
+            yrow[jj + 0] = (float)acc[0];
+            yrow[jj + 1] = (float)acc[1];
+            yrow[jj + 2] = (float)acc[2];
+            yrow[jj + 3] = (float)acc[3];
+        }
+        // Хвост 1-3 токенов: строка уже развёрнута, считаем по t в double и
+        // сворачиваем группы с масштабом — тот же порядок, что у скалярного
+        // эталона backend_scalar.c.
+        for (jj = ntok - ntok % 4; jj < ntok; jj++) {
+            double acc = 0.0;
+            int j0 = 0;
+            while (j0 < cols) {
+                const int64_t idx = base + (int64_t)j0;
+                const unsigned off = (unsigned)idx & 31u;
+                const int64_t gidx = idx >> 5;
+                const double scale = (double)load_f32_unaligned(j->scales,
+                                                               gidx);
+                const double minv = j->asym
+                    ? (double)load_f32_unaligned(j->mins, gidx) : 0.0;
+                const double cg = j->asym ? minv + 8.0 * scale : 0.0;
+                double p = 0.0, sx = 0.0;
+                int cnt = VTM_Q4_GROUP_SIZE - (int)off;
+                int t;
+
+                if (cnt > cols - j0) cnt = cols - j0;
+                for (t = 0; t < cnt; t++) {
+                    const double bx = (double)j->x[
+                        (size_t)(j0 + t) * (size_t)ntok + (size_t)jj];
+                    p += (double)wrow[j0 + t] * bx;
+                    if (j->asym) sx += bx;
+                }
+                acc += p * scale + (j->asym ? sx * cg : 0.0);
+                j0 += cnt;
+            }
+            yrow[jj] = (float)acc;
+        }
+    }
+}
+
+static void q4_batch_neon_worker(void *p, int tid, int r0, int r1) {
+    q4_batch_neon_rows((q4_batch_neon_job *)p, tid, r0, r1);
+}
+
+int vtm_neon_q4_batch(float *y, const uint8_t *q, const float *scales,
+                      const float *mins, const float *x, int rows, int cols,
+                      int ntok, int asym) {
+    q4_batch_neon_job job;
+    size_t groups;
+    int vt, g, jj, t;
+
+    if (!y || !q || !scales || !x) return -1;
+    if (rows < 0 || cols < 0 || ntok < 0) return -1;
+    if (asym && !mins) return -1;
+    if (rows == 0 || cols == 0 || ntok == 0) return 0;
+    vt = vtm_threads();
+    job.y = y;
+    job.q = q;
+    job.scales = scales;
+    job.mins = mins;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    job.ntok = ntok;
+    job.asym = asym;
+    job.aligned = (cols % VTM_Q4_GROUP_SIZE) == 0;
+    job.wrow_all = (float *)malloc((size_t)vt * (size_t)cols * sizeof(float));
+    if (!job.wrow_all) return -1;
+    groups = (size_t)cols / (size_t)VTM_Q4_GROUP_SIZE;
+    job.xsum = NULL;
+    if (job.aligned && asym) {
+        // Σx группы по токенам: одна и та же для всех строк (cols кратен 32).
+        job.xsum = (double *)malloc(groups * (size_t)ntok * sizeof(double));
+        if (!job.xsum) {
+            free(job.wrow_all);
+            return -1;
+        }
+        for (g = 0; g < (int)groups; g++) {
+            for (jj = 0; jj < ntok; jj++) {
+                double s = 0.0;
+                const int64_t row = (int64_t)g * VTM_Q4_GROUP_SIZE;
+                for (t = 0; t < VTM_Q4_GROUP_SIZE; t++)
+                    s += (double)x[(size_t)(row + t) * (size_t)ntok
+                                   + (size_t)jj];
+                job.xsum[(size_t)g * (size_t)ntok + (size_t)jj] = s;
+            }
+        }
+    }
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok,
+                      q4_batch_neon_worker, &job);
+    free(job.xsum);
+    free(job.wrow_all);
+    return 0;
+}
+
 // MM с тритовой A. n == 1 — это фактически TMV по одной строке (tied
 // lm_head: [vocab, hidden] * [hidden, 1]), поэтому идём тем же путём, что
 // и TMV. Для n > 1 — rank-1 обновление по столбцам: 16 значений t копим в
