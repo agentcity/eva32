@@ -936,5 +936,26 @@
     "status": "pending",
     "file": "0141-vtm-u64-offsets.md",
     "assignee": ""
+  },
+  {
+    "id": "0142",
+    "title": "3B холодной третизацией: уменьшается ли урон с размером",
+    "status": "in_progress",
+    "file": "0142-cold-3b.md",
+    "assignee": "agent:cold-3b"
+  },
+  {
+    "id": "0143",
+    "title": "Урон от тритовой таблицы: int8, посрочные масштабы, остаток",
+    "status": "in_progress",
+    "file": "0143-embed-damage.md",
+    "assignee": "agent:embed-damage"
+  },
+  {
+    "id": "0144",
+    "title": "План обхода урона таблицы: решение для 1.5B/3B",
+    "status": "in_progress",
+    "file": "0144-embed-plan.md",
+    "assignee": "agent:embed-plan"
   }
 ]
