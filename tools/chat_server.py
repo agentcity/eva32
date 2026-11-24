@@ -153,7 +153,15 @@ VTM_SEARCH_DIRS: tuple[str, ...] = ("runs", "export")
 #: Для демо-модели (vocab=128) она не подходит — чат вернёт понятную ошибку.
 FALLBACK_TOKENIZER = ROOT / "tests" / "vtm" / "fixtures" / "tokenizer.json"
 #: Системный промпт EVA32: одинаковый для обеих моделей — сравнение честное.
+#: Боевой промпт (6 правил, ~1500 символов) — для сильных моделей.
 SYSTEM_PROMPT_PATH = ROOT / "prompts" / "system.assistant.md"
+#: Компактный промпт для квантованных моделей: 3 строки. На длинном промпте
+#: 3B Q4_1 теряет следование инструкции и уходит в посторонние темы, на
+#: компактном — отвечает по делу; prefill при этом в разы дешевле.
+COMPACT_PROMPT_PATH = ROOT / "prompts" / "system.compact.md"
+#: Что подставлять по умолчанию: компактный промпт (обе колонки одинаково,
+#: иначе сравнение моделей перестаёт быть честным).
+DEFAULT_PROMPT_PATH = COMPACT_PROMPT_PATH
 
 #: Ошибки записи, означающие уход клиента: стрим прекращаем, не шумим в лог.
 _CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
@@ -1249,10 +1257,11 @@ def _short_error(exc: BaseException, limit: int = 700) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def load_system_prompt() -> str:
-    """Системный промпт EVA32 из ``prompts/system.assistant.md`` (или "")."""
+def load_system_prompt(path: pathlib.Path | None = None) -> str:
+    """Системный промпт из ``prompts/`` (по умолчанию — компактный)."""
+    target = path or DEFAULT_PROMPT_PATH
     try:
-        return SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").strip()
+        return target.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
 
