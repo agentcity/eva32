@@ -55,6 +55,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -752,6 +753,8 @@ class VtmChatBackend(ChatBackend):
         # последних 40 символов и останавливаемся — лучше короткий ответ, чем
         # полотно с эхом.
         guard_text = ""
+        #: Сколько символов держим в запасе, чтобы не отдать начало маркера.
+        pending = ""
         try:
             for token in inner.stream_ids(prompt_ids, max_new_tokens=max_tokens):
                 if eos_id >= 0 and int(token) == eos_id:
@@ -761,17 +764,34 @@ class VtmChatBackend(ChatBackend):
                 completion += 1
                 chunk = decoder.push(int(token))
                 if chunk:
-                    stopped_by_marker = _hit_stop_marker(chunk)
-                    if stopped_by_marker:
-                        # Не отдаём служебный маркер в текст ответа.
-                        chunk = _strip_stop_markers(chunk)
+                    # Держим «хвост» неотданным: маркер конца («user:»,
+                    # <|im_end|>) может прийти в следующем куске, и тогда этот
+                    # хвост нужно не отдать, а вырезать.
+                    pending += chunk
+                    stopped_by_marker = _hit_stop_marker(pending)
                     guard_text = (guard_text + chunk)[-400:]
-                    if chunk:
-                        yield StreamEvent(text=chunk)
-                    if stopped_by_marker or _looks_like_loop(guard_text):
-                        finish = "stop" if stopped_by_marker else "repeat"
+                    if stopped_by_marker:
+                        clean = _strip_stop_markers(pending)
+                        if clean:
+                            yield StreamEvent(text=clean)
+                        pending = ""
+                        finish = "stop"
                         eos_seen = True
                         break
+                    if _looks_like_loop(guard_text):
+                        if pending:
+                            yield StreamEvent(text=pending)
+                        pending = ""
+                        finish = "repeat"
+                        eos_seen = True
+                        break
+                    if len(pending) > _MARKER_LOOKAHEAD:
+                        cut = len(pending) - _MARKER_LOOKAHEAD
+                        yield StreamEvent(text=pending[:cut])
+                        pending = pending[cut:]
+            if pending:
+                yield StreamEvent(text=pending)
+                pending = ""
             tail = decoder.finish()
             if tail:
                 yield StreamEvent(text=tail)
@@ -1483,9 +1503,13 @@ def _non_negative_float(value: str) -> float:
 #: обычный текст (``<|endoftext|>Human:``), а не через eos_token_id.
 _STOP_MARKERS = ("<|endoftext|>", "<|im_end|>", "<|im_start|>user")
 
+#: Модель иногда доигрывает диалог за пользователя: пишет «user:» и продолжает
+#: отвечать на собственный вопрос. Ловим начало такой реплики по строке.
+_STOP_LINE = re.compile(r"(?m)^[ \t]*(?:user|human|ассистент|assistant)\s*:", re.I)
+
 
 def _hit_stop_marker(chunk: str) -> bool:
-    return any(marker in chunk for marker in _STOP_MARKERS)
+    return any(marker in chunk for marker in _STOP_MARKERS) or bool(_STOP_LINE.search(chunk))
 
 
 def _strip_stop_markers(chunk: str) -> str:
@@ -1495,7 +1519,15 @@ def _strip_stop_markers(chunk: str) -> str:
         index = chunk.find(marker)
         if index >= 0:
             cut = min(cut, index)
+    found = _STOP_LINE.search(chunk)
+    if found:
+        cut = min(cut, found.start())
     return chunk[:cut]
+
+
+#: Сколько символов ответа держим неотданными: маркер «user:» короче, но
+#: запас нужен и на «<|im_end|>» с переносами.
+_MARKER_LOOKAHEAD = 16
 
 
 def _looks_like_loop(text: str, *, words: int = 3, repeats: int = 3,
