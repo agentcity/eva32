@@ -1603,6 +1603,24 @@ def _validate_payload(
         )
 
     catalog = {backend.id: backend for backend in server.registry}
+    # У ВТМ один C-контекст на модель: две колонки с ОДНОЙ моделью отменяют
+    # друг друга (вторая генерация снимает первую — «генерация отменена»).
+    # Лучше сказать это сразу, чем показать «зависло».
+    def _vtm_key(item: Any) -> tuple[str, str] | None:
+        if not isinstance(item, dict):
+            return None
+        if item.get("backend", "vtm") != "vtm":
+            return None
+        return ("vtm", str(item.get("model") or ""))
+
+    keys = [_vtm_key(item) for item in raw_sides]
+    if keys[0] is not None and keys[0] == keys[1]:
+        raise ClientError(
+            "В обеих колонках одна и та же ВТМ-модель: у неё один C-контекст, "
+            "и вторая генерация отменяет первую. Выберите другую модель или "
+            "сравнивайте с Ollama."
+        )
+
     sides: list[dict[str, Any]] = []
     for index, raw_side in enumerate(raw_sides):
         if not isinstance(raw_side, Mapping):
