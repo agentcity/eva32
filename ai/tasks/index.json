@@ -1031,7 +1031,7 @@
   {
     "id": "0156",
     "title": "7B Q4 в 4 ГиБ: fp16-масштабы и тритовый эмбеддинг",
-    "status": "in_progress",
+    "status": "done",
     "file": "0156-q4-7b.md",
     "assignee": "agent:q4-7b"
   },
@@ -1062,5 +1062,12 @@
     "status": "in_progress",
     "file": "0160-q4-asym-import.md",
     "assignee": "agent:q4-asym"
+  },
+  {
+    "id": "0161",
+    "title": "7B Q4 в 33 раза медленнее 3B — найти причину",
+    "status": "in_progress",
+    "file": "0161-q4-7b-slow.md",
+    "assignee": "agent:q4-7b-speed"
   }
 ]

@@ -1281,6 +1281,47 @@ class PackedQ4(Sequence[int]):
             yield self._last_group_bytes()
 
 
+class PackedF16(PackedF32):
+    """Последовательность fp16 поверх байт контейнера — без `list` на тензор.
+
+    7B Q4 с fp16-масштабами — 221 млн значений: `list[float]` занял бы ~7 ГиБ,
+    хотя в контейнере это 442 МиБ. Чтение отдаёт float (перевод из half),
+    `to_bytes()` — исходные байты, поэтому сегмент переписывается побайтово.
+    """
+
+    __slots__ = ()
+
+    def __init__(self, data: Any, offset: int, n_values: int) -> None:
+        n_values = int(n_values)
+        if n_values < 0:
+            raise ValueError("PackedF16: отрицательное число значений")
+        needle = n_values * 2
+        chunk = memoryview(data)[offset:offset + needle]
+        if len(chunk) != needle:
+            raise ValueError(f"PackedF16: обрезано {len(chunk)} из {needle} байт")
+        self._raw = chunk
+        if sys.byteorder == "little":
+            self._view = chunk.cast("e")
+        else:  # pragma: no cover - экзотическая платформа
+            import array as _array
+
+            decoded = _array.array("e")
+            decoded.frombytes(chunk)
+            decoded.byteswap()
+            self._view = decoded
+        self._n_values = n_values
+
+    def to_bytes(self) -> bytes:
+        return self._raw.tobytes()
+
+    def iter_chunks(self, chunk: int = 1 << 20):
+        step = max(2, (int(chunk) // 2) * 2)
+        raw = self._raw
+        needle = self._n_values * 2
+        for start in range(0, needle, step):
+            yield raw[start:min(start + step, needle)].tobytes()
+
+
 class PackedInt8(Sequence[int]):
     """int8-значения поверх байт сегмента: без `list[int]` на весь тензор.
 
@@ -1849,19 +1890,10 @@ def decode_q4_segment_ex(
             PackedF32(data, mins_offset, n_groups) if asymmetric else None
         )
     else:
-        # fp16-масштабы: 2 байта на значение, окно без копии не сделать тем же
-        # `cast('f')`; их число у 3B — 86,6 млн, но fp16 здесь ~173 МиБ,
-        # поэтому список допустим только для небольших тензоров.
-        scale_code = "e"
-        scales = [float(s) for s in struct.unpack_from(
-            f"<{n_groups}{scale_code}", data, scales_offset
-        )]
-        mins = (
-            [float(s) for s in struct.unpack_from(
-                f"<{n_groups}{scale_code}", data, mins_offset
-            )]
-            if asymmetric else None
-        )
+        # fp16-масштабы: 2 байта на значение, окно поверх байт сегмента —
+        # у 7B это 221 млн значений (списком было бы ~7 ГиБ).
+        scales = PackedF16(data, scales_offset, n_groups)
+        mins = PackedF16(data, mins_offset, n_groups) if asymmetric else None
     # Один проход вместо двух: сначала сообщаем о неконечном масштабе (как
     # раньше), затем об отрицательном.
     bad_finite = -1

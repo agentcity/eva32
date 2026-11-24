@@ -152,6 +152,7 @@ import array
 import dataclasses
 import hashlib
 import json
+import mmap
 import os
 import random
 import re
@@ -1052,16 +1053,43 @@ def _expect_shape(shape: Sequence[int], expected: Sequence[int], what: str) -> N
         raise ValueError(f"{what}: форма {got}, ожидалась {want}")
 
 
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def _sha256(data: Any) -> str:
+    """sha256 от bytes или от read-only mmap: кусками, без копии файла."""
+    digest = hashlib.sha256()
+    if isinstance(data, memoryview):
+        view = data.cast("B")
+        for start in range(0, len(view), 8 << 20):
+            digest.update(view[start:start + (8 << 20)])
+    else:
+        digest.update(data)
+    return digest.hexdigest()
 
 
-def _read_file(path: Path, record: Any = None, verify: bool = True) -> bytes:
+#: Файлы больше этого размера читаются через mmap: 7B q4.bin — 3,98 ГБ, и
+#: `read_bytes()` плюс нарезка сегментов давали пик ~7 ГиБ на машине с 16 ГиБ.
+MMAP_THRESHOLD = 256 << 20
+
+
+def _read_file(path: Path, record: Any = None, verify: bool = True,
+               mapped: bool = False) -> Any:
+    """Прочитать файл манифеста: bytes или (для больших) read-only mmap.
+
+    ``mapped=True`` — окно в файл вместо копии в память. Байты те же, поэтому
+    контейнер получается побайтово идентичным; sha256 при включённой проверке
+    считается кусками по отображению, без материализации всего файла.
+    """
+    expected = record.get("sha256") if isinstance(record, dict) else None
+    use_map = mapped and path.stat().st_size > MMAP_THRESHOLD
     try:
-        data = path.read_bytes()
+        if use_map:
+            with path.open("rb") as handle:
+                data: Any = memoryview(
+                    mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+                )
+        else:
+            data = path.read_bytes()
     except OSError as exc:
         raise ValueError(f"не читается {path}: {exc}") from exc
-    expected = record.get("sha256") if isinstance(record, dict) else None
     if verify and expected:
         actual = _sha256(data)
         if actual != expected:
@@ -1261,7 +1289,7 @@ def load_export(
     segment_entries = manifest.get("tensors") or []
     q4_entries = [entry for entry in segment_entries if _is_q4_entry(entry)]
     q4_data = (
-        _read_file(base / q4_name, files.get(q4_name), verify)
+        _read_file(base / q4_name, files.get(q4_name), verify, mapped=True)
         if q4_entries or q4_name in files
         else b""
     )
@@ -1430,7 +1458,7 @@ def load_export(
             "Переэкспортируйте чекпоинт (format_version 2)"
         )
     non_file = str(section.get("file") or "non_ternary.bin")
-    non_data = _read_file(base / non_file, files.get(non_file), verify)
+    non_data = _read_file(base / non_file, files.get(non_file), verify, mapped=True)
     for entry in section.get("tensors") or []:
         name = str(entry.get("name") or "?")
         kind, layer, key = _weight_role(name)
