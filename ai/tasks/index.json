@@ -1080,7 +1080,7 @@
   {
     "id": "0163",
     "title": "int8-dot (SDOT/VNNI) — путь к 10x prefill",
-    "status": "in_progress",
+    "status": "done",
     "file": "0163-int8-dot-prefill.md",
     "assignee": "agent:int8-dot"
   },

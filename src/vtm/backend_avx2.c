@@ -1182,6 +1182,351 @@ VTM_AVX2 int vtm_avx2_mm_batch(float *y, const uint8_t *w,
     return trit_batch_avx2(y, w, scales, b, m, k, n_tokens, scale_block);
 }
 
+// --- int8-dot VNNI (AVX-512) для батчевого Q4-prefill (задача 0163) --------
+//
+// ВНИМАНИЕ: на машине, где задача выполнялась (Apple M1), AVX-512 нет. Этот
+// путь проверен ТОЛЬКО кросс-компиляцией (clang -target x86_64 -mavx512vnni)
+// и ни разу не исполнялся. Поэтому он включается лишь по явному VTM_Q4_I8
+// (по умолчанию int8-dot выключен) и только если CPUID подтверждает
+// AVX-512F/BW + VNNI; иначе диспетчер идёт в прежние ядра.
+//
+// Идея та же, что у NEON-ядра vtm_neon_q4_batch_i8 (backend_neon.c): веса Q4
+// точны в int8 (s = q-8), активации пачки квантуются в int8 с масштабом на
+// токен, произведение копится в int32 по группе 32, масштаб группы и
+// (Q4_1) член min+8*scale применяются в f32. Отличие — ширина: в 512-битном
+// регистре 16 int32-дорожек, то есть одна vpdpbusd считает 16 токенов
+// (64 MAC за инструкцию) против 4 токенов (16 MAC) у NEON SDOT.
+//
+// Раскладка b-вектора: 64 байта = 16 токенов × 4 подряд идущих веса группы;
+// a-вектор — те же 4 веса, размноженные на 16 дорожек (_mm512_set1_epi32).
+//
+// VNNI умеет только u8×s8, а активации знаковые, поэтому в буфере они лежат
+// со сдвигом +128 (xq_u = xq + 128, 1..255), а сдвиг снимается членом
+//   Σ s*xq = Σ s*xq_u - 128*Σ s_t
+// где Σ s_t — сумма весов группы, она считается при разворачивании строки.
+// Остальное — как у NEON: sx[j] = max|x|/127, y += scale*sx*Σ s*xq +
+// cg*sx*Σ xq (cg = min + 8*scale, только Q4_1), режим 2 добавляет второй
+// int8-плоскость остатка r = x - q*sx с шагом sx/127.
+
+#define VTM_VNNI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+#define VTM_VNNI_TOK 16
+
+// AVX-512F/BW + VNNI (vpdpbusd). Только CPUID: EVEX-инструкции здесь не
+// исполняются, поэтому проверку можно звать на любом x86-64.
+int vtm_avx2_vnni_available(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        __builtin_cpu_init();
+        cached = (__builtin_cpu_supports("avx512f")
+                  && __builtin_cpu_supports("avx512bw")
+                  && __builtin_cpu_supports("avx512vnni")) ? 1 : 0;
+    }
+    return cached;
+}
+
+typedef struct {
+    float *y;
+    const uint8_t *q;
+    const float *scales;
+    const float *mins;
+    const float *x;
+    int8_t *xq;        // (int8) xq+128, блоки по 16 токенов
+    int8_t *xq2;       // остаток (режим 2)
+    float *sx;         // масштаб активаций на токен
+    float *xsq;        // sx[j]*Σ xq по локальной группе
+    float *xsr;        // sx[j]*Σ xq2
+    float *wsum_all;   // vt*ngroups: Σ s_t по группе (для снятия сдвига +128)
+    int rows, cols, ntok;
+    int nblk;          // (ntok+15)/16
+    int stride;        // nblk*16
+    int ngroups;
+    int asym;
+    int mode;
+    int8_t *wrow_all;
+} q4_vnni_job;
+
+// Строка Q4 -> int8 s = q-8 (естественный порядок) + Σ s по каждой группе.
+static void q4_vnni_row_weights(int8_t *w, float *wsum, const uint8_t *q,
+                                int64_t base, int cols) {
+    const int ngroups = cols / VTM_Q4_GROUP_SIZE;
+    const uint8_t *gp = q + (size_t)base / 2;
+    int g, t;
+
+    for (g = 0; g < ngroups; g++, gp += 16) {
+        int sum = 0;
+        for (t = 0; t < 16; t++) {
+            const unsigned byte = gp[t];
+            const int lo = (int)(byte & 0x0fu) - 8;
+            const int hi = (int)(byte >> 4) - 8;
+            w[g * 32 + t] = (int8_t)lo;
+            w[g * 32 + t + 16] = (int8_t)hi;
+            sum += lo + hi;
+        }
+        wsum[g] = (float)sum;
+    }
+}
+
+VTM_VNNI static void q4_vnni_row(const q4_vnni_job *j, const int8_t *w,
+                                 const float *wsum, int r) {
+    const int cols = j->cols;
+    const int ntok = j->ntok;
+    const int nblk = j->nblk;
+    const int ngroups = j->ngroups;
+    const int mode = j->mode;
+    const int asym = j->asym;
+    const int64_t gbase = (int64_t)r * (int64_t)ngroups;
+    const size_t blk = (size_t)VTM_VNNI_TOK * (size_t)cols;
+    float *yrow = j->y + (size_t)r * (size_t)ntok;
+    int g, B0, b, k;
+
+    for (B0 = 0; B0 < nblk; B0 += 2) {
+        const int nb = (nblk - B0) < 2 ? (nblk - B0) : 2;
+        __m512 af[2], sxb[2];
+        __m512i ai[2], ar[2];
+        const int8_t *xp = j->xq + (size_t)B0 * blk;
+        const int8_t *xp2 = (mode == 2) ? j->xq2 + (size_t)B0 * blk : NULL;
+
+        for (b = 0; b < nb; b++) {
+            af[b] = _mm512_setzero_ps();
+            sxb[b] = _mm512_loadu_ps(j->sx
+                                     + (size_t)(B0 + b) * VTM_VNNI_TOK);
+        }
+        for (g = 0; g < ngroups; g++) {
+            const float scale = load_f32_unaligned(j->scales, gbase + g);
+            const int8_t *wg = w + (size_t)g * 32;
+            const int8_t *xg = xp + (size_t)g * 512;
+            const int8_t *xg2 = xp2 ? xp2 + (size_t)g * 512 : NULL;
+            const float *sq = j->xsq + (size_t)g * (size_t)j->stride
+                            + (size_t)B0 * VTM_VNNI_TOK;
+            float cg = 0.0f;
+            __m512 wsumv, sub1[2], sub2[2];
+
+            if (asym)
+                cg = load_f32_unaligned(j->mins, gbase + g) + 8.0f * scale;
+            // Снятие сдвига +128: 128*scale*Σs для основной плоскости и
+            // 128*(scale/127)*Σs для остатка.
+            wsumv = _mm512_set1_ps(128.0f * scale * wsum[g]);
+            for (b = 0; b < nb; b++) {
+                sub1[b] = _mm512_mul_ps(wsumv, sxb[b]);
+                if (mode == 2)
+                    sub2[b] = _mm512_div_ps(sub1[b], _mm512_set1_ps(127.0f));
+            }
+            for (b = 0; b < nb; b++) {
+                ai[b] = _mm512_setzero_si512();
+                ar[b] = _mm512_setzero_si512();
+            }
+            for (k = 0; k < 8; k++) {
+                const __m512i av = _mm512_set1_epi32(
+                    (int)load_u32_unaligned((const uint32_t *)(const void *)
+                                            (wg + k * 4), 0));
+                for (b = 0; b < nb; b++) {
+                    ai[b] = _mm512_dpbusd_epi32(
+                        ai[b], av,
+                        _mm512_loadu_si512((const void *)
+                                           (xg + (size_t)b * blk
+                                            + (size_t)k * 64)));
+                    if (mode == 2)
+                        ar[b] = _mm512_dpbusd_epi32(
+                            ar[b], av,
+                            _mm512_loadu_si512((const void *)
+                                               (xg2 + (size_t)b * blk
+                                                + (size_t)k * 64)));
+                }
+            }
+            for (b = 0; b < nb; b++) {
+                af[b] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(ai[b]),
+                                        _mm512_mul_ps(sxb[b],
+                                                      _mm512_set1_ps(scale)),
+                                        af[b]);
+                af[b] = _mm512_sub_ps(af[b], sub1[b]);
+                if (mode == 2) {
+                    af[b] = _mm512_fmadd_ps(
+                        _mm512_cvtepi32_ps(ar[b]),
+                        _mm512_mul_ps(sxb[b],
+                                      _mm512_set1_ps(scale / 127.0f)),
+                        af[b]);
+                    af[b] = _mm512_sub_ps(af[b], sub2[b]);
+                }
+                if (asym) {
+                    af[b] = _mm512_fmadd_ps(
+                        _mm512_loadu_ps(sq + (size_t)b * VTM_VNNI_TOK),
+                        _mm512_set1_ps(cg), af[b]);
+                    if (mode == 2) {
+                        const float *sr = j->xsr
+                                        + (size_t)g * (size_t)j->stride
+                                        + (size_t)B0 * VTM_VNNI_TOK;
+                        af[b] = _mm512_fmadd_ps(
+                            _mm512_loadu_ps(sr + (size_t)b * VTM_VNNI_TOK),
+                            _mm512_set1_ps(cg / 127.0f), af[b]);
+                    }
+                }
+            }
+        }
+        for (b = 0; b < nb; b++) {
+            const int j0 = (B0 + b) * VTM_VNNI_TOK;
+            int valid = ntok - j0;
+            if (valid > VTM_VNNI_TOK) valid = VTM_VNNI_TOK;
+            _mm512_mask_storeu_ps(yrow + j0,
+                                  (__mmask16)((1u << valid) - 1u), af[b]);
+        }
+    }
+}
+
+static void q4_vnni_worker(void *p, int tid, int r0, int r1) {
+    q4_vnni_job *j = (q4_vnni_job *)p;
+    const int8_t *w = j->wrow_all + (size_t)tid * (size_t)j->cols;
+    const float *ws = j->wsum_all + (size_t)tid * (size_t)j->ngroups;
+    int r;
+
+    for (r = r0; r < r1; r++) {
+        q4_vnni_row_weights((int8_t *)w, (float *)ws, j->q,
+                            (int64_t)r * (int64_t)j->cols, j->cols);
+        q4_vnni_row(j, w, ws, r);
+    }
+}
+
+// Квантование пачки (скалярно: это доли процента работы ядра).
+static void q4_vnni_quant(q4_vnni_job *j) {
+    const int cols = j->cols;
+    const int ntok = j->ntok;
+    const int ngroups = j->ngroups;
+    const int stride = j->stride;
+    const int mode = j->mode;
+    const size_t blk = (size_t)VTM_VNNI_TOK * (size_t)cols;
+    int b, g, jj, k;
+
+    for (b = 0; b < j->nblk; b++) {
+        const int lo = b * VTM_VNNI_TOK;
+        int t;
+        for (t = 0; t < VTM_VNNI_TOK; t++) {
+            const int tok = lo + t;
+            float mx = 0.0f;
+            if (tok < ntok) {
+                for (jj = 0; jj < cols; jj++) {
+                    const float a = fabsf(j->x[(size_t)jj * (size_t)ntok
+                                               + (size_t)tok]);
+                    if (a > mx) mx = a;
+                }
+            }
+            j->sx[tok] = (tok < ntok && mx > 1e-30f) ? mx / 127.0f : 1.0f;
+        }
+    }
+    for (jj = 0; jj < ntok; jj++) {
+        const float s = j->sx[jj];
+        const float inv = 1.0f / s;
+        const int B = jj / VTM_VNNI_TOK;
+        const int lane = jj % VTM_VNNI_TOK;
+        int8_t *dst = j->xq + (size_t)B * blk + (size_t)lane * 4;
+        int8_t *dst2 = j->xq2 ? j->xq2 + (size_t)B * blk + (size_t)lane * 4
+                              : NULL;
+
+        for (g = 0; g < ngroups; g++) {
+            int sumq = 0, sumr = 0;
+            int8_t *p = dst + (size_t)g * 512;
+            int8_t *p2 = dst2 ? dst2 + (size_t)g * 512 : NULL;
+
+            for (k = 0; k < 8; k++) {
+                int m, byte4[4];
+                const int t0 = g * 32 + k * 4;
+
+                for (m = 0; m < 4; m++) {
+                    const double xv = (double)j->x[
+                        (size_t)(t0 + m) * (size_t)ntok + (size_t)jj];
+                    long q = lround(xv * (double)inv);
+                    if (q > 127) q = 127;
+                    if (q < -127) q = -127;
+                    sumq += (int)q;
+                    byte4[m] = (int)(q + 128);        // сдвиг под u8×s8
+                    if (mode == 2) {
+                        const double rv = xv - (double)q * (double)s;
+                        long rq = lround(rv * (double)inv * 127.0);
+                        if (rq > 127) rq = 127;
+                        if (rq < -127) rq = -127;
+                        sumr += (int)rq;
+                        ((int8_t *)p2)[(size_t)k * 64 + (size_t)m]
+                            = (int8_t)(rq + 128);
+                    }
+                }
+                for (m = 0; m < 4; m++)
+                    p[(size_t)k * 64 + (size_t)m] = (int8_t)byte4[m];
+            }
+            j->xsq[(size_t)g * (size_t)stride + (size_t)jj]
+                = s * (float)sumq;
+            if (mode == 2)
+                j->xsr[(size_t)g * (size_t)stride + (size_t)jj]
+                    = s * (float)sumr;
+        }
+    }
+}
+
+int vtm_avx2_q4_batch_vnni(float *y, const uint8_t *q, const float *scales,
+                           const float *mins, const float *x, int rows,
+                           int cols, int ntok, int asym, int mode) {
+    q4_vnni_job job;
+    size_t xq_sz, xs_sz;
+    int vt;
+
+    if (!y || !q || !scales || !x) return -1;
+    if (rows < 0 || cols < 0 || ntok < 0) return -1;
+    if (asym && !mins) return -1;
+    if (rows == 0 || cols == 0 || ntok == 0) return 0;
+    if (mode != 2) mode = 1;
+    if (ntok < 2) return -1;
+    if (cols % VTM_Q4_GROUP_SIZE) return -1;
+    if (!vtm_avx2_vnni_available()) return -1;
+
+    memset(&job, 0, sizeof job);
+    job.y = y;
+    job.q = q;
+    job.scales = scales;
+    job.mins = mins;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    job.ntok = ntok;
+    job.nblk = (ntok + VTM_VNNI_TOK - 1) / VTM_VNNI_TOK;
+    job.stride = job.nblk * VTM_VNNI_TOK;
+    job.ngroups = cols / VTM_Q4_GROUP_SIZE;
+    job.asym = asym;
+    job.mode = mode;
+    vt = vtm_threads();
+    xq_sz = (size_t)job.nblk * (size_t)VTM_VNNI_TOK * (size_t)cols;
+    xs_sz = (size_t)job.ngroups * (size_t)job.stride;
+
+    job.xq = (int8_t *)calloc(xq_sz, 1);
+    job.sx = (float *)malloc((size_t)job.stride * sizeof(float));
+    job.xsq = (float *)malloc(xs_sz * sizeof(float));
+    job.wrow_all = (int8_t *)malloc((size_t)vt * (size_t)cols);
+    job.wsum_all = (float *)malloc((size_t)vt * (size_t)job.ngroups
+                                   * sizeof(float));
+    if (mode == 2) {
+        job.xq2 = (int8_t *)calloc(xq_sz, 1);
+        job.xsr = (float *)malloc(xs_sz * sizeof(float));
+    }
+    if (!job.xq || !job.sx || !job.xsq || !job.wrow_all || !job.wsum_all
+        || (mode == 2 && (!job.xq2 || !job.xsr))) {
+        free(job.xq);
+        free(job.xq2);
+        free(job.sx);
+        free(job.xsq);
+        free(job.xsr);
+        free(job.wrow_all);
+        free(job.wsum_all);
+        return -1;
+    }
+    q4_vnni_quant(&job);
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok,
+                      q4_vnni_worker, &job);
+    free(job.xq);
+    free(job.xq2);
+    free(job.sx);
+    free(job.xsq);
+    free(job.xsr);
+    free(job.wrow_all);
+    free(job.wsum_all);
+    return 0;
+}
+
 int vtm_avx2_available(void) {
     static int cached = -1;
     if (cached < 0) {

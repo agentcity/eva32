@@ -1505,7 +1505,117 @@ extern int vtm_neon_q4_batch(float *y, const uint8_t *q,
                                  const float *scales, const float *mins,
                                  const float *x, int rows, int cols,
                                  int ntok, int asym);
+// int8-dot (SDOT) батчевое ядро 0163: те же аргументы + режим (1/2).
+// Отказ (-1) — CPU без FEAT_DotProd, cols не кратен 32, нет памяти: тогда
+// работает f32-ядро 0162, а не скаляр.
+extern int vtm_neon_q4_batch_i8(float *y, const uint8_t *q,
+                                const float *scales, const float *mins,
+                                const float *x, int rows, int cols,
+                                int ntok, int asym, int mode);
+#define VTM_Q4_I8_NEON 1
+#else
+#define VTM_Q4_I8_NEON 0
 #endif
+
+// VNNI (AVX-512, int8-dot) для x86-64: ядро в backend_avx2.c, там же
+// рантайм-детект `__builtin_cpu_supports("avx512vnni")`. На этой машине
+// (arm64) не собирается и не проверялось — см. отчёт 0163.
+#if defined(__x86_64__) && !defined(VTM_NO_AVX2)
+extern int vtm_avx2_q4_batch_vnni(float *y, const uint8_t *q,
+                                  const float *scales, const float *mins,
+                                  const float *x, int rows, int cols,
+                                  int ntok, int asym, int mode);
+#define VTM_Q4_I8_X86 1
+#else
+#define VTM_Q4_I8_X86 0
+#endif
+
+// Есть ли int8-dot на этом CPU/в этой сборке (без учёта VTM_Q4_I8).
+// Определена в backend_neon.c (там же — где ядра).
+extern int vtm_q4_i8_hw(void);
+
+// Режим int8-dot. VTM_Q4_I8: 0/off — выключить (f32-ядро 0162),
+// 1 — один проход int8, 2 — два прохода (int8 + остаток, точнее).
+// По умолчанию 2: на 3B Q4 один проход int8 даёт ошибку логитов ~1e-2
+// (замер — в отчёте 0163), два прохода — ~1e-4 при цене ~2x SDOT.
+// Значение запоминается при первом обращении (горячий путь).
+static int g_q4_i8_mode = -2;    // -2 — env ещё не читали
+#define VTM_Q4_I8_UNSET (-2)
+
+// По умолчанию int8-dot ВЫКЛЮЧЕН: на 3B Q4 он даёт ошибку логитов ~7,6e-2
+// (режим 2) против порога 1e-4 из задачи 0163 — это решение продакта, а не
+// тихий дефолт ядра. VTM_Q4_I8=1|2 включает, =0 выключает.
+static int q4_i8_mode_from_env(void) {
+    const char *e = getenv("VTM_Q4_I8");
+
+    if (e && *e) {
+        if (*e == '1') return 1;
+        if (*e == '2') return 2;
+    }
+    return 0;
+}
+
+int vtm_q4_i8_mode(void) {
+    int m;
+
+    if (g_q4_i8_mode != VTM_Q4_I8_UNSET) return g_q4_i8_mode;
+    m = q4_i8_mode_from_env();
+    if (!vtm_q4_i8_hw()) m = 0;   // CPU/сборка не умеют int8-dot
+    g_q4_i8_mode = m;
+    return m;
+}
+
+int vtm_q4_i8_set_mode(int mode) {
+    int m;
+
+    if (mode < 0) {
+        g_q4_i8_mode = VTM_Q4_I8_UNSET;
+        return vtm_q4_i8_mode();
+    }
+    m = mode > 2 ? 2 : mode;
+    if (!vtm_q4_i8_hw()) m = 0;
+    g_q4_i8_mode = m;
+    return m;
+}
+
+const char *vtm_q4_i8_name(void) {
+    const int m = vtm_q4_i8_mode();
+
+    if (m == 0) return "off";
+#if VTM_Q4_I8_NEON
+    return m == 2 ? "sdot2" : "sdot";
+#elif VTM_Q4_I8_X86
+    return m == 2 ? "vnni2" : "vnni";
+#else
+    return "off";
+#endif
+}
+
+// Батчевое Q4-ядро: int8-dot (0163), иначе f32-пачка (0162), иначе скаляр.
+// Порядок — по ожидаемой скорости; любой отказ ядра (-1) переводит на
+// следующую ступень, прогон не падает.
+static int q4_batch_simd(float *y, const uint8_t *q, const float *scales,
+                         const float *mins, const float *x, int rows,
+                         int cols, int ntok, int asym) {
+    const int mode = vtm_q4_i8_mode();
+
+    if (mode != 0) {
+#if VTM_Q4_I8_NEON
+        if (vtm_neon_q4_batch_i8(y, q, scales, mins, x, rows, cols, ntok,
+                                 asym, mode) == 0)
+            return 0;
+#elif VTM_Q4_I8_X86
+        if (vtm_avx2_q4_batch_vnni(y, q, scales, mins, x, rows, cols, ntok,
+                                   asym, mode) == 0)
+            return 0;
+#endif
+    }
+#if VTM_Q4_NEON
+    return vtm_neon_q4_batch(y, q, scales, mins, x, rows, cols, ntok, asym);
+#else
+    return -1;
+#endif
+}
 
 int vtm_q4_tmv_batch(float *y, const uint8_t *q, const float *scales,
                      const float *mins, const float *x, int rows, int cols,
@@ -1513,12 +1623,10 @@ int vtm_q4_tmv_batch(float *y, const uint8_t *q, const float *scales,
     if (rows < 0 || cols < 0 || n_tokens < 0) return -1;
     if (n_tokens == 1)   // одна колонка — прежнее одноколоночное ядро
         return vtm_q4_tmv(y, q, scales, mins, x, rows, cols, asym);
-#if VTM_Q4_NEON
     if (q4_simd_enabled() && vtm_simd_available()
-        && vtm_neon_q4_batch(y, q, scales, mins, x, rows, cols, n_tokens,
-                                 asym) == 0)
+        && q4_batch_simd(y, q, scales, mins, x, rows, cols, n_tokens,
+                         asym) == 0)
         return 0;
-#endif
     return q4_batch_impl(y, q, scales, mins, x, rows, cols, n_tokens, asym);
 }
 
@@ -1528,12 +1636,10 @@ int vtm_q4_mm_batch(float *y, const uint8_t *q, const float *scales,
     if (m < 0 || k < 0 || n_tokens < 0) return -1;
     // Арифметика та же, что у TMV: Q4-матрица [m,k] против N столбцов.
     if (n_tokens == 1) return vtm_q4_mm(y, q, scales, mins, b, m, k, 1, asym);
-#if VTM_Q4_NEON
     if (q4_simd_enabled() && vtm_simd_available()
-        && vtm_neon_q4_batch(y, q, scales, mins, b, m, k, n_tokens,
-                                 asym) == 0)
+        && q4_batch_simd(y, q, scales, mins, b, m, k, n_tokens,
+                         asym) == 0)
         return 0;
-#endif
     return q4_batch_impl(y, q, scales, mins, b, m, k, n_tokens, asym);
 }
 

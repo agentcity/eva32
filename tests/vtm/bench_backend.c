@@ -45,6 +45,12 @@
 #endif
 
 #define CHECK_TOL 1e-5
+// Порог для int8-пути батчевого Q4 (задача 0163). Там ошибка не
+// вычислительная, а от квантования активаций в int8, поэтому порог на три
+// порядка шире: замер на формах 3B Q4 в режиме 2 (два прохода) — 2048x2048x16
+// 5,2e-4, 11008x2048x8 1,6e-3, 2048x11008x4 3,0e-3. Режим 1 (один проход) на
+// порядок хуже и в проверку не берётся — его числа в отчёте ai/tasks/0163.
+#define CHECK_TOL_I8 1e-2
 
 // --- утилиты ---------------------------------------------------------------
 
@@ -674,16 +680,49 @@ static void check_q4_batch_case(int rows, int cols, int ntok, int asym,
         for (r = 0; r < rows; r++)
             y_ref[(size_t)r * (size_t)ntok + (size_t)j] = yt[r];
     }
-    if (vtm_q4_tmv_batch(y_bat, q, scales, mins, x, rows, cols, ntok,
-                         asym) != 0) {
-        fprintf(stderr, "check_q4_batch_case: батчевое ядро вернуло ошибку\n");
-        failures++;
-        goto done;
+    {
+        // f32-путь 0162 проверяется отдельно от int8, даже если окружение
+        // включило VTM_Q4_I8: это разные контракты точности.
+        const int saved0 = vtm_q4_i8_mode();
+        vtm_q4_i8_set_mode(0);
+        if (vtm_q4_tmv_batch(y_bat, q, scales, mins, x, rows, cols, ntok,
+                             asym) != 0) {
+            fprintf(stderr, "check_q4_batch_case: батчевое ядро вернуло "
+                            "ошибку\n");
+            failures++;
+            vtm_q4_i8_set_mode(saved0);
+            goto done;
+        }
+        vtm_q4_i8_set_mode(saved0);
     }
     snprintf(label, sizeof label, "Q4%s TMV-батч %dx%dx%d scale %.2f",
              asym ? "1" : "0", rows, cols, ntok, (double)scale);
     report(label, max_diff(y_bat, y_ref, (size_t)rows * (size_t)ntok, &ref),
            ref, CHECK_TOL);
+    // int8-dot (0163): та же пачка, но ядром SDOT/VNNI — активации квантуются
+    // в int8. Эталон тот же (поштучный f32-путь), порог — CHECK_TOL_I8.
+    // Если int8-ядра на CPU/сборке нет, vtm_q4_i8_set_mode(2) вернёт 0 и
+    // проверка пропускается.
+    {
+        const int saved = vtm_q4_i8_mode();
+        if (vtm_q4_i8_set_mode(2) != 0) {
+            memset(y_bat, 0, (size_t)rows * (size_t)ntok * sizeof(float));
+            if (vtm_q4_tmv_batch(y_bat, q, scales, mins, x, rows, cols, ntok,
+                                 asym) != 0) {
+                fprintf(stderr, "check_q4_batch_case: int8-ядро вернуло "
+                                "ошибку\n");
+                failures++;
+            } else {
+                snprintf(label, sizeof label,
+                         "Q4%s TMV-батч int8 %dx%dx%d", asym ? "1" : "0",
+                         rows, cols, ntok);
+                report(label,
+                       max_diff(y_bat, y_ref, (size_t)rows * (size_t)ntok,
+                                &ref), ref, CHECK_TOL_I8);
+            }
+        }
+        vtm_q4_i8_set_mode(saved);
+    }
 done:
     free(q);
     free(scales);
@@ -732,16 +771,41 @@ static void check_q4_mm_batch_case(int m, int k, int ntok, int asym,
         for (r = 0; r < m; r++)
             y_ref[(size_t)r * (size_t)ntok + (size_t)j] = yt[r];
     }
-    if (vtm_q4_mm_batch(y_bat, q, scales, mins, b, m, k, ntok, asym) != 0) {
-        fprintf(stderr, "check_q4_mm_batch_case: батчевое ядро вернуло "
-                        "ошибку\n");
-        failures++;
-        goto done;
+    {
+        const int saved0 = vtm_q4_i8_mode();
+        vtm_q4_i8_set_mode(0);
+        if (vtm_q4_mm_batch(y_bat, q, scales, mins, b, m, k, ntok, asym) != 0) {
+            fprintf(stderr, "check_q4_mm_batch_case: батчевое ядро вернуло "
+                            "ошибку\n");
+            failures++;
+            vtm_q4_i8_set_mode(saved0);
+            goto done;
+        }
+        vtm_q4_i8_set_mode(saved0);
     }
     snprintf(label, sizeof label, "Q4%s MM-батч %dx%dx%d scale %.2f",
              asym ? "1" : "0", m, k, ntok, (double)scale);
     report(label, max_diff(y_bat, y_ref, (size_t)m * (size_t)ntok, &ref), ref,
            CHECK_TOL);
+    {
+        const int saved = vtm_q4_i8_mode();
+        if (vtm_q4_i8_set_mode(2) != 0) {
+            memset(y_bat, 0, (size_t)m * (size_t)ntok * sizeof(float));
+            if (vtm_q4_mm_batch(y_bat, q, scales, mins, b, m, k, ntok,
+                                asym) != 0) {
+                fprintf(stderr, "check_q4_mm_batch_case: int8-ядро вернуло "
+                                "ошибку\n");
+                failures++;
+            } else {
+                snprintf(label, sizeof label, "Q4%s MM-батч int8 %dx%dx%d",
+                         asym ? "1" : "0", m, k, ntok);
+                report(label,
+                       max_diff(y_bat, y_ref, (size_t)m * (size_t)ntok, &ref),
+                       ref, CHECK_TOL_I8);
+            }
+        }
+        vtm_q4_i8_set_mode(saved);
+    }
 done:
     free(q);
     free(scales);
@@ -2441,6 +2505,8 @@ static int run_q4_batch_bench(int rows, int cols, int ntok, int iters) {
 
     printf("Q4_1 батч prefill: %dx%d x %d токен(ов), %d итераций (мин)\n",
            rows, cols, ntok, iters);
+    printf("  int8-dot: %s (VTM_Q4_I8=%d; 0 — выключен, 1 — один проход, "
+           "2 — два)\n", vtm_q4_i8_name(), vtm_q4_i8_mode());
     printf("  поштучно: %9.2f мс  (%7.2f мс/токен, %6.2f GFLOP/s)\n",
            t_tok, t_tok / (double)ntok,
            2.0 * (double)n64 * (double)ntok / (t_tok * 1e6));
@@ -2459,10 +2525,15 @@ static int run_q4_batch_bench(int rows, int cols, int ntok, int iters) {
                    before, after, before / after);
         }
     }
-    printf("  точность пачки против поштучного пути: max|diff|=%.3e "
-           "(max|ref|=%.3e) %s\n", d, ref,
-           d <= CHECK_TOL ? "ok" : "FAIL");
-    if (d > CHECK_TOL) failures++;
+    {
+        // Порог — по активному пути: у int8 (VTM_Q4_I8=1|2) это ошибка
+        // квантования активаций, а не арифметики (см. CHECK_TOL_I8).
+        const double tol = vtm_q4_i8_mode() ? CHECK_TOL_I8 : CHECK_TOL;
+        printf("  точность пачки против поштучного пути: max|diff|=%.3e "
+               "(max|ref|=%.3e) %s (порог %.0e, int8-dot %s)\n", d, ref,
+               d <= tol ? "ok" : "FAIL", tol, vtm_q4_i8_name());
+        if (d > tol) failures++;
+    }
 done:
     free(q);
     free(scales);
@@ -2628,6 +2699,8 @@ static int run_prefill_check(const char *explicit_path, int ntok) {
     printf("модель: %s\n", path);
     printf("prefill-check: %d токенов, эталон — по токену, затем пачка\n",
            ntok);
+    printf("  int8-dot: %s (VTM_Q4_I8=%d)\n", vtm_q4_i8_name(),
+           vtm_q4_i8_mode());
     m = vtm_load(path);
     if (!m) {
         fprintf(stderr, "vtm_load(%s): %s\n", path, vtm_last_error());
@@ -2738,8 +2811,13 @@ static double prefill_batch(vtm_t *m, const int32_t *ids, int n) {
     return now_ms() - t0;
 }
 
+static const char *g_ttft_lens;   // --prefill-lens
+static int g_ttft_reps = 2;       // --prefill-reps
+
 static int run_prefill_ttft(const char *explicit_path) {
-    static const int lens[] = {64, 256, 512};
+    static const int lens_def[] = {64, 256, 512};
+    const int *lens = lens_def;
+    int nlens = (int)(sizeof lens_def / sizeof lens_def[0]);
     const char *path = find_model(explicit_path);
     int32_t ids[512];
     vtm_t *m;
@@ -2750,6 +2828,23 @@ static int run_prefill_ttft(const char *explicit_path) {
         fprintf(stderr, "модель не найдена (--prefill-ttft PATH)\n");
         return 2;
     }
+    // --prefill-lens L1[,L2...] — сузить набор длин (на загруженной машине
+    // полный прогон 64/256/512x2 занимает часы); --prefill-reps N — число
+    // чередующихся повторов (по умолчанию 2, берётся минимум).
+    if (g_ttft_lens && *g_ttft_lens) {
+        static int custom[8];
+        const char *p = g_ttft_lens;
+        int k = 0;
+        while (*p && k < 8) {
+            custom[k++] = atoi(p);
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+        if (k > 0) {
+            lens = custom;
+            nlens = k;
+        }
+    }
     m = vtm_load(path);
     if (!m) {
         fprintf(stderr, "vtm_load(%s): %s\n", path, vtm_last_error());
@@ -2759,13 +2854,15 @@ static int run_prefill_ttft(const char *explicit_path) {
     for (i = 0; i < 512; i++) ids[i] = 1000 + (i * 37) % 150000;
     printf("модель: %s\nTTFT prefill (один процесс, по токену против пачки; "
            "пачка режется ядром по VTM_BATCH_TOKENS):\n", path);
+    printf("int8-dot: %s (VTM_Q4_I8=%d)\n", vtm_q4_i8_name(),
+           vtm_q4_i8_mode());
     printf("  %6s %12s %12s %9s\n", "токенов", "по токену, с", "пачкой, с",
            "ускорение");
-    for (li = 0; li < sizeof lens / sizeof lens[0]; li++) {
+    for (li = 0; li < (size_t)nlens; li++) {
         const int n = lens[li];
         double t_tok = 1e300, t_bat = 1e300;
         int rep;
-        for (rep = 0; rep < 2; rep++) {
+        for (rep = 0; rep < g_ttft_reps; rep++) {
             double a, b;
             if (rep == 0) {
                 a = prefill_token(m, ids, n);
@@ -2800,8 +2897,11 @@ static void usage(const char *prog) {
            "[--q4 [--q4-rows N] [--q4-cols N] [--q4-iters N] "
            "[--q4-batch]]\n"
            "          [--prefill-check PATH] [--prefill-ttft PATH]\n"
+           "          [--prefill-lens 64,256,512] [--prefill-reps N]\n"
            "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
-           "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8)\n",
+           "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8);\n"
+           "  env VTM_Q4_I8 — int8-dot (SDOT/VNNI) для батчевого Q4: 0 — выкл.\n"
+           "    (по умолчанию), 1 — один проход, 2 — два (точнее, ~2x SDOT);\n",
            prog);
 }
 
@@ -2863,6 +2963,12 @@ int main(int argc, char **argv) {
             prefill_check_path = (i + 1 < argc) ? argv[++i] : "";
         } else if (strcmp(argv[i], "--prefill-ttft") == 0) {
             prefill_ttft_path = (i + 1 < argc) ? argv[++i] : "";
+        } else if (strcmp(argv[i], "--prefill-lens") == 0 && i + 1 < argc) {
+            g_ttft_lens = argv[++i];
+        } else if (strcmp(argv[i], "--prefill-reps") == 0 && i + 1 < argc) {
+            g_ttft_reps = atoi(argv[++i]);
+            if (g_ttft_reps < 1) g_ttft_reps = 1;
+            if (g_ttft_reps > 8) g_ttft_reps = 8;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;

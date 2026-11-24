@@ -29,6 +29,16 @@
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
+// FEAT_DotProd (int8-dot, задача 0163): на Apple спрашиваем sysctl, на Linux —
+// HWCAP_ASIMDDP. Обе ветки нужны только для рантайм-детекта SDOT.
+#if defined(__APPLE__)
+// <sys/sysctl.h> под -D_POSIX_C_SOURCE=200809L не отдаёт BSD-типы (u_int),
+// поэтому объявляем саму функцию: символ есть в libSystem, нужен один вызов.
+extern int sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
+                        void *newp, size_t newlen);
+#elif defined(__linux__)
+#include <sys/auxv.h>
+#endif
 #define VTM_SIMD_NEON 1
 #else
 #define VTM_SIMD_NEON 0
@@ -63,6 +73,12 @@ extern int vtm_avx2_tmv_f32_batch(float *y, const float *w, const float *x,
                                   int transposed);
 extern int vtm_avx2_mm_f32_batch(float *y, const float *a, const float *b,
                                  int m, int k, int n_tokens);
+// int8-dot VNNI (задача 0163): ядро Q4-батча и рантайм-детект AVX-512 VNNI.
+extern int vtm_avx2_q4_batch_vnni(float *y, const uint8_t *q,
+                                  const float *scales, const float *mins,
+                                  const float *x, int rows, int cols,
+                                  int ntok, int asym, int mode);
+extern int vtm_avx2_vnni_available(void);
 #define VTM_SIMD_X86 1
 #else
 #define VTM_SIMD_X86 0
@@ -1352,6 +1368,439 @@ int vtm_neon_q4_batch(float *y, const uint8_t *q, const float *scales,
     return 0;
 }
 
+// --- NEON: Q4 int8-dot (SDOT) для батчевого prefill, задача 0163 -----------
+//
+// Зачем. Батчевое f32-ядро 0162 убирает повторную распаковку строки, но не
+// сами умножения: 4 MAC за инструкцию (4 f32-дорожки). SDOT (ARMv8.2
+// FEAT_DotProd) — 16 int8-умножений со сложением в int32 за инструкцию, то
+// есть 16 MAC за инструкцию, и вчетверо меньше байт на активации пачки.
+//
+// Вес Q4 точный: q в 0..15, s = q - 8 целое, |s| <= 8, поэтому int8
+// представляет его без ошибки. Ошибка — только от квантования активаций:
+//   sx[j] = max_t |x[t*N+j]| / 127,   xq = round(x / sx), |xq| <= 127.
+// Квантование — на пачку (по токену), а не на строку: x переиспользуется
+// всеми строками матрицы, поэтому это доли процента MAC.
+//
+// Арифметика (по группе 32 значения, масштаб/минимум группы — как у 0157):
+//   w = s*scale + cg,  cg = min + 8*scale (Q4_1; для Q4_0 cg = 0)
+//   Σ w*x = scale*Σ s*xq*sx + cg*Σ xq*sx + (остаток квантования)
+// Первое слагаемое — SDOT (int32, |Σ| <= 32*8*127 = 32512), второе — Σ xq
+// по группе, он НЕ зависит от строки (cols кратен 32), поэтому считается
+// один раз в квантовании. Точное значение Σ xq на группу и токен — это
+// xsq[g][j] = sx[j]*Σ xq: в строке остаётся vfmaq_n_f32 с cg.
+//
+// Раскладка под SDOT: дорожка int32 = токен (4 токена за вектор), поэтому
+//   b-вектор (16 байт) = [токен 0: 4 веса подряд][токен 1: те же 4 веса]...
+//   a-вектор (16 байт) = те же 4 веса, размноженные на 4 дорожки
+//                        (vdupq_n_u32 по 4 байтам строки весов);
+//   vdotq_s32(acc, a, b)[k] = Σ_{m=0..3} w[u+m]*xq_токена k[u+m],
+// то есть одна инструкция считает 4 токена. 32 веса группы = 8 чанков по
+// 4 -> 8 SDOT на группу и 4 токена. Веса группы грузятся из int8-строки
+// (cols байт на строку, разворачивается один раз на пачку, как у 0162).
+//
+// Режимы (env VTM_Q4_I8, см. vtm_q4_i8_mode() в backend_scalar.c):
+//   1 — один проход int8: относительная ошибка ~1/127 от максимума группы,
+//       на логитах 3B Q4 это единицы 1e-2 (замер — в отчёте 0163);
+//   2 — два прохода: к остатку r = x - xq*sx применяется ещё один int8
+//       с шагом sx/127 (|r| <= sx/2, так что |rq| <= 63). Ошибка падает в
+//       ~127 раз (единицы 1e-4), цена — второй SDOT-конвейер на тех же
+//       загруженных весах (веса переиспользуются, память не растёт).
+// Отказ (-1) — CPU без FEAT_DotProd, cols не кратен 32, нет памяти: тогда
+// диспетчер backend_scalar.c идёт в f32-ядро 0162 (и в скалярный эталон).
+
+// sdot без зависимости от -march: на сборке, где заголовок не объявляет
+// vdotq_s32 (нет __ARM_FEATURE_DOTPROD), инструкция пишется ассемблером.
+// Рантайм-проверка ниже гарантирует, что она не выполнится на CPU без неё.
+#if defined(__ARM_FEATURE_DOTPROD)
+#define VTM_SDOT(acc, a, b) vdotq_s32((acc), (a), (b))
+#else
+static inline int32x4_t vtm_sdot_one(int32x4_t acc, int8x16_t a, int8x16_t b) {
+    __asm__("sdot %0.4s, %1.16b, %2.16b" : "+w"(acc) : "w"(a), "w"(b));
+    return acc;
+}
+#define VTM_SDOT(acc, a, b) vtm_sdot_one((acc), (a), (b))
+#endif
+
+// FEAT_DotProd: 1 — SDOT есть. Кэшируется: вызывается из горячего пути.
+// Apple Silicon (любой arm64 macOS) — есть всегда; на Linux спрашиваем
+// HWCAP_ASIMDDP. Сборка под другую ОС — доверяем сборке (иначе int8-путь
+// там просто не включается).
+static int vtm_dotprod_cpu(void) {
+    static int cached = -1;
+    int v = cached;
+
+    if (v >= 0) return v;
+    v = 0;
+#if defined(__APPLE__)
+    {
+        // Ключ есть с macOS 11.2; если его нет (старая ОС), считаем, что SDOT
+        // есть: arm64 macOS живёт только на Apple Silicon, где FEAT_DotProd
+        // обязателен. Явный 0 от системы — выключаем.
+        int x = -1;
+        size_t len = sizeof x;
+        if (sysctlbyname("hw.optional.arm.FEAT_DotProd", &x, &len, NULL, 0)
+            != 0)
+            x = -1;
+        v = (x != 0) ? 1 : 0;
+    }
+#elif defined(__linux__)
+    {
+        unsigned long hw = getauxval(AT_HWCAP);
+        if (hw & (1ul << 20)) v = 1;   // HWCAP_ASIMDDP
+    }
+#else
+    v = 1;
+#endif
+    cached = v;
+    return v;
+}
+
+// 16 байт Q4 (32 значения GGML Q4_0-раскладки) -> 32 int8 s = q - 8 в
+// естественном порядке: байт j — значения j и j+16.
+static inline void q4_group_i8(const uint8_t *gp, int8_t *w) {
+    uint8x16_t b = vld1q_u8(gp);
+    int8x16_t eight = vdupq_n_s8(8);
+    int8x16_t lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(b, vdupq_n_u8(0x0fu))),
+                            eight);
+    int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b, 4)), eight);
+    vst1q_s8(w, lo);
+    vst1q_s8(w + 16, hi);
+}
+
+// Чтение 4 байт строки весов (выравнивания не требуем, алиасинга нет).
+static inline uint32_t q4_i8_load4(const int8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, sizeof v);
+    return v;
+}
+
+// 4 int32 (уже в [-127,127]) -> 4 int8 в младших байтах 32-битной дорожки.
+static inline int32x2_t q4_i8_pack4(int32x4_t v) {
+    int16x4_t w = vqmovn_s32(v);
+    return vreinterpret_s32_s8(vqmovn_s16(vcombine_s16(w, w)));
+}
+
+typedef struct {
+    float *y;
+    const uint8_t *q;
+    const float *scales;
+    const float *mins;
+    const float *x;    // активации пачки x[t*N + j]
+    int8_t *xq;        // квантованный вход, блоки по 4 токена
+    int8_t *xq2;       // остаток квантования (mode 2; иначе NULL)
+    float *sx;         // масштаб активаций на токен (stride значений)
+    float *xsq;        // sx[j]*Σ xq по локальной группе: [g*stride + j]
+    float *xsr;        // sx[j]*Σ xq2 (mode 2)
+    int rows;
+    int cols;
+    int ntok;
+    int nblk;          // (ntok + 3)/4
+    int stride;        // nblk*4 (память под хвост пачки)
+    int ngroups;       // cols/32
+    int asym;
+    int mode;
+    int8_t *wrow_all;  // vt*cols: int8-строка на поток
+} q4_i8_job;
+
+// Одна строка: веса Q4 -> int8, затем пачка (16 токенов за проход).
+static void q4_i8_row(const q4_i8_job *j, int8_t *w, int r) {
+    const int cols = j->cols;
+    const int ntok = j->ntok;
+    const int nblk = j->nblk;
+    const int stride = j->stride;
+    const int ngroups = j->ngroups;
+    const int asym = j->asym;
+    const int mode = j->mode;
+    // Проход по строке — 4 блока по 4 токена (16 токенов, как C=16 у графа).
+    const int nbmax = 4;
+    const uint8_t *gp = j->q + (size_t)r * (size_t)cols / 2;
+    const int64_t gbase = (int64_t)r * (int64_t)ngroups;
+    float *yrow = j->y + (size_t)r * (size_t)ntok;
+    int g, B0, b, k;
+
+    for (g = 0; g < ngroups; g++)
+        q4_group_i8(gp + (size_t)g * 16, w + (size_t)g * 32);
+
+    // Внутри группы 8 SDOT идут цепочкой зависимости (каждый следующий ждёт
+    // предыдущий). В режиме 1 сумма копится в ДВА независимых int32-
+    // аккумулятора (чанки 0-3 и 4-7) и складывается перед cvt — ILP важнее
+    // двух лишних vaddq (замер: 0,62-0,72 мс против 0,79 мс у одной цепочки).
+    // В режиме 2 плоскостей уже две (a и b), и раздваивать каждую нельзя:
+    // 16 int32-аккумуляторов + f32-масштабы не влезают в регистры (замер:
+    // сужение прохода до 8 токенов с двумя цепочками давало 1,5 мс против
+    // 1,0 мс у одной цепочки на 16 токенов).
+    for (B0 = 0; B0 < nblk; B0 += nbmax) {
+        const int nb = (nblk - B0) < nbmax ? (nblk - B0) : nbmax;
+        int32x4_t a0[4], a1[4], b0[4], b1[4];
+        float32x4_t af[4], sxb[4];
+        // Блок — 4 токена, то есть 4*cols байт квантованного входа.
+        const size_t blk = (size_t)4 * (size_t)cols;
+        const int8_t *xp = j->xq + (size_t)B0 * blk;
+        const int8_t *xp2 = (mode == 2) ? j->xq2 + (size_t)B0 * blk : NULL;
+
+        for (b = 0; b < nb; b++) {
+            af[b] = vdupq_n_f32(0.0f);
+            sxb[b] = vld1q_f32(j->sx + (size_t)(B0 + b) * 4);
+        }
+        for (g = 0; g < ngroups; g++) {
+            const float scale = load_f32_unaligned(j->scales, gbase + g);
+            const int8_t *wg = w + (size_t)g * 32;
+            const int8_t *xg = xp + (size_t)g * 128;
+            const int8_t *xg2 = xp2 ? xp2 + (size_t)g * 128 : NULL;
+            const float *sq = j->xsq + (size_t)g * (size_t)stride
+                            + (size_t)B0 * 4;
+            float cg = 0.0f;
+
+            if (asym) {
+                cg = load_f32_unaligned(j->mins, gbase + g) + 8.0f * scale;
+            }
+            for (b = 0; b < nb; b++) {
+                a0[b] = vdupq_n_s32(0);
+                a1[b] = vdupq_n_s32(0);
+                b0[b] = vdupq_n_s32(0);
+                b1[b] = vdupq_n_s32(0);
+            }
+            // ILP: в режиме 1 чанки 0-3 и 4-7 копятся в РАЗНЫЕ аккумуляторы
+            // (две независимые цепочки SDOT, каждая по 4), иначе цепочка из
+            // 8 зависимых sdot не даёт загрузить оба конвейера. В режиме 2
+            // плоскостей уже две (a/b), и раздваивать каждую нельзя: 16
+            // int32-аккумуляторов не влезают в регистры (замер — отчёт 0163).
+            if (mode == 2) {
+                for (k = 0; k < 8; k++) {
+                    const int8x16_t av = vreinterpretq_s8_u8(
+                        vdupq_n_u32(q4_i8_load4(wg + k * 4)));
+                    for (b = 0; b < nb; b++) {
+                        a0[b] = VTM_SDOT(a0[b], av,
+                                         vld1q_s8(xg + (size_t)b * blk
+                                                  + (size_t)k * 16));
+                        b0[b] = VTM_SDOT(b0[b], av,
+                                         vld1q_s8(xg2 + (size_t)b * blk
+                                                  + (size_t)k * 16));
+                    }
+                }
+            } else {
+                for (k = 0; k < 4; k++) {
+                    const int8x16_t av = vreinterpretq_s8_u8(
+                        vdupq_n_u32(q4_i8_load4(wg + k * 4)));
+                    for (b = 0; b < nb; b++)
+                        a0[b] = VTM_SDOT(a0[b], av,
+                                         vld1q_s8(xg + (size_t)b * blk
+                                                  + (size_t)k * 16));
+                }
+                for (k = 4; k < 8; k++) {
+                    const int8x16_t av = vreinterpretq_s8_u8(
+                        vdupq_n_u32(q4_i8_load4(wg + k * 4)));
+                    for (b = 0; b < nb; b++)
+                        a1[b] = VTM_SDOT(a1[b], av,
+                                         vld1q_s8(xg + (size_t)b * blk
+                                                  + (size_t)k * 16));
+                }
+            }
+            for (b = 0; b < nb; b++) {
+                af[b] = vfmaq_f32(af[b], vcvtq_f32_s32(vaddq_s32(a0[b], a1[b])),
+                                  vmulq_n_f32(sxb[b], scale));
+                if (mode == 2) {
+                    // sr = sx/127: остаток квантован с шагом в 127 раз мельче.
+                    af[b] = vfmaq_f32(af[b],
+                                      vcvtq_f32_s32(vaddq_s32(b0[b], b1[b])),
+                                      vmulq_n_f32(sxb[b], scale / 127.0f));
+                }
+                if (asym) {
+                    af[b] = vfmaq_n_f32(af[b], vld1q_f32(sq + (size_t)b * 4),
+                                        cg);
+                    if (mode == 2) {
+                        const float *sr = j->xsr
+                                        + (size_t)g * (size_t)stride
+                                        + (size_t)B0 * 4;
+                        af[b] = vfmaq_n_f32(af[b],
+                                            vld1q_f32(sr + (size_t)b * 4),
+                                            cg / 127.0f);
+                    }
+                }
+            }
+        }
+        for (b = 0; b < nb; b++) {
+            const int j0 = (B0 + b) * 4;
+            if (j0 + 4 <= ntok) {
+                vst1q_f32(yrow + j0, af[b]);
+            } else {
+                float tmp[4];
+                int q;
+                vst1q_f32(tmp, af[b]);
+                for (q = 0; j0 + q < ntok; q++) yrow[j0 + q] = tmp[q];
+            }
+        }
+    }
+}
+
+static void q4_i8_worker(void *p, int tid, int r0, int r1) {
+    q4_i8_job *j = (q4_i8_job *)p;
+    int8_t *w = j->wrow_all + (size_t)tid * (size_t)j->cols;
+    int r;
+
+    for (r = r0; r < r1; r++) q4_i8_row(j, w, r);
+}
+
+// Квантование пачки: sx по токену, xq (шифрованная под SDOT раскладка),
+// xsq (Σ xq по локальной группе). mode 2 — ещё остаток xq2/xsr.
+static void q4_i8_quant(q4_i8_job *j) {
+    const int cols = j->cols;
+    const int ntok = j->ntok;
+    const int nblk = j->nblk;
+    const int stride = j->stride;
+    const int ngroups = j->ngroups;
+    const int mode = j->mode;
+    const float *x = j->x;
+    const int32x4_t v127 = vdupq_n_s32(127);
+    const int32x4_t vn127 = vdupq_n_s32(-127);
+    int b, g, jj, k, t;
+
+    // 1. max|x| по токену (по 4 токена за вектор).
+    for (b = 0; b < nblk; b++) {
+        const int lo = b * 4;
+        float m[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (lo + 4 <= ntok) {
+            float32x4_t mv = vdupq_n_f32(0.0f);
+            for (t = 0; t < cols; t++)
+                mv = vmaxq_f32(mv, vabsq_f32(vld1q_f32(x + (size_t)t
+                                                       * (size_t)ntok + lo)));
+            vst1q_f32(m, mv);
+        } else {
+            int q;
+            for (t = 0; t < cols; t++) {
+                const float *p = x + (size_t)t * (size_t)ntok + lo;
+                for (q = 0; lo + q < ntok; q++) {
+                    const float a = fabsf(p[q]);
+                    if (a > m[q]) m[q] = a;
+                }
+            }
+        }
+        for (t = 0; t < 4; t++) {
+            const int tok = lo + t;
+            // Порог 1e-30: у вырожденных (почти нулевых) токенов шаг
+            // квантования был бы денормальным, а 1/sx — inf. Тогда xq = 0,
+            // что для x ~ 1e-30 и есть верный ответ с точностью до шума.
+            j->sx[tok] = (tok < ntok && m[t] > 1e-30f) ? m[t] / 127.0f : 1.0f;
+        }
+    }
+
+    // 2. Квантование: по токену, чанками по 4 значения (один store).
+    for (jj = 0; jj < ntok; jj++) {
+        const float s = j->sx[jj];
+        const float inv = 1.0f / s;   // x/s = x*127/max
+        const int B = jj >> 2, lane = jj & 3;
+        const size_t blk = (size_t)4 * (size_t)cols;
+        int8_t *dst = j->xq + (size_t)B * blk + (size_t)lane * 4;
+        int8_t *dst2 = j->xq2 ? j->xq2 + (size_t)B * blk + (size_t)lane * 4
+                              : NULL;
+
+        for (g = 0; g < ngroups; g++) {
+            int32x4_t sq = vdupq_n_s32(0);
+            int32x4_t sr = vdupq_n_s32(0);
+            int8_t *p = dst + (size_t)g * 128;
+            int8_t *p2 = dst2 ? dst2 + (size_t)g * 128 : NULL;
+
+            for (k = 0; k < 8; k++) {
+                const int t0 = g * 32 + k * 4;
+                const float *xp = x + (size_t)t0 * (size_t)ntok + jj;
+                float32x4_t v = vdupq_n_f32(xp[0]);
+                int32x4_t qi, ri;
+
+                v = vld1q_lane_f32(xp + (size_t)ntok, v, 1);
+                v = vld1q_lane_f32(xp + (size_t)ntok * 2, v, 2);
+                v = vld1q_lane_f32(xp + (size_t)ntok * 3, v, 3);
+                qi = vcvtnq_s32_f32(vmulq_n_f32(v, inv));
+                qi = vmaxq_s32(vminq_s32(qi, v127), vn127);
+                vst1_lane_s32((int32_t *)(p + (size_t)k * 16),
+                              q4_i8_pack4(qi), 0);
+                sq = vaddq_s32(sq, qi);
+                if (mode == 2) {
+                    // r = x - q*s, |r| <= s/2; шаг остатка s/127, то есть
+                    // rq = r*(127/s) = r*inv*127.
+                    const float32x4_t r = vfmsq_f32(v, vcvtq_f32_s32(qi),
+                                                    vdupq_n_f32(s));
+                    ri = vcvtnq_s32_f32(vmulq_n_f32(r, inv * 127.0f));
+                    ri = vmaxq_s32(vminq_s32(ri, v127), vn127);
+                    vst1_lane_s32((int32_t *)(p2 + (size_t)k * 16),
+                                  q4_i8_pack4(ri), 0);
+                    sr = vaddq_s32(sr, ri);
+                }
+            }
+            j->xsq[(size_t)g * (size_t)stride + jj] = s * (float)vaddvq_s32(sq);
+            if (mode == 2) {
+                j->xsr[(size_t)g * (size_t)stride + jj]
+                    = s * (float)vaddvq_s32(sr);
+            }
+        }
+    }
+}
+
+int vtm_neon_q4_batch_i8(float *y, const uint8_t *q, const float *scales,
+                         const float *mins, const float *x, int rows,
+                         int cols, int ntok, int asym, int mode) {
+    q4_i8_job job;
+    size_t xq_sz, xs_sz;
+    int vt;
+
+    if (!y || !q || !scales || !x) return -1;
+    if (rows < 0 || cols < 0 || ntok < 0) return -1;
+    if (asym && !mins) return -1;
+    if (rows == 0 || cols == 0 || ntok == 0) return 0;
+    if (mode != 2) mode = 1;
+    if (ntok < 2) return -1;                 // 1 токен — одноколоночное ядро
+    if (cols % VTM_Q4_GROUP_SIZE) return -1; // группа не рвётся по строкам
+    if (!vtm_dotprod_cpu()) return -1;       // CPU без FEAT_DotProd
+
+    memset(&job, 0, sizeof job);
+    job.y = y;
+    job.q = q;
+    job.scales = scales;
+    job.mins = mins;
+    job.rows = rows;
+    job.cols = cols;
+    job.ntok = ntok;
+    job.nblk = (ntok + 3) / 4;
+    job.stride = job.nblk * 4;
+    job.ngroups = cols / VTM_Q4_GROUP_SIZE;
+    job.asym = asym;
+    job.mode = mode;
+    vt = vtm_threads();
+    xq_sz = (size_t)job.stride * (size_t)cols;
+    xs_sz = (size_t)job.ngroups * (size_t)job.stride;
+
+    job.xq = (int8_t *)calloc(xq_sz, 1);
+    job.sx = (float *)malloc((size_t)job.stride * sizeof(float));
+    job.xsq = (float *)malloc(xs_sz * sizeof(float));
+    job.wrow_all = (int8_t *)malloc((size_t)vt * (size_t)cols);
+    if (mode == 2) {
+        job.xq2 = (int8_t *)calloc(xq_sz, 1);
+        job.xsr = (float *)malloc(xs_sz * sizeof(float));
+    }
+    if (!job.xq || !job.sx || !job.xsq || !job.wrow_all
+        || (mode == 2 && (!job.xq2 || !job.xsr))) {
+        free(job.xq);
+        free(job.xq2);
+        free(job.sx);
+        free(job.xsq);
+        free(job.xsr);
+        free(job.wrow_all);
+        return -1;
+    }
+    // x нужен и в квантовании; поле в job — const float*, поэтому берём его
+    // из аргумента (см. q4_i8_quant).
+    job.x = x;
+    q4_i8_quant(&job);
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok,
+                      q4_i8_worker, &job);
+    free(job.xq);
+    free(job.xq2);
+    free(job.sx);
+    free(job.xsq);
+    free(job.xsr);
+    free(job.wrow_all);
+    return 0;
+}
+
 // MM с тритовой A. n == 1 — это фактически TMV по одной строке (tied
 // lm_head: [vocab, hidden] * [hidden, 1]), поэтому идём тем же путём, что
 // и TMV. Для n > 1 — rank-1 обновление по столбцам: 16 значений t копим в
@@ -2243,6 +2692,19 @@ const char *vtm_simd_isa(void) {
     return vtm_simd_available() ? "avx2" : "none";
 #else
     return "none";
+#endif
+}
+
+// int8-dot: SDOT на ARM (FEAT_DotProd), VNNI на x86 (AVX-512). Спрашивается
+// один раз (кэш внутри детекта): режим выбирает backend_scalar.c по
+// VTM_Q4_I8, а само ядро ещё раз проверяет это же перед работой.
+int vtm_q4_i8_hw(void) {
+#if VTM_SIMD_NEON
+    return vtm_dotprod_cpu();
+#elif VTM_SIMD_X86
+    return vtm_avx2_available() && vtm_avx2_vnni_available();
+#else
+    return 0;
 #endif
 }
 
