@@ -1761,6 +1761,8 @@ def _run_side(
     request_load_ms: float | None = None
     char_count = 0
     completed = False
+    delta_buffer: list[str] = []
+    delta_flushed = time.monotonic()
     try:
         iterator = iter(adapter.stream(messages, max_tokens=max_tokens))
         try:
@@ -1774,18 +1776,40 @@ def _run_side(
                         first_token_ms = max(
                             0, int((time.monotonic() - started) * 1000)
                         )
-                    events.put({"type": "delta", "side": index, "text": text})
+                    # Склеиваем куски перед отправкой: у ВТМ токен — это 1–3
+                    # символа русского слова (BPE), и посимвольная выдача
+                    # выглядит как «печатает по буквам». Копим до 60 мс или до
+                    # границы слова, чтобы глаз видел слова, а не буквы.
+                    delta_buffer.append(text)
+                    now = time.monotonic()
+                    boundary = text.endswith((" ", ".", ",", "!", "?", ":", ";", "\n"))
+                    if boundary or (now - delta_flushed) >= 0.06:
+                        events.put({
+                            "type": "delta",
+                            "side": index,
+                            "text": "".join(delta_buffer),
+                        })
+                        delta_buffer.clear()
+                        delta_flushed = now
                 if isinstance(piece, StreamPiece) and piece.done:
                     usage = dict(piece.usage or {})
                     finish_reason = piece.finish_reason or finish_reason
                     request_load_ms = piece.load_ms
                     break
+            if delta_buffer:
+                events.put({"type": "delta", "side": index,
+                            "text": "".join(delta_buffer)})
+                delta_buffer.clear()
             completed = True
         finally:
             closer = getattr(iterator, "close", None)
             if callable(closer):
                 closer()
     except BaseException as exc:  # noqa: BLE001 - ошибка одной колонки не рвёт другую
+        if delta_buffer:
+            events.put({"type": "delta", "side": index,
+                        "text": "".join(delta_buffer)})
+            delta_buffer.clear()
         logger.warning("колонка %d (%s): ошибка: %s", index, side["model"], exc)
         if not stop.is_set():
             events.put(
