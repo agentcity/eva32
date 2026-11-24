@@ -961,7 +961,7 @@
   {
     "id": "0145",
     "title": "Панель метрик под чатом — диск, память, CPU, ток/с",
-    "status": "in_progress",
+    "status": "done",
     "file": "0145-chat-stats-panel.md",
     "assignee": "agent:chat-stats"
   }

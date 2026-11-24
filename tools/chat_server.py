@@ -11,11 +11,25 @@ Qwen одновременно, с временем и скоростью. Скр
 * ``GET /`` — страница: один вопрос, две колонки (ВТМ и Ollama), выбор модели
   в каждой, время ответа и ток/с;
 * ``GET /api/backends`` — закрытый список бэкендов и моделей (без путей и URL);
+* ``GET /api/models`` — карточки моделей для панели метрик (задача 0145):
+  размер файла (``stat``), параметры и KV-кэш из таблицы тензоров ``.vtm``,
+  контекст, тип хранения, источник (демо / холодный экспорт / QAT), словарь,
+  слои, бит на параметр, RSS до/после загрузки;
+* ``GET /api/system`` — нагрузка и память машины: load average, свободная
+  RAM, диск, RSS процесса, ``VTM_THREADS``;
 * ``POST /api/chat`` — SSE-поток ``text/event-stream``. События:
-  ``start`` (какая модель отвечает), ``delta`` (кусок текста), ``done``
-  (время, токены, ток/с), ``error`` (человеческий текст). Терминальное
-  событие — ``data: [DONE]``, как у ``eva/server.py``;
+  ``start`` (какая модель отвечает, первый токен холодный/тёплый),
+  ``delta`` (кусок текста), ``done`` (время, токены, TTFT/prefill/декод,
+  RSS-дельта, причина остановки, кэш префикса), ``end`` (CPU-время запроса и
+  снимок системы), ``error`` (человеческий текст). Терминальное событие —
+  ``data: [DONE]``, как у ``eva/server.py``;
 * ``GET /favicon.ico`` — 204, чтобы браузер не шумел 404.
+
+Числа панели либо сняты у источника (``stat``, ``/proc``, ``vm_stat``,
+``getrusage``, ``time.process_time``, таблица тензоров ``.vtm``), либо
+помечены как оценка; чего снять нельзя — отдаётся ``null`` и в UI это «—».
+Сеть у страницы и у сервера одна: локальная Ollama на ``127.0.0.1:11434``
+(только ``/api/ps``, чтобы узнать размер резидентной копии).
 
 Границы:
 
@@ -54,10 +68,15 @@ HTTP-слой знает только про ``backend``/``model`` из реес
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import json
 import logging
 import os
 import queue
+import shutil
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -66,6 +85,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import urlsplit
+
+try:  # ru_maxrss — пиковый RSS; на Windows модуля нет, там честное «—»
+    import resource
+except ImportError:  # pragma: no cover - не наш случай, но падать незачем
+    resource = None  # type: ignore[assignment]
 
 __all__ = [
     "BackendSpec",
@@ -78,10 +102,13 @@ __all__ = [
     "OLLAMA_BASE",
     "ChatCliAdapter",
     "StreamPiece",
+    "VtmInspect",
     "create_server",
     "default_adapters",
     "default_registry",
+    "inspect_vtm",
     "main",
+    "system_snapshot",
 ]
 
 logger = logging.getLogger("chat_server")
@@ -170,6 +197,7 @@ class StreamPiece:
     text: str = ""
     done: bool = False
     usage: dict[str, Any] = field(default_factory=dict)
+    finish_reason: str = ""
 
 
 def _resolve_tokenizer(model_path: Path, explicit: str | None = None) -> str:
@@ -240,21 +268,63 @@ class ChatCliAdapter:
 
     Один адаптер = одна модель; генерации к ней сериализуются замком, потому
     что у ВТМ один C-контекст и параллельный вызов вернул бы ``VtmBusy``.
+
+    Здесь же снимается память загрузки (задача 0145): RSS процесса до и после
+    вызова фабрики. Для ВТМ это честная дельта — модель живёт в этом процессе
+    через ``ctypes``. ``probe_ps`` — только для Ollama: её процесс чужой,
+    поэтому размер резидентной копии спрашивают у ``GET /api/ps``.
     """
 
-    def __init__(self, factory: Callable[[], Any], *, label: str = "") -> None:
+    def __init__(
+        self,
+        factory: Callable[[], Any],
+        *,
+        label: str = "",
+        kind: str = "",
+        probe_ps: Callable[[str], dict[str, Any] | None] | None = None,
+    ) -> None:
         self._factory = factory
         self.label = label
+        self.kind = kind
+        self.probe_ps = probe_ps
         self._inner: Any = None
+        #: Замер загрузки: RSS до/после, дельта, пик процесса и время сборки.
+        self.load_stats: dict[str, Any] | None = None
         # RLock: ``stream`` держит замок на всё время генерации и зовёт
         # ``_ensure``, которому нужен тот же замок.
         self._lock = threading.RLock()
+
+    @property
+    def loaded(self) -> bool:
+        """Модель уже в памяти этого процесса (а не только в реестре)."""
+        return self._inner is not None
+
+    @property
+    def cache_prefix(self) -> bool | None:
+        """Включён ли у ВТМ кэш префикса; ``None`` — бэкенд не умеет."""
+        flag = getattr(self._inner, "cache_prefix", None)
+        return flag if isinstance(flag, bool) else None
 
     def _ensure(self) -> Any:
         if self._inner is None:
             with self._lock:
                 if self._inner is None:
-                    self._inner = self._factory()
+                    before = _rss_bytes()
+                    started = time.monotonic()
+                    inner = self._factory()
+                    self._inner = inner
+                    after = _rss_bytes()
+                    self.load_stats = {
+                        "rss_before": before,
+                        "rss_after": after,
+                        "rss_delta": (
+                            after - before
+                            if before is not None and after is not None
+                            else None
+                        ),
+                        "peak": _peak_rss_bytes(),
+                        "load_ms": round((time.monotonic() - started) * 1000.0, 1),
+                    }
         return self._inner
 
     def stream(
@@ -272,7 +342,11 @@ class ChatCliAdapter:
                     if getattr(event, "done", False):
                         usage = getattr(event, "usage", {}) or {}
                         terminal = True
-                        yield StreamPiece(done=True, usage=dict(usage))
+                        yield StreamPiece(
+                            done=True,
+                            usage=dict(usage),
+                            finish_reason=str(getattr(event, "finish_reason", "") or ""),
+                        )
                         break
             finally:
                 closer = getattr(iterator, "close", None)
@@ -319,6 +393,48 @@ def _chat_cli_factory(
     return factory
 
 
+#: Корень API Ollama (``OLLAMA_BASE`` без ``/v1``) — только для ``/api/ps``.
+OLLAMA_ROOT = OLLAMA_BASE.rsplit("/v1", 1)[0]
+#: Потолок ответа ``/api/ps``: там список загруженных моделей, не гигабайты.
+_OLLAMA_PS_LIMIT = 1024 * 1024
+
+
+def _probe_ollama_ps(model: str, *, timeout: float = 1.5) -> dict[str, Any] | None:
+    """Спросить у локальной Ollama ``GET /api/ps``: ``size`` и ``size_vram``.
+
+    Ollama живёт отдельным процессом, поэтому RSS его модели нам не виден —
+    единственный честный источник этих чисел её собственный ``/api/ps``.
+    Ошибки (не запущена, таймаут, кривой JSON) — ``None``: в UI будет «—».
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(  # noqa: S310 - адрес зашит: 127.0.0.1
+            OLLAMA_ROOT + "/api/ps", timeout=timeout
+        ) as response:
+            raw = response.read(_OLLAMA_PS_LIMIT)
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001 - сеть/JSON: числа просто неизвестны
+        return None
+    entries = payload.get("models") if isinstance(payload, Mapping) else None
+    if not isinstance(entries, list):
+        return None
+    wanted = str(model).strip()
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        name = str(entry.get("name") or entry.get("model") or "").strip()
+        if name != wanted and name.split(":", 1)[0] != wanted.split(":", 1)[0]:
+            continue
+        return {
+            "model": name,
+            "size": _as_int(entry.get("size")),
+            "size_vram": _as_int(entry.get("size_vram")),
+            "expires_at": entry.get("expires_at"),
+        }
+    return None
+
+
 def default_adapters(
     registry: Iterable[BackendSpec], *, timeout: float = 120.0
 ) -> dict[tuple[str, str], Any]:
@@ -331,8 +447,704 @@ def default_adapters(
             adapters[(backend.id, model.id)] = ChatCliAdapter(
                 _chat_cli_factory(backend.kind, model, timeout),
                 label="{} / {}".format(backend.id, model.id),
+                kind=backend.kind,
+                # Сеть тестам не нужна: заглушки ``probe_ps`` не имеют.
+                probe_ps=_probe_ollama_ps if backend.kind == "ollama" else None,
             )
     return adapters
+
+
+# --------------------------------------------------------------------------- #
+# Измерения: память процесса, система, контейнер .vtm
+# --------------------------------------------------------------------------- #
+
+#: Заголовок контейнера VTM v2: magic, version, flags, n_instr, n_tensors,
+#: n_program, program_offset, meta_offset, meta_len (32 байта).
+_VTM_HEADER = struct.Struct("<4sHHIIIIII")
+#: Запись таблицы тензоров v2: 24+1+1+16+4+4+2 = 52 байта.
+_VTM_TENSOR = struct.Struct("<24sBB4IIIH")
+#: Заголовок сегмента TRT1/INT8: magic, version, flags, n, n_scale (18 байт).
+_VTM_SEGMENT = struct.Struct("<4sBBQI")
+#: Роль тензора: бит 0 — KV-кэш, payload которого в файле не лежит.
+VTM_TENSOR_FLAG_KV_CACHE = 0x0001
+#: ``offset`` тензора, payload которого в файле отсутствует.
+VTM_NO_OFFSET = 0xFFFFFFFF
+#: Байт на элемент для ``kind``: 1 fp32, 2 fp16, 3 bf16, 4 int8; 0 (trit) — сегмент.
+_VTM_KIND_BYTES = {1: 4, 2: 2, 3: 2, 4: 1}
+_VTM_KIND_NAMES = {0: "trit", 1: "fp32", 2: "fp16", 3: "bf16", 4: "int8"}
+#: Потолки чтения: битый заголовок не должен просить гигабайты.
+_VTM_MAX_TENSORS = 200_000
+_VTM_MAX_META_BYTES = 4 * 1024 * 1024
+
+
+def _align32(value: int) -> int:
+    return (int(value) + 31) & ~31
+
+
+def _linux_rss_bytes() -> int | None:
+    """RSS из ``/proc/self/status`` (Linux)."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+class _DarwinTaskInfo(ctypes.Structure):
+    """``struct proc_taskinfo`` из ``<libproc.h>`` (macOS), 96 байт."""
+
+    _fields_ = [
+        ("virtual_size", ctypes.c_uint64),
+        ("resident_size", ctypes.c_uint64),
+        ("total_user", ctypes.c_uint64),
+        ("total_system", ctypes.c_uint64),
+        ("threads_user", ctypes.c_uint64),
+        ("threads_system", ctypes.c_uint64),
+        ("policy", ctypes.c_int32),
+        ("faults", ctypes.c_int32),
+        ("pageins", ctypes.c_int32),
+        ("cow_faults", ctypes.c_int32),
+        ("messages_sent", ctypes.c_int32),
+        ("messages_received", ctypes.c_int32),
+        ("syscalls_mach", ctypes.c_int32),
+        ("syscalls_unix", ctypes.c_int32),
+        ("csw", ctypes.c_int32),
+        ("threadnum", ctypes.c_int32),
+        ("numrunning", ctypes.c_int32),
+        ("priority", ctypes.c_int32),
+    ]
+
+
+#: ``PROC_PIDTASKINFO`` из ``<libproc.h>``.
+_PROC_PIDTASKINFO = 4
+_LIBPROC: Any = None
+_LIBPROC_TRIED = False
+
+
+def _darwin_rss_bytes() -> int | None:
+    """RSS из ``proc_pidinfo()`` (macOS): ровно то, что видит система."""
+    global _LIBPROC, _LIBPROC_TRIED
+    if not _LIBPROC_TRIED:
+        _LIBPROC_TRIED = True
+        try:
+            name = ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib"
+            library = ctypes.CDLL(name)
+            library.proc_pidinfo.restype = ctypes.c_int
+            library.proc_pidinfo.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            _LIBPROC = library
+        except (OSError, AttributeError):  # pragma: no cover - среда без libproc
+            _LIBPROC = None
+    if _LIBPROC is None:  # pragma: no cover - среда без libproc
+        return None
+    info = _DarwinTaskInfo()
+    size = ctypes.sizeof(info)
+    try:
+        got = _LIBPROC.proc_pidinfo(
+            os.getpid(), _PROC_PIDTASKINFO, 0, ctypes.byref(info), size
+        )
+    except (OSError, ValueError):  # pragma: no cover - защита от ctypes
+        return None
+    if got != size:
+        return None
+    return int(info.resident_size)
+
+
+def _rss_bytes() -> int | None:
+    """RSS текущего процесса в байтах; ``None`` — платформа не даёт."""
+    if sys.platform.startswith("linux"):
+        return _linux_rss_bytes()
+    if sys.platform == "darwin":
+        return _darwin_rss_bytes()
+    return None  # pragma: no cover - Windows/BSD не поддерживаем
+
+
+def _peak_rss_bytes() -> int | None:
+    """Пиковый RSS процесса (``getrusage``): Linux — КиБ, macOS — байты."""
+    if resource is None:  # pragma: no cover - Windows
+        return None
+    try:
+        raw = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (OSError, ValueError):  # pragma: no cover - защита от ctypes
+        return None
+    return raw if sys.platform == "darwin" else raw * 1024
+
+
+def process_memory() -> dict[str, Any]:
+    """Снимок памяти процесса: текущий RSS, пик и источник числа."""
+    rss = _rss_bytes()
+    peak = _peak_rss_bytes()
+    return {
+        "rss": rss,
+        "peak": peak if peak is not None else rss,
+        "source": "proc" if rss is not None and sys.platform.startswith("linux")
+        else ("libproc" if rss is not None else ("getrusage" if peak is not None else None)),
+    }
+
+
+def _linux_ram() -> tuple[int | None, int | None]:
+    """``(всего, свободно)`` из ``/proc/meminfo``; свободно — MemAvailable."""
+    values: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                key, _, rest = line.partition(":")
+                if key not in ("MemTotal", "MemAvailable"):
+                    continue
+                values[key] = int(rest.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None, None
+    return values.get("MemTotal"), values.get("MemAvailable")
+
+
+def _darwin_ram() -> tuple[int | None, int | None]:
+    """``(всего, свободно)`` по ``vm_stat``: free + inactive + speculative."""
+    try:
+        completed = subprocess.run(
+            ["vm_stat"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - среда
+        return None, None
+    if completed.returncode != 0:  # pragma: no cover - среда
+        return None, None
+    lines = completed.stdout.splitlines()
+    page_size = 4096
+    counters: dict[str, int] = {}
+    for line in lines:
+        if "page size of" in line:
+            try:
+                page_size = int(line.split("page size of", 1)[1].split()[0])
+            except (IndexError, ValueError):  # pragma: no cover - формат vm_stat
+                pass
+            continue
+        key, _, rest = line.partition(":")
+        rest = rest.strip().rstrip(".")
+        if key and rest.isdigit():
+            counters[key.strip()] = int(rest)
+    free_pages = (
+        counters.get("Pages free", 0)
+        + counters.get("Pages inactive", 0)
+        + counters.get("Pages speculative", 0)
+    )
+    free = free_pages * page_size if counters else None
+    try:
+        total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):  # pragma: no cover - среда
+        total = None
+    return total, free
+
+
+def system_snapshot() -> dict[str, Any]:
+    """Нагрузка и память машины; чего нет — ``None`` (в UI «—»)."""
+    try:
+        load: list[float] | None = [
+            round(float(value), 2) for value in os.getloadavg()
+        ]
+    except (OSError, AttributeError):  # pragma: no cover - не на всех ОС
+        load = None
+
+    if sys.platform.startswith("linux"):
+        ram_total, ram_free = _linux_ram()
+        ram_source = "proc_meminfo" if ram_total is not None else None
+    elif sys.platform == "darwin":
+        ram_total, ram_free = _darwin_ram()
+        ram_source = "vm_stat" if ram_free is not None else None
+    else:  # pragma: no cover - Windows/BSD
+        ram_total, ram_free, ram_source = None, None, None
+
+    try:
+        usage = shutil.disk_usage(str(ROOT))
+        disk: dict[str, int] | None = {
+            "total": int(usage.total),
+            "free": int(usage.free),
+            "used": int(usage.used),
+        }
+    except OSError:  # pragma: no cover - среда без диска
+        disk = None
+
+    memory = process_memory()
+    return {
+        "load": load,
+        "cpu_count": os.cpu_count(),
+        "ram": {"total": ram_total, "free": ram_free, "source": ram_source},
+        "disk": disk,
+        "process": {
+            "pid": os.getpid(),
+            "rss": memory["rss"],
+            "peak": memory["peak"],
+            "source": memory["source"],
+        },
+        "vtm_threads": {
+            "runtime": os.environ.get("VTM_THREADS") or None,
+            "config": os.environ.get("EVA_VTM_THREADS") or None,
+            "cpu_count": os.cpu_count(),
+        },
+        "platform": sys.platform,
+    }
+
+
+@dataclass(frozen=True)
+class VtmInspect:
+    """Что удалось прочитать в контейнере ``.vtm`` (только файл, без загрузки)."""
+
+    size_bytes: int
+    format_version: int
+    tensor_count: int
+    params: int | None
+    vocab: int | None
+    layers: int | None
+    context: int | None
+    kv_bytes: int | None
+    kv_in_file: bool | None
+    weights_bytes: int | None
+    bits_per_param: float | None
+    storage: str
+    source: str
+    meta: Mapping[str, Any] = field(default_factory=dict)
+
+
+def _tensor_elements(dims: Sequence[int]) -> int:
+    """Число элементов по ``dims`` (нули — «измерения кончились»)."""
+    total = 1
+    for dim in dims:
+        if int(dim) <= 0:
+            break
+        total *= int(dim)
+    return max(0, total)
+
+
+def _read_segment(handle: Any, data_start: int, offset: int) -> dict[str, Any] | None:
+    """Разобрать заголовок сегмента TRT1/INT8 и посчитать его размер в файле."""
+    if offset in (0, VTM_NO_OFFSET):
+        return None
+    try:
+        handle.seek(data_start + int(offset))
+        raw = handle.read(_VTM_SEGMENT.size)
+    except (OSError, ValueError):
+        return None
+    if len(raw) < _VTM_SEGMENT.size:
+        return None
+    magic, _version, flags, count, scales = _VTM_SEGMENT.unpack(raw)
+    if magic not in (b"TRT1", b"INT8"):
+        return None
+    scale_bytes = 4 if flags & 1 else 2
+    trit_storage: str | None = None
+    if magic == b"TRT1":
+        # Биты 1..2 flags: 0 packed20 (20 тритов в u32), 1 native (4 в u32).
+        trit_storage = "native" if (flags >> 1) & 0x3 else "packed20"
+        words = (count + 159) // 160 * 8
+        if trit_storage == "native":
+            words = (count + 3) // 4
+        payload = words * 4
+    else:
+        payload = int(count)
+    return {
+        "magic": magic.decode("ascii"),
+        "bytes": _VTM_SEGMENT.size + int(scales) * scale_bytes + payload,
+        "trit_storage": trit_storage,
+        "scale_bytes": scale_bytes,
+    }
+
+
+def _meta_int(meta: Mapping[str, Any], *keys: str) -> int | None:
+    """Первое целое по цепочке ключей; вложенные — через точку (``model.vocab``)."""
+    for key in keys:
+        value: Any = meta
+        for part in key.split("."):
+            if not isinstance(value, Mapping):
+                value = None
+                break
+            value = value.get(part)
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, int) and value > 0:
+            return int(value)
+        if isinstance(value, float) and value.is_integer() and value > 0:
+            return int(value)
+    return None
+
+
+def _vtm_source(meta: Mapping[str, Any], vocab: int | None) -> str:
+    """Источник модели по мете; без меты — эвристика (vocab 128 = демо)."""
+    if not meta:
+        if vocab == 128:
+            return "демо (vocab=128, метаданных нет)"
+        return "неизвестно (метаданных нет)"
+    base = meta.get("base_model")
+    names: list[str] = []
+    if isinstance(base, Mapping):
+        names = [
+            str(value)
+            for value in (base.get("name_or_path"), base.get("revision"), base.get("dir"))
+            if value
+        ]
+    if meta.get("revision"):
+        names.append(str(meta["revision"]))
+    if meta.get("checkpoint"):
+        names.append(str(meta["checkpoint"]))
+    joined = " ".join(names).lower()
+    if "qat" in joined or meta.get("step") is not None:
+        return "QAT-экспорт"
+    if isinstance(meta.get("kv_cache"), Mapping) or (
+        isinstance(base, Mapping) and base.get("dir") and not meta.get("checkpoint")
+    ):
+        return "холодный экспорт"
+    if vocab == 128:
+        return "демо (vocab=128)"
+    return "экспорт (источник в мете не указан)"
+
+
+def _vtm_storage(
+    meta: Mapping[str, Any],
+    embed_kind: int | None,
+    trit_storage: str | None,
+    weight_kinds: Mapping[int, int],
+) -> str:
+    """Тип хранения: чем лежат веса и эмбеддинг."""
+    parts: list[str] = []
+    weight_part: list[str] = []
+    if weight_kinds.get(0):
+        weight_part.append("trit" + (" ({})".format(trit_storage) if trit_storage else ""))
+    if weight_kinds.get(4):
+        weight_part.append("int8")
+    for kind in (2, 3):
+        if weight_kinds.get(kind):
+            weight_part.append(_VTM_KIND_NAMES[kind])
+    if not weight_part and weight_kinds.get(1):
+        weight_part.append("fp32")
+    if weight_part:
+        parts.append("веса: " + ", ".join(weight_part))
+    quant = meta.get("quantization")
+    scale_dtype = None
+    if isinstance(quant, Mapping):
+        scale_dtype = quant.get("scale_dtype")
+    if scale_dtype is None and isinstance(meta.get("model"), Mapping):
+        scale_dtype = meta["model"].get("scale_dtype")  # type: ignore[index]
+    if scale_dtype:
+        parts.append("масштабы: {}".format(scale_dtype))
+    if embed_kind is not None:
+        parts.append("эмбеддинг: {}".format(_VTM_KIND_NAMES.get(embed_kind, "?")))
+    return "; ".join(parts) if parts else "—"
+
+
+_VTM_CACHE: dict[str, tuple[int, int, "VtmInspect | None"]] = {}
+_VTM_CACHE_LOCK = threading.Lock()
+
+
+def inspect_vtm(path: str | os.PathLike[str]) -> VtmInspect | None:
+    """Прочитать карточку модели из контейнера ``.vtm`` — без загрузки в память.
+
+    Все числа берутся из самого файла: размер — ``stat``, параметры и KV-кэш —
+    сумма по таблице тензоров, контекст/словарь/слои — из JSON-метаданных
+    (если их нет — из формы тензоров). Файл не найден или это не VTM1 —
+    ``None``.
+
+    Разбор кэшируется по ``(путь, размер, mtime)``: у холодной модели 600
+    тензоров читаются ~0.1 с, а панель спрашивает карточки после каждого
+    ответа. Кэш не врёт: изменился файл — изменился mtime.
+    """
+    target = Path(path)
+    try:
+        stat = target.stat()
+    except OSError:
+        return None
+    if not target.is_file():
+        return None
+    key = os.path.abspath(str(target))
+    stamp = (int(stat.st_size), int(stat.st_mtime_ns))
+    with _VTM_CACHE_LOCK:
+        cached = _VTM_CACHE.get(key)
+    if cached is not None and cached[0] == stamp[0] and cached[1] == stamp[1]:
+        return cached[2]
+    info = _inspect_vtm_file(target, stat)
+    with _VTM_CACHE_LOCK:
+        _VTM_CACHE[key] = (stamp[0], stamp[1], info)
+    return info
+
+
+def _inspect_vtm_file(target: Path, stat: os.stat_result) -> VtmInspect | None:
+    try:
+        with open(target, "rb") as handle:
+            head = handle.read(_VTM_HEADER.size)
+            if len(head) < _VTM_HEADER.size:
+                return None
+            (
+                magic,
+                version,
+                _flags,
+                _n_instr,
+                n_tensors,
+                _n_program,
+                _program_offset,
+                meta_offset,
+                meta_len,
+            ) = _VTM_HEADER.unpack(head)
+            if magic != b"VTM1":
+                return None
+            if n_tensors < 0 or n_tensors > _VTM_MAX_TENSORS:
+                return None
+            table = handle.read(_VTM_TENSOR.size * n_tensors)
+            if len(table) < _VTM_TENSOR.size * n_tensors:
+                return None
+
+            meta: dict[str, Any] = {}
+            if 0 < meta_len <= _VTM_MAX_META_BYTES and meta_offset + meta_len <= stat.st_size:
+                try:
+                    handle.seek(meta_offset)
+                    parsed = json.loads(handle.read(meta_len).decode("utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    meta = parsed
+
+            data_start = _align32(_VTM_HEADER.size + _VTM_TENSOR.size * n_tensors)
+            params = 0
+            weights_bytes = 0
+            kv_bytes = 0
+            kv_in_file: bool | None = None
+            kv_context: int | None = None
+            embed_kind: int | None = None
+            embed_vocab: int | None = None
+            trit_storage: str | None = None
+            weight_kinds: dict[int, int] = {}
+            layer_ids: set[str] = set()
+
+            for index in range(n_tensors):
+                (
+                    raw_name,
+                    kind,
+                    _ndim,
+                    d0,
+                    d1,
+                    d2,
+                    d3,
+                    offset,
+                    _scale_offset,
+                    tensor_flags,
+                ) = _VTM_TENSOR.unpack_from(table, index * _VTM_TENSOR.size)
+                name = raw_name.split(b"\0", 1)[0].decode("utf-8", "replace")
+                dims = (d0, d1, d2, d3)
+                elements = _tensor_elements(dims)
+                if name.startswith("l") and "." in name:
+                    layer_ids.add(name.split(".", 1)[0])
+                if name == "emb.w":
+                    embed_kind = int(kind)
+                    embed_vocab = int(d0) if d0 else None
+                # KV-кэш: новые контейнеры помечают его флагом, старые — только
+                # именем (``l0.kcache``/``l0.vcache``); признак нужен оба.
+                is_kv = bool(tensor_flags & VTM_TENSOR_FLAG_KV_CACHE) or (
+                    name.endswith("kcache") or name.endswith("vcache")
+                )
+                if is_kv:
+                    per_element = _VTM_KIND_BYTES.get(int(kind))
+                    if per_element:
+                        kv_bytes += elements * per_element
+                    if kv_context is None and d0:
+                        kv_context = int(d0)
+                    in_file = offset not in (0, VTM_NO_OFFSET)
+                    kv_in_file = bool(kv_in_file or in_file) if kv_in_file is not None else in_file
+                    continue
+                weight = (
+                    int(kind) in (0, 4)
+                    or name.endswith(".w")
+                    or name.endswith("_bias")
+                )
+                if not weight:
+                    continue
+                weight_kinds[int(kind)] = weight_kinds.get(int(kind), 0) + 1
+                params += elements
+                if int(kind) in (0, 4):
+                    segment = _read_segment(handle, data_start, int(offset))
+                    if segment is not None:
+                        weights_bytes += int(segment["bytes"])
+                        if int(kind) == 0 and segment["trit_storage"] and trit_storage is None:
+                            trit_storage = str(segment["trit_storage"])
+                else:
+                    per_element = _VTM_KIND_BYTES.get(int(kind))
+                    if per_element:
+                        weights_bytes += elements * per_element
+    except (OSError, ValueError, struct.error):
+        return None
+
+    vocab = _meta_int(meta, "vocab_size", "model.vocab", "model.vocab_size") or embed_vocab
+    layers = _meta_int(meta, "n_layers", "model.n_layers")
+    if layers is None and layer_ids:
+        layers = len(layer_ids)
+    context = _meta_int(
+        meta, "context_len", "model.context_len", "kv_cache.context_len"
+    ) or kv_context
+    bits_per_param = (
+        round(weights_bytes * 8.0 / params, 2) if params and weights_bytes else None
+    )
+    return VtmInspect(
+        size_bytes=int(stat.st_size),
+        format_version=int(version),
+        tensor_count=int(n_tensors),
+        params=params or None,
+        vocab=vocab or None,
+        layers=layers,
+        context=context,
+        kv_bytes=kv_bytes or None,
+        kv_in_file=kv_in_file,
+        weights_bytes=weights_bytes or None,
+        bits_per_param=bits_per_param,
+        storage=_vtm_storage(meta, embed_kind, trit_storage, weight_kinds),
+        source=_vtm_source(meta, vocab),
+        meta=meta,
+    )
+
+
+def _model_card(
+    backend: BackendSpec,
+    model: ModelSpec,
+    *,
+    adapter: Any = None,
+    last: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Карточка модели для ``GET /api/models``: только числа, без абсолютных путей.
+
+    Для ``.vtm`` всё читается из файла (``inspect_vtm``); для Ollama диск и
+    параметры неизвестны (``None`` → «—»), зато после ответа появляются
+    ``size``/``size_vram`` из её ``/api/ps``.
+    """
+    card: dict[str, Any] = {
+        "backend": backend.id,
+        "backend_label": backend.label,
+        "model": model.id,
+        "label": model.label,
+        "kind": backend.kind,
+        "disk_bytes": None,
+        "params": None,
+        "vocab": None,
+        "layers": None,
+        "context": None,
+        "kv_bytes": None,
+        "kv_in_file": None,
+        "storage": None,
+        "source": None,
+        "bits_per_param": None,
+        "weights_bytes": None,
+        "tensors": None,
+        "format_version": None,
+        "present": None,
+        "loaded": None,
+        "load": None,
+        "cache_prefix": None,
+        "last": dict(last) if last else None,
+    }
+    if backend.kind == "vtm":
+        target = Path(model.target or model.id)
+        card["present"] = target.is_file()
+        info = inspect_vtm(target)
+        if info is not None:
+            card.update(
+                {
+                    "disk_bytes": info.size_bytes,
+                    "params": info.params,
+                    "vocab": info.vocab,
+                    "layers": info.layers,
+                    "context": info.context,
+                    "kv_bytes": info.kv_bytes,
+                    "kv_in_file": info.kv_in_file,
+                    "storage": info.storage,
+                    "source": info.source,
+                    "bits_per_param": info.bits_per_param,
+                    "weights_bytes": info.weights_bytes,
+                    "tensors": info.tensor_count,
+                    "format_version": info.format_version,
+                }
+            )
+        elif card["present"]:
+            # Файл есть, но это не VTM1: размер всё равно честный (stat),
+            # остальное неизвестно — в UI «—», а не выдуманный ноль.
+            try:
+                card["disk_bytes"] = int(target.stat().st_size)
+            except OSError:  # pragma: no cover - файл исчез между проверками
+                card["present"] = False
+    else:
+        card["present"] = True
+        card["source"] = "Ollama (метрики — из /api/ps)"
+
+    loaded = getattr(adapter, "loaded", None)
+    if isinstance(loaded, bool):
+        card["loaded"] = loaded
+    load_stats = getattr(adapter, "load_stats", None)
+    if isinstance(load_stats, Mapping):
+        card["load"] = dict(load_stats)
+    prefix = getattr(adapter, "cache_prefix", None)
+    if isinstance(prefix, bool):
+        card["cache_prefix"] = prefix
+    return card
+
+
+def _model_cards(server: "ChatHTTPServer") -> dict[str, Any]:
+    """Карточки всех моделей реестра; последние ответы — из памяти сервера."""
+    cards: list[dict[str, Any]] = []
+    for backend in server.registry:
+        for model in backend.models:
+            key = (backend.id, model.id)
+            cards.append(
+                _model_card(
+                    backend,
+                    model,
+                    adapter=server.adapters.get(key),
+                    last=server.last_answers.get(key),
+                )
+            )
+    return {"models": cards, "baseline": server.start_memory, "max_tokens": server.max_tokens}
+
+
+def _prompt_prefix(
+    server: "ChatHTTPServer", key: tuple[str, str], prompt_text: str
+) -> dict[str, Any]:
+    """Оценка попадания в кэш префикса ВТМ по общему началу промптов.
+
+    C-рантайм (``vtm_api_*``) не отдаёт счётчик попаданий, поэтому точного
+    числа нет: считаем длину общего префикса текущего и прошлого промпта.
+    Кэш переиспользует промпт прошлого запроса без последнего токена —
+    значит попадание возможно, когда прошлый промпт целиком входит в текущий.
+    Пометка ``estimated`` в ответе обязательна: это не измерение рантайма.
+    """
+    with server.state_lock:
+        previous = server.prompts.get(key)
+        shared = 0
+        if previous is not None:
+            limit = min(len(previous), len(prompt_text))
+            while shared < limit and previous[shared] == prompt_text[shared]:
+                shared += 1
+        server.prompts[key] = prompt_text
+    adapter = server.adapters.get(key)
+    enabled = getattr(adapter, "cache_prefix", None)
+    if not isinstance(enabled, bool):
+        return {
+            "enabled": None,
+            "hit": None,
+            "shared_chars": shared,
+            "previous_chars": len(previous) if previous is not None else None,
+            "estimated": True,
+        }
+    hit = None
+    if enabled and previous is not None:
+        hit = shared >= max(1, len(previous) - 1)
+    return {
+        "enabled": enabled,
+        "hit": hit,
+        "shared_chars": shared,
+        "previous_chars": len(previous) if previous is not None else None,
+        "estimated": True,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -510,13 +1322,26 @@ def _run_side(
     started: float,
     events: "queue.Queue[Any]",
     stop: threading.Event,
+    server: Any = None,
+    prompt_text: str = "",
 ) -> None:
     """Сгенерировать одну колонку и сложить события в очередь.
 
     Пишет в очередь только этот поток; HTTP-поток читает и отправляет SSE.
     Так две модели работают параллельно, а сокет не делят между потоками.
+
+    Здесь же снимаются метрики ответа (задача 0145): TTFT и он же prefill
+    (время до первого токена), декод = остаток, причина остановки, был ли
+    первый токен холодным (модель грузилась в этом запросе), попадание в кэш
+    префикса ВТМ и ``/api/ps`` для Ollama.
     """
     adapter = side["adapter"]
+    key = (side["backend"], side["model"])
+    loaded_before = getattr(adapter, "loaded", None)
+    cold = (not loaded_before) if isinstance(loaded_before, bool) else None
+    cache_prefix = None
+    if server is not None and getattr(adapter, "kind", "") == "vtm":
+        cache_prefix = _prompt_prefix(server, key, prompt_text)
     events.put(
         {
             "type": "start",
@@ -525,10 +1350,12 @@ def _run_side(
             "backend_label": side["backend_label"],
             "model": side["model"],
             "model_label": side["model_label"],
+            "cold": cold,
         }
     )
     first_token_ms: int | None = None
     usage: dict[str, Any] = {}
+    finish_reason = ""
     char_count = 0
     completed = False
     try:
@@ -547,6 +1374,7 @@ def _run_side(
                     events.put({"type": "delta", "side": index, "text": text})
                 if isinstance(piece, StreamPiece) and piece.done:
                     usage = dict(piece.usage or {})
+                    finish_reason = piece.finish_reason or finish_reason
                     break
             completed = True
         finally:
@@ -593,18 +1421,68 @@ def _run_side(
                 if completion_tokens > 0
                 else 0.0
             )
+            decode_speed = (
+                round(completion_tokens / (decode_ms / 1000.0), 2)
+                if completion_tokens > 1 and decode_ms > 0
+                else tokens_per_second
+            )
+            # Доля от времени ответа: prefill — до первого токена (вместе с
+            # загрузкой модели, если она была холодной), декод — после.
+            prefill_pct = (
+                round((first_token_ms or 0) * 100.0 / elapsed_ms, 1)
+                if first_token_ms is not None
+                else None
+            )
+            ollama_ps = None
+            probe = getattr(adapter, "probe_ps", None)
+            if callable(probe):
+                try:
+                    ollama_ps = probe(side["model"])
+                except Exception:  # noqa: BLE001 - чужой сервис не должен рвать ответ
+                    ollama_ps = None
+            load_stats = getattr(adapter, "load_stats", None)
+            if isinstance(cache_prefix, dict) and cache_prefix.get("enabled") is None:
+                # Первый ответ мог сам загрузить модель: настройка кэша стала
+                # известна только теперь — уточняем попадание, не выдумывая.
+                enabled_now = getattr(adapter, "cache_prefix", None)
+                if isinstance(enabled_now, bool):
+                    cache_prefix["enabled"] = enabled_now
+                    previous_chars = cache_prefix.get("previous_chars")
+                    if enabled_now and previous_chars:
+                        cache_prefix["hit"] = (
+                            cache_prefix.get("shared_chars", 0)
+                            >= max(1, int(previous_chars) - 1)
+                        )
+            metrics = {
+                "elapsed_ms": elapsed_ms,
+                "first_token_ms": first_token_ms,
+                "prefill_ms": first_token_ms,
+                "prefill_pct": prefill_pct,
+                "decode_ms": max(0, decode_ms),
+                "tokens_per_second": tokens_per_second,
+                "decode_tokens_per_second": decode_speed,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "estimated": estimated,
+                "finish_reason": finish_reason or None,
+                "first_token": (
+                    "холодный" if cold else "тёплый"
+                ) if cold is not None else None,
+                "cold": cold,
+                "cache_prefix": cache_prefix,
+                "load": dict(load_stats) if isinstance(load_stats, Mapping) else None,
+                "ollama": ollama_ps,
+            }
+            if server is not None:
+                with server.state_lock:
+                    server.last_answers[key] = dict(metrics)
             events.put(
                 {
                     "type": "done",
                     "side": index,
                     "backend": side["backend"],
                     "model": side["model"],
-                    "elapsed_ms": elapsed_ms,
-                    "first_token_ms": first_token_ms,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "tokens_per_second": tokens_per_second,
-                    "estimated": estimated,
+                    **metrics,
                 }
             )
     finally:
@@ -730,6 +1608,40 @@ PAGE_HTML = """<!doctype html>
     color: var(--danger); font-style: normal; white-space: pre-wrap;
   }
   .foot { padding: 0 14px 12px; color: var(--muted); font-size: 12px; }
+  .metrics {
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 16px; margin-top: 16px;
+  }
+  @media (max-width: 860px) { .metrics { grid-template-columns: 1fr; } }
+  .metric-col {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 12px 14px; box-shadow: var(--shadow);
+    min-width: 0;
+  }
+  .metric-col h2 {
+    margin: 0 0 8px; font-size: 12px; font-weight: 700; color: var(--muted);
+    letter-spacing: .04em; text-transform: uppercase;
+  }
+  .kv {
+    display: grid; grid-template-columns: auto minmax(0, 1fr);
+    gap: 2px 10px; margin: 0 0 10px; font-size: 12.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; overflow-wrap: anywhere; }
+  .kv .sub-head {
+    grid-column: 1 / -1; margin-top: 6px; color: var(--muted); font-weight: 700;
+  }
+  .sysrow {
+    grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px 18px;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 10px 14px; box-shadow: var(--shadow);
+    color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums;
+  }
+  .sysrow b { color: var(--text); font-weight: 650; }
+  .metric-note {
+    grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 11.5px;
+  }
   @media (prefers-reduced-motion: no-preference) {
     .panel { transition: border-color .15s ease; }
   }
@@ -783,6 +1695,85 @@ PAGE_HTML = """<!doctype html>
       <pre class="answer" id="answer-1" aria-live="polite"></pre>
       <div class="foot" id="foot-1"></div>
     </article>
+  </section>
+
+  <section class="metrics" id="metrics" aria-label="Метрики моделей и системы">
+    <article class="metric-col">
+      <h2>Модель · <span id="mc-title-0">—</span></h2>
+      <dl class="kv">
+        <dt>файл на диске</dt><dd id="mc-size-0">—</dd>
+        <dt>параметры</dt><dd id="mc-params-0">—</dd>
+        <dt>контекст</dt><dd id="mc-ctx-0">—</dd>
+        <dt>KV-кэш</dt><dd id="mc-kv-0">—</dd>
+        <dt>хранение</dt><dd id="mc-storage-0">—</dd>
+        <dt>источник</dt><dd id="mc-source-0">—</dd>
+        <dt>словарь</dt><dd id="mc-vocab-0">—</dd>
+        <dt>слоёв</dt><dd id="mc-layers-0">—</dd>
+        <dt>бит / параметр</dt><dd id="mc-bpp-0">—</dd>
+        <dt>RSS до → после</dt><dd id="mc-rss-0">—</dd>
+        <dt>пик RSS</dt><dd id="mc-peak-0">—</dd>
+        <dt>резидентная копия</dt><dd id="mc-ps-0">—</dd>
+      </dl>
+      <dl class="kv">
+        <dt class="sub-head">последний ответ</dt>
+        <dt>TTFT</dt><dd id="ma-ttft-0">—</dd>
+        <dt>prefill</dt><dd id="ma-prefill-0">—</dd>
+        <dt>декод</dt><dd id="ma-decode-0">—</dd>
+        <dt>ток/с декода</dt><dd id="ma-dtps-0">—</dd>
+        <dt>всего</dt><dd id="ma-total-0">—</dd>
+        <dt>prompt / completion</dt><dd id="ma-tokens-0">—</dd>
+        <dt>остановка</dt><dd id="ma-finish-0">—</dd>
+        <dt>первый токен</dt><dd id="ma-first-0">—</dd>
+        <dt>кэш префикса</dt><dd id="ma-cache-0">—</dd>
+      </dl>
+    </article>
+
+    <article class="metric-col">
+      <h2>Модель · <span id="mc-title-1">—</span></h2>
+      <dl class="kv">
+        <dt>файл на диске</dt><dd id="mc-size-1">—</dd>
+        <dt>параметры</dt><dd id="mc-params-1">—</dd>
+        <dt>контекст</dt><dd id="mc-ctx-1">—</dd>
+        <dt>KV-кэш</dt><dd id="mc-kv-1">—</dd>
+        <dt>хранение</dt><dd id="mc-storage-1">—</dd>
+        <dt>источник</dt><dd id="mc-source-1">—</dd>
+        <dt>словарь</dt><dd id="mc-vocab-1">—</dd>
+        <dt>слоёв</dt><dd id="mc-layers-1">—</dd>
+        <dt>бит / параметр</dt><dd id="mc-bpp-1">—</dd>
+        <dt>RSS до → после</dt><dd id="mc-rss-1">—</dd>
+        <dt>пик RSS</dt><dd id="mc-peak-1">—</dd>
+        <dt>резидентная копия</dt><dd id="mc-ps-1">—</dd>
+      </dl>
+      <dl class="kv">
+        <dt class="sub-head">последний ответ</dt>
+        <dt>TTFT</dt><dd id="ma-ttft-1">—</dd>
+        <dt>prefill</dt><dd id="ma-prefill-1">—</dd>
+        <dt>декод</dt><dd id="ma-decode-1">—</dd>
+        <dt>ток/с декода</dt><dd id="ma-dtps-1">—</dd>
+        <dt>всего</dt><dd id="ma-total-1">—</dd>
+        <dt>prompt / completion</dt><dd id="ma-tokens-1">—</dd>
+        <dt>остановка</dt><dd id="ma-finish-1">—</dd>
+        <dt>первый токен</dt><dd id="ma-first-1">—</dd>
+        <dt>кэш префикса</dt><dd id="ma-cache-1">—</dd>
+      </dl>
+    </article>
+
+    <p class="sysrow" id="sysrow">
+      <span>load: <b id="sys-load">—</b></span>
+      <span>RAM свободно: <b id="sys-ram">—</b></span>
+      <span>диск свободно: <b id="sys-disk">—</b></span>
+      <span>CPU запроса: <b id="sys-cpu">—</b></span>
+      <span>RSS процесса: <b id="sys-rss">—</b></span>
+      <span>пик RSS: <b id="sys-peak">—</b></span>
+      <span>VTM_THREADS: <b id="sys-threads">—</b></span>
+      <span>ядер: <b id="sys-cpus">—</b></span>
+    </p>
+    <p class="metric-note">Размер файла — stat; параметры и KV-кэш — сумма по таблице
+      тензоров .vtm; RSS — дельта процесса chat_server до и после загрузки
+      (модель живёт в этом процессе через ctypes); load/RAM/диск — система.
+      «—» значит «недоступно», а не ноль. Кэш префикса ВТМ — оценка по общему
+      префиксу промпта: счётчик попаданий C-рантайм не отдаёт. «Резидентная
+      копия» — size/size_vram из /api/ps локальной Ollama.</p>
   </section>
 </main>
 <script>
@@ -858,6 +1849,10 @@ PAGE_HTML = """<!doctype html>
       byId("speed-" + side).textContent = "—";
       byId("tokens-" + side).textContent = "—";
       byId("foot-" + side).textContent = "";
+      ["ttft", "prefill", "decode", "dtps", "total", "tokens", "finish",
+       "first", "cache"].forEach(function (name) {
+        setText("ma-" + name + "-" + side, "—");
+      });
     });
   }
 
@@ -870,6 +1865,204 @@ PAGE_HTML = """<!doctype html>
   function formatSeconds(ms) {
     if (typeof ms !== "number" || ms < 0) { return "—"; }
     return (ms / 1000).toFixed(2) + " с";
+  }
+
+  function fmtBytes(value) {
+    if (typeof value !== "number" || !isFinite(value) || value < 0) { return "—"; }
+    var units = ["Б", "КиБ", "МиБ", "ГиБ", "ТиБ"];
+    var index = 0;
+    var size = value;
+    while (size >= 1024 && index < units.length - 1) {
+      size /= 1024;
+      index += 1;
+    }
+    return (index === 0 ? size.toFixed(0) : size.toFixed(1)) + " " + units[index];
+  }
+
+  function fmtSignedBytes(value) {
+    if (typeof value !== "number" || !isFinite(value)) { return "—"; }
+    return (value >= 0 ? "+" : "−") + fmtBytes(Math.abs(value));
+  }
+
+  function fmtNum(value) {
+    if (typeof value !== "number" || !isFinite(value)) { return "—"; }
+    return value.toLocaleString("ru-RU");
+  }
+
+  function fmtMs(value) {
+    if (typeof value !== "number" || !isFinite(value) || value < 0) { return "—"; }
+    if (value < 1000) { return value.toFixed(0) + " мс"; }
+    return (value / 1000).toFixed(2) + " с";
+  }
+
+  function fmtFreeOf(free, total) {
+    if (typeof free !== "number" && typeof total !== "number") { return "—"; }
+    return fmtBytes(free) + " из " + fmtBytes(total);
+  }
+
+  function setText(id, text) {
+    var node = byId(id);
+    if (node) { node.textContent = text; }
+  }
+
+  function finishText(reason) {
+    if (reason === "stop" || reason === "eos") { return "EOS"; }
+    if (reason === "length") { return "лимит токенов"; }
+    return "—";
+  }
+
+  function cacheText(info) {
+    if (!info) { return "—"; }
+    if (info.enabled === false) { return "выключен"; }
+    if (info.enabled === null || info.enabled === undefined) { return "—"; }
+    var shared = fmtNum(info.shared_chars) + " симв.";
+    if (info.hit === true) { return "да · общий префикс " + shared + " (оценка)"; }
+    if (info.hit === false) { return "нет · общий префикс " + shared + " (оценка)"; }
+    return "включён, попадание неизвестно";
+  }
+
+  function fillSideMetrics(side, event) {
+    setText("ma-ttft-" + side, fmtMs(event.first_token_ms));
+    var prefill = fmtMs(event.prefill_ms);
+    if (prefill !== "—" && typeof event.prefill_pct === "number") {
+      prefill += " · " + event.prefill_pct.toFixed(1) + "%";
+    }
+    setText("ma-prefill-" + side, prefill);
+    setText("ma-decode-" + side, fmtMs(event.decode_ms));
+    setText("ma-dtps-" + side, fmtNum(event.decode_tokens_per_second));
+    setText("ma-total-" + side, fmtMs(event.elapsed_ms));
+    setText(
+      "ma-tokens-" + side,
+      fmtNum(event.prompt_tokens) + " / " + fmtNum(event.completion_tokens) +
+        (event.estimated ? "*" : "")
+    );
+    setText("ma-finish-" + side, finishText(event.finish_reason));
+    setText("ma-first-" + side, event.first_token || "—");
+    setText("ma-cache-" + side, cacheText(event.cache_prefix));
+  }
+
+  function fillCard(index, card) {
+    var names = ["size", "params", "ctx", "kv", "storage", "source", "vocab",
+                 "layers", "bpp", "rss", "peak", "ps"];
+    if (!card) {
+      setText("mc-title-" + index, "—");
+      names.forEach(function (name) { setText("mc-" + name + "-" + index, "—"); });
+      return;
+    }
+    setText("mc-title-" + index, card.label || card.model || "—");
+    setText("mc-size-" + index, fmtBytes(card.disk_bytes));
+    setText("mc-params-" + index, fmtNum(card.params));
+    setText("mc-ctx-" + index,
+      typeof card.context === "number" ? fmtNum(card.context) + " ток." : "—");
+    setText("mc-kv-" + index, fmtBytes(card.kv_bytes));
+    setText("mc-storage-" + index, card.storage || "—");
+    setText("mc-source-" + index, card.source || "—");
+    setText("mc-vocab-" + index, fmtNum(card.vocab));
+    setText("mc-layers-" + index, fmtNum(card.layers));
+    setText("mc-bpp-" + index,
+      typeof card.bits_per_param === "number"
+        ? card.bits_per_param.toFixed(2) + " бит" : "—");
+    var load = card.load || {};
+    var rss = "—";
+    if (typeof load.rss_before === "number" || typeof load.rss_after === "number") {
+      rss = fmtBytes(load.rss_before) + " → " + fmtBytes(load.rss_after);
+      if (typeof load.rss_delta === "number") {
+        rss += " (" + fmtSignedBytes(load.rss_delta) + ")";
+      }
+    }
+    setText("mc-rss-" + index, rss);
+    setText("mc-peak-" + index, fmtBytes(load.peak));
+    // Резидентная копия у Ollama — из её /api/ps; у ВТМ такого источника нет
+    // (модель в этом процессе, её память — строка RSS выше).
+    var ps = card.last && card.last.ollama;
+    var psText = "—";
+    if (ps && typeof ps.size === "number") {
+      psText = fmtBytes(ps.size);
+      if (typeof ps.size_vram === "number") {
+        psText += " · VRAM " + fmtBytes(ps.size_vram);
+      }
+    }
+    setText("mc-ps-" + index, psText);
+    if (card.last) { fillSideMetrics(index, card.last); }
+  }
+
+  function fillSystem(snapshot) {
+    if (!snapshot) { return; }
+    var load = snapshot.load;
+    setText("sys-load", Array.isArray(load)
+      ? load.map(function (value) { return value.toFixed(2); }).join(" / ")
+      : "—");
+    var ram = snapshot.ram || {};
+    setText("sys-ram", fmtFreeOf(ram.free, ram.total));
+    var disk = snapshot.disk || {};
+    setText("sys-disk", fmtFreeOf(disk.free, disk.total));
+    var process = snapshot.process || {};
+    setText("sys-rss", fmtBytes(process.rss));
+    setText("sys-peak", fmtBytes(process.peak));
+    setThreads(snapshot.vtm_threads);
+    setText("sys-cpus", fmtNum(snapshot.cpu_count));
+  }
+
+  function setThreads(info) {
+    if (!info) { setText("sys-threads", "—"); return; }
+    if (info.runtime) { setText("sys-threads", info.runtime); return; }
+    if (info.config) { setText("sys-threads", info.config + " (конфиг)"); return; }
+    setText("sys-threads", "по умолчанию");
+  }
+
+  function fillEndMetrics(metrics) {
+    if (!metrics) { return; }
+    var cpu = "—";
+    if (typeof metrics.cpu_ms === "number") {
+      cpu = fmtMs(metrics.cpu_ms);
+      if (typeof metrics.cpu_cores === "number") {
+        cpu += " · " + metrics.cpu_cores.toFixed(2) + " ядра";
+      }
+    }
+    setText("sys-cpu", cpu);
+    var process = metrics.process || {};
+    setText("sys-rss", fmtBytes(process.rss));
+    setText("sys-peak", fmtBytes(process.peak));
+    var load = metrics.load;
+    setText("sys-load", Array.isArray(load)
+      ? load.map(function (value) { return value.toFixed(2); }).join(" / ")
+      : "—");
+    var ram = metrics.ram || {};
+    setText("sys-ram", fmtFreeOf(ram.free, ram.total));
+    var disk = metrics.disk || {};
+    setText("sys-disk", fmtFreeOf(disk.free, disk.total));
+    setThreads(metrics.vtm_threads);
+  }
+
+  async function refreshModels() {
+    try {
+      var response = await fetch("/api/models",
+        { headers: { "Accept": "application/json" } });
+      if (!response.ok) { return; }
+      var data = await response.json();
+      var models = Array.isArray(data.models) ? data.models : [];
+      [0, 1].forEach(function (side) {
+        var backendId = byId("backend-" + side).value;
+        var modelId = byId("model-" + side).value;
+        var card = null;
+        for (var i = 0; i < models.length; i += 1) {
+          if (models[i].backend === backendId && models[i].model === modelId) {
+            card = models[i];
+            break;
+          }
+        }
+        fillCard(side, card);
+      });
+    } catch (err) { /* панель метрик не критична для чата */ }
+  }
+
+  async function refreshSystem() {
+    try {
+      var response = await fetch("/api/system",
+        { headers: { "Accept": "application/json" } });
+      if (!response.ok) { return; }
+      fillSystem(await response.json());
+    } catch (err) { /* панель метрик не критична для чата */ }
   }
 
   function appendText(side, text) {
@@ -893,6 +2086,11 @@ PAGE_HTML = """<!doctype html>
   }
 
   function handleEvent(event) {
+    if (event.type === "end") {
+      fillEndMetrics(event.metrics);
+      refreshModels();
+      return;
+    }
     var side = event.side;
     if (side !== 0 && side !== 1) { return; }
     if (event.type === "start") {
@@ -918,6 +2116,7 @@ PAGE_HTML = """<!doctype html>
       details.push("промпт " + (event.prompt_tokens || 0) + " ток.");
       if (event.estimated) { details.push("* токены оценены по тексту"); }
       byId("foot-" + side).textContent = details.join(" · ");
+      fillSideMetrics(side, event);
       finishedSides += 1;
       if (finishedSides >= 2) { setStatus("готово", false); }
     } else if (event.type === "error") {
@@ -1042,6 +2241,7 @@ PAGE_HTML = """<!doctype html>
       if (!catalog.length) {
         setStatus("на сервере нет доступных моделей", true);
       }
+      refreshModels();
     } catch (err) {
       setStatus("не удалось загрузить список моделей: " + err.message, true);
     }
@@ -1057,10 +2257,15 @@ PAGE_HTML = """<!doctype html>
   [0, 1].forEach(function (side) {
     byId("backend-" + side).addEventListener("change", function () {
       fillModels(side, null);
+      refreshModels();
+    });
+    byId("model-" + side).addEventListener("change", function () {
+      refreshModels();
     });
   });
 
   loadCatalog();
+  refreshSystem();
 })();
 </script>
 </body>
@@ -1103,6 +2308,12 @@ class ChatHTTPServer(ThreadingHTTPServer):
         self.adapters = dict(adapters)
         self.system_prompt = system_prompt
         self.max_tokens = max(1, int(max_tokens))
+        # Метрики (задача 0145): память на старте, последние ответы по моделям
+        # и промпты — для оценки кэша префикса. Всё под одним замком.
+        self.state_lock = threading.Lock()
+        self.start_memory: dict[str, Any] = process_memory()
+        self.last_answers: dict[tuple[str, str], dict[str, Any]] = {}
+        self.prompts: dict[tuple[str, str], str] = {}
         super().__init__(server_address, ChatRequestHandler)
 
 
@@ -1128,6 +2339,10 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                         self.server.registry, max_tokens=self.server.max_tokens
                     ),
                 )
+            elif path == "/api/models":
+                self._send_json(200, _model_cards(self.server))
+            elif path == "/api/system":
+                self._send_json(200, system_snapshot())
             elif path == "/health":
                 self._send_json(200, {"status": "ok"})
             elif path == "/favicon.ico":
@@ -1340,11 +2555,29 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         events: "queue.Queue[Any]" = queue.Queue()
         stop = threading.Event()
         started = time.monotonic()
+        # CPU-время процесса на запрос: ``process_time`` считает все потоки
+        # этого процесса, поэтому снимаем его вокруг всего запроса, а не
+        # внутри колонки (две колонки идут параллельно).
+        cpu_started = time.process_time()
+        prompt_text = "\n".join(
+            "{}: {}".format(message.get("role", ""), message.get("content", ""))
+            for message in messages
+        )
         threads: list[threading.Thread] = []
         for index, side in enumerate(sides):
             thread = threading.Thread(
                 target=_run_side,
-                args=(index, side, messages, max_tokens, started, events, stop),
+                args=(
+                    index,
+                    side,
+                    messages,
+                    max_tokens,
+                    started,
+                    events,
+                    stop,
+                    self.server,
+                    prompt_text,
+                ),
                 name="chat-side-{}".format(index),
                 daemon=True,
             )
@@ -1365,7 +2598,35 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                     stop.set()
                     break
             else:
-                if not self._send_sse_data({"type": "end"}):
+                wall_ms = max(1, int((time.monotonic() - started) * 1000))
+                cpu_ms = round((time.process_time() - cpu_started) * 1000.0, 1)
+                try:
+                    snapshot = system_snapshot()
+                except Exception:  # noqa: BLE001 - метрики не должны рвать ответ
+                    logger.exception("снимок системы не снялся")
+                    snapshot = {
+                        "load": None,
+                        "ram": {"total": None, "free": None, "source": None},
+                        "disk": None,
+                        "cpu_count": os.cpu_count(),
+                        "process": {"pid": os.getpid(), "rss": None, "peak": None},
+                        "vtm_threads": {"runtime": None, "config": None},
+                    }
+                metrics = {
+                    "wall_ms": wall_ms,
+                    "cpu_ms": cpu_ms,
+                    # Сколько ядер было занято процессом за время запроса:
+                    # 1.0 — одно ядро целиком, 2.0 — два (две колонки).
+                    "cpu_cores": round(cpu_ms / wall_ms, 2) if wall_ms else None,
+                    "load": snapshot["load"],
+                    "ram": snapshot["ram"],
+                    "disk": snapshot["disk"],
+                    "cpu_count": snapshot["cpu_count"],
+                    "process": snapshot["process"],
+                    "vtm_threads": snapshot["vtm_threads"],
+                    "start_memory": self.server.start_memory,
+                }
+                if not self._send_sse_data({"type": "end", "metrics": metrics}):
                     stop.set()
                 else:
                     self._send_sse_done()
