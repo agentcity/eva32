@@ -1101,7 +1101,7 @@
   {
     "id": "0166",
     "title": "Загрузка/выгрузка модели в память и статус",
-    "status": "in_progress",
+    "status": "done",
     "file": "0166-chat-load-unload.md",
     "assignee": "agent:chat-load"
   },

@@ -23,6 +23,11 @@ Qwen одновременно, с временем и скоростью. Скр
   RSS-дельта, причина остановки, кэш префикса), ``end`` (CPU-время запроса и
   снимок системы), ``error`` (человеческий текст). Терминальное событие —
   ``data: [DONE]``, как у ``eva/server.py``;
+* ``POST /api/load`` / ``POST /api/unload`` — явная загрузка/выгрузка
+  ВТМ-модели (задача 0166). Тело — ``{"backend": "vtm", "model": "<id>"}``,
+  неизвестная модель — 400, чужой бэкенд (Ollama) — 400: её памятью
+  управляет её процесс. Ответ несёт ``loaded``, ``rss_bytes`` (дельта RSS
+  процесса до/после; 0 после выгрузки), ``load_ms``, ``requests``;
 * ``GET /favicon.ico`` — 204, чтобы браузер не шумел 404.
 
 Числа панели либо сняты у источника (``stat``, ``/proc``, ``vm_stat``,
@@ -61,6 +66,13 @@ HTTP-слой знает только про ``backend``/``model`` из реес
     python3 tools/chat_server.py --port 8765 \\
         --ollama-model qwen2.5:7b --ollama-model qwen3:8b
 
+Модель можно держать в памяти и выгружать по бездействию (как ``keep_alive``
+у Ollama, только наше решение)::
+
+    python3 tools/chat_server.py --port 8765 --keep-alive 300
+
+``0`` — держать всегда, без флага автовыгрузка выключена (по умолчанию).
+
 Только стандартная библиотека; бэкенды берутся из ``tools/chat.py`` (внутри —
 ``eva``), их файлы не меняются.
 """
@@ -70,6 +82,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+import gc
 import json
 import pathlib
 import logging
@@ -99,6 +112,7 @@ __all__ = [
     "DEFAULT_MAX_TOKENS",
     "DEFAULT_PORT",
     "HOST",
+    "ModelBusy",
     "ModelSpec",
     "OLLAMA_BASE",
     "ChatCliAdapter",
@@ -209,6 +223,10 @@ class StreamPiece:
     done: bool = False
     usage: dict[str, Any] = field(default_factory=dict)
     finish_reason: str = ""
+    #: Сколько длилась загрузка модели именно в этом запросе (``None`` —
+    #: модель уже была в памяти). Нужна, чтобы честно вычесть загрузку из
+    #: TTFT: метрика адаптера общая и могла быть перезаписана другим запросом.
+    load_ms: float | None = None
 
 
 def _resolve_tokenizer(model_path: Path, explicit: str | None = None) -> str:
@@ -301,6 +319,78 @@ def _build_vtm_specs(vtm_tokenizer: str | None) -> list[ModelSpec]:
 # --------------------------------------------------------------------------- #
 
 
+class ModelBusy(RuntimeError):
+    """Модель занята генерацией: выгрузку сейчас делать нельзя (409)."""
+
+
+def _open_backend(backend: Any, depth: int = 0) -> bool:
+    """Раскрыть бэкенд, чтобы модель оказалась в памяти (не только в объекте).
+
+    ``VtmChatBackend`` из ``tools/chat.py`` не имеет ``open()``: веса читает
+    ``VtmBackend.open()`` у вложенного ``_inner``. Идём по цепочке, но не
+    глубже двух уровней — чужой объект с методом ``open`` (файл, сокет) здесь
+    не ожидается, а случайно дёргать его нельзя. ``False`` — загружать нечего
+    (HTTP-клиент Ollama, заглушка в тестах); это не ошибка.
+    """
+    opener = getattr(backend, "open", None)
+    if callable(opener):
+        opener()
+        return True
+    if depth >= 2:
+        return False
+    nested = getattr(backend, "_inner", None)
+    if nested is not None and nested is not backend:
+        return _open_backend(nested, depth + 1)
+    return False
+
+
+def _warm_backend(backend: Any) -> bool:
+    """Прогреть модель одним коротким forward-проходом.
+
+    ``VtmBackend.open()`` только отображает файл (mmap) и разбирает
+    заголовки/таблицу тензоров: страницы весов остаются на диске, и первый
+    запрос всё равно платит за них — ровно то, от чего уходим. Один шаг
+    генерации проходит через все слои, поэтому после него TTFT запроса — это
+    генерация, а не чтение 2,24 ГиБ. Ошибку прогрева не считаем фатальной:
+    модель загружена, а запрос покажет ту же ошибку человеческим текстом.
+    """
+    stream = getattr(backend, "stream", None)
+    if not callable(stream):
+        return False
+    try:
+        for _piece in stream(
+            [{"role": "user", "content": "а"}], max_tokens=1
+        ):
+            pass
+    except Exception as exc:  # noqa: BLE001 - прогрев не должен ломать загрузку
+        logger.warning("прогрев модели не удался: %s", exc)
+        return False
+    return True
+
+
+def _close_backend(backend: Any) -> None:
+    """Закрыть бэкенд и его вложенный контекст; ошибки — в лог, не наружу.
+
+    Сначала вложенный (``VtmBackend`` держит C-контекст и память весов),
+    потом внешний. Двойное закрытие безопасно: ``VtmBackend.close()``
+    идемпотентен, а базовая ``ChatBackend.close()`` ничего не делает.
+    """
+    nested = getattr(backend, "_inner", None)
+    targets = (
+        [nested, backend]
+        if nested is not None and nested is not backend
+        else [backend]
+    )
+    for target in targets:
+        closer = getattr(target, "close", None)
+        if not callable(closer):
+            continue
+        try:
+            closer()
+        except Exception as exc:  # noqa: BLE001 - память важнее исключения
+            logger.warning("закрытие бэкенда %r: %s", target, exc)
+
+
 class ChatCliAdapter:
     """Адаптер к бэкенду из ``tools/chat.py`` (общая библиотека чата).
 
@@ -316,6 +406,14 @@ class ChatCliAdapter:
     вызова фабрики. Для ВТМ это честная дельта — модель живёт в этом процессе
     через ``ctypes``. ``probe_ps`` — только для Ollama: её процесс чужой,
     поэтому размер резидентной копии спрашивают у ``GET /api/ps``.
+
+    Задача 0166: модель можно загрузить заранее (:meth:`load`) и выгрузить
+    (:meth:`unload`). ``load`` собирает бэкенд, зовёт ``open()`` у
+    ``VtmBackend`` (C-контекст и ``mmap`` файла) и прогревает модель одним
+    токеном: только после forward-прохода страницы весов реально резидентны,
+    поэтому TTFT последующих запросов уже не содержит загрузку. Выгрузка
+    зовёт ``close()``, отпускает объект и собирает мусор: следующий запрос
+    снова загрузит модель лениво, как раньше.
     """
 
     def __init__(
@@ -333,6 +431,13 @@ class ChatCliAdapter:
         self._inner: Any = None
         #: Замер загрузки: RSS до/после, дельта, пик процесса и время сборки.
         self.load_stats: dict[str, Any] | None = None
+        #: Замер выгрузки: RSS до/после и сколько вернулось системе.
+        self.unload_stats: dict[str, Any] | None = None
+        #: Сколько запросов обслужено (успешных генераций, с ``done``).
+        self.requests = 0
+        #: ``time.monotonic()`` последней активности (загрузка или ответ) —
+        #: по нему ``--keep-alive`` решает, что модель простаивает.
+        self._last_used: float | None = None
         # RLock: ``stream`` держит замок на всё время генерации и зовёт
         # ``_ensure``, которому нужен тот же замок.
         self._lock = threading.RLock()
@@ -348,6 +453,112 @@ class ChatCliAdapter:
         flag = getattr(self._inner, "cache_prefix", None)
         return flag if isinstance(flag, bool) else None
 
+    # -- статус, загрузка, выгрузка ----------------------------------------
+
+    def status(self) -> dict[str, Any]:
+        """Состояние модели для карточки и ответов ``/api/load|unload``.
+
+        ``rss_bytes`` — реальная дельта RSS процесса от загрузки (для ВТМ
+        модель живёт здесь же); у выгруженной — 0, у Ollama — ``None``:
+        её память в чужом процессе, этот процесс о ней не знает.
+        """
+        loaded = self.loaded
+        stats = self.load_stats if isinstance(self.load_stats, Mapping) else None
+        rss_bytes: int | None = None
+        load_ms: int | float | None = None
+        if self.kind == "vtm":
+            if loaded and stats is not None:
+                rss_bytes = stats.get("rss_delta")
+                load_ms = stats.get("load_ms")
+            elif not loaded and self.unload_stats is not None:
+                rss_bytes = 0
+        return {
+            "loaded": loaded,
+            "rss_bytes": rss_bytes,
+            "load_ms": load_ms,
+            "requests": int(self.requests),
+            "load": dict(stats) if stats is not None else None,
+            "unload": (
+                dict(self.unload_stats)
+                if isinstance(self.unload_stats, Mapping)
+                else None
+            ),
+        }
+
+    def idle_seconds(self, now: float | None = None) -> float | None:
+        """Сколько секунд модель бездействует; ``None`` — не загружена."""
+        if not self.loaded:
+            return None
+        last = self._last_used
+        if last is None:  # pragma: no cover - выставляется при загрузке
+            return None
+        moment = time.monotonic() if now is None else float(now)
+        return max(0.0, moment - last)
+
+    def load(self) -> dict[str, Any]:
+        """Загрузить модель в память сейчас, не дожидаясь запроса.
+
+        Идемпотентно: у загруженной модели возвращается ``already_loaded``
+        и прежние числа, фабрика повторно не зовётся.
+        """
+        with self._lock:
+            already = self._inner is not None
+            self._ensure()
+            self._last_used = time.monotonic()
+            report = self.status()
+        report["already_loaded"] = already
+        return report
+
+    def unload(self, *, timeout: float = 0.0) -> dict[str, Any]:
+        """Выгрузить модель: закрыть контекст, отпустить память.
+
+        ``timeout=0`` — не ждать генерацию: если модель занята, поднимается
+        :class:`ModelBusy` (HTTP-слой отдаст 409). Идемпотентно: у выгруженной
+        модели ``was_loaded`` = false.
+        """
+        if timeout > 0:
+            acquired = self._lock.acquire(timeout=float(timeout))
+        else:
+            acquired = self._lock.acquire(blocking=False)
+        if not acquired:
+            raise ModelBusy(
+                "модель занята (идёт загрузка или генерация) — выгрузка не начата"
+            )
+        try:
+            inner = self._inner
+            if inner is None:
+                report = self.status()
+                report["was_loaded"] = False
+                report["freed_bytes"] = 0
+                report["unload_ms"] = 0.0
+                return report
+            before = _rss_bytes()
+            started = time.monotonic()
+            # Сначала отпускаем ссылку, потом закрываем: даже если close()
+            # бросит, адаптер не останется с «загруженной» мёртвой моделью.
+            self._inner = None
+            _close_backend(inner)
+            gc.collect()
+            after = _rss_bytes()
+            freed = (
+                before - after
+                if before is not None and after is not None
+                else None
+            )
+            self.unload_stats = {
+                "rss_before": before,
+                "rss_after": after,
+                "freed_bytes": freed,
+                "unload_ms": round((time.monotonic() - started) * 1000.0, 1),
+            }
+            report = self.status()
+            report["was_loaded"] = True
+            report["freed_bytes"] = freed
+            report["unload_ms"] = self.unload_stats["unload_ms"]
+        finally:
+            self._lock.release()
+        return report
+
     def _ensure(self) -> Any:
         if self._inner is None:
             with self._lock:
@@ -355,7 +566,16 @@ class ChatCliAdapter:
                     before = _rss_bytes()
                     started = time.monotonic()
                     inner = self._factory()
-                    self._inner = inner
+                    try:
+                        opened = _open_backend(inner)
+                        # mmap мало: чтобы «загружено» означало «веса уже в
+                        # памяти», прогоняем один токен через все слои.
+                        warmed = bool(opened and self.kind == "vtm") and _warm_backend(
+                            inner
+                        )
+                    except BaseException:
+                        _close_backend(inner)
+                        raise
                     after = _rss_bytes()
                     self.load_stats = {
                         "rss_before": before,
@@ -367,13 +587,21 @@ class ChatCliAdapter:
                         ),
                         "peak": _peak_rss_bytes(),
                         "load_ms": round((time.monotonic() - started) * 1000.0, 1),
+                        # open() раскрыл контекст сразу; false — бэкенд без
+                        # явной загрузки (HTTP-клиент, заглушка в тестах).
+                        "opened": opened,
+                        "warmed": warmed,
                     }
+                    self.unload_stats = None
+                    self._inner = inner
+                    self._last_used = time.monotonic()
         return self._inner
 
     def stream(
         self, messages: Sequence[Mapping[str, str]], *, max_tokens: int
     ) -> Iterator[StreamPiece]:
         with self._lock:
+            loaded_before = self._inner is not None
             inner = self._ensure()
             terminal = False
             iterator = inner.stream(list(messages), max_tokens=max_tokens)
@@ -385,16 +613,31 @@ class ChatCliAdapter:
                     if getattr(event, "done", False):
                         usage = getattr(event, "usage", {}) or {}
                         terminal = True
+                        # Счётчик обслуженных запросов: генератор закрывают
+                        # сразу после терминального куска, поэтому считать
+                        # его после цикла уже поздно.
+                        self.requests += 1
+                        stats_now = (
+                            self.load_stats
+                            if not loaded_before and isinstance(self.load_stats, Mapping)
+                            else None
+                        )
                         yield StreamPiece(
                             done=True,
                             usage=dict(usage),
                             finish_reason=str(getattr(event, "finish_reason", "") or ""),
+                            load_ms=(
+                                stats_now.get("load_ms")
+                                if isinstance(stats_now, Mapping)
+                                else None
+                            ),
                         )
                         break
             finally:
                 closer = getattr(iterator, "close", None)
                 if callable(closer):
                     closer()
+                self._last_used = time.monotonic()
             if not terminal:
                 raise RuntimeError(
                     "бэкенд завершил поток без терминального события"
@@ -1084,6 +1327,11 @@ def _model_card(
         "present": None,
         "loaded": None,
         "load": None,
+        "unload": None,
+        # Задача 0166: статус памяти одной строкой на карточку.
+        "rss_bytes": None,
+        "load_ms": None,
+        "requests": None,
         "cache_prefix": None,
         "last": dict(last) if last else None,
     }
@@ -1126,6 +1374,19 @@ def _model_card(
     load_stats = getattr(adapter, "load_stats", None)
     if isinstance(load_stats, Mapping):
         card["load"] = dict(load_stats)
+    status_of = getattr(adapter, "status", None)
+    if callable(status_of):
+        try:
+            status = status_of()
+        except Exception:  # noqa: BLE001 - карточка не должна падать из-за метрик
+            logger.exception("статус адаптера не снялся")
+            status = None
+        if isinstance(status, Mapping):
+            if isinstance(status.get("loaded"), bool):
+                card["loaded"] = status["loaded"]
+            for name in ("rss_bytes", "load_ms", "requests", "load", "unload"):
+                if name in status:
+                    card[name] = status[name]
     prefix = getattr(adapter, "cache_prefix", None)
     if isinstance(prefix, bool):
         card["cache_prefix"] = prefix
@@ -1181,7 +1442,13 @@ def _model_cards(server: "ChatHTTPServer") -> dict[str, Any]:
                     last=server.last_answers.get(key),
                 )
             )
-    return {"models": cards, "baseline": server.start_memory, "max_tokens": server.max_tokens}
+    return {
+        "models": cards,
+        "baseline": server.start_memory,
+        "max_tokens": server.max_tokens,
+        # Политика автовыгрузки: null — выключена, 0 — держать всегда.
+        "keep_alive": getattr(server, "keep_alive", None),
+    }
 
 
 def _prompt_prefix(
@@ -1381,6 +1648,62 @@ def _validate_payload(
     return question, use_system, max_tokens, sides
 
 
+def _validate_model_target(
+    server: "ChatHTTPServer", payload: Any
+) -> tuple[BackendSpec, ModelSpec, Any]:
+    """Проверить тело ``/api/load|unload``: ``(бэкенд, модель, адаптер)``.
+
+    Клиент называет только ``backend``/``model`` из закрытого реестра:
+    произвольного пути или URL здесь быть не может. Неизвестная модель —
+    400 (как и неизвестный бэкенд). Ollama — 400 с отдельным кодом: её
+    памятью управляет её собственный процесс, кнопки грузят только ВТМ.
+    """
+    if not isinstance(payload, Mapping):
+        raise ClientError("Тело запроса должно быть JSON-объектом.")
+    backend_id = payload.get("backend", "vtm")
+    if not isinstance(backend_id, str) or not backend_id.strip():
+        raise ClientError("Поле backend: ожидалась строка (например, vtm).")
+    model_id = payload.get("model")
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise ClientError(
+            "Поле model: нужен id модели из реестра (например, "
+            "runs/q4/3b-q4_1.vtm)."
+        )
+    registry = _refresh_registry(server)
+    catalog = {backend.id: backend for backend in registry}
+    backend = catalog.get(backend_id)
+    if backend is None:
+        raise ClientError(
+            "Неизвестный бэкенд {!r}; разрешены: {}.".format(
+                backend_id, ", ".join(sorted(catalog)) or "нет"
+            )
+        )
+    allowed = {model.id: model for model in backend.models}
+    model = allowed.get(model_id)
+    if model is None:
+        raise ClientError(
+            "Неизвестная модель {!r} для бэкенда {}; разрешены: {}.".format(
+                model_id, backend_id, ", ".join(sorted(allowed)) or "нет"
+            )
+        )
+    if backend.kind != "vtm":
+        raise ClientError(
+            "Загрузка и выгрузка есть только у ВТМ: памятью Ollama управляет "
+            "её собственный процесс (см. keep_alive в её API).",
+            code="load_unsupported",
+        )
+    adapter = server.adapters.get((backend_id, model_id))
+    if adapter is None:
+        raise ClientError(
+            "Адаптер для {} / {} не собран на сервере.".format(
+                backend_id, model_id
+            ),
+            status=503,
+            code="backend_unavailable",
+        )
+    return backend, model, adapter
+
+
 # --------------------------------------------------------------------------- #
 # Работа одной колонки
 # --------------------------------------------------------------------------- #
@@ -1435,6 +1758,7 @@ def _run_side(
     first_token_ms: int | None = None
     usage: dict[str, Any] = {}
     finish_reason = ""
+    request_load_ms: float | None = None
     char_count = 0
     completed = False
     try:
@@ -1454,6 +1778,7 @@ def _run_side(
                 if isinstance(piece, StreamPiece) and piece.done:
                     usage = dict(piece.usage or {})
                     finish_reason = piece.finish_reason or finish_reason
+                    request_load_ms = piece.load_ms
                     break
             completed = True
         finally:
@@ -1520,6 +1845,21 @@ def _run_side(
                 except Exception:  # noqa: BLE001 - чужой сервис не должен рвать ответ
                     ollama_ps = None
             load_stats = getattr(adapter, "load_stats", None)
+            # Задача 0166: если модель грузилась этим запросом, TTFT честно
+            # делится на «загрузка» и «генерация». При заранее загруженной
+            # модели (кнопка /api/load) загрузки нет и ttft_gen_ms совпадает
+            # с first_token_ms. load_ms берём из терминального куска: это
+            # число именно этого запроса, а не общий замер адаптера.
+            raw_load = request_load_ms
+            if isinstance(raw_load, (int, float)) and not isinstance(raw_load, bool):
+                request_load_ms = float(raw_load)
+            else:
+                request_load_ms = None
+            ttft_gen_ms = first_token_ms
+            if request_load_ms is not None and first_token_ms is not None:
+                ttft_gen_ms = max(
+                    0, int(round(first_token_ms - request_load_ms))
+                )
             if isinstance(cache_prefix, dict) and cache_prefix.get("enabled") is None:
                 # Первый ответ мог сам загрузить модель: настройка кэша стала
                 # известна только теперь — уточняем попадание, не выдумывая.
@@ -1548,6 +1888,10 @@ def _run_side(
                     "холодный" if cold else "тёплый"
                 ) if cold is not None else None,
                 "cold": cold,
+                # TTFT без стоимости загрузки: при warm равен first_token_ms,
+                # при cold — за вычетом load_ms этого запроса.
+                "ttft_gen_ms": ttft_gen_ms,
+                "load_ms": request_load_ms,
                 "cache_prefix": cache_prefix,
                 "load": dict(load_stats) if isinstance(load_stats, Mapping) else None,
                 "ollama": ollama_ps,
@@ -1645,6 +1989,12 @@ PAGE_HTML = """<!doctype html>
     font-weight: 650; color: #fff; background: var(--accent); cursor: pointer;
   }
   button:disabled { opacity: .55; cursor: default; }
+  button.mini {
+    padding: 6px 11px; font-size: 12px; border-radius: 7px;
+    background: var(--accent-2);
+  }
+  button.mini.alt { background: var(--muted); }
+  .loadctl { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
   #status { color: var(--muted); font-size: 13px; }
   #status.error { color: var(--danger); }
   .grid {
@@ -1749,6 +2099,10 @@ PAGE_HTML = """<!doctype html>
           <select id="backend-0" aria-label="Бэкенд слева"></select>
           <select id="model-0" aria-label="Модель слева"></select>
         </div>
+        <div class="loadctl">
+          <button type="button" class="mini" id="load-0" disabled>Загрузить</button>
+          <button type="button" class="mini alt" id="unload-0" disabled>Выгрузить</button>
+        </div>
         <div class="stats">
           <span>время: <b id="time-0">—</b></span>
           <span>ток/с: <b id="speed-0">—</b></span>
@@ -1764,6 +2118,10 @@ PAGE_HTML = """<!doctype html>
         <div class="pickers">
           <select id="backend-1" aria-label="Бэкенд справа"></select>
           <select id="model-1" aria-label="Модель справа"></select>
+        </div>
+        <div class="loadctl">
+          <button type="button" class="mini" id="load-1" disabled>Загрузить</button>
+          <button type="button" class="mini alt" id="unload-1" disabled>Выгрузить</button>
         </div>
         <div class="stats">
           <span>время: <b id="time-1">—</b></span>
@@ -1789,13 +2147,18 @@ PAGE_HTML = """<!doctype html>
         <dt>словарь</dt><dd id="mc-vocab-0">—</dd>
         <dt>слоёв</dt><dd id="mc-layers-0">—</dd>
         <dt>бит / параметр</dt><dd id="mc-bpp-0">—</dd>
+        <dt>в памяти</dt><dd id="mc-loaded-0">—</dd>
         <dt>RSS до → после</dt><dd id="mc-rss-0">—</dd>
+        <dt>RSS модели</dt><dd id="mc-rssbytes-0">—</dd>
+        <dt>загрузка</dt><dd id="mc-loadms-0">—</dd>
+        <dt>запросов</dt><dd id="mc-req-0">—</dd>
         <dt>пик RSS</dt><dd id="mc-peak-0">—</dd>
         <dt>резидентная копия</dt><dd id="mc-ps-0">—</dd>
       </dl>
       <dl class="kv">
         <dt class="sub-head">последний ответ</dt>
         <dt>TTFT</dt><dd id="ma-ttft-0">—</dd>
+        <dt>TTFT без загрузки</dt><dd id="ma-ttftgen-0">—</dd>
         <dt>prefill</dt><dd id="ma-prefill-0">—</dd>
         <dt>декод</dt><dd id="ma-decode-0">—</dd>
         <dt>ток/с декода</dt><dd id="ma-dtps-0">—</dd>
@@ -1819,13 +2182,18 @@ PAGE_HTML = """<!doctype html>
         <dt>словарь</dt><dd id="mc-vocab-1">—</dd>
         <dt>слоёв</dt><dd id="mc-layers-1">—</dd>
         <dt>бит / параметр</dt><dd id="mc-bpp-1">—</dd>
+        <dt>в памяти</dt><dd id="mc-loaded-1">—</dd>
         <dt>RSS до → после</dt><dd id="mc-rss-1">—</dd>
+        <dt>RSS модели</dt><dd id="mc-rssbytes-1">—</dd>
+        <dt>загрузка</dt><dd id="mc-loadms-1">—</dd>
+        <dt>запросов</dt><dd id="mc-req-1">—</dd>
         <dt>пик RSS</dt><dd id="mc-peak-1">—</dd>
         <dt>резидентная копия</dt><dd id="mc-ps-1">—</dd>
       </dl>
       <dl class="kv">
         <dt class="sub-head">последний ответ</dt>
         <dt>TTFT</dt><dd id="ma-ttft-1">—</dd>
+        <dt>TTFT без загрузки</dt><dd id="ma-ttftgen-1">—</dd>
         <dt>prefill</dt><dd id="ma-prefill-1">—</dd>
         <dt>декод</dt><dd id="ma-decode-1">—</dd>
         <dt>ток/с декода</dt><dd id="ma-dtps-1">—</dd>
@@ -1845,6 +2213,7 @@ PAGE_HTML = """<!doctype html>
       <span>RSS процесса: <b id="sys-rss">—</b></span>
       <span>пик RSS: <b id="sys-peak">—</b></span>
       <span>VTM_THREADS: <b id="sys-threads">—</b></span>
+      <span>keep-alive: <b id="sys-keepalive">—</b></span>
       <span>ядер: <b id="sys-cpus">—</b></span>
     </p>
     <p class="metric-note">Размер файла — stat; параметры и KV-кэш — сумма по таблице
@@ -1852,7 +2221,12 @@ PAGE_HTML = """<!doctype html>
       (модель живёт в этом процессе через ctypes); load/RAM/диск — система.
       «—» значит «недоступно», а не ноль. Кэш префикса ВТМ — оценка по общему
       префиксу промпта: счётчик попаданий C-рантайм не отдаёт. «Резидентная
-      копия» — size/size_vram из /api/ps локальной Ollama.</p>
+      копия» — size/size_vram из /api/ps локальной Ollama. Кнопки
+      «Загрузить»/«Выгрузить» держат модель в памяти заранее: у загруженной
+      модели TTFT не содержит чтения весов с диска. «RSS модели» — дельта RSS
+      процесса chat_server от загрузки, «TTFT без загрузки» — TTFT минус
+      загрузка этого запроса (у тёплого совпадает с TTFT). Автовыгрузка по
+      простою задаётся сервером (--keep-alive, по умолчанию выключена).</p>
   </section>
 </main>
 <script>
@@ -1864,6 +2238,7 @@ PAGE_HTML = """<!doctype html>
   var controller = null;
   var running = false;
   var finishedSides = 0;
+  var controlBusy = [false, false];
 
   function byId(id) { return document.getElementById(id); }
   function backendOf(id) {
@@ -1928,8 +2303,8 @@ PAGE_HTML = """<!doctype html>
       byId("speed-" + side).textContent = "—";
       byId("tokens-" + side).textContent = "—";
       byId("foot-" + side).textContent = "";
-      ["ttft", "prefill", "decode", "dtps", "total", "tokens", "finish",
-       "first", "cache"].forEach(function (name) {
+      ["ttft", "ttftgen", "prefill", "decode", "dtps", "total", "tokens",
+       "finish", "first", "cache"].forEach(function (name) {
         setText("ma-" + name + "-" + side, "—");
       });
     });
@@ -2002,6 +2377,11 @@ PAGE_HTML = """<!doctype html>
 
   function fillSideMetrics(side, event) {
     setText("ma-ttft-" + side, fmtMs(event.first_token_ms));
+    var gen = fmtMs(event.ttft_gen_ms);
+    if (typeof event.load_ms === "number" && event.load_ms > 0 && gen !== "—") {
+      gen += " (+" + fmtMs(event.load_ms) + " загрузка)";
+    }
+    setText("ma-ttftgen-" + side, gen);
     var prefill = fmtMs(event.prefill_ms);
     if (prefill !== "—" && typeof event.prefill_pct === "number") {
       prefill += " · " + event.prefill_pct.toFixed(1) + "%";
@@ -2020,12 +2400,22 @@ PAGE_HTML = """<!doctype html>
     setText("ma-cache-" + side, cacheText(event.cache_prefix));
   }
 
+  function setMemoryButtons(index, card) {
+    var isVtm = !!(card && card.kind === "vtm" && card.present !== false);
+    var isLoaded = !!(card && card.loaded === true);
+    var busy = controlBusy[index] === true;
+    byId("load-" + index).disabled = busy || !isVtm || isLoaded;
+    byId("unload-" + index).disabled = busy || !isVtm || !isLoaded;
+  }
+
   function fillCard(index, card) {
     var names = ["size", "params", "ctx", "kv", "storage", "source", "vocab",
-                 "layers", "bpp", "rss", "peak", "ps"];
+                 "layers", "bpp", "loaded", "rss", "rssbytes", "loadms", "req",
+                 "peak", "ps"];
     if (!card) {
       setText("mc-title-" + index, "—");
       names.forEach(function (name) { setText("mc-" + name + "-" + index, "—"); });
+      setMemoryButtons(index, null);
       return;
     }
     setText("mc-title-" + index, card.label || card.model || "—");
@@ -2062,6 +2452,20 @@ PAGE_HTML = """<!doctype html>
       }
     }
     setText("mc-ps-" + index, psText);
+    var loadedText = "—";
+    if (card.loaded === true) {
+      loadedText = "да";
+      if (typeof card.rss_bytes === "number") {
+        loadedText += " · " + fmtSignedBytes(card.rss_bytes);
+      }
+    } else if (card.loaded === false) {
+      loadedText = card.present === false ? "файла нет" : "нет";
+    }
+    setText("mc-loaded-" + index, loadedText);
+    setText("mc-rssbytes-" + index, fmtSignedBytes(card.rss_bytes));
+    setText("mc-loadms-" + index, fmtMs(card.load_ms));
+    setText("mc-req-" + index, fmtNum(card.requests));
+    setMemoryButtons(index, card);
     if (card.last) { fillSideMetrics(index, card.last); }
   }
 
@@ -2120,6 +2524,12 @@ PAGE_HTML = """<!doctype html>
       if (!response.ok) { return; }
       var data = await response.json();
       var models = Array.isArray(data.models) ? data.models : [];
+      if (typeof data.keep_alive === "number") {
+        setText("sys-keepalive", data.keep_alive === 0
+          ? "держать всегда" : data.keep_alive + " с простоя");
+      } else {
+        setText("sys-keepalive", "выключен");
+      }
       [0, 1].forEach(function (side) {
         var backendId = byId("backend-" + side).value;
         var modelId = byId("model-" + side).value;
@@ -2142,6 +2552,52 @@ PAGE_HTML = """<!doctype html>
       if (!response.ok) { return; }
       fillSystem(await response.json());
     } catch (err) { /* панель метрик не критична для чата */ }
+  }
+
+  async function loadModel(side, action) {
+    if (controlBusy[side]) { return; }
+    var backend = byId("backend-" + side).value;
+    var model = byId("model-" + side).value;
+    if (!backend || !model) { return; }
+    controlBusy[side] = true;
+    setMemoryButtons(side, null);
+    byId("load-" + side).disabled = true;
+    byId("unload-" + side).disabled = true;
+    setStatus((action === "load" ? "загружаю… " : "выгружаю… ") + model, false);
+    var url = action === "load" ? "/api/load" : "/api/unload";
+    try {
+      var response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify({ backend: backend, model: model })
+      });
+      var data = null;
+      try { data = await response.json(); } catch (ignored) { /* не JSON */ }
+      if (!response.ok) {
+        var message = "HTTP " + response.status;
+        if (data && data.error && data.error.message) {
+          message = data.error.message;
+        }
+        setStatus(message, true);
+      } else if (action === "load") {
+        setStatus(
+          "в памяти · " + fmtSignedBytes(data.rss_bytes) +
+          " · загрузка " + fmtMs(data.load_ms),
+          false
+        );
+      } else {
+        setStatus(
+          "выгружена · освобождено " + fmtBytes(data.freed_bytes),
+          false
+        );
+      }
+    } catch (err) {
+      setStatus("сервер недоступен: " + (err && err.message ? err.message : err), true);
+    } finally {
+      controlBusy[side] = false;
+      refreshModels();
+      refreshSystem();
+    }
   }
 
   function appendText(side, text) {
@@ -2341,6 +2797,12 @@ PAGE_HTML = """<!doctype html>
     byId("model-" + side).addEventListener("change", function () {
       refreshModels();
     });
+    byId("load-" + side).addEventListener("click", function () {
+      loadModel(side, "load");
+    });
+    byId("unload-" + side).addEventListener("click", function () {
+      loadModel(side, "unload");
+    });
   });
 
   loadCatalog();
@@ -2384,6 +2846,7 @@ class ChatHTTPServer(ThreadingHTTPServer):
         max_tokens: int,
         dynamic_models: bool = False,
         vtm_tokenizer: str | None = None,
+        keep_alive: float | None = None,
     ) -> None:
         self.registry = tuple(registry)
         self.dynamic_models = bool(dynamic_models)
@@ -2397,7 +2860,85 @@ class ChatHTTPServer(ThreadingHTTPServer):
         self.start_memory: dict[str, Any] = process_memory()
         self.last_answers: dict[tuple[str, str], dict[str, Any]] = {}
         self.prompts: dict[tuple[str, str], str] = {}
+        # Задача 0166: автовыгрузка ВТМ по бездействию. None — выключена,
+        # 0 — держать всегда, N > 0 — выгрузить после N секунд простоя.
+        self.keep_alive = None if keep_alive is None else float(keep_alive)
+        self._reaper_stop = threading.Event()
+        self._reaper: threading.Thread | None = None
         super().__init__(server_address, ChatRequestHandler)
+        if self.keep_alive is not None and self.keep_alive > 0:
+            self.start_reaper()
+
+    # -- автовыгрузка по бездействию ---------------------------------------
+
+    def start_reaper(self) -> None:
+        """Запустить фоновую нить, которая выгружает простаивающие модели."""
+        if self._reaper is not None:
+            return
+        limit = self.keep_alive or 0.0
+        interval = max(0.05, min(1.0, limit / 4.0))
+        self._reaper = threading.Thread(
+            target=self._reap_loop,
+            args=(interval,),
+            name="chat-keep-alive",
+            daemon=True,
+        )
+        self._reaper.start()
+
+    def _reap_loop(self, interval: float) -> None:
+        while not self._reaper_stop.wait(interval):
+            try:
+                self.reap_idle()
+            except Exception:  # noqa: BLE001 - нить не должна умирать молча
+                logger.exception("автовыгрузка: ошибка")
+
+    def reap_idle(self, now: float | None = None) -> list[tuple[str, str]]:
+        """Выгрузить ВТМ-модели, простаивавшие дольше ``keep_alive``.
+
+        Возвращает список ``(backend, model)``, которые выгружены. Модель,
+        которая сейчас генерирует, пропускается: выгрузка не ждёт и не рвёт
+        ответ. ``now`` подменяется тестами, чтобы не спать.
+        """
+        limit = self.keep_alive
+        if not limit or limit <= 0:
+            return []
+        moment = time.monotonic() if now is None else float(now)
+        unloaded: list[tuple[str, str]] = []
+        for key, adapter in list(self.adapters.items()):
+            if getattr(adapter, "kind", "") != "vtm":
+                continue
+            idle_of = getattr(adapter, "idle_seconds", None)
+            unload = getattr(adapter, "unload", None)
+            if not callable(idle_of) or not callable(unload):
+                continue
+            try:
+                idle = idle_of(moment)
+            except Exception:  # noqa: BLE001 - чужой адаптер не должен мешать
+                logger.exception("автовыгрузка %s: idle_seconds", key)
+                continue
+            if idle is None or idle < limit:
+                continue
+            try:
+                unload()
+            except ModelBusy:
+                continue
+            except Exception:  # noqa: BLE001
+                logger.exception("автовыгрузка %s: ошибка", key)
+                continue
+            # Кэш префикса живёт в модели: после выгрузки старый промпт —
+            # не история попаданий.
+            with self.state_lock:
+                self.prompts.pop(key, None)
+            logger.info("автовыгрузка: %s / %s (простой %.0f с)", key[0], key[1], idle)
+            unloaded.append(key)
+        return unloaded
+
+    def server_close(self) -> None:
+        self._reaper_stop.set()
+        reaper = self._reaper
+        if reaper is not None:
+            reaper.join(timeout=2.0)
+        super().server_close()
 
 
 class ChatRequestHandler(BaseHTTPRequestHandler):
@@ -2459,6 +3000,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - имя задано BaseHTTPRequestHandler
         path = urlsplit(self.path).path
         try:
+            if path in ("/api/load", "/api/unload"):
+                self._handle_memory(path)
+                return
             if path != "/api/chat":
                 self._send_json(
                     404,
@@ -2582,6 +3126,52 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         self._send_bytes(
             status, text.encode("utf-8"), "text/plain; charset=utf-8"
         )
+
+    # -- память модели (задача 0166) -----------------------------------------
+
+    def _handle_memory(self, path: str) -> None:
+        """``POST /api/load|unload``: заранее загрузить или освободить ВТМ."""
+        backend, model, adapter = _validate_model_target(
+            self.server, self._read_json_body()
+        )
+        action = "load" if path == "/api/load" else "unload"
+        key = (backend.id, model.id)
+        handler = getattr(adapter, action, None)
+        if not callable(handler):
+            raise ClientError(
+                "Адаптер модели не умеет {}.".format(
+                    "загружаться" if action == "load" else "выгружаться"
+                ),
+                code="load_unsupported",
+            )
+        try:
+            result = handler()
+        except ModelBusy as exc:
+            raise ClientError(str(exc), status=409, code="model_busy") from exc
+        except ClientError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - текст ошибки человеческий
+            logger.warning("%s %s / %s: %s", action, key[0], key[1], exc)
+            raise ClientError(
+                "Не удалось {} модель: {}".format(
+                    "загрузить" if action == "load" else "выгрузить",
+                    _short_error(exc),
+                ),
+                code="load_failed",
+            ) from exc
+        if action == "unload":
+            # Кэш префикса живёт в выгруженной модели: старый промпт больше
+            # не история попаданий.
+            with self.server.state_lock:
+                self.server.prompts.pop(key, None)
+        body: dict[str, Any] = {
+            "backend": backend.id,
+            "model": model.id,
+            "action": action,
+        }
+        if isinstance(result, Mapping):
+            body.update(result)
+        self._send_json(200, body)
 
     # -- SSE ------------------------------------------------------------------
 
@@ -2735,12 +3325,14 @@ def create_server(
     system_prompt: str | None = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: float = 120.0,
+    keep_alive: float | None = None,
 ) -> ChatHTTPServer:
     """Собрать сервер; ``port=0`` — свободный порт (удобно тестам).
 
     ``registry``/``adapters`` инжектируются тестами: реальные модели при этом
     не нужны. ``system_prompt=None`` — взять ``prompts/system.assistant.md``;
-    пустая строка отключает системное сообщение.
+    пустая строка отключает системное сообщение. ``keep_alive`` — секунды
+    простоя до автовыгрузки ВТМ (``None`` — выключено, ``0`` — держать всегда).
     """
     if host not in ("127.0.0.1", "::1"):
         raise ValueError(
@@ -2752,6 +3344,11 @@ def create_server(
         raise TypeError("max_tokens: ожидалось целое число")
     if max_tokens < 1:
         raise ValueError("max_tokens: ожидалось >= 1")
+    if keep_alive is not None:
+        if isinstance(keep_alive, bool) or not isinstance(keep_alive, (int, float)):
+            raise TypeError("keep_alive: ожидалось число секунд или None")
+        if keep_alive < 0:
+            raise ValueError("keep_alive: ожидалось >= 0 (0 — держать всегда)")
 
     resolved = tuple(registry) if registry is not None else default_registry()
     resolved_adapters = (
@@ -2766,6 +3363,7 @@ def create_server(
         adapters=resolved_adapters,
         system_prompt=prompt,
         max_tokens=max_tokens,
+        keep_alive=keep_alive,
     )
 
 
@@ -2810,6 +3408,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="модель Ollama (можно несколько раз); по умолчанию Qwen2.5/Qwen3",
     )
     parser.add_argument(
+        "--keep-alive",
+        type=float,
+        default=None,
+        metavar="СЕК",
+        help="выгружать ВТМ после N секунд бездействия (0 — держать всегда; "
+        "по умолчанию автовыгрузка выключена)",
+    )
+    parser.add_argument(
         "--no-system-prompt",
         action="store_true",
         help="не подмешивать prompts/system.assistant.md",
@@ -2845,6 +3451,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             system_prompt="" if args.no_system_prompt else None,
             max_tokens=args.max_tokens,
             timeout=args.timeout,
+            keep_alive=args.keep_alive,
         )
     except (OSError, ValueError, TypeError) as exc:
         print("не удалось запустить сервер: {}".format(exc), file=sys.stderr)
@@ -2865,6 +3472,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
     )
+    if server.keep_alive is None:
+        print("автовыгрузка ВТМ: выключена (--keep-alive N включит)")
+    elif server.keep_alive <= 0:
+        print("автовыгрузка ВТМ: выключена (0 — держать всегда)")
+    else:
+        print("автовыгрузка ВТМ: после {:.0f} с бездействия".format(server.keep_alive))
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

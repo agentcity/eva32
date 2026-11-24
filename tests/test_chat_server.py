@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import mmap
 import os
 import pathlib
 import re
@@ -615,7 +616,9 @@ def _greedy_factory(blob_holder, megabytes=12):
     return factory
 
 
-def start_server(registry, adapters, *, max_tokens=32, system_prompt="СИСТЕМА"):
+def start_server(
+    registry, adapters, *, max_tokens=32, system_prompt="СИСТЕМА", keep_alive=None
+):
     """Поднять сервер на свободном порту loopback; вернуть ``(server, thread)``."""
     server = chat_server.create_server(
         port=0,
@@ -623,6 +626,7 @@ def start_server(registry, adapters, *, max_tokens=32, system_prompt="СИСТЕ
         adapters=adapters,
         system_prompt=system_prompt,
         max_tokens=max_tokens,
+        keep_alive=keep_alive,
     )
     thread = threading.Thread(
         target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
@@ -1218,15 +1222,26 @@ class TestMetricsPage(ServerTestCase):
             'id="mc-size-0"',
             'id="mc-kv-1"',
             'id="mc-ps-0"',
+            'id="mc-loaded-0"',
+            'id="mc-rssbytes-1"',
+            'id="mc-loadms-0"',
+            'id="mc-req-1"',
+            'id="load-0"',
+            'id="unload-1"',
             'id="ma-ttft-0"',
+            'id="ma-ttftgen-1"',
             'id="ma-cache-1"',
             'id="sys-load"',
             'id="sys-rss"',
             'id="sys-threads"',
+            'id="sys-keepalive"',
         ):
             self.assertIn(element_id, page)
         self.assertIn("/api/models", page)
         self.assertIn("/api/system", page)
+        # Кнопки памяти ходят только в свои эндпоинты.
+        self.assertIn("/api/load", page)
+        self.assertIn("/api/unload", page)
 
     def test_page_stays_single_style_and_script_without_network(self):
         status, _, body = self.request("GET", "/")
@@ -1246,6 +1261,452 @@ class TestMetricsPage(ServerTestCase):
         self.assertIn("default-src 'none'", csp)
         self.assertIn("connect-src 'self'", csp)
         self.assertNotIn("http", csp)
+
+
+# --------------------------------------------------------------------------- #
+# Загрузка/выгрузка модели (задача 0166)
+# --------------------------------------------------------------------------- #
+
+
+class LoadableModel:
+    """Заглушка ВТМ с явной загрузкой: ``open()`` «читает веса», ``close()`` их отпускает.
+
+    ``stream`` ставит ``started`` до первого куска — тесту про 409 нужно
+    дождаться, что генерация действительно началась, а не спорить с ней.
+    """
+
+    cache_prefix = True
+
+    def __init__(
+        self, holder, *, megabytes=24, open_delay=0.0, stream_delay=0.0
+    ) -> None:
+        self.holder = holder
+        self.megabytes = int(megabytes)
+        self.open_delay = float(open_delay)
+        self.stream_delay = float(stream_delay)
+        self.opened = 0
+        self.closed = 0
+        self.streams = 0
+        self.started = threading.Event()
+
+    def open(self):
+        self.opened += 1
+        if self.open_delay:
+            time.sleep(self.open_delay)
+        if self.megabytes:
+            # Анонимное отображение, как веса модели: страницы уходят системе
+            # при close(), поэтому RSS-дельта и освобождение видны честно.
+            size = self.megabytes * 1024 * 1024
+            mapping = mmap.mmap(-1, size)
+            for offset in range(0, size, mmap.PAGESIZE):
+                mapping[offset] = 7
+            self.holder.append(mapping)
+
+    def close(self):
+        self.closed += 1
+        for mapping in list(self.holder):
+            try:
+                mapping.close()
+            except (BufferError, ValueError):  # pragma: no cover - защита
+                pass
+        self.holder.clear()
+
+    def stream(self, messages, *, max_tokens):
+        self.streams += 1
+        self.started.set()
+        if self.stream_delay:
+            time.sleep(self.stream_delay)
+        yield SimpleNamespace(text="ок")
+        yield SimpleNamespace(
+            done=True,
+            finish_reason="stop",
+            usage={"prompt_tokens": 3, "completion_tokens": 1},
+        )
+
+
+class LoadableFactory:
+    """Фабрика :class:`LoadableModel` с журналом созданных объектов."""
+
+    def __init__(self, holder, **kwargs):
+        self.holder = holder
+        self.kwargs = kwargs
+        self.models = []
+
+    def __call__(self):
+        model = LoadableModel(self.holder, **self.kwargs)
+        self.models.append(model)
+        return model
+
+
+class MemoryServerTestCase(unittest.TestCase):
+    """Сервер с «загружаемой» заглушкой ВТМ: POST /api/load|unload по HTTP."""
+
+    keep_alive = None
+    factory_kwargs: dict = {}
+
+    def setUp(self):
+        self.server, self.thread, self.port, self.adapter, self.factory = (
+            self.make_server(self.keep_alive, **self.factory_kwargs)
+        )
+
+    def make_server(self, keep_alive=None, **factory_kwargs):
+        holder = []
+        factory = LoadableFactory(holder, **factory_kwargs)
+        adapter = chat_server.ChatCliAdapter(factory, kind="vtm", label="vtm")
+        server, thread = start_server(
+            REGISTRY,
+            {
+                ("vtm", "mock-vtm"): adapter,
+                ("ollama", "mock-qwen"): MockAdapter(pieces=("в",)),
+            },
+            keep_alive=keep_alive,
+        )
+        self.addCleanup(stop_server, server, thread)
+        self.addCleanup(holder.clear)
+        return server, thread, server.server_address[1], adapter, factory
+
+    # -- HTTP-помощники ------------------------------------------------------
+
+    def post(self, path, payload, port=None):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return http_json(
+            port or self.port,
+            "POST",
+            path,
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+    def models(self, port=None):
+        status, raw = http_json(port or self.port, "GET", "/api/models")
+        self.assertEqual(status, 200, raw.decode("utf-8", "replace"))
+        return json.loads(raw)
+
+    def card(self, model="mock-vtm", port=None):
+        cards = [item for item in self.models(port)["models"] if item["model"] == model]
+        self.assertEqual(len(cards), 1)
+        return cards[0]
+
+    def load(self, port=None):
+        status, raw = self.post(
+            "/api/load", {"backend": "vtm", "model": "mock-vtm"}, port=port
+        )
+        self.assertEqual(status, 200, raw.decode("utf-8", "replace"))
+        return json.loads(raw)
+
+    def unload(self, port=None):
+        status, raw = self.post(
+            "/api/unload", {"backend": "vtm", "model": "mock-vtm"}, port=port
+        )
+        self.assertEqual(status, 200, raw.decode("utf-8", "replace"))
+        return json.loads(raw)
+
+    def ask(self, port=None):
+        payload = json.dumps(
+            {
+                "question": "вопрос",
+                "use_system": True,
+                "sides": [
+                    {"backend": "vtm", "model": "mock-vtm"},
+                    {"backend": "ollama", "model": "mock-qwen"},
+                ],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        status, raw = http_json(
+            port or self.port,
+            "POST",
+            "/api/chat",
+            body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200, raw.decode("utf-8", "replace"))
+        events, done = parse_sse(raw)
+        self.assertTrue(done, "поток не завершился событием [DONE]")
+        done_events = [
+            event for event in events if event["type"] == "done" and event["side"] == 0
+        ]
+        self.assertEqual(len(done_events), 1, events)
+        return done_events[0], events, raw
+
+
+class TestLoadUnloadAPI(MemoryServerTestCase):
+    """Кнопка загружает модель: статус, RSS-дельта, время, счётчик запросов."""
+
+    def test_load_makes_model_resident_and_reports_numbers(self):
+        before = self.card()
+        self.assertFalse(before["loaded"])
+        self.assertIsNone(before["rss_bytes"])
+        self.assertIsNone(before["load_ms"])
+        self.assertEqual(before["requests"], 0)
+
+        data = self.load()
+        self.assertEqual(data["action"], "load")
+        self.assertTrue(data["loaded"])
+        self.assertFalse(data["already_loaded"])
+        self.assertIsNotNone(data["rss_bytes"])
+        self.assertGreater(data["rss_bytes"], 0)
+        self.assertGreaterEqual(data["load_ms"], 0)
+        self.assertEqual(data["requests"], 0)
+        self.assertEqual(len(self.factory.models), 1)
+        self.assertEqual(self.factory.models[0].opened, 1)
+        # open() + прогрев: веса уже прочитаны, а не отложены до запроса.
+        self.assertTrue(data["load"]["opened"])
+        self.assertTrue(data["load"]["warmed"])
+        self.assertGreaterEqual(self.factory.models[0].streams, 1)
+
+        card = self.card()
+        self.assertTrue(card["loaded"])
+        self.assertEqual(card["rss_bytes"], data["rss_bytes"])
+        self.assertEqual(card["load_ms"], data["load_ms"])
+        self.assertEqual(card["requests"], 0)
+        self.assertIsNotNone(card["load"])
+        self.assertEqual(
+            card["load"]["rss_delta"],
+            card["load"]["rss_after"] - card["load"]["rss_before"],
+        )
+
+    def test_second_load_is_idempotent(self):
+        first = self.load()
+        second = self.load()
+        self.assertTrue(second["already_loaded"])
+        self.assertEqual(second["rss_bytes"], first["rss_bytes"])
+        self.assertEqual(second["load_ms"], first["load_ms"])
+        self.assertEqual(len(self.factory.models), 1, "фабрику позвали повторно")
+
+    def test_unload_clears_status_and_next_request_reloads(self):
+        loaded = self.load()
+        data = self.unload()
+        self.assertTrue(data["was_loaded"])
+        self.assertFalse(data["loaded"])
+        self.assertIsInstance(data["freed_bytes"], int)
+        self.assertGreater(data["freed_bytes"], 0, "выгрузка не освободила память")
+        self.assertEqual(data["rss_bytes"], 0)
+        self.assertIsNone(data["load_ms"])
+        self.assertEqual(self.factory.models[0].closed, 1)
+
+        card = self.card()
+        self.assertFalse(card["loaded"])
+        self.assertEqual(card["rss_bytes"], 0)
+        self.assertIsNone(card["load_ms"])
+        # История загрузки остаётся в карточке: видно, сколько заняла.
+        self.assertIsNotNone(card["load"])
+        self.assertEqual(card["load"]["load_ms"], loaded["load_ms"])
+
+        # Без загрузки запрос снова грузит модель сам — прежнее поведение.
+        done, _, _ = self.ask()
+        self.assertTrue(done["cold"])
+        self.assertEqual(len(self.factory.models), 2)
+        self.assertTrue(self.card()["loaded"])
+
+    def test_unknown_model_and_backend_are_400(self):
+        for payload in (
+            {"backend": "vtm", "model": "нет-такой.vtm"},
+            {"backend": "nope", "model": "mock-vtm"},
+            {"model": ""},
+            {"backend": "vtm"},
+        ):
+            status, raw = self.post("/api/load", payload)
+            self.assertEqual(status, 400, (payload, raw))
+            error = json.loads(raw)["error"]
+            self.assertTrue(error["message"])
+            self.assertIn(error["code"], ("invalid_request",))
+
+        # Выгрузка проверяет то же самое.
+        status, raw = self.post(
+            "/api/unload", {"backend": "vtm", "model": "нет-такой.vtm"}
+        )
+        self.assertEqual(status, 400)
+
+    def test_ollama_load_is_refused(self):
+        status, raw = self.post(
+            "/api/load", {"backend": "ollama", "model": "mock-qwen"}
+        )
+        self.assertEqual(status, 400)
+        error = json.loads(raw)["error"]
+        self.assertEqual(error["code"], "load_unsupported")
+        self.assertIn("Ollama", error["message"])
+
+    def test_adapter_without_load_is_refused(self):
+        # Заглушка без load/unload: эндпоинт обязан отказать, а не падать.
+        server, thread = start_server(
+            REGISTRY,
+            {
+                ("vtm", "mock-vtm"): MockAdapter(pieces=("а",)),
+                ("ollama", "mock-qwen"): MockAdapter(pieces=("в",)),
+            },
+        )
+        self.addCleanup(stop_server, server, thread)
+        port = server.server_address[1]
+        status, raw = self.post(
+            "/api/load", {"backend": "vtm", "model": "mock-vtm"}, port=port
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(raw)["error"]["code"], "load_unsupported")
+
+    def test_unload_is_refused_while_generating(self):
+        _, _, port, adapter, factory = self.make_server(stream_delay=0.5)
+        status, raw = self.post(
+            "/api/load", {"backend": "vtm", "model": "mock-vtm"}, port=port
+        )
+        self.assertEqual(status, 200)
+
+        results = []
+
+        def chat():
+            try:
+                payload = json.dumps(
+                    {
+                        "question": "вопрос",
+                        "use_system": False,
+                        "sides": [
+                            {"backend": "vtm", "model": "mock-vtm"},
+                            {"backend": "ollama", "model": "mock-qwen"},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                results.append(
+                    http_json(
+                        port,
+                        "POST",
+                        "/api/chat",
+                        body=payload,
+                        headers={"Content-Type": "application/json"},
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - диагностика
+                results.append(exc)
+
+        thread = threading.Thread(target=chat, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5.0)
+        deadline = time.monotonic() + 3.0
+        model = None
+        while time.monotonic() < deadline:
+            # Первый stream — прогрев при загрузке, второй — сам запрос.
+            if factory.models and factory.models[0].streams >= 2:
+                model = factory.models[0]
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(model, "генерация не началась")
+        self.assertTrue(model.started.is_set())
+
+        status, raw = self.post(
+            "/api/unload", {"backend": "vtm", "model": "mock-vtm"}, port=port
+        )
+        self.assertEqual(status, 409, raw.decode("utf-8", "replace"))
+        self.assertEqual(json.loads(raw)["error"]["code"], "model_busy")
+        thread.join(timeout=5.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(model.closed, 0, "модель закрыли во время генерации")
+        self.assertTrue(adapter.loaded)
+
+    def test_requests_are_counted_across_loads(self):
+        self.load()
+        self.ask()
+        self.ask()
+        self.assertEqual(self.card()["requests"], 2)
+        self.unload()
+        self.ask()
+        self.assertEqual(self.card()["requests"], 3)
+
+
+class TestColdWarmWithPreload(MemoryServerTestCase):
+    """TTFT: у заранее загруженной модели он не содержит загрузки."""
+
+    factory_kwargs = {"open_delay": 0.1, "stream_delay": 0.05, "megabytes": 2}
+
+    def test_preloaded_request_is_warm_and_has_no_load(self):
+        self.load()
+        done, _, _ = self.ask()
+        self.assertFalse(done["cold"])
+        self.assertEqual(done["first_token"], "тёплый")
+        self.assertIsNone(done["load_ms"])
+        self.assertEqual(done["ttft_gen_ms"], done["first_token_ms"])
+        self.assertIsInstance(done["first_token_ms"], int)
+
+    def test_cold_request_subtracts_load_from_ttft(self):
+        done, _, _ = self.ask()  # модель не загружена: грузится этим запросом
+        self.assertTrue(done["cold"])
+        self.assertEqual(done["first_token"], "холодный")
+        self.assertIsNotNone(done["load_ms"])
+        self.assertGreaterEqual(
+            done["load_ms"], 80, "задержка open() не попала в замер"
+        )
+        self.assertGreater(done["first_token_ms"], done["load_ms"])
+        self.assertEqual(
+            done["ttft_gen_ms"],
+            max(0, int(round(done["first_token_ms"] - done["load_ms"]))),
+        )
+        self.assertLess(done["ttft_gen_ms"], done["first_token_ms"])
+
+    def test_load_ms_is_not_reused_by_next_request(self):
+        self.ask()  # холодный, с загрузкой
+        second, _, _ = self.ask()  # тёплый
+        self.assertFalse(second["cold"])
+        self.assertIsNone(second["load_ms"])
+        self.assertEqual(second["ttft_gen_ms"], second["first_token_ms"])
+
+
+class TestKeepAlive(MemoryServerTestCase):
+    """Автовыгрузка по бездействию: по умолчанию выключена, N>0 — работает."""
+
+    def test_default_is_disabled(self):
+        self.assertIsNone(self.server.keep_alive)
+        self.assertIsNone(self.models()["keep_alive"])
+        self.load()
+        now = self.adapter._last_used + 10_000.0
+        self.assertEqual(self.server.reap_idle(now=now), [])
+        self.assertTrue(self.card()["loaded"])
+
+    def test_zero_means_keep_forever(self):
+        server, _, port, adapter, _ = self.make_server(0)
+        self.assertEqual(server.keep_alive, 0.0)
+        self.assertEqual(self.models(port)["keep_alive"], 0.0)
+        self.load(port=port)
+        self.assertEqual(server.reap_idle(now=adapter._last_used + 10_000.0), [])
+        self.assertTrue(adapter.loaded)
+
+    def test_reap_idle_unloads_after_the_limit(self):
+        server, _, port, adapter, factory = self.make_server(0.05)
+        self.load(port=port)
+        self.assertEqual(server.keep_alive, 0.05)
+        self.assertEqual(self.models(port)["keep_alive"], 0.05)
+        last = adapter._last_used
+        self.assertEqual(server.reap_idle(now=last + 0.01), [])
+        self.assertTrue(adapter.loaded)
+
+        self.assertEqual(
+            server.reap_idle(now=last + 1.0), [("vtm", "mock-vtm")]
+        )
+        self.assertFalse(self.card(port=port)["loaded"])
+        self.assertEqual(factory.models[0].closed, 1)
+        # Повторный проход ничего не делает: выгружать нечего.
+        self.assertEqual(server.reap_idle(now=last + 1000.0), [])
+
+    def test_background_reaper_unloads_idle_model(self):
+        server, _, port, adapter, factory = self.make_server(0.05)
+        self.load(port=port)
+        self.assertTrue(adapter.loaded)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not adapter.loaded:
+                break
+            time.sleep(0.02)
+        self.assertFalse(adapter.loaded, "фоновая автовыгрузка не сработала")
+        self.assertEqual(factory.models[0].closed, 1)
+        self.assertFalse(self.card(port=port)["loaded"])
+
+    def test_cli_flag(self):
+        parser = chat_server._build_parser()
+        self.assertIsNone(parser.parse_args([]).keep_alive)
+        self.assertEqual(parser.parse_args(["--keep-alive", "0"]).keep_alive, 0.0)
+        self.assertEqual(parser.parse_args(["--keep-alive", "120"]).keep_alive, 120.0)
+        with self.assertRaises(ValueError):
+            chat_server.create_server(
+                port=0, registry=REGISTRY, adapters={}, keep_alive=-1
+            )
 
 
 if __name__ == "__main__":
