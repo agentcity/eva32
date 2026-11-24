@@ -84,6 +84,32 @@ extern "C" {
 // 3^20 - 1; слово больше этого значения — порча данных.
 #define VTM_TRIT_MAX_WORD    3486784400u
 
+// --- Q4 (kind 5, задача 0151) ---------------------------------------------
+//
+// Самодостаточный сегмент по offset: "Q4_0" | version u8 (=1) | flags u8
+// (бит 0 — масштабы fp32, иначе fp16) | n_values u64 | n_groups u32,
+// затем n_groups масштабов; у Q4_1 перед ними идёт n_mins u32, а после
+// масштабов — n_mins min; затем упакованные нибблы: n_groups * 16 байт. Группа — 32 значения в 16 байтах, раскладка
+// GGML/0152: байт j хранит значение j в младшем ниббле и j+16 в старшем.
+// Q4_0: w = (nibble - 8) * scale; Q4_1: w = nibble * scale + min.
+// Версия контейнера не меняется (kind — новое значение байта таблицы).
+// Значение kind 5 объявлено в enum vtm_tensor_kind ниже (VTM_TENSOR_Q4).
+#define VTM_Q4_VERSION       1u
+#define VTM_Q4_HEADER_SIZE   18u
+//: Q4_1: после n_groups идёт n_mins u32 (== n_groups) — чтобы отсутствие
+//: min в обрезанном сегменте не выглядело как допустимый padding.
+#define VTM_Q4_ASYM_HEADER_SIZE 22u
+#define VTM_Q4_SCALE_BLOCK   32u
+#define VTM_Q4_GROUP_BYTES   16u
+// Синоним, который используют ядра 0152 (vtm_backend.h): 32 значения в группе.
+#ifndef VTM_Q4_GROUP_SIZE
+#define VTM_Q4_GROUP_SIZE    32
+#endif
+#define VTM_Q4_ZERO_NIBBLE   8u
+#define VTM_Q4_MAGIC_SYM     "Q4_0"
+#define VTM_Q4_MAGIC_ASYM    "Q4_1"
+#define VTM_Q4_FLAG_F32      0x01u
+
 // --- коды ошибок -----------------------------------------------------------
 typedef enum {
     VTM_OK = 0,
@@ -115,14 +141,16 @@ typedef enum {
     VTM_TENSOR_TRIT = 0,    // TRT1-сегмент: 160 тритов на блок + масштаб
     VTM_TENSOR_F32  = 1,
     VTM_TENSOR_F16  = 2,
-    VTM_TENSOR_BF16 = 3
-    // 4 (int8 + масштабы) зарезервирован, но контейнером пока не читается:
-    // int8-эмбеддинги отложены вместе с загрузчиком (задача 0043).
+    VTM_TENSOR_BF16 = 3,
+    // 4 (int8 + масштабы) объявлен в trit.h (VTM_TENSOR_INT8) и читается
+    // загрузчиком; 5 — Q4 (Q4_0/Q4_1), см. константы VTM_Q4_* выше.
+    VTM_TENSOR_Q4   = 5
 } vtm_tensor_kind;
 
 typedef enum {
     VTM_LAYOUT_TRT1 = 0,    // offset -> "TRT1"..., масштабы внутри сегмента
-    VTM_LAYOUT_RAW  = 1     // offset -> слова, scale_offset -> масштабы
+    VTM_LAYOUT_RAW  = 1,    // offset -> слова, scale_offset -> масштабы
+    VTM_LAYOUT_Q4   = 2     // kind 5: offset -> "Q4_0"/"Q4_1" сегмент
 } vtm_tensor_layout;
 
 // Флаги записи таблицы тензоров (поле reserved u16 по смещению 50).
@@ -160,18 +188,27 @@ typedef struct {
     // Для kind 1..3 — распакованные значения в арене (fp32, host-endian).
     float *f32;
     // Для kind 0 — слова pack20 в арене; масштабы уже приведены к fp32.
+    // Для kind 5 (Q4) — упакованные нибблы (16 байт на группу 32 значения);
+    // байт j группы: значение j в младшем ниббле, j+16 в старшем.
     const uint32_t *words;
     const float *scales;
+    // kind 5 (Q4): упакованные нибблы лежат в words, масштаб fp32 — в scales
+    // (одна на 32 значения). Для асимметричного варианта (Q4_1) есть минимумы
+    // на группу; q4_is_asym == 1 требует непустой q4_mins, иначе формат
+    // отвергается — тихо считать Q4_1 симметрично нельзя.
+    const float *q4_mins;
+    uint8_t q4_is_asym;
 } vtm_tensor;
 
 // --- инструкция ------------------------------------------------------------
 //
-// EMB (0x09): a — таблица словаря [vocab, dim]. Годится любой kind 0..3:
+// EMB (0x09): a — таблица словаря [vocab, dim]. Годится любой kind 0..5:
 //   kind 0 (триты) читается через LUT243 (5 тритов на выборку из 243),
-//   fp16/bf16 загрузчик уже привёл к fp32 в арене.
-// MM (0x02): A может быть тритовой матрицей — так tied lm_head считает
-//   логиты по emb.w (A = [vocab, hidden], B = [hidden, 1]); триты
-//   расквантовываются на месте (trit * scale), без копии матрицы в fp32.
+//   kind 4 загрузчик уже привёл к fp32, kind 5 (Q4) разворачивается
+//   построчно ядром 0152, fp16/bf16 — тоже fp32 в арене.
+// MM (0x02): A может быть тритовой или Q4-матрицей — так tied lm_head
+//   считает логиты по emb.w (A = [vocab, hidden], B = [hidden, 1]); триты
+//   и Q4 расквантовываются на месте, без копии матрицы в fp32.
 typedef struct {
     uint8_t opcode;
     uint8_t flags;

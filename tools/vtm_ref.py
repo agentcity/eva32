@@ -25,7 +25,8 @@
 32                       таблица тензоров: n_tensors * 52 байта
   0  name[24]  UTF-8, NUL-дополнение
  24  kind u8                        0 триты (TRT1), 1 fp32, 2 fp16, 3 bf16,
-                                    4 int8 + масштабы (INT8-сегмент)
+                                    4 int8 + масштабы (INT8-сегмент),
+                                    5 Q4: 4 бита + масштабы (Q4-сегмент)
  25  ndim u8                        1..4
  26  dims u32[4]                    недостающие измерения = 0
  42  offset u32                     смещение ОТ НАЧАЛА СЕКЦИИ ДАННЫХ, кратно 32
@@ -115,6 +116,27 @@ q:        n_values знаковых байт (q в -127..127)
 
 `n_scale = ceil(n_values/128)`, `scale_offset = NO_OFFSET`, `w = q · scale`.
 `-128` запрещён: диапазон симметричный, как у `Int8Embedding` из QAT.
+
+Тензор Q4 (kind 5, задача 0151) — сегмент с заголовком 18 байт (Q4_1 — 22):
+
+```
+"Q4_0" | version u8 (=1) | flags u8 (бит0: 1=f32 масштабы, 0=f16)
+       | n_values u64 | n_groups u32
+[Q4_1] | n_mins u32                       — явное число min (== n_groups)
+масштабы: n_groups * (4 или 2) байта
+[Q4_1] min: n_mins * (4 или 2) байта
+q:        n_groups * 16 байт (2 ниббла на байт)
+```
+
+`n_groups = ceil(n_values/32)`, `scale_offset = NO_OFFSET`. Группа — 32
+значения в 16 байтах, раскладка как в GGML Q4_0 (её ждут ядра 0152 и импорт
+GGUF 0153): байт `j` группы хранит значение `j` в младшем ниббле и значение
+`j+16` в старшем. `Q4_0`: `w = (nibble − 8) · scale` (значения 0..15
+кодируют −8..7); `Q4_1`: `w = nibble · scale + min`, `min` — fp32 на группу.
+Явное `n_mins` у Q4_1 нужно, чтобы отсутствие min в обрезанном сегменте не
+приняли за выравнивающий padding и не прочитали как Q4_0.
+Хвост последней группы (если `n_values` не кратно 32) дополняется нибблом 8
+и читателем игнорируется. Масштабы конечны и неотрицательны, `min` конечен.
 
 **Расхождение с `src/vtm/` на 2026-11-18**: C-загрузчик ждёт `n_blocks` в
 TRT1 как число 160-тритовых блоков и один масштаб на 160 тритов
@@ -323,12 +345,15 @@ KIND_F16 = 2
 KIND_BF16 = 3
 #: kind 4: знаковый int8 (-127..127) + масштабы блока 128 (задача 0044).
 KIND_INT8 = 4
+#: kind 5: Q4 — 4 бита (0..15) + масштабы группы 32 (задача 0151).
+KIND_Q4 = 5
 KIND_NAMES = {
     KIND_TRITS: "trits",
     KIND_F32: "fp32",
     KIND_F16: "fp16",
     KIND_BF16: "bf16",
     KIND_INT8: "int8",
+    KIND_Q4: "q4",
 }
 
 #: Сегмент int8-тензора (kind 4): тот же 18-байтовый заголовок, что у TRT1,
@@ -340,6 +365,28 @@ INT8_HEADER_SIZE = 18
 INT8_SCALE_BLOCK = 128
 INT8_MIN = -127
 INT8_MAX = 127
+
+#: Сегмент Q4-тензора (kind 5): заголовок 18 байт, как у INT8/TRT1
+#: (у Q4_1 — 22: после n_groups идёт явное n_mins).
+#: magic "Q4_0" (симметричный, w = (q-8)·scale) или "Q4_1" (w = q·scale+min).
+#: Группа — 32 значения в 16 байтах, раскладка GGML: байт j хранит значение j
+#: в младшем ниббле и j+16 в старшем. Масштаб — fp32 (или fp16 по флагу) на
+#: группу; у Q4_1 после масштабов лежит столько же min.
+Q4_MAGIC = b"Q4_0"
+Q4_MAGIC_ASYM = b"Q4_1"
+Q4_VERSION = 1
+Q4_HEADER_SIZE = 18
+#: У Q4_1 после n_groups идёт явное n_mins u32 (для проверки, что min
+#: действительно есть и их ровно n_groups, а не «нули из padding»).
+Q4_ASYM_HEADER_SIZE = 22
+Q4_SCALE_BLOCK = 32
+Q4_GROUP_BYTES = Q4_SCALE_BLOCK // 2  # 16 байт = 32 ниббла
+Q4_MIN = 0
+Q4_MAX = 15
+#: Ниббл нуля в симметричном Q4_0: (8 - 8) · scale = 0. Им же дополняется
+#: хвост последней группы; читатель обрезает его по n_values.
+Q4_ZERO_NIBBLE = 8
+Q4_FLAG_F32_SCALES = 0x01
 
 #: Флаги записи таблицы тензоров (поле по смещению 50, бывший «резерв»).
 #: TFLAG_KV_CACHE — K/V-кэш внимания: содержимого в файле нет (offset=0),
@@ -552,6 +599,11 @@ class Tensor:
     #: kind 4: знаковые значения int8 (-127..127). В файл идут байтами,
     #: в памяти плотные значения считаются как q · scale (`dense()`).
     qdata: list[int] | None = None
+    #: kind 5: Q4_1 — по одному min (нулю квантования) на группу 32;
+    #: у Q4_0 (симметричный) `None`.
+    q4_mins: list[float] | None = None
+    #: kind 5: False — Q4_0 (`(q-8)·scale`), True — Q4_1 (`q·scale + min`).
+    q4_asymmetric: bool = False
 
     def __post_init__(self) -> None:
         self.dims = tuple(int(d) for d in self.dims)
@@ -593,11 +645,12 @@ class Tensor:
             # Кэш существует только в таблице: содержимое не пишется и не
             # читается (его создаёт исполнитель), поэтому данные запрещены —
             # иначе легко решить, что они попадут в файл.
-            if self.kind in (KIND_TRITS, KIND_INT8):
+            if self.kind in (KIND_TRITS, KIND_INT8, KIND_Q4):
                 raise ValueError(
                     f"тензор {self.name!r}: KV-кэш обязан быть fp-тензором (kind {self.kind})"
                 )
-            if self.data is not None or self.trits is not None or self.scales is not None:
+            if (self.data is not None or self.trits is not None
+                    or self.scales is not None or self.q4_mins is not None):
                 raise ValueError(
                     f"тензор {self.name!r}: у KV-кэша нет данных — буфер создаёт "
                     "читатель (Tensor.kv_cache())"
@@ -668,10 +721,72 @@ class Tensor:
                 raise ValueError(
                     f"тензор {self.name!r}: int8-масштабы без qdata"
                 )
-        else:
-            if self.trits is not None or self.scales is not None or self.qdata is not None:
+        elif self.kind == KIND_Q4:
+            # По умолчанию поле block_size = 128 (канон тритов/int8); для Q4
+            # канон — 32, поэтому дефолт приводим к нему, а иное значение
+            # отвергаем.
+            if self.block_size == SCALE_BLOCK:
+                self.block_size = Q4_SCALE_BLOCK
+            if self.block_size != Q4_SCALE_BLOCK:
                 raise ValueError(
-                    f"тензор {self.name!r}: fp-тензор не имеет тритов/int8"
+                    f"тензор {self.name!r}: Q4 хранит масштаб только на "
+                    f"{Q4_SCALE_BLOCK} значений"
+                )
+            if self.data is not None or self.trits is not None:
+                raise ValueError(
+                    f"тензор {self.name!r}: Q4-тензор не имеет fp-данных/тритов"
+                )
+            if self.qdata is not None:
+                if len(self.qdata) != self.n_elements:
+                    raise ValueError(
+                        f"тензор {self.name!r}: {len(self.qdata)} Q4-значений, "
+                        f"а dims дают {self.n_elements}"
+                    )
+                for value in self.qdata:
+                    if not Q4_MIN <= int(value) <= Q4_MAX:
+                        raise ValueError(
+                            f"тензор {self.name!r}: Q4-значение {value!r} "
+                            f"вне {Q4_MIN}..{Q4_MAX}"
+                        )
+                expected = n_scale_blocks(self.n_elements, Q4_SCALE_BLOCK)
+                if self.scales is None:
+                    raise ValueError(f"тензор {self.name!r}: Q4 без масштабов")
+                if len(self.scales) != expected:
+                    raise ValueError(
+                        f"тензор {self.name!r}: масштабов {len(self.scales)}, "
+                        f"ожидалось {expected}"
+                    )
+                _check_finite(self.scales, f"тензор {self.name!r}: масштаб")
+                if any(s < 0 for s in self.scales):
+                    raise ValueError(
+                        f"тензор {self.name!r}: масштаб не может быть отрицательным"
+                    )
+                if self.q4_asymmetric:
+                    if self.q4_mins is None:
+                        raise ValueError(
+                            f"тензор {self.name!r}: Q4_1 без min (нулей квантования)"
+                        )
+                    if len(self.q4_mins) != expected:
+                        raise ValueError(
+                            f"тензор {self.name!r}: Q4_1 min {len(self.q4_mins)}, "
+                            f"ожидалось {expected}"
+                        )
+                    _check_finite(self.q4_mins, f"тензор {self.name!r}: Q4_1 min")
+                elif self.q4_mins is not None:
+                    raise ValueError(
+                        f"тензор {self.name!r}: Q4_0 не имеет min — "
+                        "поставьте q4_asymmetric=True для Q4_1"
+                    )
+            else:
+                if self.scales is not None or self.q4_mins is not None:
+                    raise ValueError(
+                        f"тензор {self.name!r}: Q4-масштабы/min без qdata"
+                    )
+        else:
+            if (self.trits is not None or self.scales is not None
+                    or self.qdata is not None or self.q4_mins is not None):
+                raise ValueError(
+                    f"тензор {self.name!r}: fp-тензор не имеет тритов/int8/Q4"
                 )
             if self.data is not None:
                 if len(self.data) != self.n_elements:
@@ -775,6 +890,37 @@ class Tensor:
         )
 
     @classmethod
+    def q4(
+        cls,
+        name: str,
+        dims: Sequence[int],
+        qdata: Iterable[int],
+        scales: Sequence[float],
+        scale_dtype: str = "float32",
+        *,
+        asymmetric: bool = False,
+        mins: Sequence[float] | None = None,
+    ) -> "Tensor":
+        """Q4-тензор (kind 5): нибблы 0..15, масштаб на группу 32.
+
+        `asymmetric=False` — Q4_0 (`w = (q-8)·scale`); `True` — Q4_1
+        (`w = q·scale + min`, `mins` обязательны и по числу равны scales).
+        """
+        return cls(
+            name=name,
+            kind=KIND_Q4,
+            dims=tuple(dims),
+            qdata=[int(value) for value in qdata],
+            scales=[_f32(float(value)) for value in scales],
+            scale_dtype=scale_dtype,
+            q4_asymmetric=bool(asymmetric),
+            q4_mins=(
+                [_f32(float(value)) for value in mins]
+                if mins is not None else None
+            ),
+        )
+
+    @classmethod
     def placeholder(cls, name: str, dims: Sequence[int], kind: int = KIND_F32) -> "Tensor":
         """Тензор без данных — для каркаса графа (веса ещё не загружены)."""
         return cls(name=name, kind=kind, dims=tuple(dims))
@@ -798,6 +944,24 @@ class Tensor:
             # (int8 → float, умножение на float32-масштаб).
             return [_f32(value * scales[i // block])
                     for i, value in enumerate(self.qdata)]
+        if self.kind == KIND_Q4:
+            if self.qdata is None or self.scales is None:
+                raise ValueError(f"тензор {self.name!r}: нет Q4-данных")
+            if self.q4_asymmetric and self.q4_mins is None:
+                raise ValueError(f"тензор {self.name!r}: Q4_1 без min")
+            block = Q4_SCALE_BLOCK
+            scales = self.scales
+            mins = self.q4_mins
+            values: list[float] = []
+            for index, nibble in enumerate(self.qdata):
+                group = index // block
+                if self.q4_asymmetric:
+                    if mins is None:  # pragma: no cover - проверено в __post_init__
+                        raise ValueError(f"тензор {self.name!r}: Q4_1 без min")
+                    values.append(_f32(nibble * scales[group] + mins[group]))
+                else:
+                    values.append(_f32((nibble - Q4_ZERO_NIBBLE) * scales[group]))
+            return values
         if self.data is None:
             raise ValueError(f"тензор {self.name!r}: нет данных")
         return list(self.data)
@@ -851,6 +1015,114 @@ def quantize_trits(
         else:
             trits.append(max(-1, min(1, round_half_away(value / scale))))
     return trits, scales
+
+
+def pack_q4(values: Iterable[int], pad: int = Q4_ZERO_NIBBLE) -> bytes:
+    """Упаковать нибблы 0..15 в группы по 32 значения (16 байт на группу).
+
+    Раскладка — как в GGML Q4_0 и в ядрах 0152: байт `j` группы хранит
+    значение `j` в младшем ниббле, `j+16` — в старшем. Хвост последней
+    группы дополняется нибблом `pad` (по умолчанию 8 — ноль Q4_0).
+    """
+    vals = [int(value) for value in values]
+    for index, value in enumerate(vals):
+        if not Q4_MIN <= value <= Q4_MAX:
+            raise ValueError(f"Q4: значение #{index} = {value} вне {Q4_MIN}..{Q4_MAX}")
+    if not Q4_MIN <= int(pad) <= Q4_MAX:
+        raise ValueError(f"Q4: padding-ниббл {pad} вне {Q4_MIN}..{Q4_MAX}")
+    n_groups = n_scale_blocks(len(vals), Q4_SCALE_BLOCK)
+    out = bytearray(n_groups * Q4_GROUP_BYTES)
+    for index in range(n_groups * Q4_SCALE_BLOCK):
+        group, within = divmod(index, Q4_SCALE_BLOCK)
+        value = vals[index] if index < len(vals) else int(pad)
+        offset = group * Q4_GROUP_BYTES + (within & 15)
+        if within < 16:
+            out[offset] |= value
+        else:
+            out[offset] |= value << 4
+    return bytes(out)
+
+
+def unpack_q4(data: bytes, n_values: int) -> list[int]:
+    """Развернуть `n_values` нибблов Q4 (лишний padding игнорируется)."""
+    if n_values < 0:
+        raise ValueError("Q4: отрицательное число значений")
+    n_groups = n_scale_blocks(n_values, Q4_SCALE_BLOCK)
+    need = n_groups * Q4_GROUP_BYTES
+    if len(data) < need:
+        raise ValueError(
+            f"Q4-данные обрезаны: {len(data)} байт, ожидалось {need} "
+            f"({n_groups} групп по {Q4_SCALE_BLOCK})"
+        )
+    values: list[int] = []
+    for index in range(n_values):
+        group, within = divmod(index, Q4_SCALE_BLOCK)
+        byte = data[group * Q4_GROUP_BYTES + (within & 15)]
+        values.append((byte & 0x0F) if within < 16 else (byte >> 4))
+    return values
+
+
+def quantize_q4(
+    values: Iterable[float],
+    block_size: int = Q4_SCALE_BLOCK,
+    *,
+    symmetric: bool = True,
+) -> tuple[list[int], list[float]] | tuple[list[int], list[float], list[float]]:
+    """Квантовать веса в Q4 (нибблы 0..15, масштаб на группу 32).
+
+    Симметричный Q4_0: `scale = absmax/7`, `q = clamp(round_half_away(w/scale),
+    -8, 7) + 8` — крайние ±absmax представимы, ноль кодируется нибблом 8.
+    Асимметричный Q4_1: `scale = (max-min)/15`, `min` — настоящий минимум
+    блока, `q = clamp(round_half_away((w-min)/scale), 0, 15)`, `w = q·scale+min`.
+    У нулевого блока масштаб 0 (Q4_1 — ещё и min = значение блока). Для Q4_0
+    возвращается пара `(qdata, scales)`, для Q4_1 — тройка
+    `(qdata, scales, mins)`. Числа округляются до float32, чтобы совпасть с
+    контейнером после чтения с диска.
+    """
+    if block_size != Q4_SCALE_BLOCK:
+        raise ValueError(
+            f"Q4 хранит масштаб только на {Q4_SCALE_BLOCK} значений"
+        )
+    vals = [_f32(float(v)) for v in values]
+    _check_finite(vals, "quantize_q4")
+    qdata: list[int] = []
+    scales: list[float] = []
+    mins_list: list[float] = []
+    for start in range(0, len(vals), block_size):
+        block = vals[start:start + block_size]
+        if symmetric:
+            absmax = max(abs(v) for v in block) if block else 0.0
+            scale = _f32(absmax / 7.0) if absmax > 0 else 0.0
+            scales.append(scale)
+            for value in block:
+                if scale == 0.0:
+                    qdata.append(Q4_ZERO_NIBBLE)
+                else:
+                    signed = max(-8, min(7, round_half_away(
+                        _f32(value / scale)
+                    )))
+                    qdata.append(signed + Q4_ZERO_NIBBLE)
+        else:
+            lo = min(block) if block else 0.0
+            hi = max(block) if block else 0.0
+            if hi == lo:
+                scale = 0.0
+                zero = _f32(lo)
+            else:
+                scale = _f32((hi - lo) / 15.0)
+                zero = _f32(lo)
+            scales.append(scale)
+            mins_list.append(zero)
+            for value in block:
+                if scale == 0.0:
+                    qdata.append(0)
+                else:
+                    qdata.append(max(0, min(15, round_half_away(
+                        _f32((value - zero) / scale)
+                    ))))
+    if symmetric:
+        return qdata, scales
+    return qdata, scales, mins_list
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +1202,13 @@ def tensor_payload_size(tensor: Tensor) -> int:
             + n_scale_blocks(n_values, INT8_SCALE_BLOCK) * scale_bytes
             + n_values
         )
+    if tensor.kind == KIND_Q4:
+        n_values = tensor.n_elements
+        n_groups = n_scale_blocks(n_values, Q4_SCALE_BLOCK)
+        scale_bytes = 4 if tensor.scale_dtype == "float32" else 2
+        aux_bytes = n_groups * scale_bytes * (2 if tensor.q4_asymmetric else 1)
+        header = Q4_HEADER_SIZE + (4 if tensor.q4_asymmetric else 0)
+        return header + aux_bytes + n_groups * Q4_GROUP_BYTES
     if tensor.kind == KIND_F32:
         return tensor.n_elements * 4
     if tensor.kind in (KIND_F16, KIND_BF16):
@@ -1009,6 +1288,152 @@ def decode_int8_segment(data: bytes) -> tuple[list[int], list[float], str]:
                 f"INT8-сегмент: q #{index} = {value} меньше {INT8_MIN}"
             )
     return qdata, [float(s) for s in scales], scale_dtype
+
+
+def encode_q4_segment(tensor: Tensor) -> bytes:
+    """Собрать Q4-сегмент: заголовок, масштабы, [min Q4_1], упакованные нибблы."""
+    if tensor.kind != KIND_Q4:
+        raise ValueError(f"тензор {tensor.name!r}: это не Q4")
+    if tensor.qdata is None or tensor.scales is None:
+        raise ValueError(
+            f"тензор {tensor.name!r}: нет Q4-данных — граф собран без весов, "
+            "записывать в контейнер нечего"
+        )
+    n_values = tensor.n_elements
+    n_groups = n_scale_blocks(n_values, Q4_SCALE_BLOCK)
+    if len(tensor.scales) != n_groups:
+        raise ValueError(
+            f"тензор {tensor.name!r}: масштабов {len(tensor.scales)}, "
+            f"ожидалось {n_groups}"
+        )
+    if len(tensor.qdata) != n_values:
+        raise ValueError(
+            f"тензор {tensor.name!r}: {len(tensor.qdata)} Q4-значений, "
+            f"а dims дают {n_values}"
+        )
+    asymmetric = bool(tensor.q4_asymmetric)
+    if asymmetric:
+        if tensor.q4_mins is None:
+            raise ValueError(
+                f"тензор {tensor.name!r}: Q4_1 без min — тихо писать Q4_0 нельзя"
+            )
+        if len(tensor.q4_mins) != n_groups:
+            raise ValueError(
+                f"тензор {tensor.name!r}: Q4_1 min {len(tensor.q4_mins)}, "
+                f"ожидалось {n_groups}"
+            )
+    elif tensor.q4_mins is not None:
+        raise ValueError(
+            f"тензор {tensor.name!r}: Q4_0 не имеет min (q4_asymmetric=False)"
+        )
+    magic = Q4_MAGIC_ASYM if asymmetric else Q4_MAGIC
+    flags = Q4_FLAG_F32_SCALES if tensor.scale_dtype == "float32" else 0
+    header = _TRT1_STRUCT.pack(magic, Q4_VERSION, flags, n_values, n_groups)
+    if asymmetric:
+        # Явное число min: читатель обязан сверить его с ceil(n/32), иначе
+        # отсутствие min можно спутать с выравнивающим padding'ом.
+        header += struct.pack("<I", n_groups)
+    scale_code = "f" if tensor.scale_dtype == "float32" else "e"
+    try:
+        scales_bytes = struct.pack(f"<{n_groups}{scale_code}", *tensor.scales)
+        mins_bytes = (
+            struct.pack(f"<{n_groups}{scale_code}", *tensor.q4_mins)
+            if asymmetric else b""
+        )
+    except (struct.error, OverflowError) as exc:
+        raise ValueError(
+            f"тензор {tensor.name!r}: масштаб/min не влезает в "
+            f"{tensor.scale_dtype}"
+        ) from exc
+    return header + scales_bytes + mins_bytes + pack_q4(tensor.qdata)
+
+
+def decode_q4_segment_ex(
+    data: bytes,
+) -> tuple[list[int], list[float], str, bool, list[float] | None]:
+    """Разобрать Q4-сегмент: нибблы, масштабы, dtype, asym, min'ы.
+
+    Лишние байты в конце (выравнивание payload'а до 32) игнорируются.
+    """
+    if len(data) < Q4_HEADER_SIZE:
+        raise ValueError(
+            f"Q4-сегмент короче заголовка: {len(data)} < {Q4_HEADER_SIZE}"
+        )
+    magic, version, flags, n_values, n_groups = _TRT1_STRUCT.unpack_from(data, 0)
+    if magic not in (Q4_MAGIC, Q4_MAGIC_ASYM):
+        raise ValueError(f"чужой magic Q4-сегмента: {magic!r}")
+    if version != Q4_VERSION:
+        raise ValueError(f"неизвестная версия Q4-сегмента: {version}")
+    if flags & ~Q4_FLAG_F32_SCALES:
+        raise ValueError(f"неизвестные флаги Q4-сегмента: 0x{flags:02x}")
+    asymmetric = magic == Q4_MAGIC_ASYM
+    expected_groups = n_scale_blocks(n_values, Q4_SCALE_BLOCK)
+    if n_groups != expected_groups:
+        raise ValueError(
+            f"в заголовке Q4 {n_groups} групп, ожидалось {expected_groups} "
+            f"для {n_values} значений (группа {Q4_SCALE_BLOCK})"
+        )
+    header_size = Q4_HEADER_SIZE
+    if asymmetric:
+        if len(data) < Q4_ASYM_HEADER_SIZE:
+            raise ValueError(
+                f"Q4_1-сегмент короче заголовка: {len(data)} < "
+                f"{Q4_ASYM_HEADER_SIZE} (нет n_mins)"
+            )
+        n_mins = struct.unpack_from("<I", data, Q4_HEADER_SIZE)[0]
+        if n_mins != expected_groups:
+            raise ValueError(
+                f"Q4_1: n_mins={n_mins}, ожидалось {expected_groups} "
+                f"(по одному min на группу {Q4_SCALE_BLOCK}) — тихо считать "
+                "Q4_0 нельзя"
+            )
+        header_size = Q4_ASYM_HEADER_SIZE
+    scale_dtype = "float32" if flags & Q4_FLAG_F32_SCALES else "float16"
+    scale_size = 4 if scale_dtype == "float32" else 2
+    scales_offset = header_size
+    mins_offset = scales_offset + n_groups * scale_size
+    q_offset = mins_offset + (n_groups * scale_size if asymmetric else 0)
+    expected_len = q_offset + n_groups * Q4_GROUP_BYTES
+    if len(data) < expected_len:
+        raise ValueError(
+            f"Q4-сегмент обрезан: {len(data)} байт, ожидалось {expected_len}"
+        )
+    scale_code = "f" if scale_dtype == "float32" else "e"
+    scales = [float(s) for s in struct.unpack_from(
+        f"<{n_groups}{scale_code}", data, scales_offset
+    )]
+    mins = (
+        [float(s) for s in struct.unpack_from(
+            f"<{n_groups}{scale_code}", data, mins_offset
+        )]
+        if asymmetric else None
+    )
+    for index, scale in enumerate(scales):
+        if not math.isfinite(scale) or scale < 0:
+            raise ValueError(
+                f"Q4-сегмент: масштаб #{index} = {scale!r} "
+                "(должен быть конечным и неотрицательным)"
+            )
+    if mins is not None:
+        for index, value in enumerate(mins):
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"Q4-сегмент: min #{index} = {value!r} не конечный"
+                )
+    qdata = unpack_q4(data[q_offset:q_offset + n_groups * Q4_GROUP_BYTES],
+                      n_values)
+    for index, value in enumerate(qdata):
+        if not Q4_MIN <= value <= Q4_MAX:  # pragma: no cover - ниббл всегда 0..15
+            raise ValueError(
+                f"Q4-сегмент: значение #{index} = {value} вне {Q4_MIN}..{Q4_MAX}"
+            )
+    return qdata, scales, scale_dtype, asymmetric, mins
+
+
+def decode_q4_segment(data: bytes) -> tuple[list[int], list[float], str]:
+    """Разобрать Q4-сегмент (совместимый вид: без asym/min)."""
+    qdata, scales, scale_dtype, _asymmetric, _mins = decode_q4_segment_ex(data)
+    return qdata, scales, scale_dtype
 
 
 def encode_trit_segment(tensor: Tensor) -> bytes:
@@ -1139,6 +1564,8 @@ def encode_tensor_payload(tensor: Tensor) -> bytes:
         return encode_trit_segment(tensor)
     if tensor.kind == KIND_INT8:
         return encode_int8_segment(tensor)
+    if tensor.kind == KIND_Q4:
+        return encode_q4_segment(tensor)
     if tensor.data is None:
         raise ValueError(
             f"тензор {tensor.name!r}: нет данных — граф собран без весов, "
@@ -1182,6 +1609,19 @@ def decode_tensor_values(tensor: Tensor, payload: bytes) -> None:
         tensor.qdata = qdata
         tensor.scales = scales
         tensor.scale_dtype = scale_dtype
+        return
+    if tensor.kind == KIND_Q4:
+        qdata, scales, scale_dtype, asymmetric, mins = decode_q4_segment_ex(payload)
+        if len(qdata) != tensor.n_elements:
+            raise ValueError(
+                f"тензор {tensor.name!r}: в сегменте {len(qdata)} Q4-значений, "
+                f"а dims дают {tensor.n_elements}"
+            )
+        tensor.qdata = qdata
+        tensor.scales = scales
+        tensor.scale_dtype = scale_dtype
+        tensor.q4_asymmetric = asymmetric
+        tensor.q4_mins = mins
         return
     n = tensor.n_elements
     if tensor.kind == KIND_F32:
@@ -1545,7 +1985,7 @@ def write_vtm(
             continue
         tensor.offset = data_size
         tensor.scale_offset = (
-            NO_OFFSET if tensor.kind in (KIND_TRITS, KIND_INT8) else 0
+            NO_OFFSET if tensor.kind in (KIND_TRITS, KIND_INT8, KIND_Q4) else 0
         )
         if tensor.offset % ALIGNMENT:
             raise RuntimeError(  # pragma: no cover - защита от ошибки в align_up
@@ -1672,6 +2112,16 @@ def _empty_payload_prefix(tensor: Tensor) -> tuple[bytes, int]:
             INT8_MAGIC, INT8_VERSION, flags, tensor.n_elements, n_scales
         )
         return header, size
+    if tensor.kind == KIND_Q4:
+        flags = Q4_FLAG_F32_SCALES if tensor.scale_dtype == "float32" else 0
+        n_groups = n_scale_blocks(tensor.n_elements, Q4_SCALE_BLOCK)
+        header = _TRT1_STRUCT.pack(
+            Q4_MAGIC_ASYM if tensor.q4_asymmetric else Q4_MAGIC,
+            Q4_VERSION, flags, tensor.n_elements, n_groups,
+        )
+        if tensor.q4_asymmetric:
+            header += struct.pack("<I", n_groups)
+        return header, size
     return b"", size
 
 
@@ -1762,7 +2212,7 @@ def write_vtm_stream(
         prefix, size = _empty_payload_prefix(tensor)
         tensor.offset = data_size
         tensor.scale_offset = (
-            NO_OFFSET if tensor.kind in (KIND_TRITS, KIND_INT8) else 0
+            NO_OFFSET if tensor.kind in (KIND_TRITS, KIND_INT8, KIND_Q4) else 0
         )
         if tensor.offset % ALIGNMENT:  # pragma: no cover - защита от align_up
             raise RuntimeError(
@@ -1884,7 +2334,7 @@ def _payload_extent(
     У KV-кэша (flags & TFLAG_KV_CACHE) payload'а нет: 0 байт, читать нечего.
     """
     if flags & TFLAG_KV_CACHE:
-        if kind in (KIND_TRITS, KIND_INT8):
+        if kind in (KIND_TRITS, KIND_INT8, KIND_Q4):
             raise ValueError(
                 f"KV-кэш обязан быть fp-тензором, а запись говорит kind={kind}"
             )
@@ -1928,6 +2378,47 @@ def _payload_extent(
         scale_dtype = "float32" if flags & 0x01 else "float16"
         scale_size = 4 if scale_dtype == "float32" else 2
         return INT8_HEADER_SIZE + n_scales * scale_size + n_values, scale_dtype
+    if kind == KIND_Q4:
+        if start + Q4_HEADER_SIZE > len(data):
+            raise ValueError("Q4-сегмент выходит за конец файла")
+        magic, version, qflags, n_values, n_groups = _TRT1_STRUCT.unpack_from(
+            data, start
+        )
+        if magic not in (Q4_MAGIC, Q4_MAGIC_ASYM):
+            raise ValueError(f"чужой magic Q4-сегмента: {magic!r}")
+        if version != Q4_VERSION:
+            raise ValueError(f"неизвестная версия Q4-сегмента: {version}")
+        if qflags & ~Q4_FLAG_F32_SCALES:
+            raise ValueError(f"неизвестные флаги Q4-сегмента: 0x{qflags:02x}")
+        if n_values != n_elements:
+            raise ValueError(
+                f"в Q4-сегменте {n_values} значений, а dims дают {n_elements}"
+            )
+        expected_groups = n_scale_blocks(n_values, Q4_SCALE_BLOCK)
+        if n_groups != expected_groups:
+            raise ValueError(
+                f"в Q4-сегменте {n_groups} групп, ожидалось "
+                f"{expected_groups}"
+            )
+        scale_dtype = "float32" if qflags & Q4_FLAG_F32_SCALES else "float16"
+        scale_size = 4 if scale_dtype == "float32" else 2
+        asymmetric = magic == Q4_MAGIC_ASYM
+        header_size = Q4_HEADER_SIZE
+        if asymmetric:
+            if start + Q4_ASYM_HEADER_SIZE > len(data):
+                raise ValueError("Q4_1-сегмент короче заголовка (нет n_mins)")
+            n_mins = struct.unpack_from("<I", data, start + Q4_HEADER_SIZE)[0]
+            if n_mins != expected_groups:
+                raise ValueError(
+                    f"Q4_1: n_mins={n_mins}, ожидалось {expected_groups}"
+                )
+            header_size = Q4_ASYM_HEADER_SIZE
+        return (
+            header_size
+            + n_groups * scale_size * (2 if asymmetric else 1)
+            + n_groups * Q4_GROUP_BYTES,
+            scale_dtype,
+        )
     if kind == KIND_F32:
         return n_elements * 4, None
     if kind in (KIND_F16, KIND_BF16):
@@ -2032,7 +2523,7 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
             # KV_NO_OFFSET; старый загрузчик до 0101 на нём отказывает, а не
             # читает данные по offset=0 как мусор. Контейнеры без флага
             # (0101 и старше) по-прежнему несут offset=0.
-            if kind == KIND_TRITS:
+            if kind in (KIND_TRITS, KIND_INT8, KIND_Q4):
                 raise ValueError(f"тензор {name!r}: KV-кэш обязан быть fp-тензором")
             if scale_offset != 0:
                 raise ValueError(
@@ -2105,6 +2596,14 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
                 raise ValueError(
                     f"тензор {name!r}: scale_offset={scale_offset}, ожидалось "
                     f"{NO_OFFSET} (масштабы внутри INT8-сегмента)"
+                )
+            tensor.scale_offset = NO_OFFSET
+            tensor.scale_dtype = scale_dtype or "float32"
+        elif kind == KIND_Q4:
+            if scale_offset != NO_OFFSET:
+                raise ValueError(
+                    f"тензор {name!r}: scale_offset={scale_offset}, ожидалось "
+                    f"{NO_OFFSET} (масштабы внутри Q4-сегмента)"
                 )
             tensor.scale_offset = NO_OFFSET
             tensor.scale_dtype = scale_dtype or "float32"

@@ -67,6 +67,41 @@ static vtm_status req_trit(vtm_t *m, const vtm_tensor *t, uint32_t ins,
     return VTM_OK;
 }
 
+// --- kind 5 (Q4), задача 0152 ----------------------------------------------
+//
+// Контракт — kind 5 (VTM_TENSOR_Q4), 4 бита, группы 32, масштаб fp32 на
+// группу. Раскладка нибблов — GGML Q4_0 (см. vtm_backend.h), указатель на
+// байты — t->words; fallback на t->f32 оставлен на случай, если загрузчик
+// положит упакованные данные туда.
+static const uint8_t *q4_bytes(const vtm_tensor *t) {
+    if (t->words) return (const uint8_t *)t->words;
+    return (const uint8_t *)t->f32;
+}
+
+static vtm_status req_q4(vtm_t *m, const vtm_tensor *t, uint32_t ins,
+                         const char *role) {
+    uint64_t groups;
+    if (!t || t->kind != VTM_TENSOR_Q4 || !t->scales || !q4_bytes(t))
+        return fail(m, ins, VTM_E_TENSOR,
+                    "%s: нужен Q4-тензор (kind 5): байты и масштабы", role);
+    // Q4_1 без минимумов — испорченный формат. Считать его симметрично
+    // нельзя: логиты разойдутся молча (задача 0152).
+    if (t->q4_is_asym && !t->q4_mins)
+        return fail(m, ins, VTM_E_FORMAT,
+                    "%s: Q4_1 без минимумов (q4_is_asym=1, q4_mins=NULL)",
+                    role);
+    if (t->scale_block != 32)
+        return fail(m, ins, VTM_E_FORMAT,
+                    "%s: Q4: блок масштаба %u, ожидали 32", role,
+                    (unsigned)t->scale_block);
+    groups = ((uint64_t)t->n_elements + 31u) / 32u;
+    if ((uint64_t)t->n_scales < groups)
+        return fail(m, ins, VTM_E_FORMAT,
+                    "%s: Q4: масштабов %u, нужно %llu (групп по 32)", role,
+                    (unsigned)t->n_scales, (unsigned long long)groups);
+    return VTM_OK;
+}
+
 static vtm_status same_count(vtm_t *m, const vtm_tensor *x, const vtm_tensor *y,
                              uint32_t ins, const char *role) {
     if (x->n_elements != y->n_elements)
@@ -147,6 +182,29 @@ static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     if (x == y)
         return fail(m, ins, VTM_E_SHAPE,
                     "dst и x — один тензор; TMV не умеет in-place");
+
+    // Q4 (kind 5): веса остаются упакованными. Ни арены, ни fp32-копии —
+    // ядро читает строку по 16 байт на 32 значения, деквантизует в scratch
+    // и сразу умножает (задача 0152).
+    if (w->kind == VTM_TENSOR_Q4) {
+        if ((in->flags & VTM_FLAG_TMV_TRANSPOSED) != 0)
+            return fail(m, ins, VTM_E_UNSUPPORTED,
+                        "TMV: Q4 с VTM_FLAG_TMV_TRANSPOSED не поддержан");
+        if ((st = req_q4(m, w, ins, "a (W)")) != VTM_OK) return st;
+        rows = (int)w->dims[0];
+        cols = (int)w->dims[1];
+        if (x->n_elements != (uint32_t)cols)
+            return fail(m, ins, VTM_E_SHAPE,
+                        "x: элементов %u, у W cols=%d", x->n_elements, cols);
+        if (y->n_elements != (uint32_t)rows)
+            return fail(m, ins, VTM_E_SHAPE,
+                        "y: элементов %u, у W rows=%d", y->n_elements, rows);
+        if (vtm_q4_tmv(y->f32, q4_bytes(w), w->scales,
+                       w->q4_is_asym ? w->q4_mins : NULL, x->f32, rows, cols,
+                       w->q4_is_asym ? 1 : 0) != 0)
+            return fail(m, ins, VTM_E_TENSOR, "ядро Q4 TMV вернуло ошибку");
+        return VTM_OK;
+    }
 
     // Плотный TMV: y = W·x. Нужен для нетернарных весов (эмбеддинги,
     // lm_head при tied_embeddings), которым в тритной матрице места нет.
@@ -232,7 +290,7 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     const vtm_tensor *b;
     const vtm_tensor *y;
     int mm, kk, nn, r, c, t;
-    int a_trit;
+    int a_trit, a_q4;
 
     if (!a) return st;
     b = need(m, in->b, ins, "b (B)", &st);
@@ -240,7 +298,10 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     y = need(m, in->dst, ins, "dst (Y)", &st);
     if (!y) return st;
     a_trit = a->kind == VTM_TENSOR_TRIT;
-    if (a_trit) {
+    a_q4 = a->kind == VTM_TENSOR_Q4;
+    if (a_q4) {
+        if ((st = req_q4(m, a, ins, "a (A)")) != VTM_OK) return st;
+    } else if (a_trit) {
         if (!a->words || !a->scales)
             return fail(m, ins, VTM_E_TENSOR,
                         "a (A): тритовая матрица без слов/масштабов");
@@ -268,6 +329,17 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
                     (unsigned)y->dims[0], (unsigned)y->dims[1], mm, nn);
     if (y == a || y == b)
         return fail(m, ins, VTM_E_SHAPE, "MM: dst совпадает с входом");
+
+    if (a_q4) {
+        // Q4 A (kind 5): не разворачиваем матрицу в fp32 — ядро деквантизует
+        // строку кусками и сразу считает. n == 1 (tied lm_head) — типовой
+        // случай; общий n тоже поддержан (дороже по распаковке).
+        if (vtm_q4_mm(y->f32, q4_bytes(a), a->scales,
+                      a->q4_is_asym ? a->q4_mins : NULL, b->f32, mm, kk, nn,
+                      a->q4_is_asym ? 1 : 0) != 0)
+            return fail(m, ins, VTM_E_TENSOR, "ядро Q4 MM вернуло ошибку");
+        return VTM_OK;
+    }
 
     if (a_trit) {
         if (simd_mm_enabled(m) &&
@@ -593,6 +665,21 @@ static vtm_status op_emb(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     if (y->n_elements != (uint32_t)dim)
         return fail(m, ins, VTM_E_SHAPE,
                     "EMB: y=%u элементов, dim=%d", y->n_elements, dim);
+
+    if (e->kind == VTM_TENSOR_Q4) {
+        // Q4-таблица словаря остаётся упакованной: разворачиваем одну строку
+        // в y (EMB и так копирует строку), в арену fp32-копии нет.
+        size_t base;
+        if ((st = req_q4(m, e, ins, "a (E)")) != VTM_OK) return st;
+        base = (size_t)token * (size_t)dim;
+        if (vtm_q4_dequant_row(y->f32, q4_bytes(e), e->scales,
+                               e->q4_is_asym ? e->q4_mins : NULL,
+                               (int64_t)base, dim,
+                               e->q4_is_asym ? 1 : 0) != 0)
+            return fail(m, ins, VTM_E_TENSOR,
+                        "EMB: ядро Q4 вернуло ошибку");
+        return VTM_OK;
+    }
 
     if (e->kind == VTM_TENSOR_TRIT) {
         size_t base, i;

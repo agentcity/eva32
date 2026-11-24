@@ -14,11 +14,18 @@
 //   ./bench_backend --batch         — батчевые TMV/MM (0122) на формах
 //                                     1.5B: «по токену» против пачки и
 //                                     оценка prefill 32/128.
+//   ./bench_backend --q4            — Q4 (kind 5, 0152): скорость и RSS
+//                                     против fp32-копии, форма 151936x896
+//                                     (lm_head Qwen-0.5B); --q4-rows/cols/iters
+//                                     меняют форму и число итераций.
 //
 // Бэкенд «кандидат» берётся из --backend или VTM_BACKEND (vtm_backend_from_env),
 // по умолчанию — simd, если он доступен.
 #include "vtm.h"
 #include "vtm_backend.h"
+// Только тесту: минимальная машина без загрузчика, чтобы проверить проводку
+// kind 5 в interp.c (op_tmv/op_mm/op_emb) без сборки контейнера.
+#include "vtm_internal.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -26,6 +33,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+#if defined(__linux__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
 
 #define CHECK_TOL 1e-5
 
@@ -263,6 +277,272 @@ static void batch_f32_ref(float *y, const float *w, const float *x, int rows,
         }
 }
 
+// --- Q4 (kind 5, задача 0152) ----------------------------------------------
+//
+// Упаковка — как в GGML Q4_0: 32 значения в 16 байтах, байт j хранит
+// value[j] (младший ниббл) и value[j+16] (старший). Эталон ниже —
+// независимая распаковка в double, без вызова ядра: иначе сравнение было бы
+// сравнением кода с самим собой.
+static uint8_t *make_q4(int n, uint32_t seed) {
+    size_t groups = ((size_t)n + VTM_Q4_GROUP_SIZE - 1)
+                  / VTM_Q4_GROUP_SIZE;
+    uint8_t *q = (uint8_t *)calloc(groups * (VTM_Q4_GROUP_SIZE / 2), 1u);
+    size_t g;
+
+    if (!q) return NULL;
+    for (g = 0; g < groups; g++) {
+        int j;
+        for (j = 0; j < VTM_Q4_GROUP_SIZE / 2; j++) {
+            unsigned lo = rng_next(&seed) & 0x0fu;
+            unsigned hi = rng_next(&seed) & 0x0fu;
+            q[g * (VTM_Q4_GROUP_SIZE / 2) + (size_t)j]
+                = (uint8_t)(lo | (hi << 4));
+        }
+    }
+    return q;
+}
+
+// scale > 0 — все масштабы равны scale; scale == 0 — 0.005..0.035.
+static float *make_q4_scales(int n, float scale, uint32_t seed) {
+    size_t groups = ((size_t)n + VTM_Q4_GROUP_SIZE - 1)
+                  / VTM_Q4_GROUP_SIZE;
+    float *s = (float *)malloc((groups ? groups : 1u) * sizeof(float));
+    size_t g;
+
+    if (!s) return NULL;
+    for (g = 0; g < groups; g++)
+        s[g] = scale > 0.0f
+             ? scale
+             : 0.005f + 0.03f * (float)(rng_next(&seed) % 1000u) / 999.0f;
+    return s;
+}
+
+// Q4_1: min на группу, -0.05..0.05.
+static float *make_q4_mins(int n, uint32_t seed) {
+    size_t groups = ((size_t)n + VTM_Q4_GROUP_SIZE - 1)
+                  / VTM_Q4_GROUP_SIZE;
+    float *m = (float *)malloc((groups ? groups : 1u) * sizeof(float));
+    size_t g;
+
+    if (!m) return NULL;
+    for (g = 0; g < groups; g++)
+        m[g] = -0.05f + 0.1f * (float)(rng_next(&seed) % 1000u) / 999.0f;
+    return m;
+}
+
+static double q4_ref_value(const uint8_t *q, int64_t idx, const float *scales,
+                           const float *mins, int asym) {
+    int64_t g = idx / VTM_Q4_GROUP_SIZE;
+    unsigned within = (unsigned)(idx % VTM_Q4_GROUP_SIZE);
+    unsigned byte = q[g * (VTM_Q4_GROUP_SIZE / 2) + (within & 15u)];
+    unsigned v = (within < 16u) ? (byte & 0x0fu) : (byte >> 4);
+    double scale = (double)scales[g];
+    return asym ? (double)v * scale + (double)mins[g]
+                : ((double)v - 8.0) * scale;
+}
+
+static void q4_tmv_ref(float *y, const uint8_t *q, const float *scales,
+                       const float *mins, const float *x, int rows, int cols,
+                       int asym) {
+    int r, j;
+    for (r = 0; r < rows; r++) {
+        int64_t base = (int64_t)r * (int64_t)cols;
+        double acc = 0.0;
+        for (j = 0; j < cols; j++)
+            acc += q4_ref_value(q, base + (int64_t)j, scales, mins, asym)
+                 * (double)x[j];
+        y[r] = (float)acc;
+    }
+}
+
+static void q4_mm_ref(float *y, const uint8_t *q, const float *scales,
+                      const float *mins, const float *b, int m, int k, int n,
+                      int asym) {
+    int r, c, t;
+    for (r = 0; r < m; r++) {
+        int64_t base = (int64_t)r * (int64_t)k;
+        for (c = 0; c < n; c++) {
+            double acc = 0.0;
+            for (t = 0; t < k; t++)
+                acc += q4_ref_value(q, base + (int64_t)t, scales, mins, asym)
+                     * (double)b[(size_t)t * (size_t)n + (size_t)c];
+            y[(size_t)r * (size_t)n + (size_t)c] = (float)acc;
+        }
+    }
+}
+
+// Резидентная память процесса: нужна, чтобы показать, что Q4-ядро не тянет
+// fp32-копию весов. macOS — task_info, Linux — /proc/self/statm; иначе 0.
+static size_t rss_bytes(void) {
+#if defined(__APPLE__)
+    // phys_footprint, а не resident_size: последний не считает сжатые
+    // страницы, и на больших матрицах RSS «прыгал» вниз после ядра.
+    task_vm_info_data_t info;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  (task_info_t)&info, &cnt) == KERN_SUCCESS)
+        return (size_t)info.phys_footprint;
+#elif defined(__linux__)
+    FILE *f = fopen("/proc/self/statm", "r");
+    long total = 0, resident = 0;
+    if (f) {
+        if (fscanf(f, "%ld %ld", &total, &resident) == 2) {
+            long pg = sysconf(_SC_PAGESIZE);
+            fclose(f);
+            if (pg > 0) return (size_t)resident * (size_t)pg;
+            return 0;
+        }
+        fclose(f);
+    }
+#endif
+    return 0;
+}
+
+static double mb_of(size_t bytes) { return (double)bytes / (1024.0 * 1024.0); }
+
+// Плотный fp32 TMV для сравнения скорости: та же арифметика (double по
+// строке), то же разбиение по строкам, что у Q4-ядра.
+typedef struct {
+    float *y;
+    const float *w;
+    const float *x;
+    int cols;
+} f32_tmv_job;
+
+static void f32_tmv_rows(void *p, int tid, int r0, int r1) {
+    f32_tmv_job *j = (f32_tmv_job *)p;
+    int r, t;
+    (void)tid;
+    for (r = r0; r < r1; r++) {
+        double acc = 0.0;
+        const float *wr = j->w + (size_t)r * (size_t)j->cols;
+        for (t = 0; t < j->cols; t++)
+            acc += (double)wr[t] * (double)j->x[t];
+        j->y[r] = (float)acc;
+    }
+}
+
+static void f32_tmv(float *y, const float *w, const float *x, int rows,
+                    int cols) {
+    f32_tmv_job job;
+    job.y = y;
+    job.w = w;
+    job.x = x;
+    job.cols = cols;
+    vtm_parallel_rows(rows, (double)rows * (double)cols, f32_tmv_rows, &job);
+}
+
+// Минимальная машина VTM без loader.c: три тензора, TMV/MM + HALT. Нужна,
+// чтобы проверить именно проводку kind 5 в interp.c (op_tmv/op_mm): поля
+// q4_is_asym/q4_mins и ошибку формата, не дожидаясь загрузчика 0151.
+static vtm_status q4_interp_tmv(const vtm_tensor *W, const float *x, float *y,
+                                int rows, int cols, char *err, size_t errcap) {
+    vtm_t m;
+    vtm_tensor ts[3];
+    vtm_instr ins[2];
+    vtm_status st;
+
+    memset(&m, 0, sizeof m);
+    memset(ts, 0, sizeof ts);
+    memset(ins, 0, sizeof ins);
+    ts[0] = *W;
+    ts[1].kind = VTM_TENSOR_F32;
+    ts[1].ndim = 2;
+    ts[1].dims[0] = 1;
+    ts[1].dims[1] = (uint32_t)cols;
+    ts[1].n_elements = (uint32_t)cols;
+    ts[1].f32 = (float *)x;
+    ts[2].kind = VTM_TENSOR_F32;
+    ts[2].ndim = 2;
+    ts[2].dims[0] = 1;
+    ts[2].dims[1] = (uint32_t)rows;
+    ts[2].n_elements = (uint32_t)rows;
+    ts[2].f32 = y;
+    ins[0].opcode = VTM_OP_TMV;
+    ins[0].a = 0;
+    ins[0].b = 1;
+    ins[0].dst = 2;
+    ins[1].opcode = VTM_OP_HALT;
+    m.tensors = ts;
+    m.n_tensors = 3;
+    m.instr = ins;
+    m.n_instr = 2;
+    m.backend = &vtm_backend_scalar_lut;
+    st = vtm_run(&m, NULL, NULL);
+    if (err && errcap) snprintf(err, errcap, "%s", vtm_error_message(&m));
+    return st;
+}
+
+static vtm_status q4_interp_mm(const vtm_tensor *A, const float *b, float *y,
+                               int rows, int k, int n, char *err,
+                               size_t errcap) {
+    vtm_t m;
+    vtm_tensor ts[3];
+    vtm_instr ins[2];
+    vtm_status st;
+
+    memset(&m, 0, sizeof m);
+    memset(ts, 0, sizeof ts);
+    memset(ins, 0, sizeof ins);
+    ts[0] = *A;
+    ts[1].kind = VTM_TENSOR_F32;
+    ts[1].ndim = 2;
+    ts[1].dims[0] = (uint32_t)k;
+    ts[1].dims[1] = (uint32_t)n;
+    ts[1].n_elements = (uint32_t)(k * n);
+    ts[1].f32 = (float *)b;
+    ts[2].kind = VTM_TENSOR_F32;
+    ts[2].ndim = 2;
+    ts[2].dims[0] = (uint32_t)rows;
+    ts[2].dims[1] = (uint32_t)n;
+    ts[2].n_elements = (uint32_t)(rows * n);
+    ts[2].f32 = y;
+    ins[0].opcode = VTM_OP_MM;
+    ins[0].a = 0;
+    ins[0].b = 1;
+    ins[0].dst = 2;
+    ins[1].opcode = VTM_OP_HALT;
+    m.tensors = ts;
+    m.n_tensors = 3;
+    m.instr = ins;
+    m.n_instr = 2;
+    m.backend = &vtm_backend_scalar_lut;
+    st = vtm_run(&m, NULL, NULL);
+    if (err && errcap) snprintf(err, errcap, "%s", vtm_error_message(&m));
+    return st;
+}
+
+static vtm_status q4_interp_emb(const vtm_tensor *E, float *y, int token,
+                                int dim, char *err, size_t errcap) {
+    vtm_t m;
+    vtm_tensor ts[2];
+    vtm_instr ins[2];
+    vtm_status st;
+
+    memset(&m, 0, sizeof m);
+    memset(ts, 0, sizeof ts);
+    memset(ins, 0, sizeof ins);
+    ts[0] = *E;
+    ts[1].kind = VTM_TENSOR_F32;
+    ts[1].ndim = 1;
+    ts[1].dims[0] = (uint32_t)dim;
+    ts[1].n_elements = (uint32_t)dim;
+    ts[1].f32 = y;
+    ins[0].opcode = VTM_OP_EMB;
+    ins[0].a = 0;
+    ins[0].dst = 1;
+    ins[0].imm = token;
+    ins[1].opcode = VTM_OP_HALT;
+    m.tensors = ts;
+    m.n_tensors = 2;
+    m.instr = ins;
+    m.n_instr = 2;
+    m.backend = &vtm_backend_scalar_lut;
+    st = vtm_run(&m, NULL, NULL);
+    if (err && errcap) snprintf(err, errcap, "%s", vtm_error_message(&m));
+    return st;
+}
+
 // --- проверки --------------------------------------------------------------
 
 static int failures;
@@ -275,6 +555,260 @@ static void report(const char *what, double diff, double ref, double tol) {
 }
 
 // Возвращает 0, если simd == scalar в пределах tol.
+// Q4 TMV: ядро против независимой деквантизации в double. asym=0 — Q4_0,
+// asym=1 — Q4_1 (q*scale+min). Формы включают cols не кратные 32, чтобы
+// проверить группу, пересекающую границу строк.
+static void check_q4_tmv_case(int rows, int cols, int asym, float scale) {
+    int n = rows * cols;
+    uint32_t seed = 0x4b00u + (uint32_t)rows * 131u + (uint32_t)cols
+                  + (uint32_t)asym * 7u;
+    uint8_t *q = make_q4(n, seed);
+    float *scales = make_q4_scales(n, scale, seed ^ 0x91u);
+    float *mins = asym ? make_q4_mins(n, seed ^ 0x33u) : NULL;
+    float *x = make_vec((size_t)cols, seed ^ 0x51u);
+    float *y_ref = (float *)calloc((size_t)rows, sizeof(float));
+    float *y_q4 = (float *)calloc((size_t)rows, sizeof(float));
+    char label[96];
+    double ref = 0.0;
+
+    if (!q || !scales || (asym && !mins) || !x || !y_ref || !y_q4) {
+        fprintf(stderr, "check_q4_tmv_case: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    q4_tmv_ref(y_ref, q, scales, mins, x, rows, cols, asym);
+    if (vtm_q4_tmv(y_q4, q, scales, mins, x, rows, cols, asym) != 0) {
+        fprintf(stderr, "check_q4_tmv_case: ядро вернуло ошибку\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "Q4%s TMV %dx%d scale %.2f",
+             asym ? "1" : "0", rows, cols, (double)scale);
+    report(label, max_diff(y_q4, y_ref, (size_t)rows, &ref), ref, CHECK_TOL);
+done:
+    free(q);
+    free(scales);
+    free(mins);
+    free(x);
+    free(y_ref);
+    free(y_q4);
+}
+
+static void check_q4_mm_case(int m, int k, int n, int asym, float scale) {
+    int n_el = m * k;
+    uint32_t seed = 0x9d00u + (uint32_t)m * 17u + (uint32_t)k * 3u
+                  + (uint32_t)n + (uint32_t)asym * 11u;
+    uint8_t *q = make_q4(n_el, seed);
+    float *scales = make_q4_scales(n_el, scale, seed ^ 0x77u);
+    float *mins = asym ? make_q4_mins(n_el, seed ^ 0x22u) : NULL;
+    float *b = make_vec((size_t)k * (size_t)n, seed ^ 0x11u);
+    float *y_ref = (float *)calloc((size_t)m * (size_t)n, sizeof(float));
+    float *y_q4 = (float *)calloc((size_t)m * (size_t)n, sizeof(float));
+    char label[112];
+    double ref = 0.0;
+
+    if (!q || !scales || (asym && !mins) || !b || !y_ref || !y_q4) {
+        fprintf(stderr, "check_q4_mm_case: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    q4_mm_ref(y_ref, q, scales, mins, b, m, k, n, asym);
+    if (vtm_q4_mm(y_q4, q, scales, mins, b, m, k, n, asym) != 0) {
+        fprintf(stderr, "check_q4_mm_case: ядро вернуло ошибку\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "Q4%s MM %dx%dx%d scale %.2f",
+             asym ? "1" : "0", m, k, n, (double)scale);
+    report(label, max_diff(y_q4, y_ref, (size_t)m * (size_t)n, &ref), ref,
+           CHECK_TOL);
+done:
+    free(q);
+    free(scales);
+    free(mins);
+    free(b);
+    free(y_ref);
+    free(y_q4);
+}
+
+// Контракт аргументов: NULL/отрицательные размеры — -1; asym без mins — -1;
+// нулевая размерность — 0 и никакого обращения к буферам.
+static void check_q4_args(void) {
+    float x[2] = {1.0f, 2.0f};
+    float y[2] = {0.0f, 0.0f};
+    float scales[1] = {1.0f};
+    float mins[1] = {0.0f};
+    uint8_t q[16] = {0};
+    int bad = 0;
+
+    if (vtm_q4_tmv(NULL, q, scales, NULL, x, 1, 2, 0) != -1) bad = 1;
+    if (vtm_q4_tmv(y, NULL, scales, NULL, x, 1, 2, 0) != -1) bad = 1;
+    if (vtm_q4_tmv(y, q, NULL, NULL, x, 1, 2, 0) != -1) bad = 1;
+    if (vtm_q4_tmv(y, q, scales, NULL, NULL, 1, 2, 0) != -1) bad = 1;
+    if (vtm_q4_tmv(y, q, scales, NULL, x, -1, 2, 0) != -1) bad = 1;
+    if (vtm_q4_tmv(y, q, scales, NULL, x, 1, 2, 1) != -1) bad = 1;
+    if (vtm_q4_tmv(y, q, scales, mins, x, 0, 2, 1) != 0) bad = 1;
+    if (vtm_q4_mm(NULL, q, scales, NULL, x, 1, 2, 1, 0) != -1) bad = 1;
+    if (vtm_q4_mm(y, q, scales, NULL, x, 1, 2, 1, 1) != -1) bad = 1;
+    if (vtm_q4_mm(y, q, scales, NULL, x, 1, 2, 0, 0) != 0) bad = 1;
+    printf("  %-34s %s\n", "Q4 аргументы/NULL/размеры",
+           bad ? "FAIL" : "ok");
+    if (bad) failures++;
+}
+
+// Проводка kind 5 через interp.c: sym и asym на одних и тех же q/scales дают
+// разные результаты (asym учитывает mins), а asym без mins отвергается
+// VTM_E_FORMAT, а не считается молча симметрично.
+static void check_q4_interp(void) {
+    enum { ROWS = 13, COLS = 97, K = 37, MM_ROWS = 7, MM_K = 53 };
+    int n = ROWS * COLS;
+    int groups = (n + VTM_Q4_GROUP_SIZE - 1) / VTM_Q4_GROUP_SIZE;
+    uint8_t *q = make_q4(n, 0x5150u);
+    float *scales = make_q4_scales(n, 0.02f, 0x77u);
+    float *mins = make_q4_mins(n, 0x33u);
+    float *x = make_vec((size_t)COLS, 0x11u);
+    float *y_sym = (float *)calloc((size_t)ROWS, sizeof(float));
+    float *y_asym = (float *)calloc((size_t)ROWS, sizeof(float));
+    float *y_ref = (float *)calloc((size_t)ROWS, sizeof(float));
+    float *y_nomins = (float *)calloc((size_t)ROWS, sizeof(float));
+    vtm_tensor W;
+    char err[256];
+    vtm_status st;
+    double d, ref = 0.0;
+
+    if (!q || !scales || !mins || !x || !y_sym || !y_asym || !y_ref
+        || !y_nomins) {
+        fprintf(stderr, "check_q4_interp: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    memset(&W, 0, sizeof W);
+    W.kind = VTM_TENSOR_Q4;
+    W.ndim = 2;
+    W.dims[0] = ROWS;
+    W.dims[1] = COLS;
+    W.n_elements = (uint32_t)n;
+    W.words = (const uint32_t *)q;
+    W.scales = scales;
+    W.n_scales = (uint32_t)groups;
+    W.scale_block = VTM_Q4_GROUP_SIZE;
+    W.scale_is_f32 = 1;
+    W.q4_is_asym = 0;
+
+    err[0] = '\0';
+    st = q4_interp_tmv(&W, x, y_sym, ROWS, COLS, err, sizeof err);
+    q4_tmv_ref(y_ref, q, scales, NULL, x, ROWS, COLS, 0);
+    report("Q4 sym через interp (TMV)",
+           max_diff(y_sym, y_ref, (size_t)ROWS, &ref), ref,
+           st == VTM_OK ? CHECK_TOL : -1.0);
+
+    W.q4_is_asym = 1;
+    W.q4_mins = mins;
+    err[0] = '\0';
+    st = q4_interp_tmv(&W, x, y_asym, ROWS, COLS, err, sizeof err);
+    q4_tmv_ref(y_ref, q, scales, mins, x, ROWS, COLS, 1);
+    report("Q4 asym через interp (TMV)",
+           max_diff(y_asym, y_ref, (size_t)ROWS, &ref), ref,
+           st == VTM_OK ? CHECK_TOL : -1.0);
+
+    d = max_diff(y_sym, y_asym, (size_t)ROWS, NULL);
+    printf("  %-34s max|sym-asym|=%.3e  %s\n", "Q4 sym != asym (одни qs)",
+           d, d > 1e-4 ? "ok" : "FAIL");
+    if (!(d > 1e-4)) failures++;
+
+    // asym без минимумов — ошибка формата с внятным текстом.
+    W.q4_mins = NULL;
+    err[0] = '\0';
+    st = q4_interp_tmv(&W, x, y_nomins, ROWS, COLS, err, sizeof err);
+    printf("  %-34s st=%d (%s)  %s\n", "Q4_1 без mins отвергнут", (int)st,
+           err, st == VTM_E_FORMAT && strstr(err, "Q4_1") ? "ok" : "FAIL");
+    if (st != VTM_E_FORMAT || !strstr(err, "Q4_1")) failures++;
+
+    // MM: та же проводка, n == 1 (tied lm_head).
+    {
+        int mn = MM_ROWS * MM_K;
+        int mgroups = (mn + VTM_Q4_GROUP_SIZE - 1) / VTM_Q4_GROUP_SIZE;
+        uint8_t *mq = make_q4(mn, 0x9001u);
+        float *mscales = make_q4_scales(mn, 0.02f, 0x9002u);
+        float *bm = make_vec((size_t)MM_K, 0x9003u);
+        float *ym = (float *)calloc((size_t)MM_ROWS, sizeof(float));
+        float *yref = (float *)calloc((size_t)MM_ROWS, sizeof(float));
+        vtm_tensor A;
+        if (!mq || !mscales || !bm || !ym || !yref) {
+            fprintf(stderr, "check_q4_interp: нет памяти на MM\n");
+            failures++;
+        } else {
+            memset(&A, 0, sizeof A);
+            A.kind = VTM_TENSOR_Q4;
+            A.ndim = 2;
+            A.dims[0] = MM_ROWS;
+            A.dims[1] = MM_K;
+            A.n_elements = (uint32_t)mn;
+            A.words = (const uint32_t *)mq;
+            A.scales = mscales;
+            A.n_scales = (uint32_t)mgroups;
+            A.scale_block = VTM_Q4_GROUP_SIZE;
+            st = q4_interp_mm(&A, bm, ym, MM_ROWS, MM_K, 1, err, sizeof err);
+            q4_mm_ref(yref, mq, mscales, NULL, bm, MM_ROWS, MM_K, 1, 0);
+            report("Q4 sym через interp (MM n=1)",
+                   max_diff(ym, yref, (size_t)MM_ROWS, &ref), ref,
+                   st == VTM_OK ? CHECK_TOL : -1.0);
+        }
+        free(mq);
+        free(mscales);
+        free(bm);
+        free(ym);
+        free(yref);
+    }
+
+    // EMB: Q4-таблица словаря — разворачивается только выбранная строка.
+    {
+        int vocab = 11, dim = 37, en = vocab * dim, etok = vocab - 1;
+        int egroups = (en + VTM_Q4_GROUP_SIZE - 1) / VTM_Q4_GROUP_SIZE;
+        uint8_t *eq = make_q4(en, 0xa001u);
+        float *escales = make_q4_scales(en, 0.02f, 0xa002u);
+        float *ey = (float *)calloc((size_t)dim, sizeof(float));
+        float *eref = (float *)calloc((size_t)dim, sizeof(float));
+        vtm_tensor E;
+        if (!eq || !escales || !ey || !eref) {
+            fprintf(stderr, "check_q4_interp: нет памяти на EMB\n");
+            failures++;
+        } else {
+            int j;
+            memset(&E, 0, sizeof E);
+            E.kind = VTM_TENSOR_Q4;
+            E.ndim = 2;
+            E.dims[0] = (uint32_t)vocab;
+            E.dims[1] = (uint32_t)dim;
+            E.n_elements = (uint32_t)en;
+            E.words = (const uint32_t *)eq;
+            E.scales = escales;
+            E.n_scales = (uint32_t)egroups;
+            E.scale_block = VTM_Q4_GROUP_SIZE;
+            st = q4_interp_emb(&E, ey, etok, dim, err, sizeof err);
+            for (j = 0; j < dim; j++)
+                eref[j] = (float)q4_ref_value(
+                    eq, (int64_t)etok * dim + j, escales, NULL, 0);
+            report("Q4 sym через interp (EMB)",
+                   max_diff(ey, eref, (size_t)dim, &ref), ref,
+                   st == VTM_OK ? CHECK_TOL : -1.0);
+        }
+        free(eq);
+        free(escales);
+        free(ey);
+        free(eref);
+    }
+done:
+    free(q);
+    free(scales);
+    free(mins);
+    free(x);
+    free(y_sym);
+    free(y_asym);
+    free(y_ref);
+    free(y_nomins);
+}
+
 static int check_tmv_case(int rows, int cols, int scale_block, float scale,
                           const vtm_backend *cand) {
     int n_trits = rows * cols;
@@ -570,6 +1104,34 @@ static int run_checks(const vtm_backend *cand) {
         }
         check_batch_f32_case(7, 13, 5);
         check_batch_f32_case(64, 37, 16);
+    }
+
+    // Q4 (kind 5, задача 0152): независимый эталон — деквантизация в double.
+    // Проверяем Q4_0 и Q4_1, хвосты групп (cols не кратны 32) и MM n>1.
+    {
+        static const int q4shapes[][2] = {
+            {1, 1}, {1, 31}, {1, 32}, {1, 33}, {7, 37}, {5, 53},
+            {17, 128}, {64, 160}, {128, 128}, {3, 1031}
+        };
+        static const int q4mmshapes[][3] = {
+            {5, 7, 3}, {8, 16, 8}, {64, 128, 1}, {16, 32, 64}, {3, 1000, 17}
+        };
+        size_t qi;
+        for (qi = 0; qi < sizeof(q4shapes) / sizeof(q4shapes[0]); qi++) {
+            int qn = q4shapes[qi][0] * q4shapes[qi][1];
+            float qs = qn > 8192 ? 0.02f : 1.0f;
+            check_q4_tmv_case(q4shapes[qi][0], q4shapes[qi][1], 0, qs);
+            check_q4_tmv_case(q4shapes[qi][0], q4shapes[qi][1], 1, qs);
+        }
+        for (qi = 0; qi < sizeof(q4mmshapes) / sizeof(q4mmshapes[0]); qi++) {
+            float qs = q4mmshapes[qi][1] > 128 ? 0.02f : 1.0f;
+            check_q4_mm_case(q4mmshapes[qi][0], q4mmshapes[qi][1],
+                             q4mmshapes[qi][2], 0, qs);
+            check_q4_mm_case(q4mmshapes[qi][0], q4mmshapes[qi][1],
+                             q4mmshapes[qi][2], 1, qs);
+        }
+        check_q4_args();
+        check_q4_interp();
     }
 
     if (failures) {
@@ -1204,6 +1766,168 @@ static int run_batch_bench(int ntok, int iters) {
 
 // --- логиты модели ---------------------------------------------------------
 
+// --- Q4: скорость и RSS против fp32-пути (задача 0152) --------------------
+//
+// Форма по умолчанию — lm_head Qwen-0.5B: 151936x896 ≈ 136 М весов (это
+// крупнейшая матрица 0.5B-раскладки). В Q4 она занимает 0,5 байта/вес +
+// 4 байта на 32 веса (масштабы) ≈ 76 МБ; fp32-копия тех же весов — 544 МБ.
+// Замер показывает: (1) во сколько раз Q4-ядро медленнее/быстрее fp32 на
+// одной и той же арифметике; (2) на сколько растёт RSS на веса и на само
+// ядро (у ядра — 4 КБ scratch на поток, роста быть не должно).
+// Минимум по итерациям, а не среднее: на общей машине среднее ловит чужие
+// процессы и троттлинг (разброс был 45–365 мс на одном и том же fp32-ядре).
+static double bench_q4_tmv(const uint8_t *q, const float *scales,
+                           const float *x, float *y, int rows, int cols,
+                           int iters) {
+    double best = 1e300;
+    int i;
+    if (vtm_q4_tmv(y, q, scales, NULL, x, rows, cols, 0) != 0) return -1.0;
+    for (i = 0; i < iters; i++) {
+        double t0 = now_ms();
+        vtm_q4_tmv(y, q, scales, NULL, x, rows, cols, 0);
+        {
+            double dt = now_ms() - t0;
+            if (dt < best) best = dt;
+        }
+    }
+    return best;
+}
+
+static double bench_f32_tmv(const float *w, const float *x, float *y,
+                            int rows, int cols, int iters) {
+    double best = 1e300;
+    int i;
+    f32_tmv(y, w, x, rows, cols);
+    for (i = 0; i < iters; i++) {
+        double t0 = now_ms();
+        f32_tmv(y, w, x, rows, cols);
+        {
+            double dt = now_ms() - t0;
+            if (dt < best) best = dt;
+        }
+    }
+    return best;
+}
+
+static int run_q4_bench(int rows, int cols, int iters) {
+    int64_t n64 = (int64_t)rows * (int64_t)cols;
+    int n = (int)n64;
+    size_t groups = ((size_t)n + VTM_Q4_GROUP_SIZE - 1) / VTM_Q4_GROUP_SIZE;
+    size_t q_bytes = groups * (VTM_Q4_GROUP_SIZE / 2);
+    size_t s_bytes = groups * sizeof(float);
+    size_t f32_bytes = (size_t)n * sizeof(float);
+    uint8_t *q = NULL;
+    float *scales = NULL, *x = NULL, *y = NULL, *y_f32 = NULL, *w = NULL;
+    size_t rss0, rss_q4, rss_kernel, rss_f32;
+    double t_q4, t_f32;
+    double maxd = 0.0, maxr = 0.0;
+    int r, s;
+
+    failures = 0;
+    if (n64 <= 0 || n64 > (int64_t)0x3fffffff) {
+        fprintf(stderr, "Q4: слишком большая форма %dx%d\n", rows, cols);
+        return 2;
+    }
+    x = make_vec((size_t)cols, 0x123u);
+    y = (float *)calloc((size_t)rows, sizeof(float));
+    y_f32 = (float *)calloc((size_t)rows, sizeof(float));
+    if (!x || !y || !y_f32) {
+        fprintf(stderr, "Q4: нет памяти на форму %dx%d\n", rows, cols);
+        goto done;
+    }
+    // База — до весов: рост RSS должен быть от упакованных весов + масштабов,
+    // а не от fp32-копии.
+    rss0 = rss_bytes();
+    q = make_q4(n, 0x5150u);
+    scales = make_q4_scales(n, 0.0f, 0x77u);
+    if (!q || !scales) {
+        fprintf(stderr, "Q4: нет памяти на веса %dx%d\n", rows, cols);
+        goto done;
+    }
+    // Ядро Q4 (прогрев, чтобы не мерить первый вызов).
+    if (vtm_q4_tmv(y, q, scales, NULL, x, rows, cols, 0) != 0) {
+        fprintf(stderr, "Q4: ядро вернуло ошибку\n");
+        goto done;
+    }
+    rss_q4 = rss_bytes();
+    t_q4 = bench_q4_tmv(q, scales, x, y, rows, cols, iters);
+    rss_kernel = rss_bytes();
+    if (t_q4 < 0.0) {
+        fprintf(stderr, "Q4: ядро вернуло ошибку на замере\n");
+        goto done;
+    }
+
+    // Точность на выборке строк против независимой деквантизации в double.
+    s = rows < 8 ? rows : 8;
+    for (r = 0; r < s; r++) {
+        int rr = (int)((int64_t)r * (rows - 1) / (s > 1 ? s - 1 : 1));
+        int64_t base = (int64_t)rr * (int64_t)cols;
+        double acc = 0.0, d;
+        int j;
+        for (j = 0; j < cols; j++)
+            acc += q4_ref_value(q, base + (int64_t)j, scales, NULL, 0)
+                 * (double)x[j];
+        d = fabs(acc - (double)y[rr]);
+        if (d > maxd) maxd = d;
+        if (fabs(acc) > maxr) maxr = fabs(acc);
+    }
+
+    // fp32-путь: материализуем те же веса в fp32 (как пришлось бы без Q4).
+    w = (float *)malloc(f32_bytes);
+    if (!w) {
+        fprintf(stderr, "Q4: нет памяти на fp32-копию %.1f МБ\n",
+                mb_of(f32_bytes));
+        goto done;
+    }
+    for (r = 0; r < n; r++) w[r] = (float)q4_ref_value(q, r, scales, NULL, 0);
+    rss_f32 = rss_bytes();
+    f32_tmv(y_f32, w, x, rows, cols);
+    t_f32 = bench_f32_tmv(w, x, y_f32, rows, cols, iters);
+    if (t_f32 < 0.0) {
+        fprintf(stderr, "Q4: fp32-ядро вернуло ошибку\n");
+        goto done;
+    }
+
+    printf("Q4 TMV: %dx%d = %d весов (1 токен), %d итераций\n", rows, cols, n,
+           iters);
+    printf("  Q4 упаковано: %8.1f МБ (+масштабы %6.1f МБ) = %.2f Б/вес\n",
+           mb_of(q_bytes), mb_of(s_bytes),
+           (double)(q_bytes + s_bytes) / (double)n);
+    printf("  fp32-копия:   %8.1f МБ = 4.00 Б/вес (в %.1f раза больше)\n",
+           mb_of(f32_bytes),
+           (double)f32_bytes / (double)(q_bytes + s_bytes));
+    if (rss0) {
+        printf("  RSS база: %.1f МБ; после Q4-весов: %.1f МБ (%+.1f); "
+               "после ядра: %.1f МБ (%+.1f за ядро)\n",
+               mb_of(rss0), mb_of(rss_q4),
+               mb_of(rss_q4) - mb_of(rss0), mb_of(rss_kernel),
+               mb_of(rss_kernel) - mb_of(rss_q4));
+        printf("  RSS + fp32-копия: %.1f МБ (%+.1f к базе, %+.1f к Q4)\n",
+               mb_of(rss_f32), mb_of(rss_f32) - mb_of(rss0),
+               mb_of(rss_f32) - mb_of(rss_q4));
+    }
+    printf("  Q4  : %8.3f мс/итер (мин)  %7.2f GFLOP/s\n", t_q4,
+           2.0 * (double)n / (t_q4 * 1e6));
+    printf("  fp32: %8.3f мс/итер (мин)  %7.2f GFLOP/s  (Q4/fp32 = %.2fx)\n",
+           t_f32, 2.0 * (double)n / (t_f32 * 1e6), t_f32 / t_q4);
+    printf("  точность Q4 vs double-эталон (выборка %d строк): "
+           "max|diff|=%.3e (max|ref|=%.3e)\n", s, maxd, maxr);
+    if (maxd > CHECK_TOL) {
+        printf("  Q4 точность: FAIL (> %.0e)\n", CHECK_TOL);
+        failures++;
+        goto done;
+    }
+    printf("  Q4 точность: ok (в пределах %.0e)\n", CHECK_TOL);
+done:
+    free(q);
+    free(scales);
+    free(x);
+    free(y);
+    free(y_f32);
+    free(w);
+    return failures ? 1 : 0;
+}
+
 static int emit_first(void *user, int token, int position) {
     int *out = (int *)user;
     (void)position;
@@ -1321,7 +2045,8 @@ static void usage(const char *prog) {
     printf("usage: %s [--rows N] [--cols N] [--iters N] [--scale-block 128|160]\n"
            "          [--backend auto|scalar|simd|direct] [--check] "
            "[--threads] [--pool] [--logits PATH] [--no-mm]\n"
-           "          [--batch] [--batch-tokens N]\n"
+           "          [--batch] [--batch-tokens N] "
+           "[--q4 [--q4-rows N] [--q4-cols N] [--q4-iters N]]\n"
            "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
            "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8)\n",
            prog);
@@ -1331,6 +2056,7 @@ int main(int argc, char **argv) {
     int rows = 1024, cols = 1024, iters = 50, scale_block = 160;
     int check = 0, no_mm = 0, threads = 0, pool = 0, batch = 0;
     int batch_tokens = 16;
+    int q4 = 0, q4_rows = 151936, q4_cols = 896, q4_iters = 3;
     const char *logits_path = NULL;
     const char *backend_name = NULL;
     const vtm_backend *cand;
@@ -1343,6 +2069,14 @@ int main(int argc, char **argv) {
             cols = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
             iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--q4") == 0) {
+            q4 = 1;
+        } else if (strcmp(argv[i], "--q4-rows") == 0 && i + 1 < argc) {
+            q4_rows = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--q4-cols") == 0 && i + 1 < argc) {
+            q4_cols = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--q4-iters") == 0 && i + 1 < argc) {
+            q4_iters = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--scale-block") == 0 && i + 1 < argc) {
             scale_block = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
@@ -1378,6 +2112,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "scale-block должен быть 128 или 160\n");
         return 2;
     }
+    if (q4 && (q4_rows <= 0 || q4_cols <= 0 || q4_iters <= 0 ||
+               q4_cols > (1 << 20))) {
+        fprintf(stderr, "плохие --q4-rows/--q4-cols/--q4-iters\n");
+        return 2;
+    }
 
     if (backend_name)
         cand = vtm_backend_by_name(backend_name);
@@ -1390,6 +2129,8 @@ int main(int argc, char **argv) {
     if (!backend_name && (!getenv("VTM_BACKEND") || !*getenv("VTM_BACKEND")))
         cand = &vtm_backend_simd;  // бенчмарк по умолчанию меряет SIMD
 
+    if (q4)
+        return run_q4_bench(q4_rows, q4_cols, q4_iters);
     if (pool)
         return run_pool(iters);
     if (batch) {

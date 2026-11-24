@@ -793,6 +793,227 @@ static int tmv_lut(float *y, const uint8_t *w, const float *scales,
                           (int)VTM_SCALE_BLOCK_160);
 }
 
+// --- Q4 (kind 5): ленивая деквантизация на лету (задача 0152) --------------
+//
+// 7B в Q4 — это 4,4 ГБ файла; материализация в fp32 дала бы ~28,7 ГБ, то есть
+// не влезает в RAM. Поэтому Q4-путь не разворачивает матрицу ни в арену, ни в
+// отдельную fp32-копию: строка читается упакованно, группа из 32 значений
+// деквантизуется в стековый буфер (256 Б double) и сразу умножается на
+// активации. Пиковая память ядра — 256 Б scratch на поток, независимо от
+// rows/cols.
+//
+// Контракт представления — в vtm_backend.h (VTM_Q4_GROUP_SIZE): 32 значения
+// в 16 байтах, раскладка как в GGML Q4_0 — байт j группы хранит значение j
+// (младший ниббл) и j+16 (старший), чтобы импорт GGUF был копированием;
+// группа 32 по сплющенной матрице, масштаб fp32 на группу; Q4_0
+// (q-8)*scale, Q4_1 q*scale+min. Деквантизация и накопление — в
+// double, как в эталоне; float-округления веса нет, поэтому расхождение с
+// эталонной деквантизацией в double — только порядок сложения (тот же, что у
+// scalar).
+//
+// Границы строк: группа считается по глобальному индексу r*cols+j. Если cols
+// не кратен 32, группа может пересекать границу строк — это согласуется с
+// плоской раскладкой тензора и проверено тестом на cols=37/1031.
+//
+// Память: строка НЕ разворачивается целиком (для lm_head 151936 значений это
+// 1,2 МБ на строку в double). Деквантизуется группа из 32 значений, она же
+// умножается и выбрасывается; scratch — 256 Б на стеке вызова, без malloc на
+// строку/токен и без кэша в контексте.
+
+typedef struct {
+    float *y;
+    const uint8_t *q;
+    const float *scales;
+    const float *mins;
+    const float *x;
+    int cols;
+    int asym;
+} q4_tmv_job;
+
+typedef struct {
+    float *y;
+    const uint8_t *q;
+    const float *scales;
+    const float *mins;
+    const float *b;
+    int k;
+    int n;
+    int asym;
+} q4_mm_job;
+
+// Развернуть группу (или её хвост) в buf. buf — scratch на стеке, не арена.
+// off — смещение внутри группы (0..31): строка может начинаться не с границы
+// группы, если cols не кратен 32. Для полной группы (off == 0, n == 32) нет
+// ни делений, ни ветки на каждый элемент: один байт даёт сразу пару
+// (j, j+16), как в GGML Q4_0.
+static void q4_dequant_group(double *buf, const uint8_t *q,
+                             const float *scales, const float *mins,
+                             uint64_t g, unsigned off, int n, int asym) {
+    const uint8_t *gp = q + (size_t)g * (VTM_Q4_GROUP_SIZE / 2);
+    // Масштабы/минимумы из загрузчика могут лежать в mmap по смещению
+    // 2 mod 4 (сегмент Q4 — 18/22 байта заголовка, как TRT1), поэтому читаем
+    // их через memcpy, а не разыменованием float* (иначе UB).
+    double scale = (double)load_f32_unaligned(scales, (int64_t)g);
+    double minv = asym
+                ? (double)load_f32_unaligned(mins, (int64_t)g) : 0.0;
+    int k;
+
+    if (off == 0 && n == VTM_Q4_GROUP_SIZE) {
+        int j;
+        for (j = 0; j < VTM_Q4_GROUP_SIZE / 2; j++) {
+            unsigned byte = gp[j];
+            double lo = (double)(byte & 0x0fu);
+            double hi = (double)(byte >> 4);
+            if (asym) {
+                buf[j] = lo * scale + minv;
+                buf[j + VTM_Q4_GROUP_SIZE / 2] = hi * scale + minv;
+            } else {
+                buf[j] = (lo - 8.0) * scale;
+                buf[j + VTM_Q4_GROUP_SIZE / 2] = (hi - 8.0) * scale;
+            }
+        }
+        return;
+    }
+    for (k = 0; k < n; k++) {
+        unsigned within = off + (unsigned)k;
+        unsigned byte = gp[within & 15u];
+        unsigned v = (within < 16u) ? (byte & 0x0fu) : (byte >> 4);
+        if (asym)
+            buf[k] = (double)v * scale + minv;
+        else
+            buf[k] = ((double)v - 8.0) * scale;
+    }
+}
+
+// Скалярное произведение строки Q4 на вектор v с шагом stride. Строка
+// деквантизуется по 32 значения (scratch 256 Б на стеке), поэтому память
+// ядра не зависит ни от cols, ни от rows. v — x (stride 1) или столбец B
+// (stride n).
+static double q4_dot_row(const uint8_t *q, const float *scales,
+                         const float *mins, int64_t base, int k,
+                         const float *v, int stride, int asym) {
+    double buf[VTM_Q4_GROUP_SIZE];
+    double acc = 0.0;
+    int j0 = 0;
+
+    while (j0 < k) {
+        int64_t idx = base + (int64_t)j0;
+        uint64_t g = (uint64_t)idx >> 5;
+        unsigned off = (unsigned)idx & 31u;
+        int n = VTM_Q4_GROUP_SIZE - (int)off;
+        int t;
+        if (n > k - j0) n = k - j0;
+        q4_dequant_group(buf, q, scales, mins, g, off, n, asym);
+        for (t = 0; t < n; t++)
+            acc += buf[t] * (double)v[(size_t)(j0 + t) * (size_t)stride];
+        j0 += n;
+    }
+    return acc;
+}
+
+// Одна строка Q4 -> y (EMB). Таблица словаря остаётся упакованной: в fp32
+// разворачивается только выбранная строка, и только на время EMB.
+int vtm_q4_dequant_row(float *y, const uint8_t *q, const float *scales,
+                       const float *mins, int64_t base, int cols, int asym) {
+    double buf[VTM_Q4_GROUP_SIZE];
+    int j0 = 0;
+
+    if (!y || !q || !scales || cols < 0 || base < 0) return -1;
+    if (asym && !mins) return -1;
+    while (j0 < cols) {
+        int64_t idx = base + (int64_t)j0;
+        uint64_t g = (uint64_t)idx >> 5;
+        unsigned off = (unsigned)idx & 31u;
+        int n = VTM_Q4_GROUP_SIZE - (int)off;
+        int t;
+        if (n > cols - j0) n = cols - j0;
+        q4_dequant_group(buf, q, scales, mins, g, off, n, asym);
+        for (t = 0; t < n; t++) y[j0 + t] = (float)buf[t];
+        j0 += n;
+    }
+    return 0;
+}
+
+static void q4_tmv_rows(q4_tmv_job *j, int r0, int r1) {
+    int r;
+
+    for (r = r0; r < r1; r++) {
+        int64_t base = (int64_t)r * (int64_t)j->cols;
+        j->y[r] = (float)q4_dot_row(j->q, j->scales, j->mins, base, j->cols,
+                                    j->x, 1, j->asym);
+    }
+}
+
+static void q4_tmv_worker(void *p, int tid, int r0, int r1) {
+    q4_tmv_job *j = (q4_tmv_job *)p;
+    (void)tid;
+    q4_tmv_rows(j, r0, r1);
+}
+
+int vtm_q4_tmv(float *y, const uint8_t *q, const float *scales,
+               const float *mins, const float *x, int rows, int cols,
+               int asym) {
+    q4_tmv_job job;
+
+    if (!y || !q || !scales || !x) return -1;
+    if (rows < 0 || cols < 0) return -1;
+    if (asym && !mins) return -1;
+    if (rows == 0 || cols == 0) return 0;
+    job.y = y;
+    job.q = q;
+    job.scales = scales;
+    job.mins = mins;
+    job.x = x;
+    job.cols = cols;
+    job.asym = asym;
+    vtm_parallel_rows(rows, (double)rows * (double)cols, q4_tmv_worker, &job);
+    return 0;
+}
+
+// MM: Y[r,c] = sum_t W[r,t] * B[t,c]. Строка W деквантизуется по 32 значения
+// в тот же scratch, что TMV: для n == 1 (tied lm_head в графе Qwen) это ровно
+// TMV; для n > 1 строка разворачивается заново на каждый столбец — лишние
+// сдвиги/умножения, зато никакой памяти под строку и никакой fp32-копии.
+static void q4_mm_rows(q4_mm_job *j, int r0, int r1) {
+    int r, c;
+
+    for (r = r0; r < r1; r++) {
+        int64_t base = (int64_t)r * (int64_t)j->k;
+        for (c = 0; c < j->n; c++)
+            j->y[(size_t)r * (size_t)j->n + (size_t)c]
+                = (float)q4_dot_row(j->q, j->scales, j->mins, base, j->k,
+                                    j->b + c, j->n, j->asym);
+    }
+}
+
+static void q4_mm_worker(void *p, int tid, int r0, int r1) {
+    q4_mm_job *j = (q4_mm_job *)p;
+    (void)tid;
+    q4_mm_rows(j, r0, r1);
+}
+
+int vtm_q4_mm(float *y, const uint8_t *q, const float *scales,
+              const float *mins, const float *b, int m, int k, int n,
+              int asym) {
+    q4_mm_job job;
+
+    if (!y || !q || !scales || !b) return -1;
+    if (m < 0 || k < 0 || n < 0) return -1;
+    if (asym && !mins) return -1;
+    if (m == 0 || k == 0 || n == 0) return 0;
+    job.y = y;
+    job.q = q;
+    job.scales = scales;
+    job.mins = mins;
+    job.b = b;
+    job.k = k;
+    job.n = n;
+    job.asym = asym;
+    vtm_parallel_rows(m, (double)m * (double)k * (double)n, q4_mm_worker,
+                      &job);
+    return 0;
+}
+
 // --- остальные ядра --------------------------------------------------------
 
 // Однопоточный RMSN — прежний код без изменений: при VTM_THREADS=1 и на

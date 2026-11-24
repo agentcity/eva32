@@ -177,6 +177,11 @@ static void put_u32(uint8_t *p, uint32_t v) {
     p[3] = (uint8_t)((v >> 24) & 0xFFu);
 }
 
+static void put_u64(uint8_t *p, uint64_t v) {
+    put_u32(p, (uint32_t)(v & 0xFFFFFFFFu));
+    put_u32(p + 4, (uint32_t)(v >> 32));
+}
+
 static void put_i32(uint8_t *p, int32_t v) {
     uint32_t u;
     memcpy(&u, &v, sizeof u);
@@ -281,6 +286,54 @@ static void model_add_bf16(model_t *m, const char *name, int ndim,
     buf_t b = {0};
     uint32_t i, n = dims_product(ndim, dims);
     for (i = 0; i < n; i++) buf_u16(&b, vtm_float_to_bf16(vals[i]));
+    td->blob = b.p;
+    td->blob_len = b.len;
+}
+
+// Q4-сегмент (задача 0151): 18 байт заголовка, масштабы, [min Q4_1], затем
+// n_groups * 16 байт. Байт j группы = значение j (младший ниббл) + j+16
+// (старший), как в GGML и ядрах 0152.
+static void make_q4(buf_t *seg, const uint8_t *q, uint32_t n_values,
+                    const float *scales, const float *mins, int asym,
+                    int fp32_scale, int include_mins) {
+    uint32_t n_groups = (n_values + VTM_Q4_SCALE_BLOCK - 1u)
+                      / VTM_Q4_SCALE_BLOCK;
+    uint32_t g, j;
+    buf_append(seg, asym ? VTM_Q4_MAGIC_ASYM : VTM_Q4_MAGIC_SYM, 4);
+    buf_u8(seg, VTM_Q4_VERSION);
+    buf_u8(seg, (uint8_t)(fp32_scale ? VTM_Q4_FLAG_F32 : 0));
+    buf_u64(seg, n_values);
+    buf_u32(seg, n_groups);
+    if (asym && include_mins)
+        buf_u32(seg, n_groups);  // n_mins — число min, явная проверка
+    for (g = 0; g < n_groups; g++) {
+        if (fp32_scale) buf_f32(seg, scales[g]);
+        else buf_u16(seg, vtm_float_to_half(scales[g]));
+    }
+    if (asym && include_mins) {
+        for (g = 0; g < n_groups; g++) {
+            if (fp32_scale) buf_f32(seg, mins[g]);
+            else buf_u16(seg, vtm_float_to_half(mins[g]));
+        }
+    }
+    for (g = 0; g < n_groups; g++) {
+        for (j = 0; j < 16u; j++) {
+            uint32_t lo_idx = g * VTM_Q4_SCALE_BLOCK + j;
+            uint32_t hi_idx = lo_idx + 16u;
+            uint8_t lo = lo_idx < n_values ? q[lo_idx] : VTM_Q4_ZERO_NIBBLE;
+            uint8_t hi = hi_idx < n_values ? q[hi_idx] : VTM_Q4_ZERO_NIBBLE;
+            buf_u8(seg, (uint8_t)((lo & 0x0Fu) | (uint8_t)(hi << 4)));
+        }
+    }
+}
+
+static void model_add_q4(model_t *m, const char *name, int ndim,
+                         const uint32_t *dims, const uint8_t *q,
+                         const float *scales, const float *mins, int asym,
+                         int fp32_scale) {
+    tensor_def *td = model_slot(m, name, VTM_TENSOR_Q4, ndim, dims);
+    buf_t b = {0};
+    make_q4(&b, q, dims_product(ndim, dims), scales, mins, asym, fp32_scale, 1);
     td->blob = b.p;
     td->blob_len = b.len;
 }
@@ -2706,6 +2759,234 @@ static void test_f16_bf16(void) {
 }
 
 // v0.2: словарь Qwen 151936 (> 65535) должен влезать и читаться (ADR 0011).
+// --- Q4 (kind 5, задача 0151) ----------------------------------------------
+//
+// Загрузчик обязан разобрать сегмент и оставить веса УПАКОВАННЫМИ: указатель
+// на нибблы — words (16 байт на группу 32), fp32-масштабы — scales, у Q4_1 —
+// q4_mins; f32 при этом NULL (никакой материализации в fp32-арену).
+static void test_q4_load(void) {
+    model_t md;
+    uint32_t dims[2] = {2, 19};  // 38 значений, 2 группы по 32 (хвост 6)
+    uint8_t q[38];
+    float scales[2] = {0.5f, 0.25f};
+    float mins[2] = {-1.0f, 2.0f};
+    uint8_t *img = NULL;
+    size_t size = 0;
+    vtm_t *m;
+    const vtm_tensor *t;
+    const uint8_t *bytes;
+    uint32_t i;
+
+    for (i = 0; i < 38u; i++) q[i] = (uint8_t)((i * 7u) % 16u);
+    model_init(&md);
+    model_add_q4(&md, "w", 2, dims, q, scales, mins, 0, 1);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    CHECK(m != NULL);
+    if (m) {
+        t = vtm_tensor_by_name(m, "w");
+        CHECK(t != NULL);
+        if (t) {
+            bytes = (const uint8_t *)(const void *)t->words;
+            CHECK(t->kind == VTM_TENSOR_Q4);
+            CHECK(t->n_elements == 38u);
+            CHECK(t->n_scales == 2u);
+            CHECK(t->scale_block == VTM_Q4_SCALE_BLOCK);
+            CHECK(t->scale_is_f32 == 1u);
+            CHECK(t->q4_is_asym == 0u);
+            CHECK(t->q4_mins == NULL);
+            CHECK(t->f32 == NULL);           // в fp32 не материализован
+            CHECK(t->words != NULL);
+            CHECK_NEAR(t->scales[0], 0.5f, 1e-7);
+            CHECK_NEAR(t->scales[1], 0.25f, 1e-7);
+            // Байт j группы: значение j (low) + j+16 (high).
+            CHECK(bytes[0] == (uint8_t)(q[0] | (q[16] << 4)));
+            CHECK(bytes[1] == (uint8_t)(q[1] | (q[17] << 4)));
+            // Хвост второй группы: за пределами n_values — padding 8/8.
+            CHECK(bytes[16 + 15] == 0x88u);
+        }
+        vtm_free(m);
+    }
+    free(img);
+    model_free(&md);
+}
+
+static void test_q4_asym_load(void) {
+    model_t md;
+    uint32_t dims[1] = {64};
+    uint8_t q[64];
+    float scales[2] = {0.5f, 0.25f};
+    float mins[2] = {-1.0f, 2.0f};
+    uint8_t *img = NULL;
+    size_t size = 0;
+    vtm_t *m;
+    const vtm_tensor *t = NULL;
+    uint32_t i;
+
+    for (i = 0; i < 64u; i++) q[i] = (uint8_t)(i % 16u);
+    model_init(&md);
+    model_add_q4(&md, "w", 1, dims, q, scales, mins, 1, 1);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    CHECK(m != NULL);
+    if (m) {
+        t = vtm_tensor_by_name(m, "w");
+        CHECK(t != NULL);
+        if (t) {
+            CHECK(t->kind == VTM_TENSOR_Q4);
+            CHECK(t->q4_is_asym == 1u);
+            CHECK(t->q4_mins != NULL);
+            if (t->q4_mins) {
+                CHECK_NEAR(t->q4_mins[0], -1.0f, 1e-7);
+                CHECK_NEAR(t->q4_mins[1], 2.0f, 1e-7);
+            }
+            CHECK(t->f32 == NULL);
+        }
+        vtm_free(m);
+    }
+    free(img);
+    model_free(&md);
+}
+
+static void test_q4_bad(void) {
+    model_t md;
+    uint32_t dims[1] = {64};
+    uint8_t q[64];
+    float scales[2] = {0.5f, 0.25f};
+    float mins[2] = {-1.0f, 2.0f};
+    float neg = -1.0f;
+    uint8_t *img = NULL;
+    size_t size = 0;
+    vtm_status st;
+    char err[256];
+    uint32_t i;
+    tensor_def *td;
+
+    for (i = 0; i < 64u; i++) q[i] = (uint8_t)(i % 16u);
+    model_init(&md);
+    model_add_q4(&md, "w", 1, dims, q, scales, mins, 0, 1);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    td = &md.tensors[0];
+
+    // Чужой magic.
+    memcpy(td->blob, "Q4_9", 4);
+    model_build(&md, &img, &size);
+    st = VTM_OK; err[0] = '\0';
+    CHECK(vtm_load_mem(img, size, &st, err, sizeof err) == NULL);
+    CHECK(st == VTM_E_FORMAT);
+    CHECK(strstr(err, "Q4_0/Q4_1") != NULL);
+    free(img); img = NULL;
+    memcpy(td->blob, VTM_Q4_MAGIC_SYM, 4);
+
+    // Чужая версия сегмента.
+    td->blob[4] = 2;
+    model_build(&md, &img, &size);
+    st = VTM_OK; err[0] = '\0';
+    CHECK(vtm_load_mem(img, size, &st, err, sizeof err) == NULL);
+    CHECK(st == VTM_E_VERSION);
+    free(img); img = NULL;
+    td->blob[4] = VTM_Q4_VERSION;
+
+    // Неизвестный флаг.
+    td->blob[5] |= 0x02u;
+    model_build(&md, &img, &size);
+    st = VTM_OK; err[0] = '\0';
+    CHECK(vtm_load_mem(img, size, &st, err, sizeof err) == NULL);
+    CHECK(st == VTM_E_FORMAT);
+    free(img); img = NULL;
+    td->blob[5] = VTM_Q4_FLAG_F32;
+
+    // n_values не совпадает с dims.
+    put_u64(td->blob + 6, 63);
+    model_build(&md, &img, &size);
+    st = VTM_OK; err[0] = '\0';
+    CHECK(vtm_load_mem(img, size, &st, err, sizeof err) == NULL);
+    CHECK(st == VTM_E_FORMAT);
+    free(img); img = NULL;
+    put_u64(td->blob + 6, 64);
+
+    // n_groups не ceil(n/32).
+    put_u32(td->blob + 14, 3);
+    model_build(&md, &img, &size);
+    st = VTM_OK; err[0] = '\0';
+    CHECK(vtm_load_mem(img, size, &st, err, sizeof err) == NULL);
+    CHECK(st == VTM_E_FORMAT);
+    free(img); img = NULL;
+    put_u32(td->blob + 14, 2);
+
+    // Отрицательный масштаб.
+    memcpy(td->blob + VTM_Q4_HEADER_SIZE, &neg, sizeof neg);
+    model_build(&md, &img, &size);
+    st = VTM_OK; err[0] = '\0';
+    CHECK(vtm_load_mem(img, size, &st, err, sizeof err) == NULL);
+    CHECK(st == VTM_E_SCALE);
+    free(img); img = NULL;
+    model_free(&md);
+
+    // Q4_1 с чужим n_mins: явное число min не сходится с n_groups.
+    model_init(&md);
+    model_add_q4(&md, "w", 1, dims, q, scales, mins, 1, 1);
+    td = &md.tensors[0];
+    put_u32(td->blob + VTM_Q4_HEADER_SIZE, 3);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+    st = VTM_OK; err[0] = '\0';
+    CHECK(vtm_load_mem(img, size, &st, err, sizeof err) == NULL);
+    CHECK(st == VTM_E_FORMAT);
+    CHECK(strstr(err, "n_mins=3") != NULL);
+    free(img); img = NULL;
+    model_free(&md);
+
+    // Q4_1 без min: сегмент короче на n_groups * 4 байт. Это VTM_E_FORMAT,
+    // а не тихое чтение как Q4_0 (требование координации с 0152).
+    model_init(&md);
+    td = model_slot(&md, "w", VTM_TENSOR_Q4, 1, dims);
+    {
+        buf_t b = {0};
+        make_q4(&b, q, 64, scales, mins, 1, 1, 0);
+        td->blob = b.p;
+        td->blob_len = b.len;
+    }
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+    st = VTM_OK; err[0] = '\0';
+    CHECK(vtm_load_mem(img, size, &st, err, sizeof err) == NULL);
+    CHECK(st == VTM_E_FORMAT);
+    CHECK(strstr(err, "Q4_1") != NULL);
+    free(img); img = NULL;
+    model_free(&md);
+}
+
+// Старый бинарь узнавал kind 5 как «неизвестный kind» и отказывал до чтения
+// данных; новый обязан так же отвергать любой неизвестный kind, а не угадывать.
+static void test_q4_unknown_kind_rejected(void) {
+    model_t md;
+    uint32_t dims[1] = {1};
+    uint8_t *img = NULL;
+    size_t size = 0;
+    vtm_status st = VTM_OK;
+    char err[256];
+
+    model_init(&md);
+    model_slot(&md, "bad", 6, 1, dims);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+    err[0] = '\0';
+    CHECK(vtm_load_mem(img, size, &st, err, sizeof err) == NULL);
+    CHECK(st == VTM_E_FORMAT);
+    CHECK(strstr(err, "неизвестный kind 6") != NULL);
+    free(img);
+    model_free(&md);
+}
+
 static void test_large_dims_u32(void) {
     model_t md;
     uint8_t *img = NULL;
@@ -5241,6 +5522,10 @@ int main(void) {
     test_samp();
     test_samp_strategies();
     test_f16_bf16();
+    test_q4_load();
+    test_q4_asym_load();
+    test_q4_bad();
+    test_q4_unknown_kind_rejected();
     test_large_dims_u32();
     test_cli_text();
     test_cli_chat();

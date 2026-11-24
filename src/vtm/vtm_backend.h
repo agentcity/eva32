@@ -81,6 +81,43 @@ int vtm_simd_tmv_f32_batch(float *y, const float *w, const float *x,
 int vtm_simd_mm_f32_batch(float *y, const float *a, const float *b,
                           int m, int k, int n_tokens);
 
+// --- kind 5 (Q4): ленивая деквантизация на лету (задача 0152) --------------
+//
+// Веса Q4 не материализуются в fp32: ядро читает упакованные байты строки,
+// разворачивает их в маленький scratch-буфер (стек, O(группы) на поток) и
+// сразу умножает на активации. Пиковая память ядра не зависит от размера
+// матрицы: строка разворачивается по одной группе 32 значения в scratch на
+// стеке (256 байт double на поток), без malloc на строку/токен.
+//
+// Контракт представления (согласуется с kind 5 в loader.c, задача 0151):
+//   * группа VTM_Q4_GROUP_SIZE (32) значений — 16 байт, раскладка как в
+//     GGML Q4_0 (импорт GGUF без перепаковки): байт j группы хранит значение
+//     j в младшем ниббле и значение j+16 в старшем; значения 0..15;
+//   * группы идут по сплющенной матрице, масштаб fp32 на группу:
+//     scales[(r*cols + j) / 32];
+//   * asym == 0 (Q4_0): w = (q - 8) * scale;
+//   * asym != 0 (Q4_1): w = q * scale + min, mins — fp32 на группу
+//     (обязателен при asym != 0).
+//
+// y[r] = sum_j w[r,j] * x[j] (TMV, x — строка длины cols);
+// y[r*n + c] = sum_t w[r,t] * b[t*n + c] (MM).
+//
+// 0 — успех, -1 — неверные аргументы/NULL/отрицательные размеры. Ядра не
+// выделяют памяти под веса и не пишут в арену; внутренний scratch —
+// фиксированного размера на стеке.
+#define VTM_Q4_GROUP_SIZE 32
+int vtm_q4_tmv(float *y, const uint8_t *q, const float *scales,
+               const float *mins, const float *x, int rows, int cols,
+               int asym);
+int vtm_q4_mm(float *y, const uint8_t *q, const float *scales,
+              const float *mins, const float *b, int m, int k, int n,
+              int asym);
+// Развернуть одну строку Q4 (cols значений с глобального индекса base) в y:
+// нужно EMB — таблица словаря остаётся упакованной, в арену копируется только
+// выбранная строка. 0 — успех, -1 — неверные аргументы.
+int vtm_q4_dequant_row(float *y, const uint8_t *q, const float *scales,
+                       const float *mins, int64_t base, int cols, int asym);
+
 // --- MM: SIMD-ядра вне `vtm_backend` ---------------------------------------
 //
 // В `vtm_backend` (vtm.h) поля MM нет, а op_mm() в interp.c сейчас считает
