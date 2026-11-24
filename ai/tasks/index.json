@@ -957,5 +957,12 @@
     "status": "in_progress",
     "file": "0144-embed-plan.md",
     "assignee": "agent:embed-plan"
+  },
+  {
+    "id": "0145",
+    "title": "Панель метрик под чатом — диск, память, CPU, ток/с",
+    "status": "in_progress",
+    "file": "0145-chat-stats-panel.md",
+    "assignee": "agent:chat-stats"
   }
 ]
