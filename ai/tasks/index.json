@@ -1090,5 +1090,12 @@
     "status": "in_progress",
     "file": "0164-docs-actualize.md",
     "assignee": "agent:docs-fresh"
+  },
+  {
+    "id": "0165",
+    "title": "Нативный Q4_K в контейнере",
+    "status": "in_progress",
+    "file": "0165-native-q4k.md",
+    "assignee": "agent:q4k-native"
   }
 ]
