@@ -1111,5 +1111,19 @@
     "status": "done",
     "file": "0167-q4k-speed.md",
     "assignee": "agent:q4k-speed"
+  },
+  {
+    "id": "0168",
+    "title": "Убрать накладные расходы батчевого prefill",
+    "status": "in_progress",
+    "file": "0168-prefill-overhead.md",
+    "assignee": "agent:prefill-overhead"
+  },
+  {
+    "id": "0169",
+    "title": "Декод на int8-dot с сохранением argmax",
+    "status": "in_progress",
+    "file": "0169-decode-int8.md",
+    "assignee": "agent:decode-int8"
   }
 ]
