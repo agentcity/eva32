@@ -41,9 +41,12 @@
 (``qat/ternary.py``): ``scale = absmax`` на блок 128 вдоль входной
 размерности, ``trit = clamp(round_half_away(w / scale), -1, +1)``, масштабы
 fp32 (``--scale-dtype``). Нормы, bias и ``lm_head`` — как есть, fp32 в
-``non_ternary.bin``. Таблица словаря — по флагу ``--embed none|trit``
-(``trit`` пишет её сегментом первой в ``ternary.trit`` и ссылается на неё
-из tied ``lm_head``).
+``non_ternary.bin``. Таблица словаря — по флагу ``--embed none|trit|int8``
+(``trit`` пишет её сегментом первой в ``ternary.trit``, ``int8`` — INT8-
+сегментом kind 4 в ``non_ternary.bin``; в обоих случаях tied ``lm_head``
+ссылается на неё), а гранулярность её масштаба — ``--embed-scale block|row``
+(``row`` — один масштаб на строку, разложенный по блокам 128; раскладка
+сегмента не меняется).
 
 Манифест
 ========
@@ -120,6 +123,11 @@ from qat import export as qat_export  # noqa: E402
 from qat import ternary  # noqa: E402
 from qat.config import DEFAULT_TARGET_SUFFIXES  # noqa: E402
 
+try:  # импорт как пакета (tests/*, `python3 -m tools.cold_export`)
+    from tools import vtm_ref  # noqa: E402
+except ImportError:  # pragma: no cover - запуск как `python3 tools/cold_export.py`
+    import vtm_ref  # type: ignore[no-redef]  # noqa: E402
+
 PROJECT_ROOT = _ROOT
 TOOL_VERSION = 1
 #: Имя манифеста рядом с весами (как у qat.export).
@@ -134,7 +142,15 @@ DEFAULT_CONTEXT_WINDOW = 1024
 #: Квантуются только эти Linear (порядок важен для детерминированного файла).
 TARGET_SUFFIXES: tuple[str, ...] = tuple(DEFAULT_TARGET_SUFFIXES)
 TARGET_NAMES = tuple(f"{name}.weight" for name in TARGET_SUFFIXES)
-EMBED_MODES = ("none", "trit")
+#: Куда идёт таблица словаря: ``none`` — fp32 в non_ternary.bin, ``trit`` —
+#: сегмент TRT1 в ternary.trit, ``int8`` — сегмент INT8 (kind 4) в
+#: non_ternary.bin (задача 0143; загрузчик и vtm_compile это уже умеют).
+EMBED_MODES = ("none", "trit", "int8")
+#: Гранулярность масштаба таблицы: ``block`` — absmax на блок 128 (как у
+#: Linear и как писал QAT), ``row`` — один масштаб на строку таблицы,
+#: разложенный по всем её блокам. Формат и рантайм от этого не меняются:
+#: масштабов по-прежнему ceil(n/128), просто внутри строки они одинаковые.
+EMBED_SCALES = ("block", "row")
 SCALE_DTYPES = ("float32", "float16")
 #: Линей, входная размерность которых обязана делиться на block_size.
 #: Формат .trit хранит один масштаб на block_size подряд идущих весов и не
@@ -522,8 +538,15 @@ def _blocked_dims(architecture: dict[str, Any]) -> list[tuple[str, int]]:
 
 
 def check_block_alignment(architecture: dict[str, Any], block_size: int,
-                          embed_mode: str = "none") -> None:
-    """Формат .trit не умеет row-padding: вход Linear обязан делиться на блок."""
+                          embed_mode: str = "none",
+                          embed_scale: str = "block") -> None:
+    """Формат .trit не умеет row-padding: вход Linear обязан делиться на блок.
+
+    Для таблицы словаря то же требование появляется в вариантах 0143:
+    ``int8`` (масштаб по плоскому буферу, блоки не должны переезжать через
+    строку) и ``row`` (масштаб строки раскладывается по её блокам). При
+    ``embed none``/``trit``+``block`` раскладка прежняя и проверок нет.
+    """
     bad = [
         (name, value) for name, value in _blocked_dims(architecture)
         if value % block_size
@@ -534,6 +557,15 @@ def check_block_alignment(architecture: dict[str, Any], block_size: int,
             f"размерность не делится на block_size={block_size}: {details}. "
             "Формат .trit хранит один масштаб на блок подряд идущих весов и не "
             "умеет padding по строкам; смените модель или --block-size"
+        )
+    hidden = int(architecture["hidden"])
+    if embed_mode not in (None, "", "none") and (
+        embed_mode == "int8" or embed_scale == "row"
+    ) and hidden % block_size:
+        raise ColdExportError(
+            f"hidden={hidden} не делится на block_size={block_size}: "
+            f"таблица словаря с --embed {embed_mode} --embed-scale {embed_scale} "
+            "требует, чтобы блок 128 не переезжал через границу строки"
         )
 
 
@@ -759,6 +791,345 @@ def encode_trit_segment(
 
 
 # ---------------------------------------------------------------------------
+# Таблица словаря: trit/int8 и посрочные масштабы (задача 0143)
+# ---------------------------------------------------------------------------
+#
+# Формат контейнера не меняется ни в одном варианте:
+#
+# * ``trit`` — тот же TRT1, что у Linear (20 тритов в слово, 160 на блок
+#   хранения), масштабов по-прежнему ceil(n/128);
+# * ``int8`` — INT8-сегмент kind 4 (магия ``INT8``, 18-байтовый заголовок,
+#   масштабы, знаковые q-байты), его уже читают ``vtm_compile``, C-загрузчик
+#   и Python-эталон;
+# * ``--embed-scale row`` — масштаб считается по строке таблицы и
+#   раскладывается по её блокам повтором. Для рантайма это обычные
+#   масштабы блока 128: меняется только их значение, а не раскладка. Поэтому
+#   старые контейнеры читаются как раньше, а новый вариант виден только по
+#   содержимому сегмента (и по ключу ``embed_scale`` в манифесте).
+#
+# Посрочный режим требует ``hidden % block_size == 0``: только тогда блок 128
+# не пересекает границу строки и один масштаб строки можно разложить по её
+# блокам, не меняя байтовой раскладки сегмента.
+
+#: Нулевой блок/строка в int8: так делает QAT (``Int8Embedding``).
+INT8_ZERO_SCALE = 1e-8 / 127.0
+
+
+def _row_scale(rows: int, per_row_blocks: int) -> int:
+    return rows * per_row_blocks
+
+
+def _quantize_table_torch(
+    chunk: Any, *, mode: str, scale_mode: str, block_size: int,
+) -> tuple[Any, Any]:
+    """Триты/int8 и плоские масштабы куска таблицы (torch-путь).
+
+    ``mode="trit"``, ``scale_mode="block"`` — ровно правило QAT
+    (``qat.ternary.quantize_torch``), поэтому байты такого сегмента совпадают
+    с прежним экспортом. Остальные комбинации — новые варианты 0143.
+    """
+    import torch  # noqa: PLC0415 - вызывается только на настоящих весах
+
+    w = chunk.detach().float()
+    rows, cols = int(w.shape[0]), int(w.shape[1])
+    per_row_blocks = cols // block_size
+    if mode not in ("trit", "int8"):
+        raise ColdExportError(f"таблица словаря: режим {mode!r}, ждали trit|int8")
+    if scale_mode not in EMBED_SCALES:
+        raise ColdExportError(f"масштаб таблицы: {scale_mode!r}, ждали {EMBED_SCALES}")
+    if cols % block_size:
+        raise ColdExportError(
+            f"{cols} столбцов таблицы не кратны block_size={block_size}: "
+            "раскладка масштабов по блокам не совпадёт со строками"
+        )
+    if scale_mode == "block" and mode == "trit":
+        quant = ternary.quantize_torch(w, block_size)
+        trits = quant["trits"].cpu().contiguous()
+        # trits того же shape, что w; на всякий случай приводим к 2-D.
+        trits = trits.reshape(rows, cols)
+        scales = quant["scales"].reshape(-1).cpu()
+        return trits, scales
+    if scale_mode == "block":
+        blocks = w.reshape(rows, per_row_blocks, block_size)
+        absmax = blocks.abs().amax(dim=-1)
+        scales = torch.where(
+            absmax > 0, absmax / 127.0, torch.full_like(absmax, INT8_ZERO_SCALE)
+        )
+        q = torch.round(blocks / scales.unsqueeze(-1)).clamp(-127.0, 127.0)
+        return q.reshape(rows, cols), scales.reshape(-1)
+    # --- row: один масштаб на строку ---------------------------------------
+    absmax = w.abs().amax(dim=1)
+    if mode == "int8":
+        scale_row = torch.where(
+            absmax > 0, absmax / 127.0, torch.full_like(absmax, INT8_ZERO_SCALE)
+        )
+        q = torch.round(w / scale_row.unsqueeze(1)).clamp(-127.0, 127.0)
+        q = torch.where((absmax > 0).unsqueeze(1), q, torch.zeros_like(q))
+    else:
+        safe = torch.where(absmax > 0, absmax, torch.ones_like(absmax))
+        ratio = w / safe.unsqueeze(1)
+        q = torch.sign(ratio) * torch.floor(ratio.abs() + 0.5)
+        q = q.clamp(-1.0, 1.0)
+        q = torch.where((absmax > 0).unsqueeze(1), q, torch.zeros_like(q))
+        scale_row = absmax  # нулевая строка -> нулевой масштаб (как у QAT)
+    expanded = scale_row.unsqueeze(1).expand(rows, per_row_blocks)
+    return q.reshape(rows, cols), expanded.reshape(-1).contiguous()
+
+
+def _plain_table_quant(
+    values: Sequence[float], rows: int, cols: int, *,
+    mode: str, scale_mode: str, block_size: int,
+) -> tuple[list[int], list[float]]:
+    """То же правило без torch (fake-тензоры в тестах, чистый Python).
+
+    Числа округляются до float32 на каждом шаге, как в torch-пути: тест
+    сверяет, что оба пути дают одинаковые триты/q и масштабы.
+    """
+    if cols % block_size:
+        raise ColdExportError(
+            f"{cols} столбцов таблицы не кратны block_size={block_size}"
+        )
+    per_row_blocks = cols // block_size
+    f32 = vtm_ref._f32
+    vals = [f32(float(v)) for v in values]
+    if len(vals) != rows * cols:  # pragma: no cover - защита от неверной shape
+        raise ColdExportError(
+            f"таблица: {len(vals)} значений на shape {(rows, cols)}"
+        )
+    quant: list[int] = [0] * len(vals)
+    scales: list[float] = []
+    for row in range(rows):
+        base = row * cols
+        if scale_mode == "block":
+            for blk in range(per_row_blocks):
+                start = base + blk * block_size
+                block = vals[start:start + block_size]
+                absmax = f32(max((abs(v) for v in block), default=0.0))
+                if mode == "int8":
+                    scale = f32(absmax / 127.0) if absmax > 0 else f32(INT8_ZERO_SCALE)
+                else:
+                    scale = absmax
+                scales.append(scale)
+                for offset, value in enumerate(block):
+                    index = start + offset
+                    if scale == 0.0:
+                        quant[index] = 0
+                    elif mode == "int8":
+                        ratio = f32(value / scale)
+                        quant[index] = max(-127, min(127, int(round(ratio))))
+                    else:
+                        ratio = f32(value / scale)
+                        quant[index] = max(-1, min(1, int(_round_half_away(ratio))))
+            continue
+        row_values = vals[base:base + cols]
+        absmax = f32(max((abs(v) for v in row_values), default=0.0))
+        if mode == "int8":
+            scale = f32(absmax / 127.0) if absmax > 0 else f32(INT8_ZERO_SCALE)
+        else:
+            scale = absmax
+        scales.extend([scale] * per_row_blocks)
+        for offset, value in enumerate(row_values):
+            index = base + offset
+            if scale == 0.0:
+                quant[index] = 0
+            elif mode == "int8":
+                ratio = f32(value / scale)
+                quant[index] = max(-127, min(127, int(round(ratio))))
+            else:
+                ratio = f32(value / scale)
+                quant[index] = max(-1, min(1, int(_round_half_away(ratio))))
+    return quant, scales
+
+
+def _round_half_away(value: float) -> int:
+    """Округление «половина от нуля», как ``torch.sign(x)*floor(|x|+0.5)``."""
+    return int(math.copysign(math.floor(abs(value) + 0.5), value))
+
+
+def _segment_parts(
+    *, mode: str, n_values: int, scale_dtype: str, block_size: int,
+) -> tuple[bytes, int]:
+    """Заголовок сегмента и число масштабов для n_values."""
+    flags = ternary.FLAG_SCALE_F32 if scale_dtype == "float32" else 0
+    if mode == "trit":
+        storage_blocks = (
+            n_values + ternary.TRITS_PER_STORAGE_BLOCK - 1
+        ) // ternary.TRITS_PER_STORAGE_BLOCK
+        total_scale_blocks = n_values // block_size
+        if total_scale_blocks * block_size < n_values:  # pragma: no cover
+            raise ColdExportError(
+                f"таблица: масштабов не хватает на {n_values} тритов"
+            )
+        header = struct.pack(
+            "<4sBBQI", ternary.MAGIC, ternary.VERSION, flags, n_values,
+            total_scale_blocks,
+        )
+        return header, total_scale_blocks
+    n_scales = (n_values + vtm_ref.INT8_SCALE_BLOCK - 1) // vtm_ref.INT8_SCALE_BLOCK
+    header = struct.pack(
+        "<4sBBQI", vtm_ref.INT8_MAGIC, vtm_ref.INT8_VERSION, flags, n_values,
+        n_scales,
+    )
+    return header, n_scales
+
+
+def encode_embed_segment(
+    weight: Any,
+    name: str = _EMBED_NAME,
+    *,
+    mode: str = "trit",
+    scale_mode: str = "block",
+    block_size: int = ternary.BLOCK_SIZE,
+    scale_dtype: str = "float32",
+) -> tuple[bytes, dict[str, Any]]:
+    """Сегмент таблицы словаря: TRT1 (``trit``) или INT8 (``int8``).
+
+    Возвращает ``(payload, meta)``, как ``encode_trit_segment``: payload
+    кладётся в ``ternary.trit`` (trit) или ``non_ternary.bin`` (int8), meta —
+    в запись манифеста.
+
+    Куски по строкам: таблица Qwen — это 136 Ми элементов (0.5B) и 311 Ми
+    (3B), держать её fp32-копию, триты, упакованные слова и де-квантованный
+    дубль одновременно нельзя.
+    """
+    if mode not in ("trit", "int8"):
+        raise ColdExportError(f"--embed={mode!r}: таблица бывает trit|int8")
+    if scale_mode not in EMBED_SCALES:
+        raise ColdExportError(
+            f"--embed-scale={scale_mode!r}: поддержано {', '.join(EMBED_SCALES)}"
+        )
+    shape = [int(x) for x in weight.shape]
+    if len(shape) != 2:
+        raise ColdExportError(f"{name}: таблица должна быть 2-D, а не {shape}")
+    rows, cols = shape
+    per_row_blocks = cols // block_size
+    if cols % block_size:
+        raise ColdExportError(
+            f"{name}: {cols} столбцов не кратны block_size={block_size}; "
+            "посрочный/блочный масштаб таблицы лёг бы поперёк строк"
+        )
+    torch_path = _is_torch_tensor(weight)
+    step = _chunk_rows(rows, cols) if torch_path else rows
+    scale_fmt = "<f4" if scale_dtype == "float32" else "<f2"
+    torch_scale_dtype = None
+    if torch_path:
+        import torch  # noqa: PLC0415
+
+        torch_scale_dtype = (
+            torch.float32 if scale_dtype == "float32" else torch.float16
+        )
+    scales_parts: list[bytes] = []
+    payload_parts: list[bytes] = []
+    n_values = 0
+    zero_count = 0
+    for start in range(0, rows, step):
+        if torch_path:
+            chunk = weight[start:start + step]
+            n_rows = int(chunk.shape[0])
+            quant, scales = _quantize_table_torch(
+                chunk, mode=mode, scale_mode=scale_mode, block_size=block_size,
+            )
+        else:
+            # fake-тензор: одна порция целиком (тесты без torch, таблица мелкая)
+            chunk = None
+            n_rows = min(step, rows - start)
+            quant, scales = _plain_table_quant(
+                list(weight), n_rows, cols, mode=mode, scale_mode=scale_mode,
+                block_size=block_size,
+            )
+        expected = n_rows * per_row_blocks
+        if len(scales) != expected:
+            raise ColdExportError(
+                f"{name}: масштабов {len(scales)}, ожидалось {expected}"
+            )
+        if torch_path:
+            scales_out = scales.to(torch_scale_dtype)
+            if not bool(torch.isfinite(scales_out).all()):
+                raise ColdExportError(f"{name}: масштаб не помещается в {scale_dtype}")
+            scales_parts.append(qat_export._to_numpy_bytes(scales_out, scale_fmt))
+            if mode == "trit":
+                words = ternary.pack20_torch(quant.to(torch.int8).contiguous())
+                payload_parts.append(qat_export._to_numpy_bytes(words, "<u4"))
+                zero_count += int((quant == 0).sum().item())
+                del words
+            else:
+                q_i8 = quant.to(torch.int8).cpu().contiguous()
+                payload_parts.append(q_i8.view(torch.uint8).numpy().tobytes())
+                del q_i8
+            del scales_out
+        else:
+            scales_parts.append(struct.pack(f"<{len(scales)}{scale_fmt[1]}", *scales))
+            if mode == "trit":
+                payload_parts.append(_pack20_plain(quant))
+                zero_count += sum(1 for v in quant if v == 0)
+            else:
+                payload_parts.append(bytes(value & 0xFF for value in quant))
+        n_values += n_rows * cols
+        del chunk, quant, scales
+
+    header, n_scales = _segment_parts(
+        mode=mode, n_values=n_values, scale_dtype=scale_dtype, block_size=block_size,
+    )
+    words_bytes = b"".join(payload_parts)
+    if mode == "trit":
+        storage_blocks = (
+            n_values + ternary.TRITS_PER_STORAGE_BLOCK - 1
+        ) // ternary.TRITS_PER_STORAGE_BLOCK
+        expected_words = storage_blocks * ternary.WORDS_PER_STORAGE_BLOCK * 4
+        if len(words_bytes) > expected_words:  # pragma: no cover - защита
+            raise ColdExportError(
+                f"{name}: слов {len(words_bytes)} байт, а блоков {storage_blocks} "
+                f"даёт {expected_words}"
+            )
+        if len(words_bytes) < expected_words:
+            words_bytes += b"\x00" * (expected_words - len(words_bytes))
+    payload = header + b"".join(scales_parts) + words_bytes
+    info: dict[str, Any] = {
+        "params": n_values,
+        "shape": shape,
+        "dtype": mode,
+        "kind": mode,
+        "n_scale_blocks": n_scales,
+        "scale_blocks_per_row": per_row_blocks,
+        "scale_block": block_size,
+        "scale_mode": scale_mode,
+    }
+    if mode == "trit":
+        storage_blocks = (
+            n_values + ternary.TRITS_PER_STORAGE_BLOCK - 1
+        ) // ternary.TRITS_PER_STORAGE_BLOCK
+        info.update({
+            "n_trits": n_values,
+            "n_words": (n_values + ternary.TRITS_PER_WORD - 1) // ternary.TRITS_PER_WORD,
+            "n_storage_blocks": storage_blocks,
+            "n_storage_words": storage_blocks * ternary.WORDS_PER_STORAGE_BLOCK,
+            "zero_fraction": round(zero_count / n_values, 6) if n_values else 0.0,
+        })
+    return payload, info
+
+
+def _pack20_plain(trits: Sequence[int]) -> bytes:
+    """Упаковать триты в слова по 20 без torch (fake-тензоры в тестах)."""
+    words_per_block = ternary.TRITS_PER_STORAGE_BLOCK // ternary.TRITS_PER_WORD
+    n_words = (
+        len(trits) + ternary.TRITS_PER_WORD - 1
+    ) // ternary.TRITS_PER_WORD
+    storage_blocks = (
+        n_words + words_per_block - 1
+    ) // words_per_block
+    words = [0] * (storage_blocks * words_per_block)
+    pow3 = [3 ** k for k in range(ternary.TRITS_PER_WORD)]
+    # Хвост добивается нулевыми тритами (это цифра 1 в коде слова), а не
+    # нулевыми словами: ровно так делает pack20_torch и qat.export, иначе
+    # последнее слово сегмента разошлось бы с прежним экспортом.
+    padded = list(trits) + [0] * ((-len(trits)) % ternary.TRITS_PER_WORD)
+    for index, trit in enumerate(padded):
+        word = index // ternary.TRITS_PER_WORD
+        words[word] += (int(trit) + 1) * pow3[index % ternary.TRITS_PER_WORD]
+    return struct.pack(f"<{len(words)}I", *words)
+
+
+# ---------------------------------------------------------------------------
 # Роли и порядок тензоров
 # ---------------------------------------------------------------------------
 
@@ -856,6 +1227,7 @@ def export_model(
     block_size: int = ternary.BLOCK_SIZE,
     scale_dtype: str = "float32",
     embed_mode: str = "none",
+    embed_scale: str = "block",
     context_window: int = DEFAULT_CONTEXT_WINDOW,
     limit_layers: int | None = None,
     overrides: dict[str, Any] | None = None,
@@ -879,6 +1251,8 @@ def export_model(
         raise ColdExportError(f"--scale-dtype={scale_dtype}: {SCALE_DTYPES}")
     if embed_mode not in EMBED_MODES:
         raise ColdExportError(f"--embed={embed_mode}: {EMBED_MODES}")
+    if embed_scale not in EMBED_SCALES:
+        raise ColdExportError(f"--embed-scale={embed_scale}: {EMBED_SCALES}")
     if context_window <= 0:
         raise ColdExportError(f"--context-window={context_window}: нужно > 0")
     check_supported_config(hf_config)
@@ -895,7 +1269,7 @@ def export_model(
         embed_mode=embed_mode,
         overrides=overrides,
     )
-    check_block_alignment(architecture, block_size, embed_mode)
+    check_block_alignment(architecture, block_size, embed_mode, embed_scale)
 
     # --- какие ключи берём --------------------------------------------------
     roles: dict[str, qat_export.WeightRole] = {}
@@ -938,6 +1312,7 @@ def export_model(
     trit_params = 0
     non_params = 0
     embed_entry: dict[str, Any] | None = None
+    embed_int8_entry: dict[str, Any] | None = None
     seen_layers: dict[int, set[str]] = {}
     have_embed = False
     have_final_norm = False
@@ -969,8 +1344,9 @@ def export_model(
                 trit_params += int(meta["params"])
                 seen_layers.setdefault(int(role.layer), set()).add(role.key)
             elif role.kind == "embed" and embed_mode == "trit":
-                data, meta = encode_trit_segment(
-                    value, _EMBED_NAME, block_size=block_size, scale_dtype=scale_dtype,
+                data, meta = encode_embed_segment(
+                    value, _EMBED_NAME, mode="trit", scale_mode=embed_scale,
+                    block_size=block_size, scale_dtype=scale_dtype,
                 )
                 meta.update({
                     "name": _EMBED_NAME,
@@ -985,6 +1361,31 @@ def export_model(
                 trit_entries.append(meta)
                 trit_params += int(meta["params"])
                 embed_entry = meta
+                have_embed = True
+            elif role.kind == "embed" and embed_mode == "int8":
+                # INT8-сегмент (kind 4) лежит в non_ternary.bin: так его ищет
+                # vtm_compile (`dtype: int8`) и так его читает C-загрузчик.
+                data, meta = encode_embed_segment(
+                    value, _EMBED_NAME, mode="int8", scale_mode=embed_scale,
+                    block_size=block_size, scale_dtype=scale_dtype,
+                )
+                non_handle.write(data)
+                entry = {
+                    "name": _EMBED_NAME,
+                    "role": "embed",
+                    "layer": None,
+                    "key": "embed",
+                    "shape": shape,
+                    "dtype": "int8",
+                    "offset": non_offset,
+                    "length": len(data),
+                    "params": int(meta["params"]),
+                    **{k: v for k, v in meta.items() if k != "shape"},
+                }
+                non_entries.append(entry)
+                non_offset += len(data)
+                non_params += int(meta["params"])
+                embed_int8_entry = entry
                 have_embed = True
             elif role.kind in ("embed", "final_norm", "norm", "bias", "lm_head"):
                 if role.kind == "lm_head" and architecture["tie_word_embeddings"]:
@@ -1046,14 +1447,16 @@ def export_model(
                     "tie_word_embeddings=true, но fp32-эмбеддинга в экспорте нет"
                 )
             tied_shape, tied_params = list(embed["shape"]), int(embed["params"])
+        tied_dtype = {"trit": "trit", "int8": "int8"}.get(embed_mode, "float32")
         non_entries.append({
             "name": "lm_head.weight",
             "role": "lm_head",
             "layer": None,
             "key": "lm_head",
             "shape": tied_shape,
-            "dtype": "trit" if embed_mode == "trit" else "float32",
-            "tied_to": _EMBED_NAME if embed_mode == "trit" else "model.embed_tokens.weight",
+            "dtype": tied_dtype,
+            "tied_to": _EMBED_NAME if embed_mode == "trit"
+                       else "model.embed_tokens.weight",
             "params": tied_params,
         })
 
@@ -1093,6 +1496,7 @@ def export_model(
         "scale_dtype": scale_dtype,
         "target_suffixes": list(TARGET_SUFFIXES),
         "quantize_embeddings": embed_mode,
+        "embed_scale": embed_scale,
         "rule": qat_export.QUANT_RULE,
     }
     manifest = qat_export.build_manifest(
@@ -1139,11 +1543,52 @@ def export_model(
         **source_info,
     }
     manifest["hf_config"] = hf_config
+    # qat.export считает секцию embeddings по files.embed (trit) или fp32;
+    # int8 и посрочные масштабы он не знает, поэтому описание уточняется тут.
+    # Компилятор смотрит на architecture.embed и на dtype записи, но человек
+    # и отчёт читают именно этот блок.
+    embed_fp32 = next(
+        (entry for entry in non_entries
+         if entry.get("role") == "embed" and entry.get("dtype") == "float32"),
+        None,
+    )
+    if embed_entry is not None:
+        embed_params = int(embed_entry["params"])
+        embed_bytes = int(embed_entry["trit_length"])
+    elif embed_int8_entry is not None:
+        embed_params = int(embed_int8_entry["params"])
+        embed_bytes = int(embed_int8_entry["length"])
+    elif embed_fp32 is not None:
+        embed_params = int(embed_fp32["params"])
+        embed_bytes = int(embed_fp32["length"])
+    else:  # pragma: no cover - have_embed уже проверен выше
+        embed_params = int(architecture["vocab"]) * int(architecture["hidden"])
+        embed_bytes = embed_params * 4
+    manifest["embeddings"] = {
+        "mode": embed_mode,
+        "tensor": _EMBED_NAME,
+        "storage": "ternary.trit" if embed_mode == "trit"
+                   else _NON_TERNARY_FILE,
+        "dtype": {"trit": "trit", "int8": "int8"}.get(embed_mode, "float32"),
+        "params": embed_params,
+        "bytes": embed_bytes,
+        "block_size": block_size,
+        "scale_mode": embed_scale,
+        "scale_block": vtm_ref.INT8_SCALE_BLOCK if embed_mode == "int8" else block_size,
+        "rule": qat_export.QUANT_RULE,
+        "note": (
+            "scale_mode=row: один масштаб на строку таблицы, разложенный по её "
+            "блокам 128; раскладка сегмента та же, что при block"
+            if embed_scale == "row" else
+            "scale_mode=block: absmax на блок 128 вдоль строки таблицы"
+        ),
+    }
     manifest["cold_export"] = {
         "tool_version": TOOL_VERSION,
         "block_size": block_size,
         "scale_dtype": scale_dtype,
         "embed": embed_mode,
+        "embed_scale": embed_scale,
         "context_window": int(architecture["context_len"]),
         "limit_layers": None if limit_layers is None else int(limit_layers),
         "n_layers_exported": n_layers,
@@ -1472,7 +1917,12 @@ def build_parser() -> argparse.ArgumentParser:
                              f"в кэп 512 МиБ)")
     parser.add_argument("--embed", choices=EMBED_MODES, default="none",
                         help="таблица словаря: none — fp32 в non_ternary.bin, "
-                             "trit — сегментом в ternary.trit")
+                             "trit — сегментом TRT1 в ternary.trit, "
+                             "int8 — INT8-сегментом (kind 4) в non_ternary.bin")
+    parser.add_argument("--embed-scale", choices=EMBED_SCALES, default="block",
+                        help="масштаб таблицы: block — absmax на блок 128 (как "
+                             "у Linear), row — один масштаб на строку (только "
+                             "по флагу, раскладка сегмента прежняя)")
     parser.add_argument("--block-size", type=int, default=ternary.BLOCK_SIZE,
                         help="блок absmax (VTM v0.1: только 128)")
     parser.add_argument("--scale-dtype", choices=SCALE_DTYPES, default="float32",
@@ -1545,6 +1995,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             block_size=args.block_size,
             scale_dtype=args.scale_dtype,
             embed_mode=args.embed,
+            embed_scale=args.embed_scale,
             context_window=args.context_window,
             limit_layers=args.limit_layers,
             overrides=overrides,
@@ -1570,17 +2021,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"rope_theta={result.architecture['rope_theta']:g} "
         f"eps={result.architecture['rms_norm_eps']:g} "
         f"tie={result.architecture['tie_word_embeddings']} "
-        f"embed={result.architecture['embed']} ctx={manifest['context_window']}"
+        f"embed={result.architecture['embed']}"
+        f"/{manifest.get('cold_export', {}).get('embed_scale', 'block')} "
+        f"ctx={manifest['context_window']}"
     )
     echo(
         f"[cold_export] {result.trit_path.name}: "
         f"{_human_bytes(result.trit_path.stat().st_size)} "
         f"({result.tensor_count} сегментов, {result.trit_params:,} тритов)"
     )
+    non_kind = "fp32"
+    if manifest.get("embeddings", {}).get("dtype") == "int8":
+        non_kind = "fp32, таблица словаря int8"
     echo(
         f"[cold_export] {result.non_ternary_path.name}: "
         f"{_human_bytes(result.non_ternary_path.stat().st_size)} "
-        f"({result.non_ternary_params:,} параметров fp32)"
+        f"({result.non_ternary_params:,} параметров: {non_kind})"
     )
     memory = manifest["cold_export"]["memory"]
     echo(

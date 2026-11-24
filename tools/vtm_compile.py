@@ -1891,6 +1891,19 @@ def _print_manifest(
                 f"эмбеддинги: {embed.kind_name} в non_ternary.bin "
                 f"({_human_bytes(fp32_bytes)})"
             )
+        # Гранулярность масштаба таблицы на формат не влияет (масштабов всё
+        # равно ceil(n/128), посрочный режим раскладывает масштаб строки по её
+        # блокам), но в отчёте это видно: 0143.
+        scale_mode = str(
+            (export.manifest.get("cold_export") or {}).get("embed_scale")
+            or (export.manifest.get("embeddings") or {}).get("scale_mode")
+            or "block"
+        )
+        if scale_mode != "block":
+            print(
+                f"масштаб таблицы: {scale_mode} (один масштаб на строку, "
+                f"разложен по блокам {cfg.block_size}; раскладка сегмента прежняя)"
+            )
     print(f"тензоров: {len(vtm.tensors)}, инструкций: {len(vtm.program)}")
     print("операции: " + ", ".join(f"{name}×{count}" for name, count in sorted(ops.items())))
     cache_bytes = kv_cache_bytes(cfg, context)

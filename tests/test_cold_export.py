@@ -272,12 +272,15 @@ class TestQuantization(unittest.TestCase):
             self.assertIn("128", str(ctx.exception))
 
     def test_rejects_embed_mode(self):
+        # int8 перестал быть «неизвестным режимом» в 0143: его варианты
+        # проверяет tests/test_embed_variants.py. Здесь — по-прежнему отказ на
+        # опечатке в имени режима.
         with tempfile.TemporaryDirectory() as tmp:
             state = tiny_model()
             with self.assertRaises(cold_export.ColdExportError):
                 cold_export.export_model(
                     cold_export.DictSource(state), tiny_hf_config(), tmp,
-                    embed_mode="int8",
+                    embed_mode="int4",
                 )
 
 

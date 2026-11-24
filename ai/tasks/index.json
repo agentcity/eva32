@@ -947,14 +947,14 @@
   {
     "id": "0143",
     "title": "Урон от тритовой таблицы: int8, посрочные масштабы, остаток",
-    "status": "in_progress",
+    "status": "done",
     "file": "0143-embed-damage.md",
     "assignee": "agent:embed-damage"
   },
   {
     "id": "0144",
     "title": "План обхода урона таблицы: решение для 1.5B/3B",
-    "status": "in_progress",
+    "status": "done",
     "file": "0144-embed-plan.md",
     "assignee": "agent:embed-plan"
   },
