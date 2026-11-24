@@ -2310,10 +2310,39 @@ PAGE_HTML = """<!doctype html>
     });
   }
 
+  var statusTimer = null;
+  var statusStart = 0;
+  var statusPhase = "думает";
+
+  function stopStatusTimer() {
+    if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+  }
+
   function setStatus(text, isError) {
     var node = byId("status");
+    stopStatusTimer();
     node.textContent = text;
     node.className = isError ? "error" : "";
+  }
+
+  // Работающий таймер: «думает… 7,2 с» → «отвечает… 1,4 с». Долгий prefill
+  // у ВТМ (10–40 с) без таймера выглядит как зависание.
+  function startStatusTimer(phase) {
+    stopStatusTimer();
+    statusStart = Date.now();
+    statusPhase = phase;
+    var node = byId("status");
+    node.className = "";
+    function tick() {
+      var sec = ((Date.now() - statusStart) / 1000).toFixed(1);
+      node.textContent = statusPhase + "… " + sec + " с";
+    }
+    tick();
+    statusTimer = setInterval(tick, 200);
+  }
+
+  function switchStatusPhase(phase) {
+    if (statusTimer) { statusPhase = phase; }
   }
 
   function formatSeconds(ms) {
@@ -2634,8 +2663,10 @@ PAGE_HTML = """<!doctype html>
         (event.backend_label || event.backend) + " · " +
         (event.model_label || event.model);
     } else if (event.type === "delta") {
+      if (statusPhase === "думает") { switchStatusPhase("отвечает"); }
       appendText(side, event.text || "");
     } else if (event.type === "done") {
+      stopStatusTimer();
       panelOf(side).className = "panel";
       byId("time-" + side).textContent = formatSeconds(event.elapsed_ms);
       var speed = typeof event.tokens_per_second === "number"
@@ -2653,7 +2684,12 @@ PAGE_HTML = """<!doctype html>
       byId("foot-" + side).textContent = details.join(" · ");
       fillSideMetrics(side, event);
       finishedSides += 1;
-      if (finishedSides >= 2) { setStatus("готово", false); }
+      if (finishedSides >= 2) {
+        setStatus("готово", false);
+        // Обновить карточки: статус «в памяти» и объём должны быть видны сразу.
+        refreshModels();
+        refreshSystem();
+      }
     } else if (event.type === "error") {
       panelOf(side).className = "panel failed";
       appendError(side, event.message || "неизвестная ошибка");
@@ -2705,7 +2741,7 @@ PAGE_HTML = """<!doctype html>
     running = true;
     byId("ask").disabled = true;
     resetPanels();
-    setStatus("думает…", false);
+    startStatusTimer("думает");
 
     try {
       var response = await fetch("/api/chat", {
