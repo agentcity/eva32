@@ -1097,5 +1097,12 @@
     "status": "in_progress",
     "file": "0165-native-q4k.md",
     "assignee": "agent:q4k-native"
+  },
+  {
+    "id": "0166",
+    "title": "Загрузка/выгрузка модели в память и статус",
+    "status": "in_progress",
+    "file": "0166-chat-load-unload.md",
+    "assignee": "agent:chat-load"
   }
 ]
