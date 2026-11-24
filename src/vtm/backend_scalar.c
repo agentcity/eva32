@@ -839,7 +839,45 @@ typedef struct {
     int k;
     int n;
     int asym;
+    double *rowbuf;   // vt*k double: скалярный путь n>1 (строка в double)
+    float *wbuf;      // vt*k f32: NEON-путь (строка в точных целых f32)
 } q4_mm_job;
+
+// --- выбор Q4-ядра: NEON, если TU собран с NEON (задача 0157) --------------
+//
+// Публичный контракт vtm_q4_* остаётся здесь, и здесь же — скалярный эталон
+// (в double). NEON-ядра живут в backend_neon.c; на сборке без NEON ссылок на
+// них нет, и всегда работает только скаляр. VTM_Q4_SCALAR=1 принудительно
+// возвращает скалярный путь: A/B-замер и воспроизводимость (bench_backend
+// --q4 в двух процессах даёт «NEON против скаляра»).
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+extern int vtm_neon_q4_tmv_rows(float *y, const uint8_t *q,
+                                const float *scales, const float *mins,
+                                const float *x, int r0, int r1, int cols,
+                                int asym);
+extern int vtm_neon_q4_mm_rows(float *y, const uint8_t *q, const float *scales,
+                               const float *mins, const float *b, int r0,
+                               int r1, int k, int n, int asym, float *wrow);
+extern int vtm_neon_q4_dequant_row(float *y, const uint8_t *q,
+                                   const float *scales, const float *mins,
+                                   int64_t base, int cols, int asym);
+#define VTM_Q4_NEON 1
+#else
+#define VTM_Q4_NEON 0
+#endif
+
+static int q4_simd_enabled(void) {
+#if VTM_Q4_NEON
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("VTM_Q4_SCALAR");
+        cached = !(e && *e && *e != '0');
+    }
+    return cached;
+#else
+    return 0;
+#endif
+}
 
 // Развернуть группу (или её хвост) в buf. buf — scratch на стеке, не арена.
 // off — смещение внутри группы (0..31): строка может начинаться не с границы
@@ -920,6 +958,10 @@ int vtm_q4_dequant_row(float *y, const uint8_t *q, const float *scales,
 
     if (!y || !q || !scales || cols < 0 || base < 0) return -1;
     if (asym && !mins) return -1;
+#if VTM_Q4_NEON
+    if (q4_simd_enabled())
+        return vtm_neon_q4_dequant_row(y, q, scales, mins, base, cols, asym);
+#endif
     while (j0 < cols) {
         int64_t idx = base + (int64_t)j0;
         uint64_t g = (uint64_t)idx >> 5;
@@ -932,6 +974,27 @@ int vtm_q4_dequant_row(float *y, const uint8_t *q, const float *scales,
         j0 += n;
     }
     return 0;
+}
+
+// Одна строка Q4 -> dst (k значений в double). Нужен скалярному MM при n > 1:
+// строка разворачивается один раз на все столбцы (задача 0157, п.2). Значения
+// те же, что даёт q4_dequant_group, поэтому результат MM не меняется побитово.
+static void q4_row_double(double *dst, const uint8_t *q, const float *scales,
+                          const float *mins, int64_t base, int k, int asym) {
+    double buf[VTM_Q4_GROUP_SIZE];
+    int j0 = 0;
+
+    while (j0 < k) {
+        int64_t idx = base + (int64_t)j0;
+        uint64_t g = (uint64_t)idx >> 5;
+        unsigned off = (unsigned)idx & 31u;
+        int n = VTM_Q4_GROUP_SIZE - (int)off;
+        int t;
+        if (n > k - j0) n = k - j0;
+        q4_dequant_group(buf, q, scales, mins, g, off, n, asym);
+        for (t = 0; t < n; t++) dst[j0 + t] = buf[t];
+        j0 += n;
+    }
 }
 
 static void q4_tmv_rows(q4_tmv_job *j, int r0, int r1) {
@@ -950,10 +1013,23 @@ static void q4_tmv_worker(void *p, int tid, int r0, int r1) {
     q4_tmv_rows(j, r0, r1);
 }
 
+#if VTM_Q4_NEON
+// NEON-путь: ошибку ядра не превращаем в отказ (контракт vtm_q4_* — «не
+// роняет прогон»), а откатываем строки на скалярный эталон.
+static void q4_tmv_neon_worker(void *p, int tid, int r0, int r1) {
+    q4_tmv_job *j = (q4_tmv_job *)p;
+    (void)tid;
+    if (vtm_neon_q4_tmv_rows(j->y, j->q, j->scales, j->mins, j->x, r0, r1,
+                             j->cols, j->asym) != 0)
+        q4_tmv_rows(j, r0, r1);
+}
+#endif
+
 int vtm_q4_tmv(float *y, const uint8_t *q, const float *scales,
                const float *mins, const float *x, int rows, int cols,
                int asym) {
     q4_tmv_job job;
+    vtm_rows_fn fn = q4_tmv_worker;
 
     if (!y || !q || !scales || !x) return -1;
     if (rows < 0 || cols < 0) return -1;
@@ -966,41 +1042,79 @@ int vtm_q4_tmv(float *y, const uint8_t *q, const float *scales,
     job.x = x;
     job.cols = cols;
     job.asym = asym;
-    vtm_parallel_rows(rows, (double)rows * (double)cols, q4_tmv_worker, &job);
+#if VTM_Q4_NEON
+    if (q4_simd_enabled() && vtm_simd_available()) fn = q4_tmv_neon_worker;
+#endif
+    vtm_parallel_rows(rows, (double)rows * (double)cols, fn, &job);
     return 0;
 }
 
-// MM: Y[r,c] = sum_t W[r,t] * B[t,c]. Строка W деквантизуется по 32 значения
-// в тот же scratch, что TMV: для n == 1 (tied lm_head в графе Qwen) это ровно
-// TMV; для n > 1 строка разворачивается заново на каждый столбец — лишние
-// сдвиги/умножения, зато никакой памяти под строку и никакой fp32-копии.
-static void q4_mm_rows(q4_mm_job *j, int r0, int r1) {
+// MM: Y[r,c] = sum_t W[r,t] * B[t,c]. Строка W деквантизуется ОДИН раз на
+// строку (в double), а не заново на каждый столбец: при n > 1 это убирает
+// n-кратную лишнюю распаковку (задача 0157, п.2). Значения в буфере — те же,
+// что даёт q4_dequant_group, порядок сложения по t прежний, поэтому результат
+// побитово совпадает с прежним скалярным путём. Память — k double на поток
+// (для 3B: 3072 * 8 Б = 24 КБ), выделяется один раз на вызов; если выделить
+// не удалось, работает прежний путь «строка на каждый столбец».
+static void q4_mm_rows(q4_mm_job *j, int tid, int r0, int r1) {
     int r, c;
 
-    for (r = r0; r < r1; r++) {
-        int64_t base = (int64_t)r * (int64_t)j->k;
-        for (c = 0; c < j->n; c++)
-            j->y[(size_t)r * (size_t)j->n + (size_t)c]
-                = (float)q4_dot_row(j->q, j->scales, j->mins, base, j->k,
-                                    j->b + c, j->n, j->asym);
+    if (!j->rowbuf) {
+        for (r = r0; r < r1; r++) {
+            int64_t base = (int64_t)r * (int64_t)j->k;
+            for (c = 0; c < j->n; c++)
+                j->y[(size_t)r * (size_t)j->n + (size_t)c]
+                    = (float)q4_dot_row(j->q, j->scales, j->mins, base, j->k,
+                                        j->b + c, j->n, j->asym);
+        }
+        return;
+    }
+    {
+        double *wrow = j->rowbuf + (size_t)tid * (size_t)j->k;
+        for (r = r0; r < r1; r++) {
+            int64_t base = (int64_t)r * (int64_t)j->k;
+            float *yrow = j->y + (size_t)r * (size_t)j->n;
+            q4_row_double(wrow, j->q, j->scales, j->mins, base, j->k,
+                          j->asym);
+            for (c = 0; c < j->n; c++) {
+                double acc = 0.0;
+                int t;
+                for (t = 0; t < j->k; t++)
+                    acc += wrow[t] * (double)j->b[(size_t)t * (size_t)j->n
+                                                  + (size_t)c];
+                yrow[c] = (float)acc;
+            }
+        }
     }
 }
 
 static void q4_mm_worker(void *p, int tid, int r0, int r1) {
     q4_mm_job *j = (q4_mm_job *)p;
-    (void)tid;
-    q4_mm_rows(j, r0, r1);
+    q4_mm_rows(j, tid, r0, r1);
 }
+
+#if VTM_Q4_NEON
+static void q4_mm_neon_worker(void *p, int tid, int r0, int r1) {
+    q4_mm_job *j = (q4_mm_job *)p;
+    float *wrow = j->wbuf + (size_t)tid * (size_t)j->k;
+    if (vtm_neon_q4_mm_rows(j->y, j->q, j->scales, j->mins, j->b, r0, r1,
+                            j->k, j->n, j->asym, wrow) != 0)
+        q4_mm_rows(j, tid, r0, r1);
+}
+#endif
 
 int vtm_q4_mm(float *y, const uint8_t *q, const float *scales,
               const float *mins, const float *b, int m, int k, int n,
               int asym) {
     q4_mm_job job;
+    int vt;
 
     if (!y || !q || !scales || !b) return -1;
     if (m < 0 || k < 0 || n < 0) return -1;
     if (asym && !mins) return -1;
     if (m == 0 || k == 0 || n == 0) return 0;
+    // n == 1 — это TMV по строке (tied lm_head): общий путь, без буфера строки.
+    if (n == 1) return vtm_q4_tmv(y, q, scales, mins, b, m, k, asym);
     job.y = y;
     job.q = q;
     job.scales = scales;
@@ -1009,8 +1123,24 @@ int vtm_q4_mm(float *y, const uint8_t *q, const float *scales,
     job.k = k;
     job.n = n;
     job.asym = asym;
+    job.rowbuf = NULL;
+    job.wbuf = NULL;
+    vt = vtm_threads();
+#if VTM_Q4_NEON
+    if (q4_simd_enabled() && vtm_simd_available()) {
+        job.wbuf = (float *)malloc((size_t)vt * (size_t)k * sizeof(float));
+        if (job.wbuf) {
+            vtm_parallel_rows(m, (double)m * (double)k * (double)n,
+                              q4_mm_neon_worker, &job);
+            free(job.wbuf);
+            return 0;
+        }
+    }
+#endif
+    job.rowbuf = (double *)malloc((size_t)vt * (size_t)k * sizeof(double));
     vtm_parallel_rows(m, (double)m * (double)k * (double)n, q4_mm_worker,
                       &job);
+    free(job.rowbuf);
     return 0;
 }
 

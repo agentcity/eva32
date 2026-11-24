@@ -1671,7 +1671,13 @@ generation_done:
     }
 
     {
-        double sec = (double)(c1 - c0) / (double)CLOCKS_PER_SEC;
+        // Время генерации — по монотонным часам (wall clock), а не по
+        // clock(): clock() суммирует время всех потоков, поэтому на 8 ядрах
+        // печатал «0,2 ток/с» там, где реально было 3,6. CPU-время оставляем
+        // в --stats: оно нужно, чтобы видеть цену параллелизма.
+        double sec = t_end - t_start;
+        double cpu_sec = (double)(c1 - c0) / (double)CLOCKS_PER_SEC;
+        (void)cpu_sec;
         FILE *info = stream ? stderr : stdout;
         print_tokens(info, "prompt: ", tokens, n_tokens);
         if (n_generated)

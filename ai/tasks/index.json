@@ -1038,8 +1038,15 @@
   {
     "id": "0157",
     "title": "Q4-ядра: NEON и батчинг — 0,2 ток/с не годятся",
-    "status": "in_progress",
+    "status": "done",
     "file": "0157-q4-neon.md",
     "assignee": "agent:q4-neon"
+  },
+  {
+    "id": "0158",
+    "title": "Плотный fp32 lm_head через SIMD",
+    "status": "in_progress",
+    "file": "0158-dense-mm-simd.md",
+    "assignee": "agent:dense-mm"
   }
 ]

@@ -703,6 +703,493 @@ static int rmsnorm_neon(float *y, const float *x, const float *w,
     return 0;
 }
 
+// --- NEON: Q4 (kind 5, задача 0157) ----------------------------------------
+//
+// Раскладка — по контракту vtm_backend.h: 32 значения группы в 16 байтах
+// (GGML Q4_0: байт j — значение j в младшем ниббле и j+16 в старшем), масштаб
+// fp32 на группу, группы идут по сплющенной матрице, группа может пересекать
+// границу строк (cols не кратен 32).
+//
+// Почему не vdotq_s32. vdotq считает в int8 и требует int8-активаций:
+// квантование x в int8 даёт ошибку порядка 1/127 на группу, то есть ~1e-2 на
+// строку — это на три порядка больше порога приёмки (1e-5 против
+// double-эталона). Поэтому вес разворачивается в f32 точно: значение — целое
+// s = q - 8, |s| <= 8, представимо в f32 без округления (vcvtq_f32_s32 через
+// vmovl_s8/vmovl_s16). Умножение — vfmaq_f32 (vmlaq_f32 в базовом NEON),
+// четыре независимых f32-аккумулятора на группу (по 8 слагаемых в каждом),
+// свёртка и масштаб группы — в double, как у скаляра. Ошибка группы ~1e-7
+// относительно, строки — единицы 1e-7 (бенч --q4 печатает max|diff|).
+//
+// Q4_1 (asym) сводится к той же форме: q*scale + min = s*scale + (min +
+// 8*scale), поэтому нужен ещё Σ x по группе (он считается по тем же
+// загруженным векторам), а масштаб и (min + 8*scale) применяются в double.
+
+// Группа (16 байт) -> два вектора по 16 значений s = q - 8 (j и j+16).
+static inline void q4_group_split(const uint8_t *gp, int8x16_t *slo,
+                                  int8x16_t *shi) {
+    uint8x16_t b = vld1q_u8(gp);
+    int8x16_t eight = vdupq_n_s8(8);
+    *slo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(b, vdupq_n_u8(0x0fu))),
+                    eight);
+    *shi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b, 4)), eight);
+}
+
+// 16 int8 -> 4 вектора f32 (значения целые, округления нет).
+static inline void q4_i8x16_to_f32x4(int8x16_t v, float32x4_t *f) {
+    int16x8_t lo = vmovl_s8(vget_low_s8(v));
+    int16x8_t hi = vmovl_s8(vget_high_s8(v));
+    f[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo)));
+    f[1] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo)));
+    f[2] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi)));
+    f[3] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi)));
+}
+
+// Полная группа (32 значения, off == 0) на непрерывный x: dot = Σ s_t*x_t и
+// xsum = Σ x_t (нужен только для Q4_1). dot — уже double (свёртка f32-лент),
+// масштаб группы применяет вызывающий: так ошибка не накапливается по строке.
+static inline void q4_group_dot(const uint8_t *gp, const float *xp, int asym,
+                                double *dot, double *xsum) {
+    int8x16_t sl, sh;
+    float32x4_t w0[4], w1[4];
+    float32x4_t x0, x1, x2, x3, x4, x5, x6, x7;
+    float32x4_t a0, a1, a2, a3;
+
+    q4_group_split(gp, &sl, &sh);
+    q4_i8x16_to_f32x4(sl, w0);
+    q4_i8x16_to_f32x4(sh, w1);
+    x0 = vld1q_f32(xp + 0);
+    x1 = vld1q_f32(xp + 4);
+    x2 = vld1q_f32(xp + 8);
+    x3 = vld1q_f32(xp + 12);
+    x4 = vld1q_f32(xp + 16);
+    x5 = vld1q_f32(xp + 20);
+    x6 = vld1q_f32(xp + 24);
+    x7 = vld1q_f32(xp + 28);
+    a0 = vmulq_f32(w0[0], x0);
+    a1 = vmulq_f32(w0[1], x1);
+    a2 = vmulq_f32(w0[2], x2);
+    a3 = vmulq_f32(w0[3], x3);
+    a0 = vfmaq_f32(a0, w1[0], x4);
+    a1 = vfmaq_f32(a1, w1[1], x5);
+    a2 = vfmaq_f32(a2, w1[2], x6);
+    a3 = vfmaq_f32(a3, w1[3], x7);
+    *dot = statvq_acc_f64(vaddq_f32(a0, a1))
+         + statvq_acc_f64(vaddq_f32(a2, a3));
+    if (asym) {
+        float32x4_t s0 = vaddq_f32(vaddq_f32(x0, x1), vaddq_f32(x2, x3));
+        float32x4_t s1 = vaddq_f32(vaddq_f32(x4, x5), vaddq_f32(x6, x7));
+        *xsum = statvq_acc_f64(vaddq_f32(s0, s1));
+    } else {
+        *xsum = 0.0;
+    }
+}
+
+// Dot строки Q4 на непрерывный x. Полные группы — векторами, голова/хвост
+// строки (off != 0 или неполная последняя группа, всего < 32 значений на
+// строку) — скалярно, ровно как в double-эталоне.
+static double q4_row_dot_neon(const uint8_t *q, const float *scales,
+                              const float *mins, int64_t base, int k,
+                              const float *x, int asym) {
+    double acc = 0.0;
+    int j0 = 0;
+
+    while (j0 < k) {
+        const int64_t idx = base + (int64_t)j0;
+        const uint64_t g = (uint64_t)idx >> 5;
+        const unsigned off = (unsigned)idx & 31u;
+        int n = VTM_Q4_GROUP_SIZE - (int)off;
+        if (n > k - j0) n = k - j0;
+
+        if (off == 0 && n == VTM_Q4_GROUP_SIZE) {
+            const double scale = (double)load_f32_unaligned(scales, (int64_t)g);
+            double dot, xsum;
+            q4_group_dot(q + (size_t)g * (VTM_Q4_GROUP_SIZE / 2), x + j0,
+                         asym, &dot, &xsum);
+            if (asym) {
+                const double minv = (double)load_f32_unaligned(mins,
+                                                               (int64_t)g);
+                acc += dot * scale + xsum * (minv + 8.0 * scale);
+            } else {
+                acc += dot * scale;
+            }
+            j0 += VTM_Q4_GROUP_SIZE;
+            continue;
+        }
+        {
+            const double scale = (double)load_f32_unaligned(scales, (int64_t)g);
+            const double minv = asym
+                ? (double)load_f32_unaligned(mins, (int64_t)g) : 0.0;
+            const uint8_t *gp = q
+                + (size_t)g * (VTM_Q4_GROUP_SIZE / 2);
+            int t;
+            for (t = 0; t < n; t++) {
+                unsigned within = off + (unsigned)t;
+                unsigned byte = gp[within & 15u];
+                unsigned v = (within < 16u) ? (byte & 0x0fu) : (byte >> 4);
+                double wv = asym ? (double)v * scale + minv
+                                 : ((double)v - 8.0) * scale;
+                acc += wv * (double)x[j0 + t];
+            }
+        }
+        j0 += n;
+    }
+    return acc;
+}
+
+// Строки [r0, r1) TMV по Q4. Разбиение по строкам не меняет результат:
+// каждая строка считается одним и тем же кодом в одном и том же порядке.
+int vtm_neon_q4_tmv_rows(float *y, const uint8_t *q, const float *scales,
+                         const float *mins, const float *x, int r0, int r1,
+                         int cols, int asym) {
+    int r;
+
+    if (!y || !q || !scales || !x) return -1;
+    if (cols < 0 || r0 < 0 || r1 < r0) return -1;
+    if (asym && !mins) return -1;
+    if (cols == 0) {
+        for (r = r0; r < r1; r++) y[r] = 0.0f;
+        return 0;
+    }
+    for (r = r0; r < r1; r++)
+        y[r] = (float)q4_row_dot_neon(q, scales, mins,
+                                      (int64_t)r * (int64_t)cols, cols, x,
+                                      asym);
+    return 0;
+}
+
+// Строка W -> wrow (k значений s = q - 8 в f32, точно). Хвост/голова группы —
+// скалярно. Буфер общий для всех n столбцов: деквантизация строки ровно одна
+// на строку, а не на каждый столбец (задача 0157, п.2).
+static void q4_row_weights_f32(float *wrow, const uint8_t *q, int64_t base,
+                               int k) {
+    int j0 = 0;
+
+    while (j0 < k) {
+        const int64_t idx = base + (int64_t)j0;
+        const uint64_t g = (uint64_t)idx >> 5;
+        const unsigned off = (unsigned)idx & 31u;
+        int n = VTM_Q4_GROUP_SIZE - (int)off;
+        const uint8_t *gp;
+        if (n > k - j0) n = k - j0;
+        gp = q + (size_t)g * (VTM_Q4_GROUP_SIZE / 2);
+        if (off == 0 && n == VTM_Q4_GROUP_SIZE) {
+            int8x16_t sl, sh;
+            float32x4_t f[4];
+            q4_group_split(gp, &sl, &sh);
+            q4_i8x16_to_f32x4(sl, f);
+            vst1q_f32(wrow + j0 + 0, f[0]);
+            vst1q_f32(wrow + j0 + 4, f[1]);
+            vst1q_f32(wrow + j0 + 8, f[2]);
+            vst1q_f32(wrow + j0 + 12, f[3]);
+            q4_i8x16_to_f32x4(sh, f);
+            vst1q_f32(wrow + j0 + 16, f[0]);
+            vst1q_f32(wrow + j0 + 20, f[1]);
+            vst1q_f32(wrow + j0 + 24, f[2]);
+            vst1q_f32(wrow + j0 + 28, f[3]);
+        } else {
+            int t;
+            for (t = 0; t < n; t++) {
+                unsigned within = off + (unsigned)t;
+                unsigned byte = gp[within & 15u];
+                unsigned v = (within < 16u) ? (byte & 0x0fu) : (byte >> 4);
+                wrow[j0 + t] = (float)((int)v - 8);
+            }
+        }
+        j0 += n;
+    }
+}
+
+// MM по Q4 для n > 1: wrow (k f32, развёрнутая строка) общий для всех
+// столбцов; 4 столбца считаются одним f32-вектором, группа копится в f32 и
+// вливается в double-аккумуляторы с масштабом группы. Голова/хвост строки и
+// столбцы n % 4 — скалярно (как в double-эталоне).
+//
+// wrow — scratch этого потока на k значений (вызывающий даёт свой на поток:
+// строки делятся между потоками, состояние не разделяется).
+int vtm_neon_q4_mm_rows(float *y, const uint8_t *q, const float *scales,
+                        const float *mins, const float *b, int r0, int r1,
+                        int k, int n, int asym, float *wrow) {
+    int r, c;
+
+    if (!y || !q || !scales || !b || !wrow) return -1;
+    if (k < 0 || n < 0 || r0 < 0 || r1 < r0) return -1;
+    if (asym && !mins) return -1;
+    if (k == 0) {
+        memset(y, 0, (size_t)(r1 - r0) * (size_t)n * sizeof(float));
+        return 0;
+    }
+
+    for (r = r0; r < r1; r++) {
+        const int64_t base = (int64_t)r * (int64_t)k;
+        float *yrow = y + (size_t)r * (size_t)n;
+
+        q4_row_weights_f32(wrow, q, base, k);
+
+        for (c = 0; c + 4 <= n; c += 4) {
+            float64x2_t accl = vdupq_n_f64(0.0);
+            float64x2_t acch = vdupq_n_f64(0.0);
+            int j0 = 0;
+
+            while (j0 < k) {
+                const int64_t idx = base + (int64_t)j0;
+                const uint64_t g = (uint64_t)idx >> 5;
+                const unsigned off = (unsigned)idx & 31u;
+                const double scale = (double)load_f32_unaligned(scales,
+                                                               (int64_t)g);
+                const double minv = asym
+                    ? (double)load_f32_unaligned(mins, (int64_t)g) : 0.0;
+                const double cg = asym ? minv + 8.0 * scale : 0.0;
+                int cnt = VTM_Q4_GROUP_SIZE - (int)off;
+                if (cnt > k - j0) cnt = k - j0;
+
+                if (cnt == VTM_Q4_GROUP_SIZE) {
+                    const float *bp = b + (size_t)j0 * (size_t)n + (size_t)c;
+                    float32x4_t a0 = vdupq_n_f32(0.0f);
+                    float32x4_t a1 = vdupq_n_f32(0.0f);
+                    float32x4_t a2 = vdupq_n_f32(0.0f);
+                    float32x4_t a3 = vdupq_n_f32(0.0f);
+                    float32x4_t xs0 = vdupq_n_f32(0.0f);
+                    float32x4_t xs1 = vdupq_n_f32(0.0f);
+                    float32x4_t s, sv;
+                    int t;
+
+                    for (t = 0; t < VTM_Q4_GROUP_SIZE; t += 4) {
+                        float32x4_t b0 = vld1q_f32(bp + (size_t)(t + 0)
+                                                   * (size_t)n);
+                        float32x4_t b1 = vld1q_f32(bp + (size_t)(t + 1)
+                                                   * (size_t)n);
+                        float32x4_t b2 = vld1q_f32(bp + (size_t)(t + 2)
+                                                   * (size_t)n);
+                        float32x4_t b3 = vld1q_f32(bp + (size_t)(t + 3)
+                                                   * (size_t)n);
+                        a0 = vfmaq_f32(a0, b0, vdupq_n_f32(wrow[j0 + t + 0]));
+                        a1 = vfmaq_f32(a1, b1, vdupq_n_f32(wrow[j0 + t + 1]));
+                        a2 = vfmaq_f32(a2, b2, vdupq_n_f32(wrow[j0 + t + 2]));
+                        a3 = vfmaq_f32(a3, b3, vdupq_n_f32(wrow[j0 + t + 3]));
+                        if (asym) {
+                            xs0 = vaddq_f32(xs0, vaddq_f32(b0, b1));
+                            xs1 = vaddq_f32(xs1, vaddq_f32(b2, b3));
+                        }
+                    }
+                    s = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+                    sv = vdupq_n_f64(scale);
+                    accl = vfmaq_f64(accl, vcvt_f64_f32(vget_low_f32(s)), sv);
+                    acch = vfmaq_f64(acch, vcvt_f64_f32(vget_high_f32(s)), sv);
+                    if (asym) {
+                        float32x4_t xs = vaddq_f32(xs0, xs1);
+                        float64x2_t cgv = vdupq_n_f64(cg);
+                        accl = vfmaq_f64(accl, vcvt_f64_f32(vget_low_f32(xs)),
+                                         cgv);
+                        acch = vfmaq_f64(acch,
+                                         vcvt_f64_f32(vget_high_f32(xs)), cgv);
+                    }
+                } else {
+                    double tmp[4];
+                    int i;
+                    vst1q_f64(tmp, accl);
+                    vst1q_f64(tmp + 2, acch);
+                    for (i = 0; i < 4; i++) {
+                        double p = 0.0, xs = 0.0;
+                        int t;
+                        for (t = 0; t < cnt; t++) {
+                            const float *bp = b + (size_t)(j0 + t)
+                                * (size_t)n + (size_t)c + (size_t)i;
+                            double bx = (double)bp[0];
+                            p += (double)wrow[j0 + t] * bx;
+                            if (asym) xs += bx;
+                        }
+                        tmp[i] += p * scale + (asym ? xs * cg : 0.0);
+                    }
+                    accl = vld1q_f64(tmp);
+                    acch = vld1q_f64(tmp + 2);
+                }
+                j0 += cnt;
+            }
+            vst1q_f32(yrow + c, vcombine_f32(vcvt_f32_f64(accl),
+                                             vcvt_f32_f64(acch)));
+        }
+        // n = 2 или 3 (короткий prompt): те же группы, но по два столбца —
+        // иначе такой MM уходил бы в скалярный хвост и терял весь выигрыш.
+        for (; c + 2 <= n; c += 2) {
+            float64x2_t acc = vdupq_n_f64(0.0);
+            int j0 = 0;
+
+            while (j0 < k) {
+                const int64_t idx = base + (int64_t)j0;
+                const uint64_t g = (uint64_t)idx >> 5;
+                const unsigned off = (unsigned)idx & 31u;
+                const double scale = (double)load_f32_unaligned(scales,
+                                                               (int64_t)g);
+                const double minv = asym
+                    ? (double)load_f32_unaligned(mins, (int64_t)g) : 0.0;
+                const double cg = asym ? minv + 8.0 * scale : 0.0;
+                int cnt = VTM_Q4_GROUP_SIZE - (int)off;
+                if (cnt > k - j0) cnt = k - j0;
+
+                if (cnt == VTM_Q4_GROUP_SIZE) {
+                    const float *bp = b + (size_t)j0 * (size_t)n + (size_t)c;
+                    float32x2_t a0 = vdup_n_f32(0.0f);
+                    float32x2_t a1 = vdup_n_f32(0.0f);
+                    float32x2_t a2 = vdup_n_f32(0.0f);
+                    float32x2_t a3 = vdup_n_f32(0.0f);
+                    float32x2_t xs0 = vdup_n_f32(0.0f);
+                    float32x2_t xs1 = vdup_n_f32(0.0f);
+                    int t;
+
+                    for (t = 0; t < VTM_Q4_GROUP_SIZE; t += 4) {
+                        float32x2_t b0 = vld1_f32(bp + (size_t)(t + 0)
+                                                  * (size_t)n);
+                        float32x2_t b1 = vld1_f32(bp + (size_t)(t + 1)
+                                                  * (size_t)n);
+                        float32x2_t b2 = vld1_f32(bp + (size_t)(t + 2)
+                                                  * (size_t)n);
+                        float32x2_t b3 = vld1_f32(bp + (size_t)(t + 3)
+                                                  * (size_t)n);
+                        a0 = vfma_f32(a0, b0, vdup_n_f32(wrow[j0 + t + 0]));
+                        a1 = vfma_f32(a1, b1, vdup_n_f32(wrow[j0 + t + 1]));
+                        a2 = vfma_f32(a2, b2, vdup_n_f32(wrow[j0 + t + 2]));
+                        a3 = vfma_f32(a3, b3, vdup_n_f32(wrow[j0 + t + 3]));
+                        if (asym) {
+                            xs0 = vadd_f32(xs0, vadd_f32(b0, b1));
+                            xs1 = vadd_f32(xs1, vadd_f32(b2, b3));
+                        }
+                    }
+                    acc = vfmaq_f64(acc,
+                                    vcvt_f64_f32(vadd_f32(vadd_f32(a0, a1),
+                                                          vadd_f32(a2, a3))),
+                                    vdupq_n_f64(scale));
+                    if (asym)
+                        acc = vfmaq_f64(acc,
+                                        vcvt_f64_f32(vadd_f32(xs0, xs1)),
+                                        vdupq_n_f64(cg));
+                } else {
+                    double tmp[2];
+                    int i;
+                    vst1q_f64(tmp, acc);
+                    for (i = 0; i < 2; i++) {
+                        double p = 0.0, xs = 0.0;
+                        int t;
+                        for (t = 0; t < cnt; t++) {
+                            const float *bp = b + (size_t)(j0 + t)
+                                * (size_t)n + (size_t)c + (size_t)i;
+                            double bx = (double)bp[0];
+                            p += (double)wrow[j0 + t] * bx;
+                            if (asym) xs += bx;
+                        }
+                        tmp[i] += p * scale + (asym ? xs * cg : 0.0);
+                    }
+                    acc = vld1q_f64(tmp);
+                }
+                j0 += cnt;
+            }
+            vst1_f32(yrow + c, vcvt_f32_f64(acc));
+        }
+        for (; c < n; c++) {
+            double acc = 0.0;
+            int j0 = 0;
+            while (j0 < k) {
+                const int64_t idx = base + (int64_t)j0;
+                const uint64_t g = (uint64_t)idx >> 5;
+                const unsigned off = (unsigned)idx & 31u;
+                const double scale = (double)load_f32_unaligned(scales,
+                                                               (int64_t)g);
+                const double minv = asym
+                    ? (double)load_f32_unaligned(mins, (int64_t)g) : 0.0;
+                const double cg = asym ? minv + 8.0 * scale : 0.0;
+                double p = 0.0, xs = 0.0;
+                int cnt = VTM_Q4_GROUP_SIZE - (int)off;
+                int t;
+                if (cnt > k - j0) cnt = k - j0;
+                for (t = 0; t < cnt; t++) {
+                    const float *bp = b + (size_t)(j0 + t) * (size_t)n
+                        + (size_t)c;
+                    double bx = (double)bp[0];
+                    p += (double)wrow[j0 + t] * bx;
+                    if (asym) xs += bx;
+                }
+                acc += p * scale + (asym ? xs * cg : 0.0);
+                j0 += cnt;
+            }
+            yrow[c] = (float)acc;
+        }
+    }
+    return 0;
+}
+
+// Развернуть одну строку Q4 (EMB) в f32. Как и в эталоне, в y пишется
+// (float) от значения, посчитанного в double, — расхождение не больше ulp.
+int vtm_neon_q4_dequant_row(float *y, const uint8_t *q, const float *scales,
+                            const float *mins, int64_t base, int cols,
+                            int asym) {
+    int j0 = 0;
+
+    if (!y || !q || !scales || cols < 0 || base < 0) return -1;
+    if (asym && !mins) return -1;
+    while (j0 < cols) {
+        const int64_t idx = base + (int64_t)j0;
+        const uint64_t g = (uint64_t)idx >> 5;
+        const unsigned off = (unsigned)idx & 31u;
+        const double scale = (double)load_f32_unaligned(scales, (int64_t)g);
+        const double minv = asym
+            ? (double)load_f32_unaligned(mins, (int64_t)g) : 0.0;
+        const uint8_t *gp = q + (size_t)g * (VTM_Q4_GROUP_SIZE / 2);
+        int n = VTM_Q4_GROUP_SIZE - (int)off;
+
+        if (n > cols - j0) n = cols - j0;
+        if (off == 0 && n == VTM_Q4_GROUP_SIZE) {
+            int8x16_t sl, sh;
+            float32x4_t f[4];
+            float32x4_t sc, mn;
+            q4_group_split(gp, &sl, &sh);
+            sc = vdupq_n_f32((float)scale);
+            mn = vdupq_n_f32((float)minv);
+            q4_i8x16_to_f32x4(sl, f);
+            if (asym) {
+                f[0] = vfmaq_f32(mn, f[0], sc);
+                f[1] = vfmaq_f32(mn, f[1], sc);
+                f[2] = vfmaq_f32(mn, f[2], sc);
+                f[3] = vfmaq_f32(mn, f[3], sc);
+            } else {
+                f[0] = vmulq_f32(f[0], sc);
+                f[1] = vmulq_f32(f[1], sc);
+                f[2] = vmulq_f32(f[2], sc);
+                f[3] = vmulq_f32(f[3], sc);
+            }
+            vst1q_f32(y + j0 + 0, f[0]);
+            vst1q_f32(y + j0 + 4, f[1]);
+            vst1q_f32(y + j0 + 8, f[2]);
+            vst1q_f32(y + j0 + 12, f[3]);
+            q4_i8x16_to_f32x4(sh, f);
+            if (asym) {
+                f[0] = vfmaq_f32(mn, f[0], sc);
+                f[1] = vfmaq_f32(mn, f[1], sc);
+                f[2] = vfmaq_f32(mn, f[2], sc);
+                f[3] = vfmaq_f32(mn, f[3], sc);
+            } else {
+                f[0] = vmulq_f32(f[0], sc);
+                f[1] = vmulq_f32(f[1], sc);
+                f[2] = vmulq_f32(f[2], sc);
+                f[3] = vmulq_f32(f[3], sc);
+            }
+            vst1q_f32(y + j0 + 16, f[0]);
+            vst1q_f32(y + j0 + 20, f[1]);
+            vst1q_f32(y + j0 + 24, f[2]);
+            vst1q_f32(y + j0 + 28, f[3]);
+        } else {
+            int t;
+            for (t = 0; t < n; t++) {
+                unsigned within = off + (unsigned)t;
+                unsigned byte = gp[within & 15u];
+                unsigned v = (within < 16u) ? (byte & 0x0fu) : (byte >> 4);
+                y[j0 + t] = (float)(asym ? (double)v * scale + minv
+                                         : ((double)v - 8.0) * scale);
+            }
+        }
+        j0 += n;
+    }
+    return 0;
+}
+
 // MM с тритовой A. n == 1 — это фактически TMV по одной строке (tied
 // lm_head: [vocab, hidden] * [hidden, 1]), поэтому идём тем же путём, что
 // и TMV. Для n > 1 — rank-1 обновление по столбцам: 16 значений t копим в
