@@ -1094,7 +1094,7 @@
   {
     "id": "0165",
     "title": "Нативный Q4_K в контейнере",
-    "status": "in_progress",
+    "status": "done",
     "file": "0165-native-q4k.md",
     "assignee": "agent:q4k-native"
   },

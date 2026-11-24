@@ -1151,6 +1151,250 @@ int vtm_neon_q4_dequant_row(float *y, const uint8_t *q, const float *scales,
     return 0;
 }
 
+// --- NEON: Q4_K (kind 6, задача 0165) --------------------------------------
+//
+// Блок GGML — 144 байта на 256 значений: d fp16, dmin fp16, 12 байт
+// 6-битных scale/min, 128 байт нибблов. Кусок qs[32k:32k+32] даёт два
+// под-блока: младшие нибблы — под-блок 2k (32 значения подряд), старшие —
+// 2k+1. В отличие от Q4_0 (байт j = значения j и j+16), здесь значения
+// под-блока идут подряд, поэтому одна 16-байтовая загрузка — 16 значений.
+//
+// Арифметика: q ∈ 0..15 точно представим в f32, поэтому Σ q·x копится в
+// f32-лентах (4 независимых аккумулятора), а d·sc и −dmin·m применяются в
+// double — как у Q4_1. Для второго под-блока пары нужен Σ x (минимум
+// под-блока умножается на сумму активаций).
+//
+// Быстрый путь — только при cols, кратном 256 (тогда строка начинается с
+// границы блока): у Qwen2.5 3B это все Q4_K-матрицы (2048, 11008, 256).
+// Иначе ядро возвращает -1, и вызывающий считает строку скалярным эталоном.
+
+static inline float q4k_f16(const uint8_t *p) {
+    uint16_t h;
+    memcpy(&h, p, sizeof h);
+    return vtm_half_to_float(h);
+}
+
+// get_scale_min_k4 из ggml: 6-битные (scale, min) под-блока j.
+static inline void q4k_scale_min(const uint8_t *scales, unsigned j,
+                                 unsigned *sc, unsigned *mn) {
+    if (j < 4u) {
+        *sc = (unsigned)scales[j] & 0x3Fu;
+        *mn = (unsigned)scales[j + 4u] & 0x3Fu;
+    } else {
+        *sc = ((unsigned)scales[j + 4u] & 0x0Fu)
+            | (((unsigned)scales[j - 4u] >> 6) << 4);
+        *mn = ((unsigned)scales[j + 4u] >> 4)
+            | (((unsigned)scales[j] >> 6) << 4);
+    }
+}
+
+// 32 значения под-блока (low/high нибблы 32 байт qs) на xp[0..31] в double:
+// dot = Σ q·x. q ∈ 0..15 точно представим в f32, но произведение q·x в f32
+// округляется (|q·x| до десятков → ошибка ~1e-6 на слагаемое), поэтому
+// активации заранее приведены к double, а произведение считается vfmaq_f64:
+// ошибка строки — единицы 1e-9, как у скалярного эталона (проверено на срезе
+// 3B: 1,07e-6 → 5e-9 по логитам). Минимум под-блока применяется к Σx
+// вызывающим — Σx тоже double.
+static inline double q4k_dot32(const uint8_t *qs, const double *xp, int high) {
+    uint8x16_t b0 = vld1q_u8(qs);
+    uint8x16_t b1 = vld1q_u8(qs + 16);
+    int8x16_t q0, q1;
+    float32x4_t w[4];
+    float64x2_t a[8];
+    int i;
+
+    if (high) {
+        q0 = vreinterpretq_s8_u8(vshrq_n_u8(b0, 4));
+        q1 = vreinterpretq_s8_u8(vshrq_n_u8(b1, 4));
+    } else {
+        uint8x16_t mask = vdupq_n_u8(0x0fu);
+        q0 = vreinterpretq_s8_u8(vandq_u8(b0, mask));
+        q1 = vreinterpretq_s8_u8(vandq_u8(b1, mask));
+    }
+    for (i = 0; i < 8; i++) a[i] = vdupq_n_f64(0.0);
+
+    q4_i8x16_to_f32x4(q0, w);
+    for (i = 0; i < 4; i++) {
+        a[i * 2] = vfmaq_f64(a[i * 2], vcvt_f64_f32(vget_low_f32(w[i])),
+                             vld1q_f64(xp + 4 * i));
+        a[i * 2 + 1] = vfmaq_f64(a[i * 2 + 1],
+                                 vcvt_f64_f32(vget_high_f32(w[i])),
+                                 vld1q_f64(xp + 4 * i + 2));
+    }
+    q4_i8x16_to_f32x4(q1, w);
+    for (i = 0; i < 4; i++) {
+        a[i * 2] = vfmaq_f64(a[i * 2], vcvt_f64_f32(vget_low_f32(w[i])),
+                             vld1q_f64(xp + 16 + 4 * i));
+        a[i * 2 + 1] = vfmaq_f64(a[i * 2 + 1],
+                                 vcvt_f64_f32(vget_high_f32(w[i])),
+                                 vld1q_f64(xp + 16 + 4 * i + 2));
+    }
+    return vaddvq_f64(a[0]) + vaddvq_f64(a[1]) + vaddvq_f64(a[2])
+         + vaddvq_f64(a[3]) + vaddvq_f64(a[4]) + vaddvq_f64(a[5])
+         + vaddvq_f64(a[6]) + vaddvq_f64(a[7]);
+}
+
+// Σ xp[0..31] в double (нужна для минимума под-блока: w = scale·q + minv).
+static inline double q4k_sum32(const double *xp) {
+    float64x2_t a0 = vdupq_n_f64(0.0), a1 = a0, a2 = a0, a3 = a0;
+    int i;
+    for (i = 0; i < 32; i += 8) {
+        a0 = vaddq_f64(a0, vld1q_f64(xp + i));
+        a1 = vaddq_f64(a1, vld1q_f64(xp + i + 2));
+        a2 = vaddq_f64(a2, vld1q_f64(xp + i + 4));
+        a3 = vaddq_f64(a3, vld1q_f64(xp + i + 6));
+    }
+    return vaddvq_f64(vaddq_f64(a0, a1)) + vaddvq_f64(vaddq_f64(a2, a3));
+}
+
+// Одна полная строка Q4_K (cols кратен 256) -> скалярное произведение.
+// xd — активации, заранее приведённые к double (общие для всех строк).
+static double q4k_row_dot_neon(const uint8_t *blocks, int64_t base, int cols,
+                               const double *xd, const double *xsums) {
+    double acc = 0.0;
+    int64_t block = base / (int64_t)VTM_Q4K_BLOCK_VALUES;
+    int nblocks = cols / (int)VTM_Q4K_BLOCK_VALUES;
+    int b;
+
+    for (b = 0; b < nblocks; b++) {
+        const uint8_t *bp = blocks
+            + (size_t)(block + b) * (size_t)VTM_Q4K_BLOCK_BYTES;
+        double d = (double)q4k_f16(bp);
+        double dmin = (double)q4k_f16(bp + 2);
+        const double *xp = xd + (size_t)b * VTM_Q4K_BLOCK_VALUES;
+        unsigned s;
+        for (s = 0; s < 8u; s++) {
+            unsigned sc, mn;
+            double dot, xsum;
+            q4k_scale_min(bp + 4, s, &sc, &mn);
+            dot = q4k_dot32(bp + 16u + (size_t)(s >> 1) * 32u,
+                            xp + (size_t)s * 32u, (int)(s & 1u));
+            // Σx по под-блоку не зависит от весов: посчитана один раз на
+            // вызов (см. vtm_neon_q4k_tmv_rows), а не на каждую строку.
+            xsum = xsums[(size_t)b * 8u + (size_t)s];
+            acc += (d * (double)sc) * dot + (-(dmin * (double)mn)) * xsum;
+        }
+    }
+    return acc;
+}
+
+int vtm_neon_q4k_tmv_rows(float *y, const uint8_t *blocks, const float *x,
+                          int r0, int r1, int cols) {
+    double *xd, *xsums, *buf;
+    int r, i;
+
+    if (!y || !blocks || !x || r0 < 0 || r1 < r0 || cols <= 0) return -1;
+    if (cols % (int)VTM_Q4K_BLOCK_VALUES != 0) return -1;  // скалярный эталон
+    // Активации — одни на все строки: double-копия и Σx по под-блокам
+    // считаются один раз на вызов, а не на строку.
+    buf = (double *)malloc(((size_t)cols + (size_t)(cols / 32) * 8u)
+                           * sizeof(double));
+    if (!buf) return -1;
+    xd = buf;
+    xsums = buf + cols;
+    for (i = 0; i < cols; i++) xd[i] = (double)x[i];
+    for (i = 0; i < cols / 32; i++)
+        xsums[i] = q4k_sum32(xd + (size_t)i * 32u);
+    for (r = r0; r < r1; r++) {
+        int64_t base = (int64_t)r * (int64_t)cols;
+        y[r] = (float)q4k_row_dot_neon(blocks, base, cols, xd, xsums);
+    }
+    free(buf);
+    return 0;
+}
+
+// --- NEON: Q6_K (kind 7, задача 0165) --------------------------------------
+//
+// Блок Q6_K — 210 байт на 256 значений: ql 128, qh 64, scales 16*int8, d fp16.
+// 16 под-блоков по 16 значений: для под-блока sub chunk = sub/8,
+// quad = (sub%8)/2 (ниббл ql и сдвиг 2 бит из qh), half = sub%2,
+// q = (ql-ниббл | (2 бита из qh) << 4) − 32, w = d*sc*q.
+//
+// Арифметика — как у Q4_K: q точно представим в f32, активации заранее
+// в double, произведение — vfmaq_f64, а d*sc применяется к сумме. Минимума
+// у Q6_K нет, поэтому Σx не нужна. Быстрый путь — при cols, кратном 256.
+
+static inline double q6k_dot16(const uint8_t *block, unsigned sub,
+                               const double *xp) {
+    unsigned chunk = sub >> 3, in = sub & 7u;
+    unsigned quad = in >> 1, half = in & 1u;
+    const uint8_t *ql = block + (size_t)chunk * 64u
+                      + (size_t)(quad & 1u) * 32u + (size_t)half * 16u;
+    const uint8_t *qh = block + 128u + (size_t)chunk * 32u
+                      + (size_t)half * 16u;
+    uint8x16_t qlb = vld1q_u8(ql);
+    uint8x16_t qhb = vld1q_u8(qh);
+    uint8x16_t nib;
+    uint8x16_t two;
+    int8x16_t q;
+    float32x4_t w[4];
+    float64x2_t a[8];
+    int i;
+
+    if (quad >= 2u) {
+        nib = vshrq_n_u8(qlb, 4);
+    } else {
+        nib = vandq_u8(qlb, vdupq_n_u8(0x0fu));
+    }
+    // Сдвиг qh — переменный (0/2/4/6), поэтому vshlq_u8 с отрицательным
+    // сдвигом, а не vshrq_n_u8 (у того сдвиг — константа компиляции).
+    two = vandq_u8(vshlq_u8(qhb, vdupq_n_s8(-(int)(quad * 2u))),
+                   vdupq_n_u8(0x03u));
+    q = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(nib, vshlq_n_u8(two, 4))),
+                 vdupq_n_s8(32));
+    q4_i8x16_to_f32x4(q, w);
+    for (i = 0; i < 8; i++) a[i] = vdupq_n_f64(0.0);
+    for (i = 0; i < 4; i++) {
+        a[i * 2] = vfmaq_f64(a[i * 2], vcvt_f64_f32(vget_low_f32(w[i])),
+                             vld1q_f64(xp + 4 * i));
+        a[i * 2 + 1] = vfmaq_f64(a[i * 2 + 1],
+                                 vcvt_f64_f32(vget_high_f32(w[i])),
+                                 vld1q_f64(xp + 4 * i + 2));
+    }
+    return vaddvq_f64(a[0]) + vaddvq_f64(a[1]) + vaddvq_f64(a[2])
+         + vaddvq_f64(a[3]) + vaddvq_f64(a[4]) + vaddvq_f64(a[5])
+         + vaddvq_f64(a[6]) + vaddvq_f64(a[7]);
+}
+
+static double q6k_row_dot_neon(const uint8_t *blocks, int64_t base, int cols,
+                               const double *xd) {
+    double acc = 0.0;
+    int64_t block = base / (int64_t)VTM_Q4K_BLOCK_VALUES;
+    int nblocks = cols / (int)VTM_Q4K_BLOCK_VALUES;
+    int b;
+
+    for (b = 0; b < nblocks; b++) {
+        const uint8_t *bp = blocks
+            + (size_t)(block + b) * (size_t)VTM_Q6K_BLOCK_BYTES;
+        double d = (double)q4k_f16(bp + 208u);
+        const double *xp = xd + (size_t)b * VTM_Q4K_BLOCK_VALUES;
+        unsigned s;
+        for (s = 0; s < 16u; s++) {
+            int sc = (int)(int8_t)bp[192u + s];
+            acc += (d * (double)sc) * q6k_dot16(bp, s, xp + (size_t)s * 16u);
+        }
+    }
+    return acc;
+}
+
+int vtm_neon_q6k_tmv_rows(float *y, const uint8_t *blocks, const float *x,
+                          int r0, int r1, int cols) {
+    double *xd;
+    int r, i;
+
+    if (!y || !blocks || !x || r0 < 0 || r1 < r0 || cols <= 0) return -1;
+    if (cols % (int)VTM_Q4K_BLOCK_VALUES != 0) return -1;  // скалярный эталон
+    xd = (double *)malloc((size_t)cols * sizeof(double));
+    if (!xd) return -1;
+    for (i = 0; i < cols; i++) xd[i] = (double)x[i];
+    for (r = r0; r < r1; r++) {
+        int64_t base = (int64_t)r * (int64_t)cols;
+        y[r] = (float)q6k_row_dot_neon(blocks, base, cols, xd);
+    }
+    free(xd);
+    return 0;
+}
+
 // --- NEON: батчевый Q4 TMV/MM (задача 0162) --------------------------------
 //
 // y[r*N + j] = sum_t W[r,t]*x[t*N + j]. Строка W разворачивается из нибблов

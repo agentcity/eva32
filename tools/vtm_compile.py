@@ -184,12 +184,12 @@ TMV_FLAG_TRANSPOSED = 0x04
 
 
 def q4_transposed_error(name: str) -> str:
-    """Текст отказа «транспонированный Q4 не поддержан» (одно место)."""
+    """Текст отказа «транспонированный Q4/Q4_K не поддержан» (одно место)."""
     return (
-        f"вес {name!r}: Q4 (kind 5) с VTM_FLAG_TMV_TRANSPOSED не поддержан — "
-        "ядра 0152 (vtm_q4_tmv/mm) читают матрицу только как [rows, cols] "
-        "и считают W·x. Транспонированный Q4 — отдельная задача; "
-        "переэкспортируйте вес в обычной ориентации"
+        f"вес {name!r}: Q4/Q4_K/Q6_K с VTM_FLAG_TMV_TRANSPOSED не поддержан — "
+        "ядра 0152/0165 (vtm_q4_*, vtm_q4k_*, vtm_q6k_*) читают матрицу "
+        "только как [rows, cols] и считают W·x. Транспонированный Q4 — "
+        "отдельная задача; переэкспортируйте вес в обычной ориентации"
     )
 
 
@@ -418,16 +418,24 @@ def matrix_tensor(
             raise ValueError(
                 f"вес {name!r}: форма {spec.dims}, ожидалась {(rows, cols)}"
             )
-        if dense and spec.kind in (vtm_ref.KIND_TRITS, vtm_ref.KIND_Q4):
+        if dense and spec.kind in (
+            vtm_ref.KIND_TRITS, vtm_ref.KIND_Q4,
+            vtm_ref.KIND_Q4K, vtm_ref.KIND_Q6K,
+        ):
             raise ValueError(
                 f"вес {name!r}: нужен плотный fp-тензор, а пришли "
                 f"{spec.kind_name}"
             )
-        if not dense and spec.kind not in (vtm_ref.KIND_TRITS, vtm_ref.KIND_Q4):
+        if not dense and spec.kind not in (
+            vtm_ref.KIND_TRITS, vtm_ref.KIND_Q4,
+            vtm_ref.KIND_Q4K, vtm_ref.KIND_Q6K,
+        ):
             raise ValueError(
                 f"вес {name!r}: нужны триты или Q4, а пришёл {spec.kind_name}"
             )
-        if transposed and spec.kind == vtm_ref.KIND_Q4:
+        if transposed and spec.kind in (
+            vtm_ref.KIND_Q4, vtm_ref.KIND_Q4K, vtm_ref.KIND_Q6K
+        ):
             raise ValueError(q4_transposed_error(name))
         spec.name = name
         return graph.add(spec)
@@ -464,7 +472,9 @@ def check_q4_tmv_support(
         if int(instr.op) != Op.TMV or not (int(instr.flags) & TMV_FLAG_TRANSPOSED):
             continue
         matrix = tensors[int(instr.a)]
-        if matrix.kind == vtm_ref.KIND_Q4:
+        if matrix.kind in (
+            vtm_ref.KIND_Q4, vtm_ref.KIND_Q4K, vtm_ref.KIND_Q6K
+        ):
             raise ValueError(
                 q4_transposed_error(matrix.name) + f" (инструкция TMV #{index})"
             )
@@ -746,7 +756,9 @@ def compile_model(
         # Q4-матрица (kind 5) из q4.bin импорта GGUF: TMV считает упакованные
         # нибблы, fp32-копии нет. Ориентация — обычная [vocab, hidden].
         lm_head = matrix_tensor(g, "lm_head.w", cfg.vocab, hidden, w.get("lm_head"))
-        if g.tensors[lm_head].kind != vtm_ref.KIND_Q4:
+        if g.tensors[lm_head].kind not in (
+            vtm_ref.KIND_Q4, vtm_ref.KIND_Q4K, vtm_ref.KIND_Q6K
+        ):
             raise ValueError(
                 f"lm_head='q4', а матрица {g.tensors[lm_head].kind_name}; "
                 "импорт GGUF --format q4 кладёт lm_head Q4-сегментом, "
@@ -1229,15 +1241,31 @@ def _manifest_architecture(manifest: dict[str, Any]) -> ModelConfig:
 
 
 def _is_q4_entry(entry: dict[str, Any]) -> bool:
-    """Запись таблицы тензоров манифеста — Q4-сегмент (kind 5)?
+    """Запись таблицы тензоров манифеста — Q4-сегмент (kind 5/6/7)?
 
     Импорт GGUF (0153) пишет `dtype: "q4_0"`, `kind: "q4"` и смещения
-    `q4_offset`/`q4_length`; поддерживаем все три признака, чтобы манифест,
-    собранный вручную, тоже читался.
+    `q4_offset`/`q4_length`; нативный импорт (0165) — `dtype/kind:
+    "q4_k"|"q6_k"` и те же смещения; поддерживаем все признаки, чтобы
+    манифест, собранный вручную, тоже читался.
     """
     dtype = str(entry.get("dtype") or "").lower()
     kind = str(entry.get("kind") or "").lower()
-    return dtype.startswith("q4") or kind == "q4" or "q4_offset" in entry
+    return (
+        dtype.startswith("q4") or dtype.startswith("q6")
+        or kind == "q4" or kind in ("q4_k", "q6_k")
+        or "q4_offset" in entry
+    )
+
+
+def _q4k_kind_of(entry: dict[str, Any]) -> int | None:
+    """kind контейнера для нативной записи (6 — Q4_K, 7 — Q6_K) или None."""
+    dtype = str(entry.get("dtype") or "").lower()
+    kind = str(entry.get("kind") or "").lower()
+    if kind == "q6_k" or dtype == "q6_k":
+        return vtm_ref.KIND_Q6K
+    if kind == "q4_k" or dtype == "q4_k":
+        return vtm_ref.KIND_Q4K
+    return None
 
 
 def load_export(
@@ -1330,21 +1358,37 @@ def load_export(
                     "fp32/int8/триты; импорт GGUF (0153) кладёт словарь "
                     "в non_ternary.bin (int8)"
                 )
-            qdata, scales, scale_dtype, asym, mins = (
-                vtm_ref.decode_q4_segment_ex(q4_data[offset:offset + length])
-            )
-            if len(qdata) != vtm_ref.prod(shape):
-                raise ValueError(
-                    f"{name}: в Q4-сегменте {len(qdata)} значений, а shape "
-                    f"{tuple(shape)} даёт {vtm_ref.prod(shape)}"
-                )
             tensor_name = (
                 f"l{layer}.{key}.w" if role == "matrix" else "lm_head.w"
             )
-            tensor = vtm_ref.Tensor.q4(
-                tensor_name, shape, qdata, scales, scale_dtype,
-                asymmetric=asym, mins=mins,
-            )
+            native_kind = _q4k_kind_of(entry)
+            if native_kind is not None:
+                # kind 6/7 (0165): блоки GGML как есть, окно в mmap q4.bin.
+                # Масштабы и min внутри блоков, отдельных массивов нет.
+                qdata, decoded_kind = vtm_ref.decode_q4k_segment_ex(
+                    q4_data[offset:offset + length], native_kind
+                )
+                if len(qdata) != vtm_ref.prod(shape):
+                    raise ValueError(
+                        f"{name}: в сегменте {len(qdata)} значений, а shape "
+                        f"{tuple(shape)} даёт {vtm_ref.prod(shape)}"
+                    )
+                tensor = vtm_ref.Tensor.q4k(
+                    tensor_name, shape, qdata, kind=decoded_kind
+                )
+            else:
+                qdata, scales, scale_dtype, asym, mins = (
+                    vtm_ref.decode_q4_segment_ex(q4_data[offset:offset + length])
+                )
+                if len(qdata) != vtm_ref.prod(shape):
+                    raise ValueError(
+                        f"{name}: в Q4-сегменте {len(qdata)} значений, а shape "
+                        f"{tuple(shape)} даёт {vtm_ref.prod(shape)}"
+                    )
+                tensor = vtm_ref.Tensor.q4(
+                    tensor_name, shape, qdata, scales, scale_dtype,
+                    asymmetric=asym, mins=mins,
+                )
             if role == "lm_head":
                 if cfg.tie_word_embeddings:
                     continue  # tied: отдельная матрица не нужна
@@ -2121,12 +2165,15 @@ def _print_manifest(
     if export.q4_params:
         files = export.manifest.get("files") or {}
         q4_bytes = int((files.get("q4.bin") or {}).get("bytes") or 0)
+        q4_section = export.manifest.get("q4") or {}
+        native = bool(q4_section.get("native"))
+        kinds = "kind 6/7 (Q4_K/Q6_K нативно)" if native else "kind 5"
         lm_line = (
             "lm_head — MM по таблице словаря (tied)"
-            if export.tied else "lm_head — TMV по kind 5"
+            if export.tied else f"lm_head — TMV по {kinds}"
         )
         print(
-            f"Q4: {export.q4_params:,} весов kind 5 в q4.bin "
+            f"Q4: {export.q4_params:,} весов {kinds} в q4.bin "
             f"({_human_bytes(q4_bytes)}), {lm_line}, без fp32-материализации"
         )
     cache_bytes = kv_cache_bytes(cfg, context)

@@ -245,6 +245,22 @@ Q4_NIBBLE_MAX = 15
 Q4_SCALE_MAX = 7.0
 #: Бит 0 flags Q4-сегмента: 1 — масштабы fp32, 0 — fp16 (ADR 0017).
 Q4_FLAG_F32_SCALES = 0x01
+
+#: Нативные блоки GGML (kind 6/7, ADR 0018, задача 0165): сегмент
+#: "Q4K "/"Q6K " | version u8 | reserved u8 | n_values u64 | n_blocks u32,
+#: затем блоки как в GGUF — 144 байта (Q4_K) или 210 (Q6_K) на 256 значений.
+#: Импорт `--q4-kind q4_k` копирует их байт-в-байт: rel-RMS = 0 по построению.
+Q4K_MAGIC = b"Q4K "
+Q6K_MAGIC = b"Q6K "
+Q4K_VERSION = 1
+Q4K_HEADER_SIZE = 18
+Q4K_BLOCK_VALUES = 256
+Q4K_BLOCK_BYTES = 144
+Q6K_BLOCK_BYTES = 210
+#: Вид нативного сегмента -> kind контейнера (6 — Q4_K, 7 — Q6_K).
+NATIVE_KINDS = {"q4_k": 6, "q6_k": 7}
+#: Целевые виды импорта, при которых тензор пишется блоками как есть.
+NATIVE_TARGETS = ("q4k", "q6k")
 #: Сколько байт занимает один масштаб Q4-сегмента.
 Q4_SCALE_BYTES = {"float32": 4, "float16": 2}
 TRT1_MAGIC = b"TRT1"
@@ -287,8 +303,15 @@ EMBED_MODES = ("int8", "trit", "float32", "float16")
 #: Вид Q4-сегмента (kind 5): Q4_1 — импорт по умолчанию (минимум группы,
 #: 4 байта/группа дороже), Q4_0 — симметричный, нужен 7B: у него бюджет
 #: 4 ГиБ (ADR 0016) не сходится с min'ами (см. докстроку модуля).
-Q4_KINDS = ("q4_0", "q4_1")
+Q4_KINDS = ("q4_0", "q4_1", "q4_k")
+#: q4_k — нативное хранение блоков GGML (kind 6/7, ADR 0018): Q4_K-тензоры
+#: пишутся Q4_K-блоками, Q6_K-тензоры — Q6_K-блоками, без переквантования.
 _Q4_KIND_ALIASES = {
+    "q4_k": "q4_k",
+    "q4k": "q4_k",
+    "q4-k": "q4_k",
+    "native": "q4_k",
+    "ggml": "q4_k",
     "q4_0": "q4_0",
     "q4-0": "q4_0",
     "q40": "q4_0",
@@ -512,6 +535,35 @@ class GgufFile:
         if len(data) != info.n_bytes:
             raise GgufError(f"тензор {info.name!r}: файл обрезан")
         return data
+
+    def iter_tensor_raw_chunks(
+        self, info: TensorInfo, chunk_bytes: int = 1 << 20
+    ) -> Iterator[bytes]:
+        """Сырые байты тензора кусками, кратными блоку GGML.
+
+        Нужно нативному импорту Q4_K/Q6_K (задача 0165): блоки копируются в
+        контейнер байт-в-байт, поэтому деквантовать тензор в fp32 (как
+        `iter_tensor_chunks`) не только дорого, но и вредно — это ровно та
+        ступень потерь, которую убирает kind 6/7.
+        """
+        spec = info.spec
+        total = info.n_bytes
+        step = max(
+            spec.block_bytes, (int(chunk_bytes) // spec.block_bytes) * spec.block_bytes
+        )
+        with open(self.path, "rb") as handle:
+            handle.seek(self.data_offset + info.offset)
+            done = 0
+            while done < total:
+                want = min(step, total - done)
+                raw = handle.read(want)
+                if len(raw) != want:
+                    raise GgufError(
+                        f"тензор {info.name!r}: файл обрезан на байте {done} "
+                        f"(нужно {want}, прочитано {len(raw)})"
+                    )
+                yield raw
+                done += want
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -911,9 +963,10 @@ def _normalize_q4_kind(kind: str) -> str:
     normalized = _Q4_KIND_ALIASES.get(text)
     if normalized is None:
         raise GgufError(
-            f"q4_kind={kind!r}, допустимо auto (по умолчанию: q4_1, если "
-            "контейнер влезает в 4 ГиБ, иначе q4_0) | q4_1 (asym) | q4_0 "
-            "(sym; синонимы: asym/q4-1 и sym/q4-0)"
+            f"q4_kind={kind!r}, допустимо auto (по умолчанию: q4_k, если "
+            "источник — Q4_K/Q6_K и контейнер влезает в 4 ГиБ; иначе q4_1, "
+            "если влезает, иначе q4_0) | q4_k (нативно, блоки GGML) | "
+            "q4_1 (asym) | q4_0 (sym)"
         )
     return normalized
 
@@ -935,7 +988,14 @@ def estimate_container_bytes(
     total = 0
     for plan in plans:
         n_values = plan.n_values
-        if plan.target == "q4":
+        if plan.target in NATIVE_TARGETS:
+            # Блоки GGML как есть: 144 байта (Q4_K) / 210 (Q6_K) на 256.
+            block_bytes = (
+                Q4K_BLOCK_BYTES if plan.target == "q4k" else Q6K_BLOCK_BYTES
+            )
+            blocks = (n_values + Q4K_BLOCK_VALUES - 1) // Q4K_BLOCK_VALUES
+            total += Q4K_HEADER_SIZE + blocks * block_bytes
+        elif plan.target == "q4":
             groups = (n_values + Q4_SCALE_BLOCK - 1) // Q4_SCALE_BLOCK
             total += (
                 (Q4_ASYM_HEADER_SIZE if q4_asym else Q4_HEADER_SIZE)
@@ -1467,10 +1527,129 @@ class _SegmentEncoder:
         self.body.close()
 
 
+class _NativeBlockEncoder:
+    """Накопитель сегмента kind 6/7: блоки GGML байт-в-байт.
+
+    Импорт `--q4-kind q4_k` не квантует заново: сырые байты тензора GGUF
+    (144 байта на блок Q4_K, 210 — Q6_K) копятся в spool, заголовок
+    (n_values/n_blocks) пишется в конце, когда число блоков известно.
+    Приёмка «rel-RMS 0» проверяется не на слово: `blocks_sha256` сегмента
+    сверяется с sha256 того же региона GGUF после записи файла
+    (`_verify_q4_file`), а `--stats` дополнительно сравнивает два независимых
+    декодера — импортёра (`_dequant_q4_k`/`_dequant_q6_k`) и контейнера
+    (`vtm_ref.q4k_block_values`/`q6k_block_values`).
+
+    `d`/`dmin` каждого блока проверяются на конечность: NaN/inf в GGUF —
+    отказ с именем тензора и номером блока, а не «тихие» NaN-логиты.
+    """
+
+    def __init__(self, kind: str, collect_stats: bool = False):
+        if kind not in ("q4_k", "q6_k"):
+            raise GgufError(f"нативный вид {kind!r}, допустимо q4_k|q6_k")
+        self.kind = kind
+        self.block_values = Q4K_BLOCK_VALUES
+        self.block_bytes = (
+            Q4K_BLOCK_BYTES if kind == "q4_k" else Q6K_BLOCK_BYTES
+        )
+        self.body = tempfile.SpooledTemporaryFile(max_size=SPOOL_LIMIT)
+        self.n_values = 0
+        self.collect_stats = bool(collect_stats)
+        self.stats = _Stats()
+        self.blocks_sha256 = hashlib.sha256()
+        self.n_blocks = 0
+
+    @property
+    def magic(self) -> bytes:
+        return Q4K_MAGIC if self.kind == "q4_k" else Q6K_MAGIC
+
+    def _check_block(self, block: bytes, where: str) -> None:
+        if self.kind == "q4_k":
+            d_offset, m_offset = 0, 2
+        else:
+            d_offset, m_offset = 208, 208
+        d = struct.unpack_from("<e", block, d_offset)[0]
+        m = struct.unpack_from("<e", block, m_offset)[0]
+        if not (math.isfinite(d) and math.isfinite(m)):
+            raise GgufError(
+                f"{where}: d/dmin не конечны ({d!r}/{m!r}) — GGUF повреждён"
+            )
+
+    def _cross_check(self, block: bytes, where: str) -> None:
+        """Сверить декодер импортёра с декодером контейнера (для --stats)."""
+        try:  # noqa: PLC0415 - только при --stats
+            from tools import vtm_ref
+        except ImportError:  # запуск как скрипт: sys.path[0] — tools/
+            import vtm_ref
+
+        if self.kind == "q4_k":
+            reference = _dequant_q4_k(block, GGUF_TYPES[12])
+            decoded = vtm_ref.q4k_block_values(block)
+        else:
+            reference = _dequant_q6_k(block, GGUF_TYPES[14])
+            decoded = vtm_ref.q6k_block_values(block)
+        if len(reference) != len(decoded):
+            raise GgufError(
+                f"{where}: декодер контейнера дал {len(decoded)} значений, "
+                f"эталон — {len(reference)}"
+            )
+        for want, got in zip(reference, decoded):
+            self.stats.add(want, got)
+
+    def add_raw(self, raw: bytes, where: str = "тензор") -> None:
+        if not raw:
+            return
+        if len(raw) % self.block_bytes:
+            raise GgufError(
+                f"{where}: {len(raw)} байт не кратны блоку {self.block_bytes} "
+                f"({self.kind}) — ошибка нарезки"
+            )
+        if self.collect_stats:
+            for offset in range(0, len(raw), self.block_bytes):
+                self._cross_check(
+                    raw[offset:offset + self.block_bytes],
+                    f"{where}: блок #{(self.n_blocks + offset // self.block_bytes)}",
+                )
+        for offset in range(0, len(raw), self.block_bytes):
+            self._check_block(
+                raw[offset:offset + self.block_bytes],
+                f"{where}: блок #{(self.n_blocks + offset // self.block_bytes)}",
+            )
+        self.body.write(raw)
+        self.blocks_sha256.update(raw)
+        self.n_blocks += len(raw) // self.block_bytes
+        self.n_values += len(raw) // self.block_bytes * self.block_values
+
+    def write_to(self, sink: "_Sink") -> int:
+        if self.n_values == 0:
+            raise GgufError("пустой сегмент Q4_K/Q6_K")
+        if self.n_values % Q4K_BLOCK_VALUES:
+            raise GgufError(
+                f"{self.kind}: {self.n_values} значений не кратны блоку "
+                f"{Q4K_BLOCK_VALUES}"
+            )
+        header = (
+            self.magic
+            + bytes((Q4K_VERSION, 0))
+            + struct.pack("<Q", self.n_values)
+            + struct.pack("<I", self.n_blocks)
+        )
+        start = sink.offset
+        sink.write(header)
+        self.body.seek(0)
+        while True:
+            chunk = self.body.read(1 << 20)
+            if not chunk:
+                break
+            sink.write(chunk)
+        return sink.offset - start
+
+    def close(self) -> None:
+        self.body.close()
+
+
 # ---------------------------------------------------------------------------
 # Имена тензоров GGUF -> Qwen/Llama
 # ---------------------------------------------------------------------------
-
 #: Глобальные тензоры Qwen/Llama.
 GLOBAL_TENSORS: dict[str, tuple[str, str, str]] = {
     "token_embd.weight": ("model.embed_tokens.weight", "embed", "embed"),
@@ -1806,6 +1985,7 @@ def plan_import(
     *,
     fmt: str,
     embed_mode: str,
+    q4_kind: str = "auto",
 ) -> list[PlannedTensor]:
     """Проверить имена/формы всех тензоров и решить, что куда писать.
 
@@ -1885,7 +2065,21 @@ def plan_import(
                     f"{info.name}: форма {shape}, ожидалась {expected}"
                 )
             n_values = info.n_elements
-        if (
+        native = (
+            fmt == "q4"
+            and q4_kind == "q4_k"
+            and role in ("matrix", "lm_head")
+            and info.spec.kind in ("q4_k", "q6_k")
+        )
+        if native:
+            # Нативное хранение (kind 6/7): блок GGML — 256 значений, и
+            # копировать можно только целые блоки.
+            if n_values % Q4K_BLOCK_VALUES:
+                raise GgufError(
+                    f"{info.name}: {n_values} значений не кратны блоку "
+                    f"GGML {Q4K_BLOCK_VALUES} — нельзя скопировать как kind 6/7"
+                )
+        elif (
             fmt == "q4"
             and role in ("matrix", "lm_head")
             and n_values % Q4_SCALE_BLOCK
@@ -1911,6 +2105,9 @@ def plan_import(
             target = "f32"
         elif embed_mode in ("float32", "float16") and role == "embed":
             target = "f32" if embed_mode == "float32" else "f16"
+        elif role in ("matrix", "lm_head") and native:
+            # Q4_K -> kind 6, Q6_K -> kind 7: байты GGUF как есть.
+            target = "q4k" if info.spec.kind == "q4_k" else "q6k"
         elif role in ("matrix", "lm_head"):
             target = "q4" if fmt == "q4" else "trit"
         else:
@@ -2121,12 +2318,15 @@ def import_gguf(
     `q4_scale_dtype` — fp32 или fp16 для масштабов Q4-сегмента: цена fp32 —
     1 бит на вес (у 7B это +0,44 ГиБ, то есть выход за 4 ГиБ, ADR 0016).
 
-    `q4_kind` — `auto` (по умолчанию) | `q4_1` | `q4_0`. Q4_1 пишет `min`
-    на группу 32 и почти не теряет точность на Q4_K-подблоках; цена — 2–4
-    байта на группу 32. `auto` выбирает Q4_1, если оценка контейнера
-    влезает в предел 4 ГиБ (ADR 0016), иначе Q4_0 — и сообщает выбор с
-    числами в stderr: у 7B Q4_1 с fp16-масштабами и тритовым эмбеддингом
-    даёт ~4,55 ГБ (106 % предела), у 3B — ~2,4 ГБ.
+    `q4_kind` — `auto` (по умолчанию) | `q4_k` | `q4_1` | `q4_0`.
+    `q4_k` — нативное хранение блоков GGML (kind 6 для Q4_K, kind 7 для
+    Q6_K, ADR 0018): тензор копируется байт-в-байт, rel-RMS к весам GGUF = 0.
+    Q4_1 пишет `min` на группу 32 и почти не теряет точность на
+    Q4_K-подблоках; цена — 2–4 байта на группу 32. `auto` выбирает `q4_k`,
+    если все Linear/lm_head в источнике — Q4_K/Q6_K и оценка влезает в
+    предел 4 ГиБ; иначе Q4_1, если влезает; иначе Q4_0 — и сообщает выбор с
+    числами в stderr. У 3B Q4_K_M нативный контейнер ~1,9 ГиБ, у 7B — >4 ГиБ
+    (не влезает, ADR 0016).
 
     `embed_mode` — int8 | trit | float32 | float16. `trit` кладёт таблицу
     словаря TRT1-сегментом в `ternary.trit` (kind 0) и уменьшает её с 0,53
@@ -2143,11 +2343,50 @@ def import_gguf(
     cfg = infer_config(
         gguf, tie=tie, limit_layers=limit_layers, limit_vocab=limit_vocab
     )
-    plans = plan_import(gguf, cfg, fmt=fmt, embed_mode=embed_mode)
-
-    # Вид Q4 зависит от бюджета: 3B Q4_1 влезает с запасом, 7B — нет.
+    # Вид Q4 зависит от бюджета и от источника. Сначала пробуем нативное
+    # хранение (kind 6/7, ADR 0018): если все Linear/lm_head — Q4_K/Q6_K и
+    # оценка влезает в 4 ГиБ, переквантования нет вообще (rel-RMS 0).
     auto_kind = q4_kind == "auto"
-    if fmt == "q4":
+    if fmt == "q4" and q4_kind in ("auto", "q4_k"):
+        native_plans = plan_import(
+            gguf, cfg, fmt=fmt, embed_mode=embed_mode, q4_kind="q4_k"
+        )
+        mixed = [plan.gguf_name for plan in native_plans if plan.target == "q4"]
+        native_bytes = estimate_container_bytes(
+            native_plans, q4_asym=False, scale_dtype=q4_scale_dtype
+        )
+        if q4_kind == "q4_k":
+            if mixed:
+                raise GgufError(
+                    "q4_kind=q4_k, но не все Linear/lm_head — Q4_K/Q6_K: "
+                    + ", ".join(mixed[:5])
+                    + (" и ещё %d" % (len(mixed) - 5) if len(mixed) > 5 else "")
+                    + f". Нативно копируются только Q4_K/Q6_K; для {mixed[0]} "
+                    "нужен --q4-kind q4_1|q4_0 (с переквантованием)"
+                )
+            if native_bytes + CONTAINER_MARGIN > CONTAINER_LIMIT:
+                raise GgufError(
+                    f"q4_kind=q4_k: оценка контейнера "
+                    f"{native_bytes / 2**30:.2f} ГиБ > "
+                    f"{CONTAINER_LIMIT / 2**30:.0f} ГиБ (ADR 0016, u32-смещения)"
+                    "; для 7B Q4_K_M нативное хранение не влезает — используйте "
+                    "--q4-kind q4_1 (fp16-масштабы) или дождитесь u64-смещений"
+                )
+            plans = native_plans
+        elif not mixed and native_bytes + CONTAINER_MARGIN <= CONTAINER_LIMIT:
+            q4_kind = "q4_k"
+            plans = native_plans
+            print(
+                f"gguf_import: q4_kind=auto → q4_k: все Linear/lm_head — "
+                f"Q4_K/Q6_K, нативная оценка {native_bytes / 2**30:.2f} ГиБ "
+                f"≤ {CONTAINER_LIMIT / 2**30:.0f} ГиБ — переквантования нет",
+                file=sys.stderr,
+            )
+    if fmt != "q4":
+        # Тритовый экспорт: Q4-виды не участвуют, план один.
+        plans = plan_import(gguf, cfg, fmt=fmt, embed_mode=embed_mode)
+    if fmt == "q4" and q4_kind in ("auto", "q4_1", "q4_0"):
+        plans = plan_import(gguf, cfg, fmt=fmt, embed_mode=embed_mode)
         asym_bytes = estimate_container_bytes(
             plans, q4_asym=True, scale_dtype=q4_scale_dtype
         )
@@ -2210,7 +2449,10 @@ def import_gguf(
     else:
         out.mkdir(parents=True)
 
-    q4_plans = [plan for plan in plans if plan.target == "q4"]
+    q4_plans = [
+        plan for plan in plans
+        if plan.target == "q4" or plan.target in NATIVE_TARGETS
+    ]
     trit_plans = [plan for plan in plans if plan.target == "trit"]
     q4_path = out / Q4_FILE if q4_plans else None
     trit_path = out / "ternary.trit"
@@ -2237,6 +2479,7 @@ def import_gguf(
         return stats_by_role.setdefault(role, _Stats())
 
     def _entry(plan: PlannedTensor, offset: int, length: int, kind: str) -> dict:
+        in_q4_file = kind in ("q4", "q4_k", "q6_k")
         return {
             "name": plan.hf_name,
             "role": plan.role,
@@ -2244,11 +2487,14 @@ def import_gguf(
             "key": plan.key,
             "shape": list(plan.shape),
             "kind": kind,
-            "dtype": q4_kind if kind == "q4" else "trit",
+            "dtype": (
+                kind if kind in ("q4_k", "q6_k")
+                else q4_kind if kind == "q4" else "trit"
+            ),
             "offset": offset,
             "length": length,
-            ("q4_offset" if kind == "q4" else "trit_offset"): offset,
-            ("q4_length" if kind == "q4" else "trit_length"): length,
+            ("q4_offset" if in_q4_file else "trit_offset"): offset,
+            ("q4_length" if in_q4_file else "trit_length"): length,
             "params": plan.n_values,
             "source_tensor": plan.gguf_name,
             "source_type": plan.info.spec.name,
@@ -2257,7 +2503,57 @@ def import_gguf(
     try:
         for plan in plans:
             total_params += plan.n_values
-            if plan.target == "q4":
+            if plan.target in NATIVE_TARGETS:
+                # kind 6/7: байты GGUF как есть, без деквантования и
+                # повторного квантования (ADR 0018).
+                assert q4_sink is not None
+                native_kind = "q4_k" if plan.target == "q4k" else "q6_k"
+                encoder = _NativeBlockEncoder(
+                    native_kind, collect_stats=stats
+                )
+                need_values = plan.n_values
+                for raw in gguf.iter_tensor_raw_chunks(plan.info):
+                    if need_values <= 0:
+                        break
+                    take = min(
+                        len(raw),
+                        need_values // Q4K_BLOCK_VALUES * (
+                            Q4K_BLOCK_BYTES if native_kind == "q4_k"
+                            else Q6K_BLOCK_BYTES
+                        ),
+                    )
+                    encoder.add_raw(raw[:take], plan.gguf_name)
+                    need_values -= (
+                        take // (Q4K_BLOCK_BYTES if native_kind == "q4_k"
+                                 else Q6K_BLOCK_BYTES)
+                    ) * Q4K_BLOCK_VALUES
+                if need_values != 0:
+                    raise GgufError(
+                        f"{plan.gguf_name}: прочитано меньше блоков, чем "
+                        f"обещает shape (осталось {need_values} значений)"
+                    )
+                q4_sink.align(32)
+                length = encoder.write_to(q4_sink)
+                entry = _entry(
+                    plan, q4_sink.offset - length, length,
+                    "q4_k" if native_kind == "q4_k" else "q6_k",
+                )
+                entry["native"] = True
+                entry["blocks_sha256"] = encoder.blocks_sha256.hexdigest()
+                entry["source_type"] = plan.info.spec.name
+                encoder.close()
+                q4_params += plan.n_values
+                source_values_q4 += plan.info.n_bytes
+                segment_entries.append(entry)
+                if stats:
+                    stats_by_role.setdefault("q4", _Stats()).merge(encoder.stats)
+                if progress:
+                    print(
+                        f"  {native_kind:<6} {plan.hf_name:<47} "
+                        f"{plan.n_values / 1e6:7.1f} МЭ → {length / 1e6:7.1f} МБ",
+                        file=sys.stderr,
+                    )
+            elif plan.target == "q4":
                 assert q4_sink is not None
                 encoder = _SegmentEncoder(
                     "q4", collect_stats=stats, scale_dtype=q4_scale_dtype,
@@ -2468,6 +2764,10 @@ def import_gguf(
         "scale_dtype": "float32",
         "target": fmt,
         "rule": (
+            ("Linear -> Q4_K/Q6_K (kind 6/7): блоки GGML байт-в-байт, "
+             "без деквантования и повторного квантования; "
+             "Q4_K: w=d*sc*q-dmin*m; Q6_K: w=d*sc*(q-32)")
+            if fmt == "q4" and q4_kind == "q4_k" else
             ("Linear -> Q4_1 (kind 5, asym): min=min(32); "
              "scale=(max-min)/15; "
              "q=clamp(round_half_away((w-min)/scale),0,15); w=q*scale+min")
@@ -2491,7 +2791,11 @@ def import_gguf(
             if fmt == "q4" else None
         ),
         "container_limit_bytes": CONTAINER_LIMIT,
-        "q4_layout": "ggml: байт j = значение j (low), j+16 (high)",
+        "q4_layout": (
+            "ggml Q4_K/Q6_K: блоки 256 значений (144/210 байт) как есть"
+            if q4_kind == "q4_k" else
+            "ggml: байт j = значение j (low), j+16 (high)"
+        ),
         "trit_block_size": TRIT_SCALE_BLOCK,
         "trit_layout": "packed20: 20 тритов в u32, 160 тритов в 32 байтах",
         "trit_scale_rule": (
@@ -2505,7 +2809,40 @@ def import_gguf(
     }
     scale_label = "f32" if q4_scale_dtype == "float32" else "f16"
     q4_section = None
-    if q4_path is not None:
+    if q4_path is not None and q4_kind == "q4_k":
+        native_entries = [
+            entry for entry in segment_entries
+            if entry.get("kind") in ("q4_k", "q6_k")
+        ]
+        q4_section = {
+            "file": Q4_FILE,
+            "kind": 6,
+            "kinds": {"q4_k": 6, "q6_k": 7},
+            "native": True,
+            "block_size": Q4K_BLOCK_VALUES,
+            "segment": {
+                "magic": ["Q4K ", "Q6K "],
+                "version": Q4K_VERSION,
+                "header_bytes": Q4K_HEADER_SIZE,
+                "order": "header, blocks GGML (144 Q4_K / 210 Q6_K)",
+                "aligned": 32,
+                "note": (
+                    "ровно tools/vtm_ref.py:encode_q4k_segment "
+                    "(Tensor.q4k(...)); блоки — байт-в-байт из GGUF"
+                ),
+            },
+            "tensors": len(q4_plans),
+            "params": q4_params,
+            "q4k_tensors": sum(
+                1 for entry in native_entries if entry["kind"] == "q4_k"
+            ),
+            "q6k_tensors": sum(
+                1 for entry in native_entries if entry["kind"] == "q6_k"
+            ),
+            "rel_rms": 0.0,
+            "note": "переквантования нет: rel-RMS к весам GGUF = 0",
+        }
+    elif q4_path is not None:
         q4_section = {
             "file": Q4_FILE,
             "kind": 5,
@@ -2695,6 +3032,9 @@ def import_gguf(
             "note": (
                 "манифест читается tools/vtm_compile.py без изменений: "
                 + (
+                    "q4.bin (kind 6/7, Q4_K/Q6_K) в Tensor.q4k(...), "
+                    "lm_head='q4' → TMV"
+                    if fmt == "q4" and q4_kind == "q4_k" else
                     "q4.bin (kind 5, Q4_1/asym) в Tensor(kind=Q4, "
                     "q4_asymmetric=True), lm_head='q4' → TMV"
                     if fmt == "q4" and q4_asym else
@@ -2805,6 +3145,76 @@ def _verify_q4_file(
     size = path.stat().st_size
     with open(path, "rb") as handle:
         for entry in entries:
+            if entry.get("kind") in ("q4_k", "q6_k"):
+                # Нативный сегмент kind 6/7 (ADR 0018): заголовок 18 байт и
+                # блоки как в GGUF. Сверяем не только длины, но и sha256
+                # блоков с исходным регионом — это и есть «rel-RMS 0».
+                native_kind = str(entry["kind"])
+                block_bytes = (
+                    Q4K_BLOCK_BYTES if native_kind == "q4_k" else Q6K_BLOCK_BYTES
+                )
+                expected_magic = Q4K_MAGIC if native_kind == "q4_k" else Q6K_MAGIC
+                offset = int(entry["q4_offset"])
+                length = int(entry["q4_length"])
+                if offset < 0 or length < Q4K_HEADER_SIZE or offset + length > size:
+                    raise GgufError(
+                        f"{entry['name']}: сегмент [{offset}, {offset + length}) "
+                        f"вне {path.name} ({size} байт)"
+                    )
+                handle.seek(offset)
+                header = handle.read(Q4K_HEADER_SIZE)
+                magic = header[:4]
+                version = header[4]
+                reserved = header[5]
+                n_values = struct.unpack_from("<Q", header, 6)[0]
+                n_blocks = struct.unpack_from("<I", header, 14)[0]
+                if magic != expected_magic or version != Q4K_VERSION:
+                    raise GgufError(
+                        f"{entry['name']}: чужой заголовок {magic!r}/{version} "
+                        f"(ожидался {expected_magic!r}/{Q4K_VERSION})"
+                    )
+                if reserved != 0:
+                    raise GgufError(
+                        f"{entry['name']}: reserved={reserved}, ожидался 0"
+                    )
+                if n_values != entry["params"]:
+                    raise GgufError(
+                        f"{entry['name']}: в заголовке {n_values} значений, "
+                        f"в манифесте {entry['params']}"
+                    )
+                expected_blocks = (
+                    n_values + Q4K_BLOCK_VALUES - 1
+                ) // Q4K_BLOCK_VALUES
+                if n_blocks != expected_blocks:
+                    raise GgufError(
+                        f"{entry['name']}: блоков {n_blocks}, ожидалось "
+                        f"{expected_blocks}"
+                    )
+                expected_length = Q4K_HEADER_SIZE + n_blocks * block_bytes
+                if length < expected_length:
+                    raise GgufError(
+                        f"{entry['name']}: сегмент {length} байт, а по "
+                        f"заголовку нужно {expected_length}"
+                    )
+                want = entry.get("blocks_sha256")
+                if want:
+                    digest = hashlib.sha256()
+                    left = n_blocks * block_bytes
+                    handle.seek(offset + Q4K_HEADER_SIZE)
+                    while left > 0:
+                        chunk = handle.read(min(1 << 20, left))
+                        if not chunk:
+                            raise GgufError(
+                                f"{entry['name']}: файл оборвался на блоках"
+                            )
+                        digest.update(chunk)
+                        left -= len(chunk)
+                    if digest.hexdigest() != want:
+                        raise GgufError(
+                            f"{entry['name']}: sha256 блоков сегмента не "
+                            "совпал с исходным GGUF — веса не байт-в-байт"
+                        )
+                continue
             if entry.get("kind") != "q4":
                 continue  # в tensors[] может быть и TRT1-эмбеддинг
             offset = int(entry["q4_offset"])
@@ -3052,12 +3462,14 @@ def build_parser() -> argparse.ArgumentParser:
              "4 ГиБ, ADR 0016)",
     )
     imp.add_argument(
-        "--q4-kind", choices=("auto", "q4_1", "q4_0", "asym", "sym"),
+        "--q4-kind", choices=("auto", "q4_k", "q4_1", "q4_0", "asym", "sym"),
         default="auto",
-        help="вид Q4-сегмента (kind 5): auto (по умолчанию) — q4_1, если "
-             "оценка контейнера влезает в 4 ГиБ (3B), иначе q4_0 (7B: Q4_1 "
-             "даёт 106 %% предела); q4_1 — min на группу 32, почти без потерь "
-             "на Q4_K-подблоках (+2–4 байта/группа); q4_0 — симметричный",
+        help="вид Q4-сегмента: auto (по умолчанию) — q4_k, если все "
+             "Linear/lm_head в источнике Q4_K/Q6_K и контейнер влезает в "
+             "4 ГиБ (3B: переквантования нет), иначе q4_1 (влезает) или q4_0 "
+             "(7B: Q4_1 даёт 106 %% предела); q4_k — нативные блоки GGML "
+             "(kind 6/7, rel-RMS 0); q4_1 — min на группу 32; q4_0 — "
+             "симметричный",
     )
     imp.add_argument(
         "--embed", choices=("int8", "trit", "fp16", "fp32", "float16", "float32"),
@@ -3108,7 +3520,14 @@ def _print_result(result: ImportResult) -> None:
     )
     q4 = result.manifest.get("q4")
     trit = result.manifest.get("trit")
-    if q4:
+    if q4 and q4.get("native"):
+        print(
+            f"  Linear → Q4_K/Q6_K нативно, kind 6/7, блоки GGML байт-в-байт "
+            f"(Q4_K-тензоров {q4['q4k_tensors']}, Q6_K — "
+            f"{q4['q6k_tensors']}): {q4['params'] / 1e6:.1f} МЭ, "
+            f"q4.bin {_human_bytes(result.q4_bytes)}"
+        )
+    elif q4:
         kind = "Q4_1 (asym, min на группу)" if q4["asymmetric"] else "Q4_0 (sym)"
         print(
             f"  Linear → {kind}, kind 5, масштабы {q4['scale_dtype']}: "
@@ -3141,10 +3560,23 @@ def _print_result(result: ImportResult) -> None:
             "  ВНИМАНИЕ: частичная модель (--limit-layers/--limit-vocab) — "
             "только для дымового теста, не для качества"
         )
+    native_entries = [
+        entry for entry in result.manifest.get("tensors", [])
+        if entry.get("kind") in ("q4_k", "q6_k")
+    ]
+    if native_entries:
+        print(
+            f"  нативно: {len(native_entries)} сегментов kind 6/7, "
+            "sha256 блоков = исходный GGUF (переквантования нет, rel-RMS 0)"
+        )
     for role, stats in sorted(result.stats.items()):
         if stats.values:
+            label = (
+                "нативная сверка декодеров" if q4 and q4.get("native")
+                and role == "q4" else "переквантование"
+            )
             print(
-                f"  переквантование {role}: относительная RMS-ошибка "
+                f"  {label} {role}: относительная RMS-ошибка "
                 f"{stats.rel_rms:.1%}, max|Δ|={stats.max_abs:.4g}"
             )
     compiler = result.manifest["compiler"]

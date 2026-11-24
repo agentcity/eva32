@@ -392,12 +392,21 @@ static int fits_size_t(uint64_t v, size_t *out) {
     return 0;
 }
 
+// Размер блока GGML для kind 6 (Q4_K) / kind 7 (Q6_K): 144 и 210 байт.
+static uint64_t q4k_block_bytes(uint8_t kind) {
+    return kind == VTM_TENSOR_Q4K ? (uint64_t)VTM_Q4K_BLOCK_BYTES
+                                  : (uint64_t)VTM_Q6K_BLOCK_BYTES;
+}
+
 static int tensor_arena_size(const vtm_tensor *t, size_t *out) {
     uint64_t n, a, b;
     if (t->kind == VTM_TENSOR_TRIT) {
         if (mul_u64(t->n_blocks, 32u, &a) != 0) return -1;
         if (mul_u64(t->n_scales, 4u, &b) != 0) return -1;
         if (add_u64(a, b, &n) != 0) return -1;
+    } else if (t->kind == VTM_TENSOR_Q4K || t->kind == VTM_TENSOR_Q6K) {
+        // kind 6/7: блоки GGML как есть (144/210 байт на 256 значений).
+        if (mul_u64(t->n_qblocks, q4k_block_bytes(t->kind), &n) != 0) return -1;
     } else if (t->kind == VTM_TENSOR_Q4) {
         // Худший случай: упакованные нибблы + fp32-масштабы (+ min у Q4_1).
         if (mul_u64(t->n_scales, VTM_Q4_GROUP_BYTES, &a) != 0) return -1;
@@ -426,6 +435,7 @@ typedef struct {
     int    copy_scales; // трит: копировать/конвертировать масштабы в арену
     int    copy_q4;     // Q4: копировать упакованные нибблы в арену
     int    copy_q4_min; // Q4_1: копировать/конвертировать min в арену
+    int    copy_qblocks; // Q4_K/Q6_K: копировать блоки GGML в арену
 } tensor_plan;
 
 static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
@@ -439,6 +449,7 @@ static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
     p->copy_scales = 0;
     p->copy_q4 = 0;
     p->copy_q4_min = 0;
+    p->copy_qblocks = 0;
 
     if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) {
         // writable и can_reference тут ни при чём: файла нет, копировать
@@ -471,6 +482,19 @@ static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
         if (p->copy_scales) total += scales_bytes;
         if (p->copy_q4_min) total += scales_bytes;
         return fits_size_t(total, &p->arena_size);
+    }
+
+    if (t->kind == VTM_TENSOR_Q4K || t->kind == VTM_TENSOR_Q6K) {
+        // kind 6/7 (0165): блоки GGML остаются байтами — ровно как в файле.
+        // Блоки выровнены на 2 (d fp16), а не на 4/8, поэтому в mmap их
+        // можно ссылать только при VTM_UNALIGNED_LOADS или на ARM64 (где
+        // memcpy-чтение fp16 компилируется в обычный ldrh); иначе — копия в
+        // арену. fp32-материализации нет ни в одном случае.
+        uint64_t bytes = 0;
+        if (mul_u64(t->n_qblocks, q4k_block_bytes(t->kind), &bytes) != 0)
+            return -1;
+        p->copy_qblocks = !(can_reference && !writable && VTM_UNALIGNED_LOADS);
+        return fits_size_t(p->copy_qblocks ? bytes : 0, &p->arena_size);
     }
 
     if (!can_reference || writable) {
@@ -654,6 +678,20 @@ static int fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
             }
         } else {
             t->q4_mins = NULL;
+        }
+        t->f32 = NULL;
+    } else if (t->kind == VTM_TENSOR_Q4K || t->kind == VTM_TENSOR_Q6K) {
+        // kind 6/7 (0165): блоки GGML как есть — ни распаковки, ни fp32-копии.
+        // В mmap-режиме и при VTM_UNALIGNED_LOADS указатель смотрит в
+        // отображение (блоки читаются через memcpy — выравнивание не нужно),
+        // иначе блоки лежат в арене (calloc'нутый буфер уже выровнен).
+        const uint8_t *seg = data + t->offset;
+        size_t bytes = (size_t)t->n_qblocks * q4k_block_bytes(t->kind);
+        if (p->copy_qblocks) {
+            memcpy(dst, seg + VTM_Q4K_HEADER_SIZE, bytes);
+            t->qblocks = dst;
+        } else {
+            t->qblocks = seg + VTM_Q4K_HEADER_SIZE;
         }
         t->f32 = NULL;
     } else if (t->kind == VTM_TENSOR_F32) {
@@ -1211,10 +1249,10 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         memcpy(t->name, e, 24);
         t->kind = e[24];
         t->ndim = e[25];
-        // kind 4 (int8 + масштабы, задача 0044) и kind 5 (Q4, задача 0151) —
-        // последние известные виды. Старый загрузчик отвергал бы kind 5 как
-        // «неизвестный kind» ещё до чтения данных (это и есть tripwire).
-        if (t->kind != VTM_TENSOR_INT8 && t->kind > VTM_TENSOR_Q4)
+        // kind 4 (int8 + масштабы, задача 0044), kind 5 (Q4, 0151) и kind 6/7
+        // (Q4_K/Q6_K, 0165) — известные виды. Старый загрузчик отвергал бы
+        // kind > 4 как «неизвестный kind» ещё до чтения данных (tripwire).
+        if (t->kind != VTM_TENSOR_INT8 && t->kind > VTM_TENSOR_Q6K)
             FAIL(VTM_E_FORMAT, "тензор %u (%s): неизвестный kind %u",
                  i, t->name, (unsigned)t->kind);
         if (t->ndim < 1 || t->ndim > VTM_MAX_DIMS)
@@ -1247,6 +1285,8 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         t->n_scales = 0;
         t->scale_block = 0;
         t->scale_is_f32 = 0;
+        t->qblocks = NULL;
+        t->n_qblocks = 0;
         t->layout = VTM_LAYOUT_TRT1;
 
         // KV-кэш (VTM_TENSOR_FLAG_KV_CACHE): payload'а в файле нет — ни слов,
@@ -1262,7 +1302,8 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) {
             uint64_t bytes;
             if (t->kind == VTM_TENSOR_TRIT || t->kind == VTM_TENSOR_INT8 ||
-                t->kind == VTM_TENSOR_Q4)
+                t->kind == VTM_TENSOR_Q4 || t->kind == VTM_TENSOR_Q4K ||
+                t->kind == VTM_TENSOR_Q6K)
                 FAIL(VTM_E_FORMAT,
                      "тензор %u (%s): KV-кэш обязан быть fp-тензором (kind %u)",
                      i, t->name, (unsigned)t->kind);
@@ -1682,6 +1723,88 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                 (uint8_t)((seg[5] & VTM_Q4_FLAG_F32) ? 1u : 0u);
             t->q4_is_asym = (uint8_t)asym;
             t->layout = VTM_LAYOUT_Q4;
+        } else if (t->kind == VTM_TENSOR_Q4K ||
+                   t->kind == VTM_TENSOR_Q6K) {
+            // kind 6/7 (0165): блоки GGML как есть. Заголовок 18 байт:
+            // magic | version | reserved(=0) | n_values u64 | n_blocks u32,
+            // затем n_blocks блоков по 144 (Q4_K) или 210 (Q6_K) байт. В fp32
+            // НЕ расквантовываем: t->qblocks смотрит в отмеченные блоки,
+            // t->f32 == NULL. d/dmin каждого блока проверяются на конечность:
+            // NaN в контейнере дал бы тихие NaN-логиты.
+            const uint8_t *seg = p + data_start + t->offset;
+            const char *magic = t->kind == VTM_TENSOR_Q4K
+                              ? VTM_Q4K_MAGIC : VTM_Q6K_MAGIC;
+            uint64_t n_values, total, block_bytes;
+            uint32_t n_blk, expected_blocks, k;
+
+            if (t->scale_offset != VTM_NO_OFFSET)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): kind=Q4_K/Q6_K требует "
+                     "scale_offset=0x%08X (масштабы внутри блока), а пришло %u",
+                     i, t->name, (unsigned)VTM_NO_OFFSET, t->scale_offset);
+            if (!range_ok(t->offset, VTM_Q4K_HEADER_SIZE, data_size))
+                FAIL(VTM_E_BOUNDS,
+                     "тензор %u (%s): заголовок Q4_K/Q6_K за границей данных",
+                     i, t->name);
+            if (memcmp(seg, magic, 4) != 0)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): kind=%u без сегмента %s", i, t->name,
+                     (unsigned)t->kind, magic);
+            if (seg[4] != VTM_Q4K_VERSION)
+                FAIL(VTM_E_VERSION,
+                     "тензор %u (%s): версия Q4_K-сегмента %u", i, t->name,
+                     (unsigned)seg[4]);
+            if (seg[5] != 0)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): reserved Q4_K-сегмента = %u, ожидался 0 "
+                     "(поле зарезервировано, а не маска флагов)", i, t->name,
+                     (unsigned)seg[5]);
+            n_values = rd64(seg + 6);
+            n_blk = rd32(seg + 14);
+            if (n_values != (uint64_t)t->n_elements)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): Q4_K n_values=%llu, dims дают %u",
+                     i, t->name, (unsigned long long)n_values, t->n_elements);
+            expected_blocks = (uint32_t)(((uint64_t)t->n_elements
+                                          + VTM_Q4K_BLOCK_VALUES - 1u)
+                                         / VTM_Q4K_BLOCK_VALUES);
+            if (n_blk != expected_blocks)
+                FAIL(VTM_E_FORMAT,
+                     "тензор %u (%s): Q4_K n_blocks=%u, ожидали %u (блок %u)",
+                     i, t->name, n_blk, expected_blocks,
+                     (unsigned)VTM_Q4K_BLOCK_VALUES);
+            block_bytes = q4k_block_bytes(t->kind);
+            if (mul_u64(n_blk, block_bytes, &total) != 0 ||
+                add_u64(total, VTM_Q4K_HEADER_SIZE, &total) != 0)
+                FAIL(VTM_E_BOUNDS, "тензор %u (%s): Q4_K слишком велик",
+                     i, t->name);
+            if (!range_ok(t->offset, total, data_size))
+                FAIL(VTM_E_BOUNDS,
+                     "тензор %u (%s): Q4_K-сегмент (%llu байт) за границей",
+                     i, t->name, (unsigned long long)total);
+            {
+                const uint8_t *bp = seg + VTM_Q4K_HEADER_SIZE;
+                // Q4_K: d в байтах 0-1, dmin в 2-3. Q6_K: d — последние два
+                // байта блока (208-209), dmin у него нет (масштабы — int8).
+                unsigned doff = t->kind == VTM_TENSOR_Q4K ? 0u : 208u;
+                unsigned moff = t->kind == VTM_TENSOR_Q4K ? 2u : 208u;
+                for (k = 0; k < n_blk; k++) {
+                    const uint8_t *b = bp + (size_t)k * (size_t)block_bytes;
+                    float d = vtm_half_to_float(rd16(b + doff));
+                    float mn = vtm_half_to_float(rd16(b + moff));
+                    if (!isfinite(d) || !isfinite(mn))
+                        FAIL(VTM_E_SCALE,
+                             "тензор %u (%s): блок #%u: d/dmin не конечны",
+                             i, t->name, k);
+                }
+            }
+            t->n_blocks = 0;
+            t->n_scales = 0;
+            t->scale_block = (uint32_t)VTM_Q4K_BLOCK_VALUES;
+            t->scale_is_f32 = 0;
+            t->n_qblocks = n_blk;
+            t->layout = t->kind == VTM_TENSOR_Q4K
+                      ? VTM_LAYOUT_Q4K : VTM_LAYOUT_Q6K;
         } else {
             size_t esize = (t->kind == VTM_TENSOR_F32) ? 4u : 2u;
             uint64_t bytes = (uint64_t)t->n_elements * esize;
@@ -2095,6 +2218,8 @@ int vtm_internal_tensor_is_mapped(const vtm_t *m, uint32_t index) {
     t = &m->tensors[index];
     if (t->kind == VTM_TENSOR_TRIT || t->kind == VTM_TENSOR_Q4) {
         p = (const uint8_t *)(const void *)t->words;
+    } else if (t->kind == VTM_TENSOR_Q4K || t->kind == VTM_TENSOR_Q6K) {
+        p = t->qblocks;
     } else {
         p = (const uint8_t *)(const void *)t->f32;
     }

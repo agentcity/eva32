@@ -728,6 +728,10 @@ static const char *kind_name(uint8_t kind) {
     case VTM_TENSOR_F32:  return "f32";
     case VTM_TENSOR_F16:  return "f16";
     case VTM_TENSOR_BF16: return "bf16";
+    case 4:               return "int8";  // VTM_TENSOR_INT8 из trit.h
+    case VTM_TENSOR_Q4:   return "q4";
+    case VTM_TENSOR_Q4K:  return "q4_k";
+    case VTM_TENSOR_Q6K:  return "q6_k";
     default:              return "?";
     }
 }

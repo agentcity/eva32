@@ -347,6 +347,10 @@ KIND_BF16 = 3
 KIND_INT8 = 4
 #: kind 5: Q4 — 4 бита (0..15) + масштабы группы 32 (задача 0151).
 KIND_Q4 = 5
+#: kind 6: Q4_K — блоки GGML 144 байта на 256 значений (задача 0165).
+KIND_Q4K = 6
+#: kind 7: Q6_K — блоки GGML 210 байт на 256 значений (задача 0165).
+KIND_Q6K = 7
 KIND_NAMES = {
     KIND_TRITS: "trits",
     KIND_F32: "fp32",
@@ -354,7 +358,11 @@ KIND_NAMES = {
     KIND_BF16: "bf16",
     KIND_INT8: "int8",
     KIND_Q4: "q4",
+    KIND_Q4K: "q4_k",
+    KIND_Q6K: "q6_k",
 }
+#: Виды, у которых payload — упакованные данные, а не fp-значения.
+PACKED_KINDS = (KIND_TRITS, KIND_INT8, KIND_Q4, KIND_Q4K, KIND_Q6K)
 
 #: Сегмент int8-тензора (kind 4): тот же 18-байтовый заголовок, что у TRT1,
 #: но magic "INT8". По offset: заголовок, масштабы, n_elements байт q.
@@ -387,6 +395,28 @@ Q4_MAX = 15
 #: хвост последней группы; читатель обрезает его по n_values.
 Q4_ZERO_NIBBLE = 8
 Q4_FLAG_F32_SCALES = 0x01
+
+#: Сегмент Q4_K/Q6_K (kind 6/7, задача 0165, ADR 0018): блоки GGML как есть.
+#: Заголовок 18 байт — как у kind 5:
+#:   "Q4K "/"Q6K " | version u8 (=1) | reserved u8 (=0)
+#:                 | n_values u64 | n_blocks u32
+#: затем n_blocks блоков: у Q4_K 144 байта (d fp16, dmin fp16, 12 байт
+#: 6-битных scale/min, 128 байт нибблов; w = d*sc*q - dmin*m), у Q6_K
+#: 210 байт (ql 128, qh 64, scales 16*int8, d fp16; w = d*sc*(q-32)).
+#: n_blocks = ceil(n_values/256), scale_offset = NO_OFFSET.
+Q4K_MAGIC = b"Q4K "
+Q6K_MAGIC = b"Q6K "
+Q4K_VERSION = 1
+Q4K_HEADER_SIZE = 18
+Q4K_BLOCK_VALUES = 256
+Q4K_BLOCK_BYTES = 144
+Q4K_SCALES_BYTES = 12
+Q6K_BLOCK_BYTES = 210
+#: 6-битные (scale, min) под-блока `j` из 12 байт Q4_K — как ggml.
+#: Формула продублирована из tools/gguf_import.py (`_scale_min_k4`), чтобы
+#: кодек контейнера не зависел от импортёра.
+Q4K_SCALE_BLOCK = 32
+Q4K_SUB_BLOCKS = Q4K_BLOCK_VALUES // Q4K_SCALE_BLOCK
 
 #: Флаги записи таблицы тензоров (поле по смещению 50, бывший «резерв»).
 #: TFLAG_KV_CACHE — K/V-кэш внимания: содержимого в файле нет (offset=0),
@@ -646,7 +676,7 @@ class Tensor:
             # Кэш существует только в таблице: содержимое не пишется и не
             # читается (его создаёт исполнитель), поэтому данные запрещены —
             # иначе легко решить, что они попадут в файл.
-            if self.kind in (KIND_TRITS, KIND_INT8, KIND_Q4):
+            if self.kind in PACKED_KINDS:
                 raise ValueError(
                     f"тензор {self.name!r}: KV-кэш обязан быть fp-тензором (kind {self.kind})"
                 )
@@ -802,6 +832,38 @@ class Tensor:
                 if self.scales is not None or self.q4_mins is not None:
                     raise ValueError(
                         f"тензор {self.name!r}: Q4-масштабы/min без qdata"
+                    )
+        elif self.kind in (KIND_Q4K, KIND_Q6K):
+            # kind 6/7: блоки GGML как есть. Масштабы и min живут внутри
+            # блока, отдельных массивов нет; fp32-значений тоже нет.
+            if self.block_size == SCALE_BLOCK:
+                self.block_size = Q4K_BLOCK_VALUES
+            if self.block_size != Q4K_BLOCK_VALUES:
+                raise ValueError(
+                    f"тензор {self.name!r}: {self.kind_name} хранит блок "
+                    f"только на {Q4K_BLOCK_VALUES} значений"
+                )
+            if (self.data is not None or self.trits is not None
+                    or self.scales is not None or self.q4_mins is not None):
+                raise ValueError(
+                    f"тензор {self.name!r}: {self.kind_name}-тензор не имеет "
+                    "fp-данных/тритов/отдельных масштабов"
+                )
+            if self.qdata is not None:
+                if not isinstance(self.qdata, PackedQ4K):
+                    self.qdata = PackedQ4K(
+                        self.qdata, 0, self.n_elements, self.kind
+                    )
+                if self.qdata.kind != self.kind:
+                    raise ValueError(
+                        f"тензор {self.name!r}: qdata kind "
+                        f"{self.qdata.kind}, а тензор kind {self.kind}"
+                    )
+                if len(self.qdata) != self.n_elements:
+                    raise ValueError(
+                        f"тензор {self.name!r}: {len(self.qdata)} "
+                        f"{self.kind_name}-значений, а dims дают "
+                        f"{self.n_elements}"
                     )
         else:
             if (self.trits is not None or self.scales is not None
@@ -965,6 +1027,34 @@ class Tensor:
         """Тензор без данных — для каркаса графа (веса ещё не загружены)."""
         return cls(name=name, kind=kind, dims=tuple(dims))
 
+    @classmethod
+    def q4k(
+        cls,
+        name: str,
+        dims: Sequence[int],
+        blocks: Any,
+        kind: int = KIND_Q4K,
+        *,
+        offset: int = 0,
+    ) -> "Tensor":
+        """Q4_K/Q6_K-тензор (kind 6/7): блоки GGML как есть, без fp32-копии.
+
+        `blocks` — байты блоков (144 у Q4_K, 210 у Q6_K) или окно
+        (`PackedQ4K`/mmap); `offset` — смещение окна внутри `blocks`.
+        Списка значений у тензора нет: у 3B это 2,77 млрд чисел.
+        """
+        window = (
+            blocks if isinstance(blocks, PackedQ4K)
+            else PackedQ4K(blocks, offset, prod(tuple(dims)), kind)
+        )
+        return cls(
+            name=name,
+            kind=kind,
+            dims=tuple(dims),
+            qdata=window,
+            block_size=Q4K_BLOCK_VALUES,
+        )
+
     # -- данные --------------------------------------------------------------
 
     def dense(self) -> list[float]:
@@ -1002,6 +1092,14 @@ class Tensor:
                 else:
                     values.append(_f32((nibble - Q4_ZERO_NIBBLE) * scales[group]))
             return values
+        if self.kind in (KIND_Q4K, KIND_Q6K):
+            if self.qdata is None:
+                raise ValueError(f"тензор {self.name!r}: нет {self.kind_name}-данных")
+            if not isinstance(self.qdata, PackedQ4K):  # pragma: no cover
+                raise ValueError(
+                    f"тензор {self.name!r}: qdata не окно блоков Q4_K/Q6_K"
+                )
+            return list(self.qdata.iter_values())
         if self.data is None:
             raise ValueError(f"тензор {self.name!r}: нет данных")
         return list(self.data)
@@ -1443,6 +1541,296 @@ def unpack_q4(data: bytes, n_values: int) -> list[int]:
     return values
 
 
+# --- Q4_K/Q6_K: блоки GGML как есть (kind 6/7, задача 0165) -----------------
+
+
+def q4k_scale_min(index: int, scales: bytes | memoryview) -> tuple[int, int]:
+    """6-битные (scale, min) под-блока `index` из 12 байт Q4_K — как ggml.
+
+    `get_scale_min_k4` из ggml-quants.c: первые четыре под-блока берут
+    младшие 6 бит байтов 0..3 (scale) и 4..7 (min), остальные — старшие два
+    бита «парных» байтов как старшие биты 6-битного значения.
+    """
+    if not 0 <= index < Q4K_SUB_BLOCKS:
+        raise ValueError(f"Q4_K: под-блок {index} вне 0..{Q4K_SUB_BLOCKS - 1}")
+    if index < 4:
+        return int(scales[index]) & 0x3F, int(scales[index + 4]) & 0x3F
+    return (
+        (int(scales[index + 4]) & 0x0F) | ((int(scales[index - 4]) >> 6) << 4),
+        (int(scales[index + 4]) >> 4) | ((int(scales[index]) >> 6) << 4),
+    )
+
+
+def q4k_block_values(block: bytes | memoryview,
+                     n_values: int = Q4K_BLOCK_VALUES) -> list[float]:
+    """Развернуть блок Q4_K (144 байта) в `n_values` fp32-значений.
+
+    Раскладка: `d fp16 | dmin fp16 | scales 12 | qs 128`. Кусок `qs[32k:32k+32]`
+    даёт два под-блока: младшие нибблы — под-блок `2k` (32 значения подряд),
+    старшие — `2k+1`; `w = d·sc·q − dmin·m`. Формула и порядок — те же, что в
+    `_dequant_q4_k` импортёра; здесь она нужна читателю контейнера.
+    """
+    if len(block) < Q4K_BLOCK_BYTES:
+        raise ValueError(
+            f"Q4_K: блок обрезан ({len(block)} < {Q4K_BLOCK_BYTES} байт)"
+        )
+    d, dmin = struct.unpack_from("<ee", block, 0)
+    scales = block[4:16]
+    qs = memoryview(block)[16:144]
+    out: list[float] = []
+    for sub in range(Q4K_SUB_BLOCKS):
+        scale, minimum = q4k_scale_min(sub, scales)
+        dd = float(d) * scale
+        mm = float(dmin) * minimum
+        chunk = qs[(sub >> 1) * 32:(sub >> 1) * 32 + 32]
+        if sub & 1:
+            values = (int(byte) >> 4 for byte in chunk)
+        else:
+            values = (int(byte) & 0x0F for byte in chunk)
+        # Без _f32: d — fp16 (точно), sc/q — целые, поэтому произведение
+        # точно и в double; C-ядро kind 6/7 считает так же. Округление до
+        # float32 здесь добавило бы 6e-8 на вес и разошлось бы с C.
+        out.extend(dd * value - mm for value in values)
+    return out[:n_values]
+
+
+def q6k_block_values(block: bytes | memoryview,
+                     n_values: int = Q4K_BLOCK_VALUES) -> list[float]:
+    """Развернуть блок Q6_K (210 байт) в `n_values` fp32-значений.
+
+    Раскладка: `ql 128 | qh 64 | scales 16*int8 | d fp16`. Внутри блока два
+    независимых 128-значных куска по 4 под-блока; `q = (ql-ниббл | 2 бита из
+    qh) − 32`, `w = d·sc·q`.
+    """
+    if len(block) < Q6K_BLOCK_BYTES:
+        raise ValueError(
+            f"Q6_K: блок обрезан ({len(block)} < {Q6K_BLOCK_BYTES} байт)"
+        )
+    d = struct.unpack_from("<e", block, 208)[0]
+    scales = struct.unpack_from("<16b", block, 192)
+    ql = memoryview(block)[0:128]
+    qh = memoryview(block)[128:192]
+    out: list[float] = []
+    for group in (0, 1):
+        base = group * 64
+        qhb = group * 32
+        low0 = [int(ql[base + i]) & 0x0F for i in range(32)]
+        high0 = [int(ql[base + i]) >> 4 for i in range(32)]
+        low1 = [int(ql[base + 32 + i]) & 0x0F for i in range(32)]
+        high1 = [int(ql[base + 32 + i]) >> 4 for i in range(32)]
+        quads = (
+            [low0[i] | ((int(qh[qhb + i]) & 0x03) << 4) for i in range(32)],
+            [low1[i] | (((int(qh[qhb + i]) >> 2) & 0x03) << 4)
+             for i in range(32)],
+            [high0[i] | (((int(qh[qhb + i]) >> 4) & 0x03) << 4)
+             for i in range(32)],
+            [high1[i] | (((int(qh[qhb + i]) >> 6) & 0x03) << 4)
+             for i in range(32)],
+        )
+        for quad_index, values in enumerate(quads):
+            for half in (0, 1):
+                multiplier = float(d) * scales[group * 8 + quad_index * 2 + half]
+                # Без _f32 — как C: d/sc/q точны в double (см. Q4_K выше).
+                out.extend(
+                    multiplier * (value - 32)
+                    for value in values[half * 16:half * 16 + 16]
+                )
+    return out[:n_values]
+
+
+class PackedQ4K(Sequence[float]):
+    """Q4_K/Q6_K значения поверх уже упакованных блоков GGML.
+
+    `bytes`/`memoryview` блоков остаются как есть (в mmap — окно, не копия):
+    у 3B это 1,8 ГиБ, и `list[float]` на 2,77 млрд значений занял бы ~22 ГиБ.
+    `len()` — число значений (как у списка), `__getitem__` разворачивает
+    только свой блок, `iter_values()` идёт по блокам, `iter_packed()` отдаёт
+    байты блоков для потоковой записи сегмента.
+    """
+
+    __slots__ = ("_packed", "_n_values", "_kind", "_n_blocks")
+
+    def __init__(self, data: Any, offset: int, n_values: int, kind: int) -> None:
+        if kind not in (KIND_Q4K, KIND_Q6K):
+            raise ValueError(f"PackedQ4K: kind={kind}")
+        n_values = int(n_values)
+        if n_values < 0:
+            raise ValueError("Q4_K: отрицательное число значений")
+        block_bytes = _q4k_block_bytes(kind)
+        n_blocks = n_scale_blocks(n_values, Q4K_BLOCK_VALUES)
+        needle = n_blocks * block_bytes
+        chunk = memoryview(data)[offset:offset + needle]
+        if len(chunk) != needle:
+            raise ValueError(
+                f"{KIND_NAMES[kind]}: данные обрезаны: {len(chunk)} байт, "
+                f"ожидалось {needle} ({n_blocks} блоков по {block_bytes})"
+            )
+        self._packed = chunk
+        self._n_values = n_values
+        self._kind = kind
+        self._n_blocks = n_blocks
+
+    @property
+    def kind(self) -> int:
+        return self._kind
+
+    @property
+    def n_blocks(self) -> int:
+        return self._n_blocks
+
+    @property
+    def block_bytes(self) -> int:
+        return _q4k_block_bytes(self._kind)
+
+    def __len__(self) -> int:
+        return self._n_values
+
+    def block(self, index: int) -> memoryview:
+        return self._packed[index * self.block_bytes:
+                             (index + 1) * self.block_bytes]
+
+    def __getitem__(self, index: Any) -> Any:
+        if isinstance(index, slice):
+            return list(self.iter_values())[index]
+        index = int(index)
+        if index < 0:
+            index += self._n_values
+        if not 0 <= index < self._n_values:
+            raise IndexError(f"Q4_K: индекс {index} вне 0..{self._n_values - 1}")
+        block = index // Q4K_BLOCK_VALUES
+        within = index % Q4K_BLOCK_VALUES
+        decode = q4k_block_values if self._kind == KIND_Q4K else q6k_block_values
+        return decode(self.block(block), within + 1)[within]
+
+    def iter_values(self):
+        decode = q4k_block_values if self._kind == KIND_Q4K else q6k_block_values
+        left = self._n_values
+        for block in range(self._n_blocks):
+            take = min(Q4K_BLOCK_VALUES, left)
+            for value in decode(self.block(block), take):
+                yield value
+            left -= take
+
+    def __iter__(self):
+        return self.iter_values()
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, (PackedQ4K, list, tuple)):
+            if len(other) != self._n_values:
+                return False
+            return all(left == right for left, right in zip(self, other))
+        return NotImplemented
+
+    def __repr__(self) -> str:  # pragma: no cover - только для отладки
+        return f"PackedQ4K(n={self._n_values}, kind={self._kind})"
+
+    def to_packed(self) -> bytes:
+        return self._packed.tobytes()
+
+    def iter_packed(self, chunk: int = STREAM_CHUNK):
+        step = max(1, int(chunk) // self.block_bytes) * self.block_bytes
+        needle = self._n_blocks * self.block_bytes
+        for start in range(0, needle, step):
+            yield self._packed[start:min(start + step, needle)]
+
+
+def _q4k_block_bytes(kind: int) -> int:
+    if kind == KIND_Q4K:
+        return Q4K_BLOCK_BYTES
+    if kind == KIND_Q6K:
+        return Q6K_BLOCK_BYTES
+    raise ValueError(f"не Q4_K/Q6_K kind={kind}")
+
+
+def _q4k_magic(kind: int) -> bytes:
+    return Q4K_MAGIC if kind == KIND_Q4K else Q6K_MAGIC
+
+
+def q4k_segment_header(kind: int, n_values: int) -> tuple[bytes, int]:
+    """Заголовок сегмента kind 6/7 и число блоков (без данных)."""
+    n_values = int(n_values)
+    if n_values <= 0:
+        raise ValueError(f"{KIND_NAMES.get(kind, kind)}: пустой сегмент")
+    n_blocks = n_scale_blocks(n_values, Q4K_BLOCK_VALUES)
+    header = (
+        _q4k_magic(kind)
+        + bytes((Q4K_VERSION, 0))
+        + struct.pack("<Q", n_values)
+        + struct.pack("<I", n_blocks)
+    )
+    return header, n_blocks
+
+
+def encode_q4k_segment(tensor: Tensor) -> bytes:
+    """Собрать сегмент kind 6/7: 18-байтовый заголовок + блоки как есть."""
+    header, n_blocks = q4k_segment_header(tensor.kind, tensor.n_elements)
+    qdata = tensor.qdata
+    assert qdata is not None  # проверено в Tensor
+    if not isinstance(qdata, PackedQ4K):  # pragma: no cover - Tensor оборачивает
+        raise ValueError(f"тензор {tensor.name!r}: qdata не PackedQ4K")
+    blocks = bytes(qdata.to_packed())
+    if len(blocks) != n_blocks * qdata.block_bytes:  # pragma: no cover
+        raise ValueError(f"тензор {tensor.name!r}: блоков не {n_blocks}")
+    return header + blocks
+
+
+def decode_q4k_segment_ex(
+    data: bytes | memoryview, kind: int | None = None
+) -> tuple[PackedQ4K, int]:
+    """Разобрать сегмент kind 6/7: окно блоков (без копии) и kind.
+
+    `kind=None` — взять из magic ("Q4K " -> 6, "Q6K " -> 7). Лишние байты в
+    конце (выравнивание payload'а до 32) игнорируются. Проверяется то же, что
+    в C-загрузчике: version, reserved (обязан быть 0 — это зарезервированное
+    поле, а не маскируемые флаги), n_values и n_blocks.
+    """
+    if len(data) < Q4K_HEADER_SIZE:
+        raise ValueError(
+            f"Q4_K-сегмент короче заголовка: {len(data)} < {Q4K_HEADER_SIZE}"
+        )
+    magic = bytes(data[:4])
+    if magic == Q4K_MAGIC:
+        actual = KIND_Q4K
+    elif magic == Q6K_MAGIC:
+        actual = KIND_Q6K
+    else:
+        raise ValueError(f"чужой magic Q4_K/Q6_K-сегмента: {magic!r}")
+    if kind is not None and kind != actual:
+        raise ValueError(
+            f"сегмент {magic!r} — kind {actual}, а запись говорит kind {kind}"
+        )
+    version = int(data[4])
+    reserved = int(data[5])
+    if version != Q4K_VERSION:
+        raise ValueError(f"неизвестная версия Q4_K-сегмента: {version}")
+    if reserved != 0:
+        raise ValueError(
+            f"Q4_K-сегмент: reserved={reserved}, ожидался 0 (поле "
+            "зарезервировано, а не маска флагов)"
+        )
+    n_values = struct.unpack_from("<Q", data, 6)[0]
+    n_blocks = struct.unpack_from("<I", data, 14)[0]
+    expected_blocks = n_scale_blocks(n_values, Q4K_BLOCK_VALUES)
+    if n_blocks != expected_blocks:
+        raise ValueError(
+            f"в заголовке {KIND_NAMES[actual]} {n_blocks} блоков, ожидалось "
+            f"{expected_blocks} для {n_values} значений (блок "
+            f"{Q4K_BLOCK_VALUES})"
+        )
+    block_bytes = _q4k_block_bytes(actual)
+    expected_len = Q4K_HEADER_SIZE + n_blocks * block_bytes
+    if len(data) < expected_len:
+        raise ValueError(
+            f"{KIND_NAMES[actual]}-сегмент обрезан: {len(data)} байт, "
+            f"ожидалось {expected_len}"
+        )
+    window = PackedQ4K(
+        memoryview(data)[Q4K_HEADER_SIZE:expected_len],
+        0, int(n_values), actual,
+    )
+    return window, actual
+
+
 def quantize_q4(
     values: Iterable[float],
     block_size: int = Q4_SCALE_BLOCK,
@@ -1590,6 +1978,9 @@ def tensor_payload_size(tensor: Tensor) -> int:
         aux_bytes = n_groups * scale_bytes * (2 if tensor.q4_asymmetric else 1)
         header = Q4_HEADER_SIZE + (4 if tensor.q4_asymmetric else 0)
         return header + aux_bytes + n_groups * Q4_GROUP_BYTES
+    if tensor.kind in (KIND_Q4K, KIND_Q6K):
+        n_blocks = n_scale_blocks(tensor.n_elements, Q4K_BLOCK_VALUES)
+        return Q4K_HEADER_SIZE + n_blocks * _q4k_block_bytes(tensor.kind)
     if tensor.kind == KIND_F32:
         return tensor.n_elements * 4
     if tensor.kind in (KIND_F16, KIND_BF16):
@@ -1826,6 +2217,21 @@ def encode_q4_segment(tensor: Tensor) -> bytes:
     эта функция по определению возвращает один `bytes` на весь сегмент.
     """
     return b"".join(iter_q4_payload(tensor))
+
+
+def iter_q4k_payload(tensor: Tensor, chunk: int = STREAM_CHUNK):
+    """Куски payload'а kind 6/7: заголовок и блоки как есть.
+
+    Блоки — те же байты, что в GGUF/сегменте (`PackedQ4K.iter_packed`), поэтому
+    запись в контейнер не перепаковывает веса.
+    """
+    header, _n_blocks = q4k_segment_header(tensor.kind, tensor.n_elements)
+    yield header
+    qdata = tensor.qdata
+    assert qdata is not None  # проверено в Tensor
+    if not isinstance(qdata, PackedQ4K):  # pragma: no cover
+        raise ValueError(f"тензор {tensor.name!r}: qdata не PackedQ4K")
+    yield from qdata.iter_packed(chunk)
 
 
 def decode_q4_segment_ex(
@@ -2081,6 +2487,8 @@ def encode_tensor_payload(tensor: Tensor) -> bytes:
         return encode_int8_segment(tensor)
     if tensor.kind == KIND_Q4:
         return encode_q4_segment(tensor)
+    if tensor.kind in (KIND_Q4K, KIND_Q6K):
+        return encode_q4k_segment(tensor)
     if tensor.data is None:
         raise ValueError(
             f"тензор {tensor.name!r}: нет данных — граф собран без весов, "
@@ -2137,6 +2545,17 @@ def decode_tensor_values(tensor: Tensor, payload: bytes) -> None:
         tensor.scale_dtype = scale_dtype
         tensor.q4_asymmetric = asymmetric
         tensor.q4_mins = mins
+        return
+    if tensor.kind in (KIND_Q4K, KIND_Q6K):
+        qdata, decoded_kind = decode_q4k_segment_ex(payload, tensor.kind)
+        if len(qdata) != tensor.n_elements:
+            raise ValueError(
+                f"тензор {tensor.name!r}: в сегменте {len(qdata)} "
+                f"{tensor.kind_name}-значений, а dims дают {tensor.n_elements}"
+            )
+        tensor.qdata = qdata
+        tensor.kind = decoded_kind
+        tensor.block_size = Q4K_BLOCK_VALUES
         return
     n = tensor.n_elements
     if tensor.kind == KIND_F32:
@@ -2443,6 +2862,8 @@ def _streamed_payload_kind(tensor: Tensor) -> str | None:
         return None
     if tensor.kind == KIND_Q4 and isinstance(tensor.qdata, PackedQ4):
         return "q4"
+    if tensor.kind in (KIND_Q4K, KIND_Q6K) and isinstance(tensor.qdata, PackedQ4K):
+        return "q4k"
     if tensor.kind == KIND_INT8 and isinstance(tensor.qdata, PackedInt8):
         return "int8"
     return None
@@ -2511,6 +2932,10 @@ def write_vtm(
         if streamed == "q4":
             _q4_segment_header(tensor)  # валидация без материализации
             payloads.append(None)
+        elif streamed == "q4k":
+            # kind 6/7: блоки уже байты — проверяем заголовок и размер.
+            q4k_segment_header(tensor.kind, tensor.n_elements)
+            payloads.append(None)
         elif streamed == "int8":
             _int8_segment_header(tensor)
             payloads.append(None)
@@ -2538,7 +2963,7 @@ def write_vtm(
             continue
         tensor.offset = data_size
         tensor.scale_offset = (
-            NO_OFFSET if tensor.kind in (KIND_TRITS, KIND_INT8, KIND_Q4) else 0
+            NO_OFFSET if tensor.kind in PACKED_KINDS else 0
         )
         if tensor.offset % ALIGNMENT:
             raise RuntimeError(  # pragma: no cover - защита от ошибки в align_up
@@ -2608,6 +3033,8 @@ def write_vtm(
                 # Q4-сегмент потоком: заголовок, масштабы, нибблы — куски
                 # прямо из байт сегмента (без bytes на весь тензор).
                 pieces = (
+                    iter_q4k_payload(tensor)
+                    if tensor.kind in (KIND_Q4K, KIND_Q6K) else
                     iter_int8_payload(tensor)
                     if tensor.kind == KIND_INT8 else iter_q4_payload(tensor)
                 )
@@ -2711,6 +3138,11 @@ def _empty_payload_prefix(tensor: Tensor) -> tuple[bytes, int]:
         if tensor.q4_asymmetric:
             header += struct.pack("<I", n_groups)
         return header, size
+    if tensor.kind in (KIND_Q4K, KIND_Q6K):
+        # kind 6/7: заголовок с n_values/n_blocks, блоки — нули (веса 0:
+        # d=0, dmin=0, scales=0 — валидный «пустой» блок).
+        header, _n_blocks = q4k_segment_header(tensor.kind, tensor.n_elements)
+        return header, size
     return b"", size
 
 
@@ -2798,7 +3230,7 @@ def write_vtm_stream(
         prefix, size = _empty_payload_prefix(tensor)
         tensor.offset = data_size
         tensor.scale_offset = (
-            NO_OFFSET if tensor.kind in (KIND_TRITS, KIND_INT8, KIND_Q4) else 0
+            NO_OFFSET if tensor.kind in PACKED_KINDS else 0
         )
         if tensor.offset % ALIGNMENT:  # pragma: no cover - защита от align_up
             raise RuntimeError(
@@ -2920,7 +3352,7 @@ def _payload_extent(
     У KV-кэша (flags & TFLAG_KV_CACHE) payload'а нет: 0 байт, читать нечего.
     """
     if flags & TFLAG_KV_CACHE:
-        if kind in (KIND_TRITS, KIND_INT8, KIND_Q4):
+        if kind in PACKED_KINDS:
             raise ValueError(
                 f"KV-кэш обязан быть fp-тензором, а запись говорит kind={kind}"
             )
@@ -3004,6 +3436,40 @@ def _payload_extent(
             + n_groups * scale_size * (2 if asymmetric else 1)
             + n_groups * Q4_GROUP_BYTES,
             scale_dtype,
+        )
+    if kind in (KIND_Q4K, KIND_Q6K):
+        # Сегмент kind 6/7: заголовок 18 байт + блоки GGML как есть.
+        if start + Q4K_HEADER_SIZE > len(data):
+            raise ValueError("Q4_K/Q6_K-сегмент выходит за конец файла")
+        magic = bytes(data[start:start + 4])
+        expected_magic = _q4k_magic(kind)
+        if magic != expected_magic:
+            raise ValueError(
+                f"чужой magic сегмента kind {kind}: {magic!r} "
+                f"(ожидался {expected_magic!r})"
+            )
+        version = int(data[start + 4])
+        reserved = int(data[start + 5])
+        if version != Q4K_VERSION:
+            raise ValueError(f"неизвестная версия Q4_K-сегмента: {version}")
+        if reserved != 0:
+            raise ValueError(
+                f"Q4_K-сегмент: reserved={reserved}, ожидался 0"
+            )
+        n_values = struct.unpack_from("<Q", data, start + 6)[0]
+        n_blocks = struct.unpack_from("<I", data, start + 14)[0]
+        if n_values != n_elements:
+            raise ValueError(
+                f"в сегменте {n_values} значений, а dims дают {n_elements}"
+            )
+        expected_blocks = n_scale_blocks(n_values, Q4K_BLOCK_VALUES)
+        if n_blocks != expected_blocks:
+            raise ValueError(
+                f"в сегменте {n_blocks} блоков, ожидалось {expected_blocks}"
+            )
+        return (
+            Q4K_HEADER_SIZE + n_blocks * _q4k_block_bytes(kind),
+            None,
         )
     if kind == KIND_F32:
         return n_elements * 4, None
@@ -3109,7 +3575,7 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
             # KV_NO_OFFSET; старый загрузчик до 0101 на нём отказывает, а не
             # читает данные по offset=0 как мусор. Контейнеры без флага
             # (0101 и старше) по-прежнему несут offset=0.
-            if kind in (KIND_TRITS, KIND_INT8, KIND_Q4):
+            if kind in PACKED_KINDS:
                 raise ValueError(f"тензор {name!r}: KV-кэш обязан быть fp-тензором")
             if scale_offset != 0:
                 raise ValueError(
@@ -3193,6 +3659,14 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
                 )
             tensor.scale_offset = NO_OFFSET
             tensor.scale_dtype = scale_dtype or "float32"
+        elif kind in (KIND_Q4K, KIND_Q6K):
+            if scale_offset != NO_OFFSET:
+                raise ValueError(
+                    f"тензор {name!r}: scale_offset={scale_offset}, ожидалось "
+                    f"{NO_OFFSET} (масштабы внутри Q4_K/Q6_K-блока)"
+                )
+            tensor.scale_offset = NO_OFFSET
+            tensor.block_size = Q4K_BLOCK_VALUES
         elif scale_offset != 0:
             raise ValueError(
                 f"тензор {name!r}: scale_offset должен быть 0 для fp-тензора"

@@ -19,6 +19,7 @@
 | [0015](0015-kv-out-of-file.md) | KV-кэши вне файла контейнера и tripwire для старых бинарей | accepted |
 | [0016](0016-vtm-4gib-limit.md) | Предел 4 ГиБ у `.vtm` и что с ним делать | accepted |
 | [0017](0017-q4-kind.md) | kind 5 (Q4_0/Q4_1) без смены версии контейнера | accepted |
+| [0018](0018-q4k-native.md) | kind 6/7 (Q4_K/Q6_K) — блоки GGML как есть | accepted |
 
 ## Правила
 

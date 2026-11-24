@@ -110,6 +110,35 @@ extern "C" {
 #define VTM_Q4_MAGIC_ASYM    "Q4_1"
 #define VTM_Q4_FLAG_F32      0x01u
 
+// --- Q4_K/Q6_K (kind 6/7, задача 0165) ------------------------------------
+//
+// Ollama раздаёт Qwen в Q4_K_M: смесь блоков Q4_K и Q6_K. Переквантовать их
+// в kind 5 — это лишняя ступень потерь (5,1 % rel-RMS, задача 0160), поэтому
+// оба вида хранятся нативно, байт-в-байт как в GGML (ADR 0018).
+//
+// Сегмент по offset, заголовок 18 байт — как у kind 5:
+//   "Q4K "/"Q6K " | version u8 (=1) | reserved u8 (=0)
+//                 | n_values u64 | n_blocks u32
+// затем n_blocks блоков. У Q4_K блок — 144 байта (d fp16, dmin fp16,
+// 12 байт 6-битных scale/min, 128 байт нибблов, 256 значений,
+// w = d*sc*q - dmin*m). У Q6_K блок — 210 байт (ql 128, qh 64,
+// scales 16*int8, d fp16, 256 значений, w = d*sc*(q-32)).
+//
+// `n_blocks = ceil(n_values/256)`, `scale_offset = 0xFFFFFFFF`; хвост
+// последнего блока (n_values не кратно 256) дополняется нулями и читателем
+// игнорируется. Блоки начинаются по смещению 2 mod 4, поэтому d/dmin
+// читаются через memcpy (невыровненный доступ к fp16 не UB, но и не float*).
+#define VTM_Q4K_VERSION        1u
+#define VTM_Q4K_HEADER_SIZE    18u
+#define VTM_Q4K_BLOCK_VALUES   256u
+#define VTM_Q4K_BLOCK_BYTES    144u
+#define VTM_Q4K_MAGIC          "Q4K "
+#define VTM_Q4K_SCALE_SIZE     12u
+#define VTM_Q6K_BLOCK_VALUES   256u
+#define VTM_Q6K_BLOCK_BYTES    210u
+#define VTM_Q6K_MAGIC          "Q6K "
+#define VTM_Q6K_SCALE_COUNT    16u
+
 // --- коды ошибок -----------------------------------------------------------
 typedef enum {
     VTM_OK = 0,
@@ -144,13 +173,18 @@ typedef enum {
     VTM_TENSOR_BF16 = 3,
     // 4 (int8 + масштабы) объявлен в trit.h (VTM_TENSOR_INT8) и читается
     // загрузчиком; 5 — Q4 (Q4_0/Q4_1), см. константы VTM_Q4_* выше.
-    VTM_TENSOR_Q4   = 5
+    VTM_TENSOR_Q4   = 5,
+    // 6 — Q4_K, 7 — Q6_K: блоки GGML как есть (ADR 0018, задача 0165).
+    VTM_TENSOR_Q4K  = 6,
+    VTM_TENSOR_Q6K  = 7
 } vtm_tensor_kind;
 
 typedef enum {
     VTM_LAYOUT_TRT1 = 0,    // offset -> "TRT1"..., масштабы внутри сегмента
     VTM_LAYOUT_RAW  = 1,    // offset -> слова, scale_offset -> масштабы
-    VTM_LAYOUT_Q4   = 2     // kind 5: offset -> "Q4_0"/"Q4_1" сегмент
+    VTM_LAYOUT_Q4   = 2,    // kind 5: offset -> "Q4_0"/"Q4_1" сегмент
+    VTM_LAYOUT_Q4K  = 3,    // kind 6: offset -> "Q4K " сегмент (блоки GGML)
+    VTM_LAYOUT_Q6K  = 4     // kind 7: offset -> "Q6K " сегмент (блоки GGML)
 } vtm_tensor_layout;
 
 // Флаги записи таблицы тензоров (поле reserved u16 по смещению 50).
@@ -198,6 +232,11 @@ typedef struct {
     // отвергается — тихо считать Q4_1 симметрично нельзя.
     const float *q4_mins;
     uint8_t q4_is_asym;
+    // kind 6/7 (Q4_K/Q6_K): блоки GGML как есть (144/210 байт, 256 значений).
+    // Указатель — в mmap или в арену; fp32-материализации нет и здесь.
+    // n_qblocks = ceil(n_elements/256), layout — VTM_LAYOUT_Q4K/Q6K.
+    const uint8_t *qblocks;
+    uint32_t n_qblocks;
 } vtm_tensor;
 
 // --- инструкция ------------------------------------------------------------

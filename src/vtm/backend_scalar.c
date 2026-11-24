@@ -1112,6 +1112,11 @@ extern int vtm_neon_q4_mm_rows(float *y, const uint8_t *q, const float *scales,
 extern int vtm_neon_q4_dequant_row(float *y, const uint8_t *q,
                                    const float *scales, const float *mins,
                                    int64_t base, int cols, int asym);
+// kind 6 (Q4_K): блоки GGML (144 байта на 256 значений), задача 0165.
+extern int vtm_neon_q4k_tmv_rows(float *y, const uint8_t *blocks,
+                                 const float *x, int r0, int r1, int cols);
+extern int vtm_neon_q6k_tmv_rows(float *y, const uint8_t *blocks,
+                                 const float *x, int r0, int r1, int cols);
 #define VTM_Q4_NEON 1
 #else
 #define VTM_Q4_NEON 0
@@ -1849,6 +1854,311 @@ static int softmax_scalar(float *y, const float *x, int rows, int cols,
         }
     }
     return 0;
+}
+
+// --- Q4_K/Q6_K (kind 6/7): блоки GGML на лету (задача 0165) ----------------
+//
+// Контракт — ADR 0018: сегмент несёт блоки GGML байт-в-байт (Q4_K — 144 байта
+// на 256 значений, Q6_K — 210), fp32-материализации нет. Ядро деквантизует
+// один под-блок (32 значения у Q4_K, 16 у Q6_K) в стековый буфер и сразу
+// умножает на активации — пиковая память 256 Б на поток.
+//
+// Арифметика — double, как у kind 5: weight = d*sc*q - dmin*m (Q4_K) или
+// d*sc*(q-32) (Q6_K) считается в double, произведение с активацией — тоже.
+// Это эталон: NEON-путь (backend_neon.c) даёт расхождение порядка 1e-7 на
+// строку, как и у Q4.
+//
+// Раскладка Q4_K: 32-байтовый кусок qs[32k:32k+32] — два под-блока: младшие
+// нибблы дают под-блок 2k (32 значения подряд), старшие — 2k+1.
+// Раскладка Q6_K: 16 под-блоков по 16 значений; для под-блока sub
+// chunk = sub/8, quad = (sub%8)/2 (номер ниббла и сдвиг 2 бит из qh),
+// half = sub%2.
+
+static uint64_t qk_block_bytes(int kind) {
+    return kind == VTM_TENSOR_Q4K ? (uint64_t)VTM_Q4K_BLOCK_BYTES
+                                  : (uint64_t)VTM_Q6K_BLOCK_BYTES;
+}
+
+static double qk_load_f16(const uint8_t *p) {
+    uint16_t h;
+    memcpy(&h, p, sizeof h);
+    return (double)vtm_half_to_float(h);
+}
+
+// 6-битные (scale, min) под-блока Q4_K — get_scale_min_k4 из ggml.
+static void q4k_scale_min(const uint8_t *scales, unsigned j,
+                          unsigned *sc, unsigned *mn) {
+    if (j < 4u) {
+        *sc = (unsigned)scales[j] & 0x3Fu;
+        *mn = (unsigned)scales[j + 4u] & 0x3Fu;
+    } else {
+        *sc = ((unsigned)scales[j + 4u] & 0x0Fu)
+            | (((unsigned)scales[j - 4u] >> 6) << 4);
+        *mn = ((unsigned)scales[j + 4u] >> 4)
+            | (((unsigned)scales[j] >> 6) << 4);
+    }
+}
+
+// Под-блок -> buf (n значений, начиная с off внутри под-блока).
+static void qk_dequant_sub(double *buf, const uint8_t *block, unsigned sub,
+                           unsigned off, int n, int kind) {
+    if (kind == VTM_TENSOR_Q4K) {
+        double d = qk_load_f16(block);
+        double dmin = qk_load_f16(block + 2u);
+        const uint8_t *scales = block + 4u;
+        const uint8_t *qs = block + 16u + (size_t)(sub >> 1) * 32u;
+        unsigned sc, mn;
+        double scale, mnv;
+        int j;
+        q4k_scale_min(scales, sub, &sc, &mn);
+        scale = d * (double)sc;
+        mnv = -(dmin * (double)mn);
+        if (off == 0u && n == 32) {
+            for (j = 0; j < n; j++) {
+                unsigned byte = qs[j];
+                unsigned q = (sub & 1u) ? (byte >> 4) : (byte & 0x0Fu);
+                buf[j] = scale * (double)q + mnv;
+            }
+            return;
+        }
+        for (j = 0; j < n; j++) {
+            unsigned within = off + (unsigned)j;
+            unsigned byte = qs[within];
+            unsigned q = (sub & 1u) ? (byte >> 4) : (byte & 0x0Fu);
+            buf[j] = scale * (double)q + mnv;
+        }
+        return;
+    }
+    {
+        unsigned chunk = sub >> 3, in = sub & 7u;
+        unsigned quad = in >> 1, half = in & 1u;
+        const uint8_t *ql = block + (size_t)chunk * 64u
+                          + (size_t)(quad & 1u) * 32u + (size_t)half * 16u;
+        const uint8_t *qh = block + 128u + (size_t)chunk * 32u
+                          + (size_t)half * 16u;
+        int sc = (int)(int8_t)block[192u + sub];
+        double mult = qk_load_f16(block + 208u) * (double)sc;
+        unsigned shift = quad * 2u;
+        int j;
+        for (j = 0; j < n; j++) {
+            unsigned within = off + (unsigned)j;
+            unsigned byte = ql[within];
+            unsigned nib = (quad >= 2u) ? (byte >> 4) : (byte & 0x0Fu);
+            unsigned q = nib | (((((unsigned)qh[within]) >> shift) & 3u) << 4);
+            buf[j] = mult * ((double)q - 32.0);
+        }
+    }
+}
+
+static double qk_dot_row(const uint8_t *blocks, int64_t base, int k,
+                         const float *v, int stride, int kind) {
+    double buf[32];
+    double acc = 0.0;
+    int j0 = 0, sub_values = (kind == VTM_TENSOR_Q4K) ? 32 : 16;
+
+    while (j0 < k) {
+        int64_t idx = base + (int64_t)j0;
+        uint64_t blk = (uint64_t)idx >> 8;
+        unsigned within = (unsigned)idx & 255u;
+        unsigned sub = within / (unsigned)sub_values;
+        unsigned off = within % (unsigned)sub_values;
+        int n = sub_values - (int)off;
+        const uint8_t *block = blocks + (size_t)blk * (size_t)qk_block_bytes(kind);
+        int t;
+        if (n > k - j0) n = k - j0;
+        qk_dequant_sub(buf, block, sub, off, n, kind);
+        for (t = 0; t < n; t++)
+            acc += buf[t] * (double)v[(size_t)(j0 + t) * (size_t)stride];
+        j0 += n;
+    }
+    return acc;
+}
+
+static void qk_row_double(double *dst, const uint8_t *blocks, int64_t base,
+                          int k, int kind) {
+    double buf[32];
+    int j0 = 0, sub_values = (kind == VTM_TENSOR_Q4K) ? 32 : 16;
+
+    while (j0 < k) {
+        int64_t idx = base + (int64_t)j0;
+        uint64_t blk = (uint64_t)idx >> 8;
+        unsigned within = (unsigned)idx & 255u;
+        unsigned sub = within / (unsigned)sub_values;
+        unsigned off = within % (unsigned)sub_values;
+        int n = sub_values - (int)off;
+        const uint8_t *block = blocks + (size_t)blk * (size_t)qk_block_bytes(kind);
+        int t;
+        if (n > k - j0) n = k - j0;
+        qk_dequant_sub(buf, block, sub, off, n, kind);
+        for (t = 0; t < n; t++) dst[j0 + t] = buf[t];
+        j0 += n;
+    }
+}
+
+// Одна строка kind 6/7 -> y (EMB): у таблицы словаря разворачивается только
+// выбранная строка, в арене fp32-копии нет.
+static int qk_dequant_row_impl(float *y, const uint8_t *blocks, int64_t base,
+                               int cols, int kind) {
+    double buf[32];
+    int j0 = 0, sub_values = (kind == VTM_TENSOR_Q4K) ? 32 : 16;
+
+    if (!y || !blocks || cols < 0 || base < 0) return -1;
+    while (j0 < cols) {
+        int64_t idx = base + (int64_t)j0;
+        uint64_t blk = (uint64_t)idx >> 8;
+        unsigned within = (unsigned)idx & 255u;
+        unsigned sub = within / (unsigned)sub_values;
+        unsigned off = within % (unsigned)sub_values;
+        int n = sub_values - (int)off;
+        const uint8_t *block = blocks + (size_t)blk * (size_t)qk_block_bytes(kind);
+        int t;
+        if (n > cols - j0) n = cols - j0;
+        qk_dequant_sub(buf, block, sub, off, n, kind);
+        for (t = 0; t < n; t++) y[j0 + t] = (float)buf[t];
+        j0 += n;
+    }
+    return 0;
+}
+
+typedef struct {
+    float *y;
+    const uint8_t *blocks;
+    const float *x;
+    int cols;
+    int kind;
+} qk_tmv_job;
+
+typedef struct {
+    float *y;
+    const uint8_t *blocks;
+    const float *b;
+    int k;
+    int n;
+    int kind;
+    double *rowbuf;
+} qk_mm_job;
+
+static void qk_tmv_rows(qk_tmv_job *j, int tid, int r0, int r1) {
+    int r;
+    (void)tid;
+    for (r = r0; r < r1; r++) {
+        int64_t base = (int64_t)r * (int64_t)j->cols;
+        j->y[r] = (float)qk_dot_row(j->blocks, base, j->cols, j->x, 1, j->kind);
+    }
+}
+
+static void qk_tmv_worker(void *p, int tid, int r0, int r1) {
+    qk_tmv_rows((qk_tmv_job *)p, tid, r0, r1);
+}
+
+static void qk_mm_rows(qk_mm_job *j, int tid, int r0, int r1) {
+    int r, c;
+    double *wrow = j->rowbuf + (size_t)tid * (size_t)j->k;
+
+    for (r = r0; r < r1; r++) {
+        int64_t base = (int64_t)r * (int64_t)j->k;
+        float *yrow = j->y + (size_t)r * (size_t)j->n;
+        qk_row_double(wrow, j->blocks, base, j->k, j->kind);
+        for (c = 0; c < j->n; c++) {
+            double acc = 0.0;
+            int t;
+            for (t = 0; t < j->k; t++)
+                acc += wrow[t] * (double)j->b[(size_t)t * (size_t)j->n
+                                              + (size_t)c];
+            yrow[c] = (float)acc;
+        }
+    }
+}
+
+static void qk_mm_worker(void *p, int tid, int r0, int r1) {
+    qk_mm_rows((qk_mm_job *)p, tid, r0, r1);
+}
+
+#if VTM_Q4_NEON
+// NEON-откат при ошибке ядра — тот же скалярный эталон.
+static void qk_tmv_neon_worker(void *p, int tid, int r0, int r1) {
+    qk_tmv_job *j = (qk_tmv_job *)p;
+    if (j->kind == VTM_TENSOR_Q4K) {
+        if (vtm_neon_q4k_tmv_rows(j->y, j->blocks, j->x, r0, r1, j->cols) == 0)
+            return;
+    } else if (vtm_neon_q6k_tmv_rows(j->y, j->blocks, j->x, r0, r1,
+                                     j->cols) == 0) {
+        return;
+    }
+    qk_tmv_rows(j, tid, r0, r1);
+}
+#endif
+
+static int qk_tmv(float *y, const uint8_t *blocks, const float *x, int rows,
+                  int cols, int kind) {
+    qk_tmv_job job;
+    vtm_rows_fn fn = qk_tmv_worker;
+
+    if (!y || !blocks || !x || rows < 0 || cols < 0) return -1;
+    if (rows == 0 || cols == 0) return 0;
+    job.y = y;
+    job.blocks = blocks;
+    job.x = x;
+    job.cols = cols;
+    job.kind = kind;
+#if VTM_Q4_NEON
+    if (q4_simd_enabled() && vtm_simd_available())
+        fn = qk_tmv_neon_worker;
+#endif
+    vtm_parallel_rows(rows, (double)rows * (double)cols, fn, &job);
+    return 0;
+}
+
+static int qk_mm(float *y, const uint8_t *blocks, const float *b, int m, int k,
+                 int n, int kind) {
+    qk_mm_job job;
+    int vt;
+
+    if (!y || !blocks || !b || m < 0 || k < 0 || n < 0) return -1;
+    if (m == 0 || k == 0 || n == 0) return 0;
+    if (n == 1) return qk_tmv(y, blocks, b, m, k, kind);
+    vt = vtm_threads();
+    job.y = y;
+    job.blocks = blocks;
+    job.b = b;
+    job.k = k;
+    job.n = n;
+    job.kind = kind;
+    job.rowbuf = (double *)malloc((size_t)vt * (size_t)k * sizeof(double));
+    if (!job.rowbuf) return -1;
+    vtm_parallel_rows(m, (double)m * (double)k * (double)n, qk_mm_worker, &job);
+    free(job.rowbuf);
+    return 0;
+}
+
+int vtm_q4k_tmv(float *y, const uint8_t *blocks, const float *x, int rows,
+                int cols) {
+    return qk_tmv(y, blocks, x, rows, cols, VTM_TENSOR_Q4K);
+}
+
+int vtm_q4k_mm(float *y, const uint8_t *blocks, const float *b, int m, int k,
+               int n) {
+    return qk_mm(y, blocks, b, m, k, n, VTM_TENSOR_Q4K);
+}
+
+int vtm_q4k_dequant_row(float *y, const uint8_t *blocks, int64_t base,
+                        int cols) {
+    return qk_dequant_row_impl(y, blocks, base, cols, VTM_TENSOR_Q4K);
+}
+
+int vtm_q6k_tmv(float *y, const uint8_t *blocks, const float *x, int rows,
+                int cols) {
+    return qk_tmv(y, blocks, x, rows, cols, VTM_TENSOR_Q6K);
+}
+
+int vtm_q6k_mm(float *y, const uint8_t *blocks, const float *b, int m, int k,
+               int n) {
+    return qk_mm(y, blocks, b, m, k, n, VTM_TENSOR_Q6K);
+}
+
+int vtm_q6k_dequant_row(float *y, const uint8_t *blocks, int64_t base,
+                        int cols) {
+    return qk_dequant_row_impl(y, blocks, base, cols, VTM_TENSOR_Q6K);
 }
 
 // --- публичные описатели бэкендов -----------------------------------------
