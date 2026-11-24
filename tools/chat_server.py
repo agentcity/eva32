@@ -255,6 +255,21 @@ def default_registry(
     ВТМ-модели добавляются только если файл существует: иначе выбор в UI
     предлагал бы заведомо нерабочий вариант. Порядок фиксирован.
     """
+    vtm = _build_vtm_specs(vtm_tokenizer)
+    catalog = tuple(ollama_models) if ollama_models is not None else DEFAULT_OLLAMA_MODELS
+    ollama = tuple(
+        ModelSpec(id=name, label=label, target=name) for name, label in catalog
+    )
+    return (
+        BackendSpec(id="vtm", label="ВТМ (локальная)", kind="vtm", models=tuple(vtm)),
+        BackendSpec(
+            id="ollama", label="Ollama (Qwen)", kind="ollama", models=ollama
+        ),
+    )
+
+
+def _build_vtm_specs(vtm_tokenizer: str | None) -> list[ModelSpec]:
+    """Собрать ВТМ-модели из файлов на диске (без кэша — вызов дешёвый)."""
     vtm: list[ModelSpec] = []
     for path in _discover_vtm_models():
         relative = path.relative_to(ROOT).as_posix()
@@ -266,17 +281,7 @@ def default_registry(
                 tokenizer=_resolve_tokenizer(path, vtm_tokenizer),
             )
         )
-
-    catalog = tuple(ollama_models) if ollama_models is not None else DEFAULT_OLLAMA_MODELS
-    ollama = tuple(
-        ModelSpec(id=name, label=label, target=name) for name, label in catalog
-    )
-    return (
-        BackendSpec(id="vtm", label="ВТМ (локальная)", kind="vtm", models=tuple(vtm)),
-        BackendSpec(
-            id="ollama", label="Ollama (Qwen)", kind="ollama", models=ollama
-        ),
-    )
+    return vtm
 
 
 # --------------------------------------------------------------------------- #
@@ -1115,11 +1120,46 @@ def _model_card(
     return card
 
 
+
+def _live_model(backend: BackendSpec, model: ModelSpec) -> bool:
+    """Модель реально доступна прямо сейчас.
+
+    Реестр собирается один раз при старте, но модели удаляются (чистка
+    нерабочих артефактов) и появляются новые. Поэтому перед отдачей в UI
+    проверяем файл: удалённые не показываем, иначе список превращается в
+    кладбище. Для Ollama проверка ленивая — живой список даёт /api/ps.
+    """
+    if backend.kind != "vtm":
+        return True
+    return bool(model.target) and os.path.isfile(model.target)
+
+
+def _refresh_registry(server: "ChatHTTPServer") -> tuple[BackendSpec, ...]:
+    """Пересобрать ВТМ-часть реестра из файлов (дёшево: glob + stat)."""
+    if not getattr(server, "dynamic_models", False):
+        return tuple(server.registry)
+    vtm = _build_vtm_specs(getattr(server, "vtm_tokenizer", None))
+    merged: list[BackendSpec] = []
+    for backend in server.registry:
+        if backend.kind == "vtm":
+            merged.append(BackendSpec(id=backend.id, label=backend.label,
+                                      kind="vtm", models=tuple(vtm)))
+        else:
+            merged.append(backend)
+    server.registry = tuple(merged)
+    return server.registry
+
+
 def _model_cards(server: "ChatHTTPServer") -> dict[str, Any]:
     """Карточки всех моделей реестра; последние ответы — из памяти сервера."""
     cards: list[dict[str, Any]] = []
-    for backend in server.registry:
+    for backend in _refresh_registry(server):
         for model in backend.models:
+            # В реальном сервере удалённые файлы не показываем (иначе список
+            # превращается в кладбище после чистки); тесты передают свой реестр
+            # и должны видеть карточки отсутствующих моделей с present=false.
+            if getattr(server, "dynamic_models", False) and not _live_model(backend, model):
+                continue
             key = (backend.id, model.id)
             cards.append(
                 _model_card(
@@ -2329,8 +2369,12 @@ class ChatHTTPServer(ThreadingHTTPServer):
         adapters: Mapping[tuple[str, str], Any],
         system_prompt: str,
         max_tokens: int,
+        dynamic_models: bool = False,
+        vtm_tokenizer: str | None = None,
     ) -> None:
         self.registry = tuple(registry)
+        self.dynamic_models = bool(dynamic_models)
+        self.vtm_tokenizer = vtm_tokenizer
         self.adapters = dict(adapters)
         self.system_prompt = system_prompt
         self.max_tokens = max(1, int(max_tokens))
