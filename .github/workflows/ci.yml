@@ -73,6 +73,12 @@ jobs:
       - name: VTM docs (tools/check_vtm_docs.py)
         run: python3 tools/check_vtm_docs.py
 
+      # Свежесть документации (0164): у каждого docs/*.md, кроме adr/, есть
+      # «Актуально на ГГГГ-ММ-ДД»; старше 30 дней или дата из будущего — красный.
+      # Там же проверяются ссылки docs/ и README (0 битых).
+      - name: Docs freshness (tools/check_docs_dates.py)
+        run: python3 tools/check_docs_dates.py
+
       # Всё то же одной командой плюс проверка «Python-набор проходит после
       # make clean». Шаги выше дают точную локализацию падения, этот —
       # повторяемость на чистом дереве.

@@ -1,5 +1,7 @@
 # Голосовой прототип: ASR → eva → TTS
 
+> Актуально на 2026-11-24.
+
 - Статус: рабочий прототип, проверен на macOS (Apple Silicon)
 - Задача: [`ai/tasks/0032-eva-voice.md`](../ai/tasks/0032-eva-voice.md)
 - Решение: [`docs/adr/0010-voice-pipeline.md`](adr/0010-voice-pipeline.md)
