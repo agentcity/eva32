@@ -1027,5 +1027,19 @@
     "status": "done",
     "file": "0155-stream-q4-writer.md",
     "assignee": "agent:stream-q4"
+  },
+  {
+    "id": "0156",
+    "title": "7B Q4 в 4 ГиБ: fp16-масштабы и тритовый эмбеддинг",
+    "status": "in_progress",
+    "file": "0156-q4-7b.md",
+    "assignee": "agent:q4-7b"
+  },
+  {
+    "id": "0157",
+    "title": "Q4-ядра: NEON и батчинг — 0,2 ток/с не годятся",
+    "status": "in_progress",
+    "file": "0157-q4-neon.md",
+    "assignee": "agent:q4-neon"
   }
 ]
