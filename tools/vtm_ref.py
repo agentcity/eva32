@@ -585,7 +585,7 @@ class Tensor:
     dims: tuple[int, ...]
     data: list[float] | None = None
     trits: list[int] | None = None
-    scales: list[float] | None = None
+    scales: list[float] | PackedF32 | None = None
     scale_dtype: str = "float32"
     block_size: int = SCALE_BLOCK
     offset: int = 0
@@ -598,10 +598,11 @@ class Tensor:
     storage: str = STORAGE_PACKED20
     #: kind 4: знаковые значения int8 (-127..127). В файл идут байтами,
     #: в памяти плотные значения считаются как q · scale (`dense()`).
-    qdata: list[int] | None = None
+    #: У kind 5 это `PackedQ4` (окно в байты сегмента) — см. `Tensor.q4`.
+    qdata: list[int] | PackedQ4 | PackedInt8 | None = None
     #: kind 5: Q4_1 — по одному min (нулю квантования) на группу 32;
-    #: у Q4_0 (симметричный) `None`.
-    q4_mins: list[float] | None = None
+    #: у Q4_0 (симметричный) `None`. Может быть `PackedF32` (без списка).
+    q4_mins: list[float] | PackedF32 | None = None
     #: kind 5: False — Q4_0 (`(q-8)·scale`), True — Q4_1 (`q·scale + min`).
     q4_asymmetric: bool = False
 
@@ -698,12 +699,15 @@ class Tensor:
                         f"тензор {self.name!r}: {len(self.qdata)} int8-значений, "
                         f"а dims дают {self.n_elements}"
                     )
-                for value in self.qdata:
-                    if not INT8_MIN <= int(value) <= INT8_MAX:
-                        raise ValueError(
-                            f"тензор {self.name!r}: int8-значение {value!r} "
-                            f"вне {INT8_MIN}..{INT8_MAX}"
-                        )
+                if not isinstance(self.qdata, PackedInt8):
+                    # У `PackedInt8` диапазон проверен при разборе сегмента
+                    # (`first_below`): обход 311 млн значений не нужен.
+                    for value in self.qdata:
+                        if not INT8_MIN <= int(value) <= INT8_MAX:
+                            raise ValueError(
+                                f"тензор {self.name!r}: int8-значение {value!r} "
+                                f"вне {INT8_MIN}..{INT8_MAX}"
+                            )
                 if self.scales is None:
                     raise ValueError(f"тензор {self.name!r}: int8 без масштабов")
                 expected = n_scale_blocks(self.n_elements, self.block_size)
@@ -712,11 +716,18 @@ class Tensor:
                         f"тензор {self.name!r}: масштабов {len(self.scales)}, "
                         f"ожидалось {expected}"
                     )
-                _check_finite(self.scales, f"тензор {self.name!r}: масштаб")
-                if any(s < 0 for s in self.scales):
-                    raise ValueError(
-                        f"тензор {self.name!r}: масштаб не может быть отрицательным"
+                if isinstance(self.scales, PackedF32):
+                    # Окно в байты сегмента: один проход, без списков.
+                    self.scales.check_finite_nonneg(
+                        f"тензор {self.name!r}: масштаб"
                     )
+                else:
+                    _check_finite(self.scales, f"тензор {self.name!r}: масштаб")
+                    if any(s < 0 for s in self.scales):
+                        raise ValueError(
+                            f"тензор {self.name!r}: масштаб не может быть "
+                            "отрицательным"
+                        )
             elif self.scales is not None:
                 raise ValueError(
                     f"тензор {self.name!r}: int8-масштабы без qdata"
@@ -742,12 +753,15 @@ class Tensor:
                         f"тензор {self.name!r}: {len(self.qdata)} Q4-значений, "
                         f"а dims дают {self.n_elements}"
                     )
-                for value in self.qdata:
-                    if not Q4_MIN <= int(value) <= Q4_MAX:
-                        raise ValueError(
-                            f"тензор {self.name!r}: Q4-значение {value!r} "
-                            f"вне {Q4_MIN}..{Q4_MAX}"
-                        )
+                if not isinstance(self.qdata, PackedQ4):
+                    # У `PackedQ4` значение — ниббл байта, то есть 0..15 по
+                    # построению; обход 2,77 млрд значений был бы минутами.
+                    for value in self.qdata:
+                        if not Q4_MIN <= int(value) <= Q4_MAX:
+                            raise ValueError(
+                                f"тензор {self.name!r}: Q4-значение {value!r} "
+                                f"вне {Q4_MIN}..{Q4_MAX}"
+                            )
                 expected = n_scale_blocks(self.n_elements, Q4_SCALE_BLOCK)
                 if self.scales is None:
                     raise ValueError(f"тензор {self.name!r}: Q4 без масштабов")
@@ -756,11 +770,18 @@ class Tensor:
                         f"тензор {self.name!r}: масштабов {len(self.scales)}, "
                         f"ожидалось {expected}"
                     )
-                _check_finite(self.scales, f"тензор {self.name!r}: масштаб")
-                if any(s < 0 for s in self.scales):
-                    raise ValueError(
-                        f"тензор {self.name!r}: масштаб не может быть отрицательным"
+                if isinstance(self.scales, PackedF32):
+                    # Окно в байты сегмента: один проход, без списков.
+                    self.scales.check_finite_nonneg(
+                        f"тензор {self.name!r}: масштаб"
                     )
+                else:
+                    _check_finite(self.scales, f"тензор {self.name!r}: масштаб")
+                    if any(s < 0 for s in self.scales):
+                        raise ValueError(
+                            f"тензор {self.name!r}: масштаб не может быть "
+                            "отрицательным"
+                        )
                 if self.q4_asymmetric:
                     if self.q4_mins is None:
                         raise ValueError(
@@ -884,8 +905,16 @@ class Tensor:
             name=name,
             kind=KIND_INT8,
             dims=tuple(dims),
-            qdata=[int(value) for value in qdata],
-            scales=[_f32(float(value)) for value in scales],
+            # Окна (`PackedInt8`/`PackedF32`) не материализуются: у 3B таблица
+            # словаря — 311 млн значений, это ~2,5 ГиБ списком.
+            qdata=(
+                qdata if isinstance(qdata, PackedInt8)
+                else [int(value) for value in qdata]
+            ),
+            scales=(
+                scales if isinstance(scales, PackedF32)
+                else [_f32(float(value)) for value in scales]
+            ),
             scale_dtype=scale_dtype,
         )
 
@@ -906,17 +935,28 @@ class Tensor:
         `asymmetric=False` — Q4_0 (`w = (q-8)·scale`); `True` — Q4_1
         (`w = q·scale + min`, `mins` обязательны и по числу равны scales).
         """
+        # Ленивые окна (`PackedQ4`/`PackedF32`) не материализуются: у 3B Q4
+        # список нибблов — это ~22 ГиБ, список fp32-масштабов — ещё ~2,8 ГиБ.
+        # Окна уже ссылаются на байты сегмента, а их числа — точные float32,
+        # поэтому `_f32` для них не меняет значение.
         return cls(
             name=name,
             kind=KIND_Q4,
             dims=tuple(dims),
-            qdata=[int(value) for value in qdata],
-            scales=[_f32(float(value)) for value in scales],
+            qdata=(
+                qdata if isinstance(qdata, PackedQ4)
+                else [int(value) for value in qdata]
+            ),
+            scales=(
+                scales if isinstance(scales, PackedF32)
+                else [_f32(float(value)) for value in scales]
+            ),
             scale_dtype=scale_dtype,
             q4_asymmetric=bool(asymmetric),
             q4_mins=(
-                [_f32(float(value)) for value in mins]
-                if mins is not None else None
+                mins if isinstance(mins, PackedF32)
+                else ([_f32(float(value)) for value in mins]
+                      if mins is not None else None)
             ),
         )
 
@@ -1017,29 +1057,329 @@ def quantize_trits(
     return trits, scales
 
 
+#: Порция при потоковой записи (байт); 1 МиБ — компромисс между числом
+#: системных вызовов и лишней памятью. Объявлена здесь, потому что её
+#: используют и ленивые Q4-последовательности (`PackedQ4.iter_packed`).
+STREAM_CHUNK = 1 << 20
+
+
+def _pack_q4_group(values: Sequence[int], pad: int) -> bytes:
+    """Одна группа из ≤32 нибблов: байт `j` = значение `j` + `j+16 << 4`."""
+    out = bytearray(Q4_GROUP_BYTES)
+    n = len(values)
+    for within in range(Q4_SCALE_BLOCK):
+        value = int(values[within]) if within < n else int(pad)
+        offset = within & 15
+        if within < 16:
+            out[offset] |= value
+        else:
+            out[offset] |= value << 4
+    return bytes(out)
+
+
+class PackedF32(Sequence[float]):
+    """Последовательность fp32 поверх байт контейнера — без list на весь тензор.
+
+    У 3B Q4 масштаб на каждую группу 32 — это 86,6 млн значений: `list[float]`
+    занял бы ~2,8 ГиБ, а представление здесь — просто окно в те же байты
+    (масштабы уже лежат в сегменте). Чтение отдаёт float, `to_bytes()` —
+    исходные байты (little-endian), поэтому сегмент переписывается побайтово.
+    """
+
+    __slots__ = ("_view", "_raw", "_n_values")
+
+    def __init__(self, data: Any, offset: int, n_values: int) -> None:
+        n_values = int(n_values)
+        if n_values < 0:
+            raise ValueError("PackedF32: отрицательное число значений")
+        needle = n_values * 4
+        chunk = memoryview(data)[offset:offset + needle]
+        if len(chunk) != needle:
+            raise ValueError(
+                f"PackedF32: обрезано {len(chunk)} из {needle} байт"
+            )
+        self._raw = chunk
+        if sys.byteorder == "little":
+            self._view = chunk.cast("f")
+        else:  # pragma: no cover - экзотическая платформа
+            import array as _array
+
+            decoded = _array.array("f")
+            decoded.frombytes(chunk)
+            decoded.byteswap()
+            self._view = decoded
+        self._n_values = n_values
+
+    def __len__(self) -> int:
+        return self._n_values
+
+    def __getitem__(self, index: Any) -> Any:
+        if isinstance(index, slice):
+            return [float(value) for value in self._view[index]]
+        return float(self._view[index])
+
+    def __iter__(self):
+        return iter(self._view)
+
+    def to_bytes(self) -> bytes:
+        """Байты fp32 в порядке little-endian (ровно как в контейнере)."""
+        # `_raw` — исходный срез байт сегмента: на любом порядке байт хоста
+        # это ровно те байты, что лежат в файле.
+        return self._raw.tobytes()
+
+    def iter_chunks(self, chunk: int = 1 << 20):
+        """Куски исходных байт без копии — для потоковой записи."""
+        step = max(4, (int(chunk) // 4) * 4)
+        raw = self._raw
+        needle = self._n_values * 4
+        for start in range(0, needle, step):
+            yield raw[start:min(start + step, needle)]
+
+    def check_finite_nonneg(self, what: str) -> None:
+        """Один проход: конечность и неотрицательность (как в Tensor/сегменте)."""
+        bad_finite = -1
+        bad_negative = -1
+        for index, value in enumerate(self._view):
+            if bad_finite < 0 and not math.isfinite(value):
+                bad_finite = index
+            elif bad_negative < 0 and value < 0:
+                bad_negative = index
+            if bad_finite >= 0 and bad_negative >= 0:
+                break
+        if bad_finite >= 0:
+            raise ValueError(
+                f"{what}: неконечное значение {float(self._view[bad_finite])!r}"
+            )
+        if bad_negative >= 0:
+            raise ValueError(f"{what} не может быть отрицательным")
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, (PackedF32, list, tuple)):
+            if len(other) != self._n_values:
+                return False
+            return all(left == right for left, right in zip(self, other))
+        return NotImplemented
+
+    def __repr__(self) -> str:  # pragma: no cover - только для отладки
+        return f"PackedF32(n={self._n_values})"
+
+
+class PackedQ4(Sequence[int]):
+    """Нибблы Q4 поверх уже упакованных байт: `list[int]` на весь тензор не нужен.
+
+    У 3B Q4 это 2,77 млрд значений (~22 ГиБ списком Python) — поэтому
+    `decode_q4_segment_ex` отдаёт это окно, а не список. Раскладка групп —
+    как в `pack_q4`/GGML Q4_0, поэтому запись сегмента — копирование байт:
+    ни распаковка в нибблы, ни повторная упаковка не нужны.
+
+    `Sequence[int]` сохраняет совместимость: `len`, индексация, срезы,
+    итерация и сравнение со списком работают как раньше (для мелких тензоров
+    разница не видна).
+    """
+
+    __slots__ = ("_packed", "_n_values")
+
+    def __init__(self, packed: Any, n_values: int) -> None:
+        n_values = int(n_values)
+        if n_values < 0:
+            raise ValueError("Q4: отрицательное число значений")
+        n_groups = n_scale_blocks(n_values, Q4_SCALE_BLOCK)
+        needle = n_groups * Q4_GROUP_BYTES
+        view = memoryview(packed)[:needle]
+        if len(view) != needle:
+            raise ValueError(
+                f"Q4-данные обрезаны: {len(view)} байт, ожидалось {needle} "
+                f"({n_groups} групп по {Q4_SCALE_BLOCK})"
+            )
+        self._packed = view
+        self._n_values = n_values
+
+    @classmethod
+    def from_segment(cls, data: Any, offset: int, n_values: int) -> "PackedQ4":
+        """Окно на упакованные нибблы сегмента (без копирования байт)."""
+        n_groups = n_scale_blocks(int(n_values), Q4_SCALE_BLOCK)
+        needle = n_groups * Q4_GROUP_BYTES
+        view = memoryview(data)[offset:offset + needle]
+        if len(view) != needle:
+            raise ValueError(
+                f"Q4-данные обрезаны: {len(view)} байт, ожидалось {needle}"
+            )
+        return cls(view, n_values)
+
+    def __len__(self) -> int:
+        return self._n_values
+
+    def __getitem__(self, index: Any) -> Any:
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(self._n_values))]
+        index = int(index)
+        n_values = self._n_values
+        if index < 0:
+            index += n_values
+        if not 0 <= index < n_values:
+            raise IndexError(f"Q4: индекс {index} вне 0..{n_values - 1}")
+        within = index & (Q4_SCALE_BLOCK - 1)
+        byte = self._packed[(index >> 5) * Q4_GROUP_BYTES + (within & 15)]
+        return (byte & 0x0F) if within < 16 else (byte >> 4)
+
+    def __iter__(self):
+        packed = self._packed
+        n_values = self._n_values
+        full_groups = n_values // Q4_SCALE_BLOCK
+        for group in range(full_groups):
+            base = group * Q4_GROUP_BYTES
+            # Сначала младшие нибблы (значения 0..15), затем старшие (16..31):
+            # порядок значений, а не порядок байт.
+            for within in range(16):
+                yield packed[base + within] & 0x0F
+            for within in range(16):
+                yield packed[base + within] >> 4
+        for index in range(full_groups * Q4_SCALE_BLOCK, n_values):
+            yield self[index]
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, (PackedQ4, list, tuple)):
+            if len(other) != self._n_values:
+                return False
+            return all(left == right for left, right in zip(self, other))
+        return NotImplemented
+
+    def __repr__(self) -> str:  # pragma: no cover - только для отладки
+        return f"PackedQ4(n={self._n_values})"
+
+    # -- запись ---------------------------------------------------------------
+
+    def _last_group_bytes(self) -> bytes:
+        """Последняя группа с padding-нибблом 8 — ровно как `pack_q4`."""
+        groups = n_scale_blocks(self._n_values, Q4_SCALE_BLOCK)
+        start = (groups - 1) * Q4_SCALE_BLOCK
+        return _pack_q4_group(
+            [self[index] for index in range(start, self._n_values)],
+            Q4_ZERO_NIBBLE,
+        )
+
+    def to_packed(self) -> bytes:
+        """Упакованные байты (с padding'ом хвоста, как у `pack_q4`)."""
+        if self._n_values % Q4_SCALE_BLOCK == 0:
+            return self._packed.tobytes()
+        out = bytearray(self._packed.tobytes())
+        out[-Q4_GROUP_BYTES:] = self._last_group_bytes()
+        return bytes(out)
+
+    def iter_packed(self, chunk: int = STREAM_CHUNK):
+        """Куски упакованных байт без копии — для потоковой записи сегмента."""
+        full_groups = self._n_values // Q4_SCALE_BLOCK
+        step = max(1, int(chunk) // Q4_GROUP_BYTES)
+        group = 0
+        while group < full_groups:
+            take = min(step, full_groups - group)
+            yield self._packed[
+                group * Q4_GROUP_BYTES:(group + take) * Q4_GROUP_BYTES
+            ]
+            group += take
+        if self._n_values % Q4_SCALE_BLOCK:
+            yield self._last_group_bytes()
+
+
+class PackedInt8(Sequence[int]):
+    """int8-значения поверх байт сегмента: без `list[int]` на весь тензор.
+
+    У 3B таблица словаря — это 311 млн int8-значений: `list[int]` занял бы
+    ~2,5 ГиБ (плюс столько же при копировании в `Tensor.int8`), хотя байты
+    уже лежат в `non_ternary.bin`. Окно отдаёт те же числа и те же байты.
+    """
+
+    __slots__ = ("_view", "_n_values")
+
+    def __init__(self, data: Any, offset: int, n_values: int) -> None:
+        n_values = int(n_values)
+        if n_values < 0:
+            raise ValueError("INT8: отрицательное число значений")
+        chunk = memoryview(data)[offset:offset + n_values]
+        if len(chunk) != n_values:
+            raise ValueError(
+                f"INT8-данные обрезаны: {len(chunk)} байт, ожидалось {n_values}"
+            )
+        # 'b' — знаковый байт: -128..127, как struct '<b'.
+        self._view = chunk.cast("b")
+        self._n_values = n_values
+
+    @classmethod
+    def from_segment(cls, data: Any, offset: int,
+                     n_values: int) -> "PackedInt8":
+        return cls(data, offset, n_values)
+
+    def __len__(self) -> int:
+        return self._n_values
+
+    def __getitem__(self, index: Any) -> Any:
+        if isinstance(index, slice):
+            return [int(value) for value in self._view[index]]
+        return int(self._view[index])
+
+    def __iter__(self):
+        return (int(value) for value in self._view)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, (PackedInt8, list, tuple)):
+            if len(other) != self._n_values:
+                return False
+            return all(left == right for left, right in zip(self, other))
+        return NotImplemented
+
+    def __repr__(self) -> str:  # pragma: no cover - только для отладки
+        return f"PackedInt8(n={self._n_values})"
+
+    def to_bytes(self) -> bytes:
+        """Байты q-значений (дополнительный код, как в контейнере)."""
+        return self._view.tobytes()
+
+    def iter_chunks(self, chunk: int = STREAM_CHUNK):
+        """Куски q-байт без копии — для потоковой записи."""
+        step = max(1, int(chunk))
+        view = self._view
+        for start in range(0, self._n_values, step):
+            yield view[start:start + step]
+
+    def first_below(self, limit: int) -> int:
+        """Индекс первого значения < limit (или -1): для сообщения об ошибке."""
+        view = self._view
+        for index in range(self._n_values):
+            if view[index] < limit:
+                return index
+        return -1
+
+
 def pack_q4(values: Iterable[int], pad: int = Q4_ZERO_NIBBLE) -> bytes:
     """Упаковать нибблы 0..15 в группы по 32 значения (16 байт на группу).
 
     Раскладка — как в GGML Q4_0 и в ядрах 0152: байт `j` группы хранит
     значение `j` в младшем ниббле, `j+16` — в старшем. Хвост последней
     группы дополняется нибблом `pad` (по умолчанию 8 — ноль Q4_0).
+
+    Память — одна группа на ходу (у `PackedQ4` — вообще копия байт): список
+    значений на весь тензор не материализуется, иначе 3B Q4 требует ~22 ГиБ.
     """
-    vals = [int(value) for value in values]
-    for index, value in enumerate(vals):
-        if not Q4_MIN <= value <= Q4_MAX:
-            raise ValueError(f"Q4: значение #{index} = {value} вне {Q4_MIN}..{Q4_MAX}")
+    if isinstance(values, PackedQ4) and int(pad) == Q4_ZERO_NIBBLE:
+        return values.to_packed()
     if not Q4_MIN <= int(pad) <= Q4_MAX:
         raise ValueError(f"Q4: padding-ниббл {pad} вне {Q4_MIN}..{Q4_MAX}")
-    n_groups = n_scale_blocks(len(vals), Q4_SCALE_BLOCK)
-    out = bytearray(n_groups * Q4_GROUP_BYTES)
-    for index in range(n_groups * Q4_SCALE_BLOCK):
-        group, within = divmod(index, Q4_SCALE_BLOCK)
-        value = vals[index] if index < len(vals) else int(pad)
-        offset = group * Q4_GROUP_BYTES + (within & 15)
-        if within < 16:
-            out[offset] |= value
-        else:
-            out[offset] |= value << 4
+    out = bytearray()
+    group: list[int] = []
+    index = 0
+    for value in values:
+        value = int(value)
+        if not Q4_MIN <= value <= Q4_MAX:
+            raise ValueError(
+                f"Q4: значение #{index} = {value} вне {Q4_MIN}..{Q4_MAX}"
+            )
+        group.append(value)
+        index += 1
+        if len(group) == Q4_SCALE_BLOCK:
+            out += _pack_q4_group(group, pad)
+            group.clear()
+    if group:
+        out += _pack_q4_group(group, pad)
     return bytes(out)
 
 
@@ -1216,8 +1556,8 @@ def tensor_payload_size(tensor: Tensor) -> int:
     raise ValueError(f"тензор {tensor.name!r}: неизвестный kind={tensor.kind}")
 
 
-def encode_int8_segment(tensor: Tensor) -> bytes:
-    """Собрать INT8-сегмент: 18-байтовый заголовок + масштабы + q-байты."""
+def _int8_segment_header(tensor: Tensor) -> tuple[bytes, int]:
+    """Проверить int8-тензор и собрать заголовок сегмента (без данных)."""
     if tensor.kind != KIND_INT8:
         raise ValueError(f"тензор {tensor.name!r}: это не int8")
     if tensor.qdata is None or tensor.scales is None:
@@ -1238,20 +1578,61 @@ def encode_int8_segment(tensor: Tensor) -> bytes:
         )
     flags = 0x01 if tensor.scale_dtype == "float32" else 0x00
     header = _TRT1_STRUCT.pack(INT8_MAGIC, INT8_VERSION, flags, n_values, n_scales)
-    scale_code = "f" if tensor.scale_dtype == "float32" else "e"
+    return header, n_scales
+
+
+def _scales_bytes(values: Sequence[float], n_scales: int, dtype: str,
+                  name: str) -> bytes:
+    """Байты масштабов: у `PackedF32` — те же байты без перепаковки."""
+    if isinstance(values, PackedF32):
+        return values.to_bytes()
+    scale_code = "f" if dtype == "float32" else "e"
     try:
-        scales_bytes = struct.pack(f"<{n_scales}{scale_code}", *tensor.scales)
+        return struct.pack(f"<{n_scales}{scale_code}", *values)
     except (struct.error, OverflowError) as exc:
         raise ValueError(
-            f"тензор {tensor.name!r}: масштаб не влезает в {tensor.scale_dtype}"
+            f"тензор {name!r}: масштаб не влезает в {dtype}"
         ) from exc
-    # q — знаковые байты: -1 -> 0xFF, 127 -> 0x7F.
-    q_bytes = bytes(value & 0xFF for value in tensor.qdata)
-    return header + scales_bytes + q_bytes
 
 
-def decode_int8_segment(data: bytes) -> tuple[list[int], list[float], str]:
-    """Разобрать INT8-сегмент; лишние байты в конце (padding) игнорируются."""
+def iter_int8_payload(tensor: Tensor, chunk: int = STREAM_CHUNK):
+    """Куски payload'а INT8-тензора — без `bytes` на весь сегмент."""
+    header, n_scales = _int8_segment_header(tensor)
+    yield header
+    scales = tensor.scales
+    assert scales is not None  # проверено в _int8_segment_header
+    if isinstance(scales, PackedF32):
+        yield from scales.iter_chunks(chunk)
+    else:
+        yield _scales_bytes(scales, n_scales, tensor.scale_dtype, tensor.name)
+    qdata = tensor.qdata
+    assert qdata is not None  # проверено в _int8_segment_header
+    if isinstance(qdata, PackedInt8):
+        yield from qdata.iter_chunks(chunk)
+    else:
+        # q — знаковые байты: -1 -> 0xFF, 127 -> 0x7F.
+        yield bytes(value & 0xFF for value in qdata)
+
+
+def encode_int8_segment(tensor: Tensor) -> bytes:
+    """Собрать INT8-сегмент: 18-байтовый заголовок + масштабы + q-байты.
+
+    Для больших тензоров предпочтителен `iter_int8_payload`: здесь по
+    определению получается один `bytes` на весь сегмент.
+    """
+    return b"".join(iter_int8_payload(tensor))
+
+
+def decode_int8_segment(
+    data: bytes,
+) -> tuple[PackedInt8, PackedF32, str]:
+    """Разобрать INT8-сегмент; лишние байты в конце (padding) игнорируются.
+
+    q и масштабы — окна в байты `data` (`PackedInt8`/`PackedF32`), а не
+    списки: таблица словаря 3B — это 311 млн значений (~2,5 ГиБ списком),
+    хотя в `non_ternary.bin` они уже лежат байтами. API совместим со
+    списком (`len`, индексация, итерация, сравнение).
+    """
     if len(data) < INT8_HEADER_SIZE:
         raise ValueError(
             f"INT8-сегмент короче заголовка: {len(data)} < {INT8_HEADER_SIZE}"
@@ -1276,22 +1657,36 @@ def decode_int8_segment(data: bytes) -> tuple[list[int], list[float], str]:
         raise ValueError(
             f"INT8-сегмент обрезан: {len(data)} байт, ожидалось {expected_len}"
         )
-    scale_code = "f" if scale_dtype == "float32" else "e"
-    scales = list(
-        struct.unpack_from(f"<{n_scales}{scale_code}", data, INT8_HEADER_SIZE)
-    )
-    q_offset = INT8_HEADER_SIZE + n_scales * scale_size
-    qdata = list(struct.unpack_from(f"<{n_values}b", data, q_offset))
-    for index, value in enumerate(qdata):
-        if value < INT8_MIN:
-            raise ValueError(
-                f"INT8-сегмент: q #{index} = {value} меньше {INT8_MIN}"
+    if scale_dtype == "float32":
+        scales: PackedF32 | list[float] = PackedF32(
+            data, INT8_HEADER_SIZE, n_scales
+        )
+    else:
+        scales = [
+            float(value) for value in struct.unpack_from(
+                f"<{n_scales}e", data, INT8_HEADER_SIZE
             )
-    return qdata, [float(s) for s in scales], scale_dtype
+        ]
+    q_offset = INT8_HEADER_SIZE + n_scales * scale_size
+    qdata = PackedInt8.from_segment(data, q_offset, n_values)
+    # Проверка диапазона — одно чтение min (затем поиск индекса только при
+    # ошибке): побайтовый обход 311 млн значений на 3B не нужен.
+    first_bad = qdata.first_below(INT8_MIN)
+    if first_bad >= 0:
+        raise ValueError(
+            f"INT8-сегмент: q #{first_bad} = {qdata[first_bad]} "
+            f"меньше {INT8_MIN}"
+        )
+    return qdata, scales, scale_dtype
 
 
-def encode_q4_segment(tensor: Tensor) -> bytes:
-    """Собрать Q4-сегмент: заголовок, масштабы, [min Q4_1], упакованные нибблы."""
+def _q4_segment_header(tensor: Tensor) -> tuple[bytes, int]:
+    """Проверить Q4-тензор и собрать заголовок сегмента (без данных).
+
+    Возвращает `(header, n_groups)`. Отдельно от `encode_q4_segment`, чтобы
+    потоковый писатель мог проверить тензор до создания файла и писать
+    масштабы/нибблы кусками.
+    """
     if tensor.kind != KIND_Q4:
         raise ValueError(f"тензор {tensor.name!r}: это не Q4")
     if tensor.qdata is None or tensor.scales is None:
@@ -1326,6 +1721,10 @@ def encode_q4_segment(tensor: Tensor) -> bytes:
         raise ValueError(
             f"тензор {tensor.name!r}: Q4_0 не имеет min (q4_asymmetric=False)"
         )
+    if tensor.scale_dtype not in ("float32", "float16"):
+        raise ValueError(
+            f"тензор {tensor.name!r}: scale_dtype={tensor.scale_dtype!r}"
+        )
     magic = Q4_MAGIC_ASYM if asymmetric else Q4_MAGIC
     flags = Q4_FLAG_F32_SCALES if tensor.scale_dtype == "float32" else 0
     header = _TRT1_STRUCT.pack(magic, Q4_VERSION, flags, n_values, n_groups)
@@ -1333,25 +1732,71 @@ def encode_q4_segment(tensor: Tensor) -> bytes:
         # Явное число min: читатель обязан сверить его с ceil(n/32), иначе
         # отсутствие min можно спутать с выравнивающим padding'ом.
         header += struct.pack("<I", n_groups)
-    scale_code = "f" if tensor.scale_dtype == "float32" else "e"
+    return header, n_groups
+
+
+def _q4_aux_bytes(values: Sequence[float], n_groups: int, dtype: str,
+                  name: str, what: str) -> bytes:
+    """Байты массива масштабов/min: у `PackedF32` — без перепаковки."""
+    if isinstance(values, PackedF32):
+        return values.to_bytes()
+    scale_code = "f" if dtype == "float32" else "e"
     try:
-        scales_bytes = struct.pack(f"<{n_groups}{scale_code}", *tensor.scales)
-        mins_bytes = (
-            struct.pack(f"<{n_groups}{scale_code}", *tensor.q4_mins)
-            if asymmetric else b""
-        )
+        return struct.pack(f"<{n_groups}{scale_code}", *values)
     except (struct.error, OverflowError) as exc:
         raise ValueError(
-            f"тензор {tensor.name!r}: масштаб/min не влезает в "
-            f"{tensor.scale_dtype}"
+            f"тензор {name!r}: {what} не влезает в {dtype}"
         ) from exc
-    return header + scales_bytes + mins_bytes + pack_q4(tensor.qdata)
+
+
+def iter_q4_payload(tensor: Tensor, chunk: int = STREAM_CHUNK):
+    """Куски payload'а Q4-тензора — без `bytes` на весь сегмент.
+
+    Порядок байт тот же, что у `encode_q4_segment`: заголовок, масштабы,
+    [min Q4_1], упакованные нибблы. У ленивого `PackedQ4` нибблы пишутся
+    прямо из байт сегмента (окно, не копия), у списка — пакуются по группам.
+    """
+    header, n_groups = _q4_segment_header(tensor)
+    yield header
+    dtype = tensor.scale_dtype
+    if isinstance(tensor.scales, PackedF32):
+        yield from tensor.scales.iter_chunks(chunk)
+    else:
+        yield _q4_aux_bytes(tensor.scales, n_groups, dtype, tensor.name, "масштаб")
+    if tensor.q4_asymmetric:
+        mins = tensor.q4_mins
+        assert mins is not None  # проверено в _q4_segment_header
+        if isinstance(mins, PackedF32):
+            yield from mins.iter_chunks(chunk)
+        else:
+            yield _q4_aux_bytes(mins, n_groups, dtype, tensor.name, "min")
+    qdata = tensor.qdata
+    assert qdata is not None  # проверено в _q4_segment_header
+    if isinstance(qdata, PackedQ4):
+        yield from qdata.iter_packed(chunk)
+    else:
+        yield pack_q4(qdata)
+
+
+def encode_q4_segment(tensor: Tensor) -> bytes:
+    """Собрать Q4-сегмент: заголовок, масштабы, [min Q4_1], упакованные нибблы.
+
+    Для больших тензоров предпочтителен `iter_q4_payload` (потоковая запись):
+    эта функция по определению возвращает один `bytes` на весь сегмент.
+    """
+    return b"".join(iter_q4_payload(tensor))
 
 
 def decode_q4_segment_ex(
     data: bytes,
-) -> tuple[list[int], list[float], str, bool, list[float] | None]:
+) -> tuple[PackedQ4, PackedF32, str, bool, PackedF32 | None]:
     """Разобрать Q4-сегмент: нибблы, масштабы, dtype, asym, min'ы.
+
+    Нибблы и масштабы — **окна в байты `data`** (`PackedQ4`/`PackedF32`), а не
+    списки: у 3B Q4 это 2,77 млрд нибблов и 86,6 млн масштабов, то есть ~22 ГиБ
+    и ~2,8 ГиБ списками Python. API совместим со списком (`len`, индексация,
+    итерация, сравнение), поэтому мелкие тесты не меняются. Материализовать
+    список можно явно: `list(qdata)`.
 
     Лишние байты в конце (выравнивание payload'а до 32) игнорируются.
     """
@@ -1398,36 +1843,74 @@ def decode_q4_segment_ex(
         raise ValueError(
             f"Q4-сегмент обрезан: {len(data)} байт, ожидалось {expected_len}"
         )
-    scale_code = "f" if scale_dtype == "float32" else "e"
-    scales = [float(s) for s in struct.unpack_from(
-        f"<{n_groups}{scale_code}", data, scales_offset
-    )]
-    mins = (
-        [float(s) for s in struct.unpack_from(
-            f"<{n_groups}{scale_code}", data, mins_offset
+    if scale_dtype == "float32":
+        scales: PackedF32 | list[float] = PackedF32(data, scales_offset, n_groups)
+        mins: PackedF32 | list[float] | None = (
+            PackedF32(data, mins_offset, n_groups) if asymmetric else None
+        )
+    else:
+        # fp16-масштабы: 2 байта на значение, окно без копии не сделать тем же
+        # `cast('f')`; их число у 3B — 86,6 млн, но fp16 здесь ~173 МиБ,
+        # поэтому список допустим только для небольших тензоров.
+        scale_code = "e"
+        scales = [float(s) for s in struct.unpack_from(
+            f"<{n_groups}{scale_code}", data, scales_offset
         )]
-        if asymmetric else None
-    )
+        mins = (
+            [float(s) for s in struct.unpack_from(
+                f"<{n_groups}{scale_code}", data, mins_offset
+            )]
+            if asymmetric else None
+        )
+    # Один проход вместо двух: сначала сообщаем о неконечном масштабе (как
+    # раньше), затем об отрицательном.
+    bad_finite = -1
+    bad_negative = -1
     for index, scale in enumerate(scales):
-        if not math.isfinite(scale) or scale < 0:
-            raise ValueError(
-                f"Q4-сегмент: масштаб #{index} = {scale!r} "
-                "(должен быть конечным и неотрицательным)"
-            )
+        if bad_finite < 0 and not math.isfinite(scale):
+            bad_finite = index
+        elif bad_negative < 0 and scale < 0:
+            bad_negative = index
+        if bad_finite >= 0 and bad_negative >= 0:
+            break
+    if bad_finite >= 0:
+        raise ValueError(
+            f"Q4-сегмент: масштаб #{bad_finite} = {scales[bad_finite]!r} "
+            "(должен быть конечным и неотрицательным)"
+        )
+    if bad_negative >= 0:
+        raise ValueError(
+            f"Q4-сегмент: масштаб #{bad_negative} = {scales[bad_negative]!r} "
+            "(должен быть конечным и неотрицательным)"
+        )
     if mins is not None:
         for index, value in enumerate(mins):
             if not math.isfinite(value):
                 raise ValueError(
                     f"Q4-сегмент: min #{index} = {value!r} не конечный"
                 )
-    qdata = unpack_q4(data[q_offset:q_offset + n_groups * Q4_GROUP_BYTES],
-                      n_values)
-    for index, value in enumerate(qdata):
-        if not Q4_MIN <= value <= Q4_MAX:  # pragma: no cover - ниббл всегда 0..15
-            raise ValueError(
-                f"Q4-сегмент: значение #{index} = {value} вне {Q4_MIN}..{Q4_MAX}"
-            )
+    # Нибблы — байты: любое значение 0..15 по построению, побайтовый обход
+    # 2,77 млрд значений не нужен (и занял бы минуты).
+    qdata = PackedQ4.from_segment(data, q_offset, n_values)
     return qdata, scales, scale_dtype, asymmetric, mins
+
+
+def decode_q4_segment_values(
+    data: bytes,
+) -> tuple[list[int], list[float], str, bool, list[float] | None]:
+    """Старый вид разбора — списками: для мелких тестов, не для 3B.
+
+    Тонкая обёртка над `decode_q4_segment_ex`; на 3B материализует ~22 ГиБ
+    нибблов, поэтому в потоковых путях не используется.
+    """
+    qdata, scales, scale_dtype, asymmetric, mins = decode_q4_segment_ex(data)
+    return (
+        list(qdata),
+        list(scales),
+        scale_dtype,
+        asymmetric,
+        None if mins is None else list(mins),
+    )
 
 
 def decode_q4_segment(data: bytes) -> tuple[list[int], list[float], str]:
@@ -1917,6 +2400,22 @@ def kv_rebuild_hint(required_bytes: int) -> str:
     )
 
 
+def _streamed_payload_kind(tensor: Tensor) -> str | None:
+    """Вид потокового payload'а тензора: "q4", "int8" или None (в память).
+
+    Поток требует ленивого окна: у Q4/INT8 из сегмента это `PackedQ4`/
+    `PackedInt8`, и тогда `bytes` на весь сегмент (1,6 ГиБ q4 + 0,3 ГиБ
+    int8 у 3B) не материализуется.
+    """
+    if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+        return None
+    if tensor.kind == KIND_Q4 and isinstance(tensor.qdata, PackedQ4):
+        return "q4"
+    if tensor.kind == KIND_INT8 and isinstance(tensor.qdata, PackedInt8):
+        return "int8"
+    return None
+
+
 def write_vtm(
     path: str | os.PathLike[str],
     tensors: Sequence[Tensor | dict[str, Any]],
@@ -1944,6 +2443,13 @@ def write_vtm(
     читает мусор. Суммарный размер кэшей проверяется по `MAX_KV_BYTES` —
     ровно так же, как это сделает загрузчик, чтобы не записать нечитаемый
     файл.
+
+    Q4/INT8 с ленивыми окнами (`decode_q4_segment_ex` даёт `PackedQ4`,
+    `decode_int8_segment` — `PackedInt8`) пишутся **потоком**, кусками по
+    `STREAM_CHUNK`: `bytes` на весь сегмент (у 3B — 1,6 ГиБ q4 и 0,3 ГиБ
+    int8) не материализуется. Байты контейнера при этом те же, что при
+    записи из списков: раскладка сегмента не зависит от представления
+    значений (сверка sha256 — в тестах `tests/test_q4_stream.py`).
     """
     tensor_list = [_as_tensor(item) for item in tensors]
     program_list = [_as_instr(item) for item in program]
@@ -1963,7 +2469,21 @@ def write_vtm(
             + kv_rebuild_hint(kv_bytes)
         )
 
-    payloads = [encode_tensor_payload(tensor) for tensor in tensor_list]
+    # Payload'ы мелких тензоров собираются в память (как раньше: ошибка
+    # «нет данных» должна всплыть до создания файла). Q4 с ленивыми окнами
+    # пишется потоком: `bytes` на 1,6 ГиБ сегмента не нужен, достаточно
+    # проверить тензор и взять размер из dims.
+    payloads: list[bytes | None] = []
+    for tensor in tensor_list:
+        streamed = _streamed_payload_kind(tensor)
+        if streamed == "q4":
+            _q4_segment_header(tensor)  # валидация без материализации
+            payloads.append(None)
+        elif streamed == "int8":
+            _int8_segment_header(tensor)
+            payloads.append(None)
+        else:
+            payloads.append(encode_tensor_payload(tensor))
     write_integrity = _integrity_requested(integrity)
 
     n_tensors = len(tensor_list)
@@ -1974,6 +2494,7 @@ def write_vtm(
     has_kv = bool(kv_caches)
     data_size = 0
     for tensor, payload in zip(tensor_list, payloads):
+        size = tensor_payload_size(tensor) if payload is None else len(payload)
         if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
             # KV-кэш места в секции данных не занимает: payload'а нет, размер
             # известен из dims. У контейнера нового вида offset — маркер
@@ -1992,28 +2513,23 @@ def write_vtm(
                 f"тензор {tensor.name!r}: offset не выровнен"
             )
         start = data_size
-        data_size = align_up(start + len(payload))
-        if digest is not None:
-            # Секция данных целиком, включая выравнивающие нули: ровно эти
-            # байты C-загрузчик хеширует от data_start до meta_offset.
-            digest.update(payload)
-            digest.update(b"\x00" * (data_size - start - len(payload)))
+        data_size = align_up(start + size)
 
+    block: dict[str, Any] | None = None
     if digest is not None:
+        # Хеш секции данных считается при записи (Q4 идёт потоком, и до неё
+        # байтов ещё нет). Длина меты не зависит от значения: оба хеша —
+        # 64 hex-символа, поэтому offset'ы считаются по плейсхолдерам.
         block = {
             "algo": INTEGRITY_ALGO,
-            "data_sha256": digest.hexdigest(),
-            # Плейсхолдер: сериализация с ним и есть вход для meta_sha256
-            # (в C/Python при проверке значение заменяется нулями).
+            "data_sha256": "0" * 64,
             INTEGRITY_META_FIELD: "0" * 64,
         }
         meta_dict.pop(INTEGRITY_KEY, None)
         meta_dict[INTEGRITY_KEY] = block
 
     meta_bytes = _encode_meta(meta_dict) if meta_dict else b""
-    if digest is not None:
-        block[INTEGRITY_META_FIELD] = hashlib.sha256(meta_bytes).hexdigest()
-        meta_bytes = _encode_meta(meta_dict)
+    meta_len = len(meta_bytes)
     meta_offset = data_start + data_size if meta_bytes else 0
     program_offset = data_start + data_size + align_up(len(meta_bytes))
     program_bytes = b"".join(instr.pack() for instr in program_list)
@@ -2054,10 +2570,51 @@ def write_vtm(
         handle.write(header)
         handle.write(bytes(table))
         handle.write(b"\x00" * (data_start - table_end))
-        for payload in payloads:
+        for tensor, payload in zip(tensor_list, payloads):
+            size = tensor_payload_size(tensor) if payload is None else len(payload)
+            if payload is None:
+                # Q4-сегмент потоком: заголовок, масштабы, нибблы — куски
+                # прямо из байт сегмента (без bytes на весь тензор).
+                pieces = (
+                    iter_int8_payload(tensor)
+                    if tensor.kind == KIND_INT8 else iter_q4_payload(tensor)
+                )
+                written_payload = 0
+                for piece in pieces:
+                    handle.write(piece)
+                    if digest is not None:
+                        digest.update(piece)
+                    written_payload += len(piece)
+                if written_payload != size:  # pragma: no cover - защита
+                    raise RuntimeError(
+                        f"тензор {tensor.name!r}: записано {written_payload} "
+                        f"байт payload'а, ожидалось {size}"
+                    )
+                if digest is not None:
+                    digest.update(b"\x00" * (align_up(size) - size))
+                handle.write(b"\x00" * (align_up(size) - size))
+                continue
             handle.write(payload)
+            if digest is not None:
+                digest.update(payload)
+                digest.update(
+                    b"\x00" * (align_up(len(payload)) - len(payload))
+                )
             handle.write(b"\x00" * (align_up(len(payload)) - len(payload)))
         if meta_bytes:
+            if digest is not None:
+                # data_sha256 известен только теперь; сериализация с настоящим
+                # значением и плейсхолдером meta_sha256 — вход для второго хеша
+                # (как в write_vtm_stream и в _verify_integrity).
+                block[INTEGRITY_DATA_FIELD] = digest.hexdigest()
+                block[INTEGRITY_META_FIELD] = "0" * 64
+                meta_bytes = _encode_meta(meta_dict)
+                block[INTEGRITY_META_FIELD] = hashlib.sha256(meta_bytes).hexdigest()
+                meta_bytes = _encode_meta(meta_dict)
+                if len(meta_bytes) != meta_len:  # pragma: no cover - защита
+                    raise RuntimeError(
+                        f"длина меты изменилась: {len(meta_bytes)} != {meta_len}"
+                    )
             handle.write(meta_bytes)
             handle.write(b"\x00" * (align_up(len(meta_bytes)) - len(meta_bytes)))
         handle.write(program_bytes)
@@ -2125,9 +2682,6 @@ def _empty_payload_prefix(tensor: Tensor) -> tuple[bytes, int]:
     return b"", size
 
 
-#: Порция нулей при потоковой записи (байт); 1 МиБ — компромисс между числом
-#: системных вызовов и лишней памятью.
-STREAM_CHUNK = 1 << 20
 _ZEROS = bytes(STREAM_CHUNK)
 
 

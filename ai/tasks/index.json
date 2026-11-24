@@ -1024,7 +1024,7 @@
   {
     "id": "0155",
     "title": "Потоковый Q4-писатель — полный 3B/7B",
-    "status": "in_progress",
+    "status": "done",
     "file": "0155-stream-q4-writer.md",
     "assignee": "agent:stream-q4"
   }
