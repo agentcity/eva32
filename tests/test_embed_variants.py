@@ -50,6 +50,16 @@ EMBED_NAME = "model.embed_tokens.weight"
 
 
 def has_torch() -> bool:
+    """Есть ли рабочий torch.
+
+    `find_spec` недостаточно: после неудачного импорта torch остаётся в
+    sys.modules и find_spec его находит, а повторный импорт падает навсегда.
+    Поэтому проверяем, что модуль живой (есть __version__), и чистим мусор.
+    """
+    import sys
+
+    if "torch" in sys.modules:
+        return getattr(sys.modules["torch"], "__version__", None) is not None
     try:
         return importlib.util.find_spec("torch") is not None
     except (ImportError, ValueError):

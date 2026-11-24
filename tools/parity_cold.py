@@ -165,10 +165,21 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 #: Локальные зависимости (torch/transformers для CPU) — только если их ещё
 #: нет: stdlib должен побеждать, иначе .pylibs подменит системные модули.
-if (ROOT / ".pylibs").is_dir() and str(ROOT / ".pylibs") not in sys.path:
-    sys.path.append(str(ROOT / ".pylibs"))
 
 from tools import parity_real as pr  # noqa: E402 - ленивых тяжёлых импортов там нет
+
+def _enable_local_pylibs() -> None:
+    """Добавить ``.pylibs`` в путь — только при запуске скриптом.
+
+    Импорт модуля из тестов не должен менять ``sys.path``: иначе каталог
+    ``.pylibs`` (собранный под 3.13) попадает в интерпретатор 3.14, ``import
+    torch`` падает и навсегда травит ``sys.modules`` — после этого чужие тесты
+    видят «torch есть» и падают вместо скипа.
+    """
+    path = ROOT / ".pylibs"
+    if path.is_dir() and str(path) not in sys.path:
+        sys.path.append(str(path))
+
 
 VTM_DIR = ROOT / "src" / "vtm"
 VTM_LIB = VTM_DIR / "libvtm.a"
