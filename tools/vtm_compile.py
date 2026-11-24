@@ -129,6 +129,17 @@ src/vtm/vtm run /tmp/synth_14b.vtm --tokens 1 --max-new 1
 материализует сегмент в fp32 в арене. `tied lm_head` в этом режиме тоже работает:
 `MM` получает ту же dequantized-таблицу.
 
+Если в манифесте `architecture.lm_head == "q4"` (импорт GGUF, задача 0153),
+матрицы Linear и отдельный lm_head лежат Q4-сегментами kind 5 в `q4.bin`
+(`dtype: "q4_0"`, `q4_offset`/`q4_length`). `load_export` разбирает сегмент
+`vtm_ref.decode_q4_segment_ex` и отдаёт `Tensor.q4(...)`; `matrix_tensor`
+принимает kind 5, а `TMV` считает упакованные нибблы без fp32-копии
+(ядра 0152). `lm_head='q4'` — это `TMV` по kind 5; при
+`tie_word_embeddings: true` отдельной Q4-матрицы нет и работает прежний
+`MM` по таблице словаря. Транспонированный Q4 (`VTM_FLAG_TMV_TRANSPOSED`)
+ядра не поддерживают: компилятор отвергает такой граф с внятной ошибкой, а
+не пишет контейнер, который C посчитает неверно.
+
 `--qwen-config` — только каркас: реальные веса не читаются, файл не пишется,
 печатается план (число тензоров/инструкций и оценка размера). Запись
 контейнера без весов запрещена (`vtm_ref.write_vtm` бросит `ValueError`).
@@ -163,6 +174,22 @@ except ImportError:  # pragma: no cover - запуск как `python3 tools/vtm
     import vtm_ref  # type: ignore[no-redef]
 
 Op = vtm_ref.Op
+
+#: Флаг TMV «матрица хранится как [cols, rows]» (VTM_FLAG_TMV_TRANSPOSED,
+#: `vtm.h`). Q4-ядра 0152 такую ориентацию не поддерживают: загрузчик C
+#: отказывает `VTM_E_UNSUPPORTED`, а компилятор обязан отказать раньше —
+#: иначе в контейнер попадёт граф, который невозможно исполнить.
+TMV_FLAG_TRANSPOSED = 0x04
+
+
+def q4_transposed_error(name: str) -> str:
+    """Текст отказа «транспонированный Q4 не поддержан» (одно место)."""
+    return (
+        f"вес {name!r}: Q4 (kind 5) с VTM_FLAG_TMV_TRANSPOSED не поддержан — "
+        "ядра 0152 (vtm_q4_tmv/mm) читают матрицу только как [rows, cols] "
+        "и считают W·x. Транспонированный Q4 — отдельная задача; "
+        "переэкспортируйте вес в обычной ориентации"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +257,8 @@ class ModelConfig(LayerConfig):
     vocab: int = 128
     n_layers: int = 1
     #: "mm" — плотная fp32-матрица через MM (политика QAT: lm_head не
-    #: тернаризуется), "tmv" — тритовая матрица.
+    #: тернаризуется), "tmv" — тритовая матрица, "q4" — Q4-сегмент kind 5
+    #: (импорт GGUF, задача 0153) через TMV.
     lm_head: str = "mm"
     #: Qwen/Llama-стиль: lm_head.weight — это та же таблица, что
     #: embed_tokens.weight. В контейнере отдельного тензора нет, MM читает
@@ -252,14 +280,19 @@ class ModelConfig(LayerConfig):
             raise ValueError("vocab должен быть > 0")
         if self.n_layers <= 0:
             raise ValueError("n_layers должен быть > 0")
-        if self.lm_head not in ("tmv", "mm"):
-            raise ValueError(f"lm_head={self.lm_head!r}, допустимо tmv|mm")
+        if self.lm_head not in ("tmv", "mm", "q4"):
+            raise ValueError(
+                f"lm_head={self.lm_head!r}, допустимо tmv|mm|q4"
+            )
         if self.tie_word_embeddings and self.lm_head == "tmv":
             raise ValueError(
                 "tie_word_embeddings вместе с lm_head='tmv' невозможен: "
                 "tied-таблица хранится как fp32-эмбеддинг, а TMV ждёт триты; "
                 "тритовые эмбеддинги идут через EMB + MM (embed_quant='trit')"
             )
+        # lm_head='q4' при tied — не противоречие: отдельной матрицы нет,
+        # MM читает таблицу словаря (так пишет манифест импорт GGUF 0153).
+
 
 
 # ---------------------------------------------------------------------------
@@ -361,13 +394,19 @@ def matrix_tensor(
     cols: int,
     spec: Any,
     dense: bool = False,
+    transposed: bool = False,
 ) -> int:
-    """Добавить матрицу весов: тритовую (TMV) или плотную fp32 (MM/каркас).
+    """Добавить матрицу весов: тритовую/Q4 (TMV) или плотную fp32 (MM/каркас).
 
     `spec` может быть готовым `vtm_ref.Tensor` из манифеста: тогда он
     добавляется в граф без копирования значений (важно для эмбеддингов
     1.5B-модели — это сотни мегабайт). Имя тензора приводится к короткому
     имени VTM (в таблице контейнера максимум 24 байта).
+
+    Для TMV (`dense=False`) принимаются триты (kind 0) и Q4 (kind 5, задача
+    0154). `transposed=True` означает, что граф хочет Wᵀ·x: для Q4 это
+    не поддержано ядрами — сразу `ValueError` (внятный отказ вместо
+    контейнера, который C не исполнит).
     """
     n_values = rows * cols
     if spec is None:
@@ -378,14 +417,28 @@ def matrix_tensor(
             raise ValueError(
                 f"вес {name!r}: форма {spec.dims}, ожидалась {(rows, cols)}"
             )
-        if dense and spec.kind == vtm_ref.KIND_TRITS:
-            raise ValueError(f"вес {name!r}: нужен плотный fp-тензор, а пришли триты")
-        if not dense and spec.kind != vtm_ref.KIND_TRITS:
+        if dense and spec.kind in (vtm_ref.KIND_TRITS, vtm_ref.KIND_Q4):
             raise ValueError(
-                f"вес {name!r}: нужны триты, а пришёл {spec.kind_name}"
+                f"вес {name!r}: нужен плотный fp-тензор, а пришли "
+                f"{spec.kind_name}"
             )
+        if not dense and spec.kind not in (vtm_ref.KIND_TRITS, vtm_ref.KIND_Q4):
+            raise ValueError(
+                f"вес {name!r}: нужны триты или Q4, а пришёл {spec.kind_name}"
+            )
+        if transposed and spec.kind == vtm_ref.KIND_Q4:
+            raise ValueError(q4_transposed_error(name))
         spec.name = name
         return graph.add(spec)
+    if transposed:
+        # Спецификация без готового Tensor: Q4 тут неоткуда взять (триты
+        # квантуются локально), поэтому флаг пока не с чем сочетать. Не
+        # игнорируем его молча — иначе будущий Q4-путь снова станет тихим.
+        raise ValueError(
+            f"вес {name!r}: transposed=True поддержан только для готового "
+            "Tensor (Q4 транспонировать нельзя); для плотного/тритового веса "
+            "соберите матрицу в нужной ориентации"
+        )
     if dense:
         return graph.add(vtm_ref.Tensor.f32(name, (rows, cols), _spec_floats(spec, n_values)))
     trits, scales = _spec_trits(spec, n_values)
@@ -394,6 +447,26 @@ def matrix_tensor(
             name, (rows, cols), trits, scales, graph.cfg.scale_dtype
         )
     )
+
+
+def check_q4_tmv_support(
+    tensors: Sequence[vtm_ref.Tensor], program: Sequence[vtm_ref.Instr]
+) -> None:
+    """Отказать, если граф просит транспонированный Q4 в TMV.
+
+    Ядра kind 5 (`vtm_q4_tmv`/`vtm_q4_mm`, задача 0152) читают матрицу
+    только как `[rows, cols]`. Компилятор сам `VTM_FLAG_TMV_TRANSPOSED` не
+    ставит, но проверка ловит граф, собранный извне (или будущий путь), до
+    записи контейнера: C иначе вернёт `VTM_E_UNSUPPORTED` уже на исполнении.
+    """
+    for index, instr in enumerate(program):
+        if int(instr.op) != Op.TMV or not (int(instr.flags) & TMV_FLAG_TRANSPOSED):
+            continue
+        matrix = tensors[int(instr.a)]
+        if matrix.kind == vtm_ref.KIND_Q4:
+            raise ValueError(
+                q4_transposed_error(matrix.name) + f" (инструкция TMV #{index})"
+            )
 
 
 def vector_tensor(graph: Graph, name: str, dims: Sequence[int], spec: Any) -> int:
@@ -668,6 +741,17 @@ def compile_model(
     elif cfg.lm_head == "tmv":
         lm_head = matrix_tensor(g, "lm_head.w", cfg.vocab, hidden, w.get("lm_head"))
         g.emit(Op.TMV, dst=logits, a=lm_head, b=hfinal)
+    elif cfg.lm_head == "q4":
+        # Q4-матрица (kind 5) из q4.bin импорта GGUF: TMV считает упакованные
+        # нибблы, fp32-копии нет. Ориентация — обычная [vocab, hidden].
+        lm_head = matrix_tensor(g, "lm_head.w", cfg.vocab, hidden, w.get("lm_head"))
+        if g.tensors[lm_head].kind != vtm_ref.KIND_Q4:
+            raise ValueError(
+                f"lm_head='q4', а матрица {g.tensors[lm_head].kind_name}; "
+                "импорт GGUF --format q4 кладёт lm_head Q4-сегментом, "
+                "для тритов/плотной матрицы поставьте lm_head='tmv'/'mm'"
+            )
+        g.emit(Op.TMV, dst=logits, a=lm_head, b=hfinal)
     else:
         lm_head = matrix_tensor(
             g, "lm_head.w", cfg.vocab, hidden, w.get("lm_head"), dense=True
@@ -698,7 +782,14 @@ def compile_model(
         "quantize_embeddings": (
             embed_storage if embed_storage in ("trit", "int8") else "none"
         ),
-        "rms_norm_eps": cfg.eps,
+        # C берёт eps RMSN из меты (приоритетнее imm/1000), а Python-эталон
+        # (`vtm_ref.execute`) — только imm/1000. Если положить сюда точный
+        # 1e-6, C и Python разойдутся на ~1e-3 относительной ошибки (на
+        # малых активациях это видно в логитах). Поэтому в мету идёт eps,
+        # представимый в imm (тот, что реально применяется), а исходный —
+        # рядом: `rms_norm_eps_exact` и `model.eps`.
+        "rms_norm_eps": cfg.eps_imm / 1000.0,
+        "rms_norm_eps_exact": cfg.eps,
         "context_len": cfg.context_len,
         "scale_block": vtm_ref.SCALE_BLOCK,
         "model": dataclasses.asdict(cfg),
@@ -720,6 +811,7 @@ def compile_model(
         meta["context_window"] = cfg.context_len
     if meta_extra:
         meta.update(meta_extra)
+    check_q4_tmv_support(g.tensors, g.program)
     return vtm_ref.VTM(tensors=g.tensors, program=g.program, meta=meta)
 
 
@@ -885,6 +977,7 @@ class Export:
     manifest: dict[str, Any]
     path: str
     trit_params: int = 0
+    q4_params: int = 0
     fp_params: int = 0
     tied: bool = False
 
@@ -1107,13 +1200,25 @@ def _manifest_architecture(manifest: dict[str, Any]) -> ModelConfig:
         raise ValueError(f"architecture в манифесте некорректна: {exc}") from exc
 
 
+def _is_q4_entry(entry: dict[str, Any]) -> bool:
+    """Запись таблицы тензоров манифеста — Q4-сегмент (kind 5)?
+
+    Импорт GGUF (0153) пишет `dtype: "q4_0"`, `kind: "q4"` и смещения
+    `q4_offset`/`q4_length`; поддерживаем все три признака, чтобы манифест,
+    собранный вручную, тоже читался.
+    """
+    dtype = str(entry.get("dtype") or "").lower()
+    kind = str(entry.get("kind") or "").lower()
+    return dtype.startswith("q4") or kind == "q4" or "q4_offset" in entry
+
+
 def load_export(
     source: str | os.PathLike[str] | dict[str, Any],
     verify: bool = True,
 ) -> Export:
-    """Прочитать манифест QAT и собрать `weights` для `compile_model`.
+    """Прочитать манифест QAT/импорта GGUF и собрать `weights` для `compile_model`.
 
-    Источник — путь к `manifest.json` (файлы `ternary.trit` и
+    Источник — путь к `manifest.json` (файлы `ternary.trit`, `q4.bin` и
     `non_ternary.bin` ищутся рядом) или уже разобранный словарь манифеста
     (тогда относительные пути считаются от текущего каталога).
     """
@@ -1149,12 +1254,21 @@ def load_export(
     cfg = _manifest_architecture(manifest)
     files = manifest.get("files") or {}
 
-    # --- тритовые сегменты --------------------------------------------------
+    # --- сегменты весов: триты (ternary.trit) и Q4 (q4.bin) -----------------
     trit_name = "ternary.trit"
     trit_data = _read_file(base / trit_name, files.get(trit_name), verify)
+    q4_name = str((manifest.get("q4") or {}).get("file") or "q4.bin")
+    segment_entries = manifest.get("tensors") or []
+    q4_entries = [entry for entry in segment_entries if _is_q4_entry(entry)]
+    q4_data = (
+        _read_file(base / q4_name, files.get(q4_name), verify)
+        if q4_entries or q4_name in files
+        else b""
+    )
 
     weights: dict[str, Any] = {"layers": [{} for _ in range(cfg.n_layers)]}
     trit_params = 0
+    q4_params = 0
     fp_params = 0
     unknown: list[str] = []
 
@@ -1163,9 +1277,72 @@ def load_export(
             raise ValueError(f"{what}: слой {layer} вне n_layers={cfg.n_layers}")
         return weights["layers"][layer]
 
-    for entry in manifest.get("tensors") or []:
+    for entry in segment_entries:
         name = str(entry.get("name") or "?")
         shape = [int(x) for x in entry.get("shape") or []]
+        role, layer, key = _weight_role(name)
+
+        if _is_q4_entry(entry):
+            # Q4-сегмент kind 5: заголовок + масштабы (+ min у Q4_1) + нибблы.
+            offset = int(entry.get("q4_offset", entry.get("offset", -1)))
+            length = int(entry.get("q4_length", entry.get("length", -1)))
+            if offset < 0 or length <= 0 or offset + length > len(q4_data):
+                raise ValueError(
+                    f"{name}: Q4-сегмент [{offset}, {offset + length}) вне "
+                    f"{q4_name} ({len(q4_data)} байт)"
+                )
+            if role in ("bias", "norm", "final_norm"):
+                raise ValueError(
+                    f"{name}: Q4 допустим только для матриц Linear и lm_head; "
+                    "нормы/bias должны лежать в non_ternary.bin"
+                )
+            if role == "embed":
+                raise ValueError(
+                    f"{name}: Q4-таблица словаря не поддержана — EMB ждёт "
+                    "fp32/int8/триты; импорт GGUF (0153) кладёт словарь "
+                    "в non_ternary.bin (int8)"
+                )
+            qdata, scales, scale_dtype, asym, mins = (
+                vtm_ref.decode_q4_segment_ex(q4_data[offset:offset + length])
+            )
+            if len(qdata) != vtm_ref.prod(shape):
+                raise ValueError(
+                    f"{name}: в Q4-сегменте {len(qdata)} значений, а shape "
+                    f"{tuple(shape)} даёт {vtm_ref.prod(shape)}"
+                )
+            tensor_name = (
+                f"l{layer}.{key}.w" if role == "matrix" else "lm_head.w"
+            )
+            tensor = vtm_ref.Tensor.q4(
+                tensor_name, shape, qdata, scales, scale_dtype,
+                asymmetric=asym, mins=mins,
+            )
+            if role == "lm_head":
+                if cfg.tie_word_embeddings:
+                    continue  # tied: отдельная матрица не нужна
+                if cfg.lm_head != "q4":
+                    raise ValueError(
+                        f"{name}: в architecture lm_head={cfg.lm_head!r}, "
+                        "а в экспорте Q4-матрица; переэкспортируйте с "
+                        "lm_head='q4' (импорт GGUF: --format q4)"
+                    )
+                _expect_shape(shape, (cfg.vocab, cfg.hidden), name)
+                weights["lm_head"] = tensor
+            elif role == "matrix":
+                expected = _layer_matrix_dims(cfg, key)
+                _expect_shape(shape, expected, name)
+                _layer_bucket(layer, name)[key] = tensor
+            elif role == "unknown":
+                unknown.append(name)
+                continue
+            else:  # pragma: no cover - роли выше перечислены
+                raise ValueError(f"{name}: неожиданная роль {role!r}")
+            if len(shape) != 2 or not all(shape):
+                raise ValueError(f"{name}: у матрицы плохая shape={shape}")
+            q4_params += vtm_ref.prod(shape)
+            continue
+
+        # --- тритовый сегмент (ternary.trit) --------------------------------
         offset = int(entry.get("trit_offset", entry.get("offset", -1)))
         length = int(entry.get("trit_length", entry.get("length", -1)))
         if offset < 0 or length <= 0 or offset + length > len(trit_data):
@@ -1173,8 +1350,7 @@ def load_export(
                 f"{name}: сегмент [{offset}, {offset + length}) вне "
                 f"ternary.trit ({len(trit_data)} байт)"
             )
-        kind, layer, key = _weight_role(name)
-        if kind == "embed":
+        if role == "embed":
             # Тритовая таблица словаря (задача 0043): экспорт кладёт её
             # сегментом ternary.trit при quantize_embeddings: trit.
             if cfg.embed_quant != "trit":
@@ -1195,13 +1371,13 @@ def load_export(
                 scales=scales,
                 scale_dtype=scale_dtype,
             )
-        elif kind in ("bias", "norm", "final_norm"):
+        elif role in ("bias", "norm", "final_norm"):
             raise ValueError(
                 f"{name}: триты допустимы только для матриц Linear, lm_head "
                 f"и таблицы словаря; нормы/bias должны лежать в "
                 f"non_ternary.bin"
             )
-        elif kind == "lm_head":
+        elif role == "lm_head":
             if cfg.tie_word_embeddings:
                 continue  # tied: отдельная матрица не нужна
             if cfg.lm_head != "tmv":
@@ -1222,7 +1398,7 @@ def load_export(
                 scales=scales,
                 scale_dtype=scale_dtype,
             )
-        elif kind == "matrix":
+        elif role == "matrix":
             expected = _layer_matrix_dims(cfg, key)
             _expect_shape(shape, expected, name)
             decoded = vtm_ref.decode_trit_segment(trit_data[offset:offset + length])
@@ -1235,11 +1411,11 @@ def load_export(
                 scale_dtype=decoded[2],
             )
             _layer_bucket(layer, name)[key] = tensor
-        elif kind == "unknown":
+        elif role == "unknown":
             unknown.append(name)
             continue
         else:  # pragma: no cover - роли выше перечислены
-            raise ValueError(f"{name}: неожиданная роль {kind!r}")
+            raise ValueError(f"{name}: неожиданная роль {role!r}")
         if len(shape) != 2 or not all(shape):
             raise ValueError(f"{name}: у матрицы плохая shape={shape}")
         trit_params += vtm_ref.prod(shape)
@@ -1308,6 +1484,13 @@ def load_export(
             if cfg.lm_head == "tmv":
                 raise ValueError(
                     f"{name}: в architecture lm_head='tmv', а тензор плотный"
+                )
+            if cfg.lm_head == "q4":
+                raise ValueError(
+                    f"{name}: в architecture lm_head='q4', а тензор плотный; "
+                    "импортируйте GGUF с --format q4 (lm_head ляжет "
+                    "Q4-сегментом в q4.bin) или переэкспортируйте с "
+                    "lm_head='mm'"
                 )
             _expect_shape(shape, (cfg.vocab, cfg.hidden), name)
             weights["lm_head"] = tensor
@@ -1391,6 +1574,7 @@ def load_export(
         manifest=manifest,
         path=path_label,
         trit_params=trit_params,
+        q4_params=q4_params,
         fp_params=fp_params,
         tied=cfg.tie_word_embeddings,
     )
@@ -1906,11 +2090,24 @@ def _print_manifest(
             )
     print(f"тензоров: {len(vtm.tensors)}, инструкций: {len(vtm.program)}")
     print("операции: " + ", ".join(f"{name}×{count}" for name, count in sorted(ops.items())))
+    if export.q4_params:
+        files = export.manifest.get("files") or {}
+        q4_bytes = int((files.get("q4.bin") or {}).get("bytes") or 0)
+        lm_line = (
+            "lm_head — MM по таблице словаря (tied)"
+            if export.tied else "lm_head — TMV по kind 5"
+        )
+        print(
+            f"Q4: {export.q4_params:,} весов kind 5 в q4.bin "
+            f"({_human_bytes(q4_bytes)}), {lm_line}, без fp32-материализации"
+        )
     cache_bytes = kv_cache_bytes(cfg, context)
-    print(
-        f"параметры: тритов {export.trit_params:,}, fp {export.fp_params:,}; "
+    params_line = (
+        f"параметры: тритов {export.trit_params:,}, "
+        f"Q4 {export.q4_params:,}, fp {export.fp_params:,}; "
         f"KV-кэш {_human_bytes(cache_bytes)} в арене, в контейнере его нет"
     )
+    print(params_line)
     for line in kv_budget_lines(vtm):
         print(line)
     if path:

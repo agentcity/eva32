@@ -1017,8 +1017,15 @@
   {
     "id": "0154",
     "title": "Компилятор: Q4-тензоры в граф (чтение q4.bin импорта)",
-    "status": "in_progress",
+    "status": "done",
     "file": "0154-compile-q4.md",
     "assignee": "agent:compile-q4"
+  },
+  {
+    "id": "0155",
+    "title": "Потоковый Q4-писатель — полный 3B/7B",
+    "status": "in_progress",
+    "file": "0155-stream-q4-writer.md",
+    "assignee": "agent:stream-q4"
   }
 ]
