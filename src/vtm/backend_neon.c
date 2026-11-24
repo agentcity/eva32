@@ -56,6 +56,13 @@ extern int vtm_avx2_tmv_blocks_batch(float *y, const uint8_t *w,
 extern int vtm_avx2_mm_batch(float *y, const uint8_t *w, const float *scales,
                              const float *b, int m, int k, int n_tokens,
                              int scale_block);
+extern int vtm_avx2_gemv_f32(float *y, const float *w, const float *x,
+                             int rows, int cols, int transposed);
+extern int vtm_avx2_tmv_f32_batch(float *y, const float *w, const float *x,
+                                  int rows, int cols, int n_tokens,
+                                  int transposed);
+extern int vtm_avx2_mm_f32_batch(float *y, const float *a, const float *b,
+                                 int m, int k, int n_tokens);
 #define VTM_SIMD_X86 1
 #else
 #define VTM_SIMD_X86 0
@@ -328,72 +335,10 @@ static int trit_batch_scalar(float *y, const uint8_t *w, const float *scales,
     return 0;
 }
 
-typedef struct {
-    float *y;
-    const float *w;
-    const float *x;
-    int rows;
-    int cols;
-    int ntok;
-    int transposed;
-    double *acc_all;
-} dense_batch_job;
-
-// Плотный батчевый TMV/MM: y[r*N+j] = sum_t W[r,t] * x[t*N+j] (W — fp32).
-// Считаем в double, как op_tmv/op_mm; порядок сложений — по t, поэтому
-// результат совпадает с батчевым скалярным путём interp.c.
-static void dense_batch_rows(dense_batch_job *j, int tid, int r0, int r1) {
-    const int cols = j->cols;
-    const int ntok = j->ntok;
-    const int rows = j->rows;
-    const float *w = j->w;
-    const float *x = j->x;
-    double *acc = j->acc_all + (size_t)tid * (size_t)ntok;
-    int r, t, jj;
-
-    for (r = r0; r < r1; r++) {
-        memset(acc, 0, (size_t)ntok * sizeof(double));
-        for (t = 0; t < cols; t++) {
-            double wv = j->transposed
-                      ? (double)w[(size_t)t * (size_t)rows + (size_t)r]
-                      : (double)w[(size_t)r * (size_t)cols + (size_t)t];
-            const float *xp = x + (size_t)t * (size_t)ntok;
-            for (jj = 0; jj < ntok; jj++)
-                acc[jj] += wv * (double)xp[jj];
-        }
-        for (jj = 0; jj < ntok; jj++)
-            j->y[(size_t)r * (size_t)ntok + (size_t)jj] = (float)acc[jj];
-    }
-}
-
-static void dense_batch_worker(void *p, int tid, int r0, int r1) {
-    dense_batch_rows((dense_batch_job *)p, tid, r0, r1);
-}
-
-static int dense_batch(float *y, const float *w, const float *x, int rows,
-                       int cols, int ntok, int transposed) {
-    dense_batch_job job;
-    int vt;
-
-    if (!y || !w || !x) return -1;
-    if (rows < 0 || cols < 0 || ntok < 0) return -1;
-    if (rows == 0 || cols == 0 || ntok == 0) return 0;
-    vt = vtm_threads();
-    job.acc_all = (double *)calloc((size_t)vt * (size_t)ntok,
-                                   sizeof(double));
-    if (!job.acc_all) return -1;
-    job.y = y;
-    job.w = w;
-    job.x = x;
-    job.rows = rows;
-    job.cols = cols;
-    job.ntok = ntok;
-    job.transposed = transposed;
-    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok,
-                      dense_batch_worker, &job);
-    free(job.acc_all);
-    return 0;
-}
+// Плотный батчевый TMV/MM (dense_batch/…) переехал в backend_scalar.c:
+// vtm_scalar_dense_batch — эталон, его же зовёт interp.c для скалярных
+// бэкендов (задача 0159). SIMD-ядра плотного батча — ниже, в секции NEON, и
+// в backend_avx2.c.
 
 // --- NEON ------------------------------------------------------------------
 
@@ -1425,6 +1370,332 @@ static int mm_f32_neon(float *y, const float *a, const float *b,
     return 0;
 }
 
+// --- NEON: плотный GEMV (n == 1), задача 0159 ------------------------------
+//
+// Перенесено из interp.c (dense_gemv, задача 0158) без изменения арифметики.
+// Внутри блока VTM_GEMV_CHUNK элементов — 4 f32-ленты (4 независимые цепи
+// FMA), блок сворачивается в double, чтобы f32-ошибка не копилась на всей
+// строке 2048. Порядок сложений иной, чем у скалярного double-цикла, поэтому
+// результат не побитовый: расхождение на logits 3B Q4 ≤ 2e-6 (порог 1e-5).
+// Строки делятся пулом vtm_parallel_rows: каждая считается тем же кодом,
+// поэтому от числа потоков результат не зависит (побитово).
+#define VTM_GEMV_CHUNK 64
+// Блок батчевого ядра короче: на каждый токен-лейн приходится
+// вдвое меньше f32-слагаемых до свёртки в double — запас по
+// точности больше (порог 1e-5 на больших формах).
+#define VTM_DENSE_BATCH_CHUNK 32
+
+// a·b: внутри блока — f32-ленты (4 аккумулятора), блок в double. Длина блока
+// ограничена, чтобы f32-ошибка не накапливалась на всей строке 2048.
+static double gemv_dot_f32_neon(const float *a, const float *b, int n) {
+    double sum = 0.0;
+    int i = 0;
+
+    for (; i + 4 <= n; ) {
+        float32x4_t a0 = vdupq_n_f32(0.0f);
+        float32x4_t a1 = a0, a2 = a0, a3 = a0;
+        int len = n - i;
+        int j = 0;
+
+        if (len > VTM_GEMV_CHUNK) len = VTM_GEMV_CHUNK;
+        for (; j + 16 <= len; j += 16) {
+            a0 = vfmaq_f32(a0, vld1q_f32(a + i + j),
+                           vld1q_f32(b + i + j));
+            a1 = vfmaq_f32(a1, vld1q_f32(a + i + j + 4),
+                           vld1q_f32(b + i + j + 4));
+            a2 = vfmaq_f32(a2, vld1q_f32(a + i + j + 8),
+                           vld1q_f32(b + i + j + 8));
+            a3 = vfmaq_f32(a3, vld1q_f32(a + i + j + 12),
+                           vld1q_f32(b + i + j + 12));
+        }
+        for (; j + 4 <= len; j += 4)
+            a0 = vfmaq_f32(a0, vld1q_f32(a + i + j),
+                           vld1q_f32(b + i + j));
+        {
+            float64x2_t lo = vaddq_f64(vcvt_f64_f32(vget_low_f32(a0)),
+                                       vcvt_f64_f32(vget_low_f32(a1)));
+            float64x2_t hi = vaddq_f64(vcvt_f64_f32(vget_high_f32(a0)),
+                                       vcvt_f64_f32(vget_high_f32(a1)));
+            float64x2_t lo2 = vaddq_f64(vcvt_f64_f32(vget_low_f32(a2)),
+                                        vcvt_f64_f32(vget_low_f32(a3)));
+            float64x2_t hi2 = vaddq_f64(vcvt_f64_f32(vget_high_f32(a2)),
+                                        vcvt_f64_f32(vget_high_f32(a3)));
+            sum += vgetq_lane_f64(lo, 0) + vgetq_lane_f64(lo, 1)
+                 + vgetq_lane_f64(hi, 0) + vgetq_lane_f64(hi, 1)
+                 + vgetq_lane_f64(lo2, 0) + vgetq_lane_f64(lo2, 1)
+                 + vgetq_lane_f64(hi2, 0) + vgetq_lane_f64(hi2, 1);
+        }
+        for (; j < len; j++)
+            sum += (double)a[i + j] * (double)b[i + j];
+        i += len;
+    }
+    for (; i < n; i++)
+        sum += (double)a[i] * (double)b[i];
+    return sum;
+}
+
+// y[r] = sum_t Wᵀ[r,t]·x[t] при W, хранящейся как [cols, rows]: r — младший
+// индекс, поэтому строки выхода читаются подряд и складываются в f32-ленты
+// (4 выхода за шаг), блок по t — в double.
+static void gemv_f32_neon_transposed_rows(const float *w, const float *x,
+                                          float *y, int rows, int cols,
+                                          int r0, int r1) {
+    int r = r0, t;
+
+    for (; r + 4 <= r1; r += 4) {
+        double acc[4] = {0.0, 0.0, 0.0, 0.0};
+        int c;
+
+        for (c = 0; c < cols; c += VTM_GEMV_CHUNK) {
+            float32x4_t part = vdupq_n_f32(0.0f);
+            int end = c + VTM_GEMV_CHUNK;
+
+            if (end > cols) end = cols;
+            for (t = c; t < end; t++)
+                part = vfmaq_n_f32(part,
+                                   vld1q_f32(w + (size_t)t * (size_t)rows
+                                             + (size_t)r),
+                                   x[t]);
+            {
+                float64x2_t lo = vcvt_f64_f32(vget_low_f32(part));
+                float64x2_t hi = vcvt_f64_f32(vget_high_f32(part));
+                acc[0] += vgetq_lane_f64(lo, 0);
+                acc[1] += vgetq_lane_f64(lo, 1);
+                acc[2] += vgetq_lane_f64(hi, 0);
+                acc[3] += vgetq_lane_f64(hi, 1);
+            }
+        }
+        y[r] = (float)acc[0];
+        y[r + 1] = (float)acc[1];
+        y[r + 2] = (float)acc[2];
+        y[r + 3] = (float)acc[3];
+    }
+    for (; r < r1; r++) {
+        double sum = 0.0;
+        for (t = 0; t < cols; t++)
+            sum += (double)w[(size_t)t * (size_t)rows + (size_t)r]
+                 * (double)x[t];
+        y[r] = (float)sum;
+    }
+}
+
+typedef struct {
+    float       *y;
+    const float *w;
+    const float *x;
+    int          rows;
+    int          cols;
+    int          transposed;
+} gemv_f32_neon_job;
+
+static void gemv_f32_neon_rows(gemv_f32_neon_job *j, int tid, int r0, int r1) {
+    int r;
+
+    (void)tid;
+    if (j->transposed) {
+        gemv_f32_neon_transposed_rows(j->w, j->x, j->y, j->rows, j->cols,
+                                      r0, r1);
+        return;
+    }
+    for (r = r0; r < r1; r++)
+        j->y[r] = (float)gemv_dot_f32_neon(
+            j->w + (size_t)r * (size_t)j->cols, j->x, j->cols);
+}
+
+static void gemv_f32_neon_worker(void *p, int tid, int r0, int r1) {
+    gemv_f32_neon_rows((gemv_f32_neon_job *)p, tid, r0, r1);
+}
+
+static int gemv_f32_neon(float *y, const float *w, const float *x,
+                         int rows, int cols, int transposed) {
+    gemv_f32_neon_job job;
+
+    if (!y || !w || !x) return -1;
+    if (rows < 0 || cols < 0) return -1;
+    if (rows == 0) return 0;
+    if (cols == 0) {
+        memset(y, 0, (size_t)rows * sizeof(float));
+        return 0;
+    }
+    job.y = y;
+    job.w = w;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    job.transposed = transposed;
+    vtm_parallel_rows(rows, (double)rows * (double)cols,
+                      gemv_f32_neon_worker, &job);
+    return 0;
+}
+
+// --- NEON: батчевый плотный TMV/MM (задача 0159) ---------------------------
+//
+// y[r*N + j] = sum_t W[r,t] · x[t*N + j] (transposed == 0) или
+// W[t,r] (transposed != 0). По вектору — токены пачки: активации лежат
+// подряд (x[t*N .. t*N+N)), вес W[r,t] — скаляр, поэтому на один t уходит
+// один broadcast и N/4 FMA. Блок VTM_DENSE_BATCH_CHUNK по t копится в
+// f32-лентах и сворачивается в double — как в GEMV выше; расхождение с
+// батчевым double-эталоном ≤1e-5 (bench_backend --check).
+//
+// Разбиение по строкам: каждая строка считается тем же кодом, поэтому от
+// числа потоков результат не зависит (побитово).
+typedef struct {
+    float       *y;
+    const float *w;
+    const float *x;
+    int          rows;
+    int          cols;
+    int          ntok;
+    int          transposed;
+    double      *acc_all;   // vt * ntok
+} dense_batch_neon_job;
+
+static void dense_batch_neon_rows(dense_batch_neon_job *j, int tid, int r0,
+                                  int r1) {
+    const int ntok = j->ntok;
+    const int cols = j->cols;
+    const int rows = j->rows;
+    const float *w = j->w;
+    const float *x = j->x;
+    double *acc = j->acc_all + (size_t)tid * (size_t)ntok;
+    int r, jj, t, c;
+
+    for (r = r0; r < r1; r++) {
+        memset(acc, 0, (size_t)ntok * sizeof(double));
+        // 16 токенов за шаг: четыре f32-ленты по 4.
+        for (jj = 0; jj + 16 <= ntok; jj += 16) {
+            const float *base = x + (size_t)jj;
+            for (c = 0; c < cols; c += VTM_DENSE_BATCH_CHUNK) {
+                float32x4_t a0 = vdupq_n_f32(0.0f);
+                float32x4_t a1 = a0, a2 = a0, a3 = a0;
+                int end = c + VTM_DENSE_BATCH_CHUNK;
+
+                if (end > cols) end = cols;
+                for (t = c; t < end; t++) {
+                    const float *xp = base + (size_t)t * (size_t)ntok;
+                    float wv = j->transposed
+                             ? w[(size_t)t * (size_t)rows + (size_t)r]
+                             : w[(size_t)r * (size_t)cols + (size_t)t];
+                    a0 = vfmaq_n_f32(a0, vld1q_f32(xp), wv);
+                    a1 = vfmaq_n_f32(a1, vld1q_f32(xp + 4), wv);
+                    a2 = vfmaq_n_f32(a2, vld1q_f32(xp + 8), wv);
+                    a3 = vfmaq_n_f32(a3, vld1q_f32(xp + 12), wv);
+                }
+                acc[jj + 0] += (double)vgetq_lane_f32(a0, 0);
+                acc[jj + 1] += (double)vgetq_lane_f32(a0, 1);
+                acc[jj + 2] += (double)vgetq_lane_f32(a0, 2);
+                acc[jj + 3] += (double)vgetq_lane_f32(a0, 3);
+                acc[jj + 4] += (double)vgetq_lane_f32(a1, 0);
+                acc[jj + 5] += (double)vgetq_lane_f32(a1, 1);
+                acc[jj + 6] += (double)vgetq_lane_f32(a1, 2);
+                acc[jj + 7] += (double)vgetq_lane_f32(a1, 3);
+                acc[jj + 8] += (double)vgetq_lane_f32(a2, 0);
+                acc[jj + 9] += (double)vgetq_lane_f32(a2, 1);
+                acc[jj + 10] += (double)vgetq_lane_f32(a2, 2);
+                acc[jj + 11] += (double)vgetq_lane_f32(a2, 3);
+                acc[jj + 12] += (double)vgetq_lane_f32(a3, 0);
+                acc[jj + 13] += (double)vgetq_lane_f32(a3, 1);
+                acc[jj + 14] += (double)vgetq_lane_f32(a3, 2);
+                acc[jj + 15] += (double)vgetq_lane_f32(a3, 3);
+            }
+        }
+        // 8 токенов — две ленты, 4 — одна; хвост 1-3 считаем по столбцам.
+        for (; jj + 8 <= ntok; jj += 8) {
+            const float *base = x + (size_t)jj;
+            for (c = 0; c < cols; c += VTM_DENSE_BATCH_CHUNK) {
+                float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0;
+                int end = c + VTM_DENSE_BATCH_CHUNK;
+
+                if (end > cols) end = cols;
+                for (t = c; t < end; t++) {
+                    const float *xp = base + (size_t)t * (size_t)ntok;
+                    float wv = j->transposed
+                             ? w[(size_t)t * (size_t)rows + (size_t)r]
+                             : w[(size_t)r * (size_t)cols + (size_t)t];
+                    a0 = vfmaq_n_f32(a0, vld1q_f32(xp), wv);
+                    a1 = vfmaq_n_f32(a1, vld1q_f32(xp + 4), wv);
+                }
+                acc[jj + 0] += (double)vgetq_lane_f32(a0, 0);
+                acc[jj + 1] += (double)vgetq_lane_f32(a0, 1);
+                acc[jj + 2] += (double)vgetq_lane_f32(a0, 2);
+                acc[jj + 3] += (double)vgetq_lane_f32(a0, 3);
+                acc[jj + 4] += (double)vgetq_lane_f32(a1, 0);
+                acc[jj + 5] += (double)vgetq_lane_f32(a1, 1);
+                acc[jj + 6] += (double)vgetq_lane_f32(a1, 2);
+                acc[jj + 7] += (double)vgetq_lane_f32(a1, 3);
+            }
+        }
+        for (; jj + 4 <= ntok; jj += 4) {
+            const float *base = x + (size_t)jj;
+            for (c = 0; c < cols; c += VTM_DENSE_BATCH_CHUNK) {
+                float32x4_t a0 = vdupq_n_f32(0.0f);
+                int end = c + VTM_DENSE_BATCH_CHUNK;
+
+                if (end > cols) end = cols;
+                for (t = c; t < end; t++) {
+                    const float *xp = base + (size_t)t * (size_t)ntok;
+                    float wv = j->transposed
+                             ? w[(size_t)t * (size_t)rows + (size_t)r]
+                             : w[(size_t)r * (size_t)cols + (size_t)t];
+                    a0 = vfmaq_n_f32(a0, vld1q_f32(xp), wv);
+                }
+                acc[jj + 0] += (double)vgetq_lane_f32(a0, 0);
+                acc[jj + 1] += (double)vgetq_lane_f32(a0, 1);
+                acc[jj + 2] += (double)vgetq_lane_f32(a0, 2);
+                acc[jj + 3] += (double)vgetq_lane_f32(a0, 3);
+            }
+        }
+        for (; jj < ntok; jj++) {
+            double sum = 0.0;
+            for (t = 0; t < cols; t++) {
+                double wv = j->transposed
+                          ? (double)w[(size_t)t * (size_t)rows + (size_t)r]
+                          : (double)w[(size_t)r * (size_t)cols + (size_t)t];
+                sum += wv * (double)x[(size_t)t * (size_t)ntok
+                                      + (size_t)jj];
+            }
+            acc[jj] += sum;
+        }
+        for (jj = 0; jj < ntok; jj++)
+            j->y[(size_t)r * (size_t)ntok + (size_t)jj] = (float)acc[jj];
+    }
+}
+
+static void dense_batch_neon_worker(void *p, int tid, int r0, int r1) {
+    dense_batch_neon_rows((dense_batch_neon_job *)p, tid, r0, r1);
+}
+
+static int dense_batch_neon(float *y, const float *w, const float *x,
+                            int rows, int cols, int ntok, int transposed) {
+    dense_batch_neon_job job;
+    int vt;
+
+    if (!y || !w || !x) return -1;
+    if (rows < 0 || cols < 0 || ntok < 0) return -1;
+    if (rows == 0 || cols == 0 || ntok == 0) return 0;
+    vt = vtm_threads();
+    job.acc_all = (double *)calloc((size_t)vt * (size_t)ntok,
+                                   sizeof(double));
+    if (!job.acc_all) return -1;
+    job.y = y;
+    job.w = w;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    job.ntok = ntok;
+    job.transposed = transposed;
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok,
+                      dense_batch_neon_worker, &job);
+    free(job.acc_all);
+    return 0;
+}
+
+// MM-обёртка без transposed — под общий тип указателя в simd_kernels.
+static int dense_batch_neon_mm(float *y, const float *a, const float *b,
+                               int m, int k, int ntok) {
+    return dense_batch_neon(y, a, b, m, k, ntok, 0);
+}
+
 // --- NEON: батчевые TMV/MM (задача 0122) -----------------------------------
 //
 // y[r*N + j] = sum_t trit(W)[r,t] * x[t*N + j]. В отличие от row_dot_trit
@@ -1694,11 +1965,18 @@ typedef struct {
                    int, int, int, int);
     int (*mm_f32)(float *, const float *, const float *, int, int, int);
     // Батчевые TMV/MM (задача 0122). NULL — публичные vtm_simd_*_batch
-    // уходят в скалярный откат (trit_batch_scalar / dense_batch).
+    // уходят в скалярный откат (trit_batch_scalar).
     int (*tmv_blocks_batch)(float *, const uint8_t *, const float *,
                             const float *, int, int, int, int);
     int (*mm_batch)(float *, const uint8_t *, const float *, const float *,
                     int, int, int, int);
+    // Плотный GEMV (n == 1) и батчевый плотный TMV/MM (задача 0159). NULL —
+    // публичные vtm_simd_* уходят в откат backend_scalar.c
+    // (vtm_scalar_gemv_f32 / vtm_scalar_dense_batch).
+    int (*gemv_f32)(float *, const float *, const float *, int, int, int);
+    int (*tmv_f32_batch)(float *, const float *, const float *, int, int,
+                         int, int);
+    int (*mm_f32_batch)(float *, const float *, const float *, int, int, int);
 } simd_kernels;
 
 static const simd_kernels g_simd = {
@@ -1708,16 +1986,22 @@ static const simd_kernels g_simd = {
     mm_trit_neon,
     mm_f32_neon,
     trit_batch_neon,
-    trit_batch_neon
+    trit_batch_neon,
+    gemv_f32_neon,
+    dense_batch_neon,
+    dense_batch_neon_mm
 #elif VTM_SIMD_X86
     vtm_avx2_tmv_blocks,
     vtm_avx2_rmsnorm,
     vtm_avx2_mm_trit,
     vtm_avx2_mm_f32,
     vtm_avx2_tmv_blocks_batch,
-    vtm_avx2_mm_batch
+    vtm_avx2_mm_batch,
+    vtm_avx2_gemv_f32,
+    vtm_avx2_tmv_f32_batch,
+    vtm_avx2_mm_f32_batch
 #else
-    NULL, NULL, NULL, NULL, NULL, NULL
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 #endif
 };
 
@@ -1776,9 +2060,23 @@ int vtm_simd_mm_trit(float *y, const uint8_t *w, const float *scales,
 
 int vtm_simd_mm_f32(float *y, const float *a, const float *b,
                     int m, int k, int n) {
+    // Один столбец — это GEMV: у mm_f32 нет векторизации по столбцам (цикл
+    // по 4 столбца не выполняется), а у vtm_simd_gemv_f32 есть (задача 0159).
+    if (n == 1) return vtm_simd_gemv_f32(y, a, b, m, k, 0);
     if (vtm_simd_available() && g_simd.mm_f32)
         return g_simd.mm_f32(y, a, b, m, k, n);
     return mm_f32_scalar(y, a, b, m, k, n);
+}
+
+// Плотный GEMV (n == 1): SIMD-ядро, если собрано и CPU его умеет, иначе
+// переносимый откат backend_scalar.c (4 double-аккумулятора).
+int vtm_simd_gemv_f32(float *y, const float *w, const float *x,
+                      int rows, int cols, int transposed) {
+    if (!y || !w || !x) return -1;
+    if (rows < 0 || cols < 0) return -1;
+    if (vtm_simd_available() && g_simd.gemv_f32)
+        return g_simd.gemv_f32(y, w, x, rows, cols, transposed);
+    return vtm_scalar_gemv_f32(y, w, x, rows, cols, transposed);
 }
 
 // --- батчевые TMV/MM: публичный контракт (задача 0122) ---------------------
@@ -1828,12 +2126,24 @@ int vtm_simd_mm_batch(float *y, const uint8_t *w, const float *scales,
     return trit_batch_scalar(y, w, scales, b, m, k, n_tokens, scale_block);
 }
 
+// --- батчевый плотный TMV/MM: публичный контракт (задача 0159) -------------
+//
+// Общий вход в плотные ядра. n_tokens == 1 — обычный одноколоночный случай:
+// отдаём его GEMV, чтобы батчевый путь не расходился с декодом. Дальше —
+// SIMD-ядро из g_simd (вектор по токенам пачки), если оно собрано и доступно,
+// иначе переносимый откат vtm_scalar_dense_batch (тот же double-порядок, что
+// у прежнего батчевого цикла interp.c).
 int vtm_simd_tmv_f32_batch(float *y, const float *w, const float *x,
                            int rows, int cols, int n_tokens, int transposed) {
     if (!y || !w || !x) return -1;
     if (rows < 0 || cols < 0 || n_tokens < 0) return -1;
     if (rows == 0 || cols == 0 || n_tokens == 0) return 0;
-    return dense_batch(y, w, x, rows, cols, n_tokens, transposed != 0);
+    if (n_tokens == 1)
+        return vtm_simd_gemv_f32(y, w, x, rows, cols, transposed);
+    if (vtm_simd_available() && g_simd.tmv_f32_batch)
+        return g_simd.tmv_f32_batch(y, w, x, rows, cols, n_tokens,
+                                    transposed);
+    return vtm_scalar_dense_batch(y, w, x, rows, cols, n_tokens, transposed);
 }
 
 int vtm_simd_mm_f32_batch(float *y, const float *a, const float *b,
@@ -1841,7 +2151,10 @@ int vtm_simd_mm_f32_batch(float *y, const float *a, const float *b,
     if (!y || !a || !b) return -1;
     if (m < 0 || k < 0 || n_tokens < 0) return -1;
     if (m == 0 || k == 0 || n_tokens == 0) return 0;
-    return dense_batch(y, a, b, m, k, n_tokens, 0);
+    if (n_tokens == 1) return vtm_simd_gemv_f32(y, a, b, m, k, 0);
+    if (vtm_simd_available() && g_simd.mm_f32_batch)
+        return g_simd.mm_f32_batch(y, a, b, m, k, n_tokens);
+    return vtm_scalar_dense_batch(y, a, b, m, k, n_tokens, 0);
 }
 
 #if VTM_SIMD_NEON

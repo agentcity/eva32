@@ -3,6 +3,9 @@
 //
 //   ./bench_backend                 — GFLOP/s: scalar-lut243 / scalar-direct /
 //                                     simd (матрица 1024x1024) + MM + RMSN;
+//                                     в конце — плотный GEMV f32 n == 1
+//                                     (tied lm_head, задача 0159), форма
+//                                     задаётся --gemv-rows/--gemv-cols;
 //   ./bench_backend --check         — «simd == scalar» на наборе форм (в т.ч.
 //                                     нечётные cols, блок 128/160, MM, RMSN);
 //                                     вызывается из `make test`, код возврата
@@ -1052,6 +1055,62 @@ done:
     free(y_cand);
 }
 
+// Плотный GEMV (n == 1, задача 0159): эталон — тот же double-цикл по t, что
+// у скалярного op_tmv/op_mm (mm_f32_ref с n == 1). Проверяются обе раскладки
+// (W и W^T) и хвосты cols, не кратные 4.
+static void check_gemv_f32_case(int rows, int cols, int transposed) {
+    uint32_t seed = 0x9e00u + (uint32_t)rows * 37u + (uint32_t)cols
+                  + (uint32_t)transposed;
+    size_t n = (size_t)rows * (size_t)cols;
+    float *w = make_vec(n, seed);
+    float *wt = transposed ? make_vec(n, seed ^ 0x2b2bu) : NULL;
+    float *x = make_vec((size_t)cols, seed ^ 0x71u);
+    float *y_ref = (float *)calloc((size_t)rows, sizeof(float));
+    float *y_cand = (float *)calloc((size_t)rows, sizeof(float));
+    const float *w_use = w;
+    char label[128];
+    double ref = 0.0;
+    int r, t;
+
+    if (!w || !x || !y_ref || !y_cand || (transposed && !wt)) {
+        fprintf(stderr, "check_gemv_f32_case: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    if (transposed) {
+        for (r = 0; r < rows; r++)
+            for (t = 0; t < cols; t++)
+                wt[(size_t)t * (size_t)rows + (size_t)r]
+                    = w[(size_t)r * (size_t)cols + (size_t)t];
+        w_use = wt;
+        // Эталон W^T: один double-цикл по t (как скалярный op_tmv).
+        for (r = 0; r < rows; r++) {
+            double sum = 0.0;
+            for (t = 0; t < cols; t++)
+                sum += (double)wt[(size_t)t * (size_t)rows + (size_t)r]
+                     * (double)x[t];
+            y_ref[r] = (float)sum;
+        }
+    } else {
+        mm_f32_ref(y_ref, w, x, rows, cols, 1);
+    }
+
+    if (vtm_simd_gemv_f32(y_cand, w_use, x, rows, cols, transposed) != 0) {
+        fprintf(stderr, "check_gemv_f32_case: ядро вернуло ошибку\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "GEMV f32 %dx%d%s", rows, cols,
+             transposed ? " (W^T)" : "");
+    report(label, max_diff(y_cand, y_ref, (size_t)rows, &ref), ref, CHECK_TOL);
+done:
+    free(w);
+    free(wt);
+    free(x);
+    free(y_ref);
+    free(y_cand);
+}
+
 static int run_checks(const vtm_backend *cand) {
     static const int shapes[][2] = {
         {1, 1}, {1, 20}, {7, 37}, {5, 53}, {17, 128}, {33, 41}, {64, 160},
@@ -1104,6 +1163,21 @@ static int run_checks(const vtm_backend *cand) {
         }
         check_batch_f32_case(7, 13, 5);
         check_batch_f32_case(64, 37, 16);
+        check_batch_f32_case(13, 11, 3);   // хвост 1-3 токена
+        check_batch_f32_case(32, 17, 8);   // ровно две 8-ленты (AVX2)
+    }
+
+    // Плотный GEMV (n == 1, задача 0159): tied lm_head в декоде. Эталон —
+    // double-цикл, как у скалярного пути; обе раскладки W.
+    {
+        static const int gshapes[][2] = {
+            {1, 1}, {1, 20}, {7, 37}, {5, 1031}, {9, 13}, {64, 2048}
+        };
+        size_t gi;
+        for (gi = 0; gi < sizeof(gshapes) / sizeof(gshapes[0]); gi++) {
+            check_gemv_f32_case(gshapes[gi][0], gshapes[gi][1], 0);
+            check_gemv_f32_case(gshapes[gi][0], gshapes[gi][1], 1);
+        }
     }
 
     // Q4 (kind 5, задача 0152): независимый эталон — деквантизация в double.
@@ -1321,6 +1395,102 @@ done:
     free(y_cand);
 }
 
+// --- плотный GEMV f32 n == 1 (задача 0159) ---------------------------------
+//
+// Форма tied lm_head: [rows, cols] × [cols, 1]. «Скаляр» — прежний путь для
+// n == 1 (один double-цикл по t: у mm_f32 нет векторизации по столбцам),
+// «simd» — vtm_simd_gemv_f32 (NEON/AVX2, переносимый откат). 3B Q4: emb.w —
+// плотная [151936, 2048], это ~311М MAC и около трети времени декода; реальная
+// форма задаётся --gemv-rows/--gemv-cols, по умолчанию меньше, чтобы бенч не
+// занимал 1,24 ГБ.
+static void bench_gemv_f32_table(int rows, int cols, int iters) {
+    uint32_t seed = 0x6e6du + (uint32_t)rows + (uint32_t)cols;
+    float *w = make_vec((size_t)rows * (size_t)cols, seed);
+    float *x = make_vec((size_t)cols, seed ^ 0x33u);
+    float *y_ref = (float *)calloc((size_t)rows, sizeof(float));
+    float *y_cand = (float *)calloc((size_t)rows, sizeof(float));
+    double ms_ref, ms_cand, flops = 2.0 * (double)rows * (double)cols;
+    double t0, t1, ref = 0.0;
+    int i;
+
+    if (!w || !x || !y_ref || !y_cand) {
+        fprintf(stderr, "bench_gemv_f32_table: нет памяти\n");
+        goto done;
+    }
+    // «До»: ровно то, что делал op_mm при n == 1 без GEMV-ядра.
+    t0 = now_ms();
+    mm_f32_ref(y_ref, w, x, rows, cols, 1);
+    t1 = now_ms();
+    ms_ref = t1 - t0;
+
+    if (vtm_simd_gemv_f32(y_cand, w, x, rows, cols, 0) != 0) {
+        printf("GEMV f32 n==1 %dx%d: ядро вернуло ошибку\n", rows, cols);
+        goto done;
+    }
+    t0 = now_ms();
+    for (i = 0; i < iters; i++)
+        vtm_simd_gemv_f32(y_cand, w, x, rows, cols, 0);
+    t1 = now_ms();
+    ms_cand = (t1 - t0) / (double)iters;
+    printf("GEMV f32 n==1 %dx%d: scalar %.3f мс (%.2f GFLOP/s), simd "
+           "%.3f мс (%.2f GFLOP/s), %.2fx, max|diff|=%.2e, max|ref|=%.2f\n",
+           rows, cols, ms_ref, flops / (ms_ref * 1e6), ms_cand,
+           flops / (ms_cand * 1e6), ms_ref / ms_cand,
+           max_diff(y_cand, y_ref, (size_t)rows, &ref), ref);
+done:
+    free(w);
+    free(x);
+    free(y_ref);
+    free(y_cand);
+}
+
+// Батчевый плотный TMV/MM (f32, задача 0159): N токенов против одной
+// матрицы. Эталон — vtm_scalar_dense_batch (прежний double-цикл interp.c),
+// кандидат — vtm_simd_mm_f32_batch (вектор по токенам пачки). N = 16 — полная
+// пачка VTM_BATCH_TOKENS; форма — tied lm_head в prefill.
+static void bench_dense_batch_table(int rows, int cols, int ntok, int iters) {
+    uint32_t seed = 0xd3d3u + (uint32_t)rows + (uint32_t)cols
+                  + (uint32_t)ntok;
+    float *a = make_vec((size_t)rows * (size_t)cols, seed);
+    float *b = make_vec((size_t)cols * (size_t)ntok, seed ^ 0x55u);
+    float *y_ref = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    float *y_cand = (float *)calloc((size_t)rows * (size_t)ntok,
+                                    sizeof(float));
+    double ms_ref, ms_cand, flops = 2.0 * (double)rows * (double)cols
+                                          * (double)ntok;
+    double t0, ref = 0.0;
+    int i;
+
+    if (!a || !b || !y_ref || !y_cand) {
+        fprintf(stderr, "bench_dense_batch_table: нет памяти\n");
+        goto done;
+    }
+    t0 = now_ms();
+    if (vtm_scalar_dense_batch(y_ref, a, b, rows, cols, ntok, 0) != 0) {
+        printf("батч f32 %dx%dxN%d: скаляр вернул ошибку\n", rows, cols, ntok);
+        goto done;
+    }
+    ms_ref = now_ms() - t0;
+    if (vtm_simd_mm_f32_batch(y_cand, a, b, rows, cols, ntok) != 0) {
+        printf("батч f32 %dx%dxN%d: ядро вернуло ошибку\n", rows, cols, ntok);
+        goto done;
+    }
+    t0 = now_ms();
+    for (i = 0; i < iters; i++)
+        vtm_simd_mm_f32_batch(y_cand, a, b, rows, cols, ntok);
+    ms_cand = (now_ms() - t0) / (double)iters;
+    printf("батч f32 %dx%dxN%d: scalar %.3f мс (%.2f GFLOP/s), simd "
+           "%.3f мс (%.2f GFLOP/s), %.2fx, max|diff|=%.2e, max|ref|=%.2f\n",
+           rows, cols, ntok, ms_ref, flops / (ms_ref * 1e6), ms_cand,
+           flops / (ms_cand * 1e6), ms_ref / ms_cand,
+           max_diff(y_cand, y_ref, (size_t)rows * (size_t)ntok, &ref), ref);
+done:
+    free(a);
+    free(b);
+    free(y_ref);
+    free(y_cand);
+}
+
 // --- многопоточность (задача 0077) -----------------------------------------
 //
 // Каждое ядро считается при 1/2/4/8 потоках в одном процессе
@@ -1498,6 +1668,96 @@ done:
     free(got);
 }
 
+// Плотный GEMV (n == 1) и батчевый плотный MM (0159): результат обязан быть
+// побитово одинаковым при 1/2/4/8 потоках — строки делятся пулом, каждая
+// считается тем же кодом.
+static void thr_gemv_f32(int rows, int cols, int iters) {
+    uint32_t seed = 0x9a9au + (uint32_t)rows + (uint32_t)cols;
+    float *w = make_vec((size_t)rows * (size_t)cols, seed);
+    float *x = make_vec((size_t)cols, seed ^ 0x42u);
+    float *ref = (float *)calloc((size_t)rows, sizeof(float));
+    float *got = (float *)calloc((size_t)rows, sizeof(float));
+    char label[96];
+    double base_ms = 0.0;
+    int i;
+
+    if (!w || !x || !ref || !got) {
+        fprintf(stderr, "thr_gemv_f32: нет памяти\n");
+        g_thr_fail++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "GEMV f32 %dx%d (n=1)", rows, cols);
+    for (i = 0; i < 4; i++) {
+        double t0, t1, ms;
+        int it;
+        vtm_threads_set(g_nts[i]);
+        if (vtm_simd_gemv_f32(got, w, x, rows, cols, 0) != 0) {
+            printf("  %-38s nt=%d ошибка ядра\n", label, g_nts[i]);
+            g_thr_fail++;
+            continue;
+        }
+        t0 = now_ms();
+        for (it = 0; it < iters; it++)
+            vtm_simd_gemv_f32(got, w, x, rows, cols, 0);
+        t1 = now_ms();
+        ms = (t1 - t0) / (double)iters;
+        if (i == 0) {
+            memcpy(ref, got, (size_t)rows * sizeof(float));
+            base_ms = ms;
+        }
+        thr_report(label, g_nts[i], got, ref, (size_t)rows, ms, base_ms);
+    }
+done:
+    free(w);
+    free(x);
+    free(ref);
+    free(got);
+}
+
+static void thr_dense_batch_f32(int rows, int cols, int ntok, int iters) {
+    uint32_t seed = 0x6b6bu + (uint32_t)rows + (uint32_t)cols;
+    float *a = make_vec((size_t)rows * (size_t)cols, seed);
+    float *b = make_vec((size_t)cols * (size_t)ntok, seed ^ 0x42u);
+    size_t n = (size_t)rows * (size_t)ntok;
+    float *ref = (float *)calloc(n, sizeof(float));
+    float *got = (float *)calloc(n, sizeof(float));
+    char label[96];
+    double base_ms = 0.0;
+    int i;
+
+    if (!a || !b || !ref || !got) {
+        fprintf(stderr, "thr_dense_batch_f32: нет памяти\n");
+        g_thr_fail++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "батч f32 %dx%dxN%d", rows, cols, ntok);
+    for (i = 0; i < 4; i++) {
+        double t0, t1, ms;
+        int it;
+        vtm_threads_set(g_nts[i]);
+        if (vtm_simd_mm_f32_batch(got, a, b, rows, cols, ntok) != 0) {
+            printf("  %-38s nt=%d ошибка ядра\n", label, g_nts[i]);
+            g_thr_fail++;
+            continue;
+        }
+        t0 = now_ms();
+        for (it = 0; it < iters; it++)
+            vtm_simd_mm_f32_batch(got, a, b, rows, cols, ntok);
+        t1 = now_ms();
+        ms = (t1 - t0) / (double)iters;
+        if (i == 0) {
+            memcpy(ref, got, n * sizeof(float));
+            base_ms = ms;
+        }
+        thr_report(label, g_nts[i], got, ref, n, ms, base_ms);
+    }
+done:
+    free(a);
+    free(b);
+    free(ref);
+    free(got);
+}
+
 static void thr_rmsnorm(const vtm_backend *b, int n, int iters) {
     uint32_t seed = 0x31337u + (uint32_t)n;
     float *x = make_vec((size_t)n, seed);
@@ -1599,6 +1859,10 @@ static int run_threads(int iters) {
     thr_mm_trit(128, 1024, 32, 160, iters);
     printf("\nMM f32 256x256x256:\n");
     thr_mm_f32(256, 256, 256, iters > 10 ? 10 : iters);
+    printf("\nGEMV f32 2048x2048 (n == 1, путь tied lm_head):\n");
+    thr_gemv_f32(2048, 2048, iters > 10 ? 10 : iters);
+    printf("\nбатч f32 512x512xN16 (prefill lm_head):\n");
+    thr_dense_batch_f32(512, 512, 16, iters > 10 ? 10 : iters);
     printf("\nRMSN n=524288 (порог %d):\n", VTM_PAR_RMSN_MIN);
     thr_rmsnorm(&vtm_backend_scalar_lut, 524288, iters);
     thr_rmsnorm(simd, 524288, iters);
@@ -2048,6 +2312,7 @@ static void usage(const char *prog) {
     printf("usage: %s [--rows N] [--cols N] [--iters N] [--scale-block 128|160]\n"
            "          [--backend auto|scalar|simd|direct] [--check] "
            "[--threads] [--pool] [--logits PATH] [--no-mm]\n"
+           "          [--gemv-rows N] [--gemv-cols N]\n"
            "          [--batch] [--batch-tokens N] "
            "[--q4 [--q4-rows N] [--q4-cols N] [--q4-iters N]]\n"
            "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
@@ -2060,6 +2325,9 @@ int main(int argc, char **argv) {
     int check = 0, no_mm = 0, threads = 0, pool = 0, batch = 0;
     int batch_tokens = 16;
     int q4 = 0, q4_rows = 151936, q4_cols = 896, q4_iters = 3;
+    // Форма плотного GEMV (f32 n == 1): по умолчанию — уменьшенный аналог
+    // tied lm_head 3B Q4 ([151936, 2048]); реальную задают флагами.
+    int gemv_rows = 16384, gemv_cols = 2048;
     const char *logits_path = NULL;
     const char *backend_name = NULL;
     const vtm_backend *cand;
@@ -2072,6 +2340,10 @@ int main(int argc, char **argv) {
             cols = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
             iters = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--gemv-rows") == 0 && i + 1 < argc) {
+            gemv_rows = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--gemv-cols") == 0 && i + 1 < argc) {
+            gemv_cols = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--q4") == 0) {
             q4 = 1;
         } else if (strcmp(argv[i], "--q4-rows") == 0 && i + 1 < argc) {
@@ -2109,6 +2381,11 @@ int main(int argc, char **argv) {
     }
     if (rows <= 0 || cols <= 0 || iters <= 0 || cols > 32768 || rows > 32768) {
         fprintf(stderr, "плохие размеры/итерации\n");
+        return 2;
+    }
+    if (gemv_rows <= 0 || gemv_cols <= 0 || gemv_cols > (1 << 20) ||
+        gemv_rows > (1 << 22)) {
+        fprintf(stderr, "плохие --gemv-rows/--gemv-cols\n");
         return 2;
     }
     if (scale_block != 128 && scale_block != 160) {
@@ -2154,10 +2431,19 @@ int main(int argc, char **argv) {
            vtm_simd_available() ? "да" : "нет", cand->name);
     bench_tmv_table(rows, cols, scale_block, iters, cand);
     if (!no_mm) {
+        int giters = iters;
         printf("\n");
         bench_mm_table(1024, 1024, 1, scale_block, iters);
         bench_mm_table(128, 1024, 32, scale_block, iters);
         bench_mm_f32_table(256, 256, 256, iters);
+        // f32 n == 1 — путь tied lm_head в декоде (задача 0159). На форме
+        // побольше число итераций меньше: один проход — сотни Мфлоп.
+        if ((double)gemv_rows * (double)gemv_cols > 1.0e7 && giters > 5)
+            giters = 5;
+        bench_gemv_f32_table(gemv_rows, gemv_cols, giters);
+        // Батчевый плотный путь — tied lm_head в prefill (N = 16 токенов).
+        bench_dense_batch_table(gemv_rows, gemv_cols, 16,
+                                giters > 3 ? 3 : giters);
     }
     return 0;
 }

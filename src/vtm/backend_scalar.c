@@ -793,6 +793,161 @@ static int tmv_lut(float *y, const uint8_t *w, const float *scales,
                           (int)VTM_SCALE_BLOCK_160);
 }
 
+// --- плотный GEMV и батчевый плотный TMV/MM: переносимый откат (0159) ------
+//
+// Этот TU собирается всегда и без SIMD, поэтому здесь — эталон и откат для
+// ядер, которые живут в backend_neon.c/backend_avx2.c:
+//
+//   * vtm_scalar_gemv_f32 — откат vtm_simd_gemv_f32, когда SIMD в сборке нет
+//     или CPU его не умеет. Вместо одной цепи FMA — 4 независимых double-
+//     аккумулятора (снимает задержку сложения, ~2,5x на длинной строке).
+//     Порядок сложений иной, чем у одного double-цикла, но расхождение —
+//     единицы ulp double, а не «похожий результат».
+//   * vtm_scalar_dense_batch — прежний батчевый цикл interp.c (batch_tmv_
+//     dense_rows/batch_mm_dense_rows), перенесённый в бэкенд без изменения
+//     арифметики: сумма по t копится в double, порядок сложений — по t.
+//     interp.c зовёт его для скалярных бэкендов, где побитовое совпадение с
+//     прогоном по токену — контракт (см. tests/vtm/test_vtm.c, batch_case).
+//
+// Раскладка активаций батча — как у всех батчевых ядер: x[t*N + j], y[r*N + j],
+// токен j — младший индекс. transposed != 0 — W хранится как [cols, rows].
+
+typedef struct {
+    float       *y;
+    const float *w;
+    const float *x;
+    int          rows;
+    int          cols;
+    int          transposed;
+} gemv_scalar_job;
+
+// a·b в double с четырьмя независимыми аккумуляторами.
+static double gemv_dot_scalar(const float *a, const float *b, int n) {
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    int i = 0;
+
+    for (; i + 4 <= n; i += 4) {
+        s0 += (double)a[i] * (double)b[i];
+        s1 += (double)a[i + 1] * (double)b[i + 1];
+        s2 += (double)a[i + 2] * (double)b[i + 2];
+        s3 += (double)a[i + 3] * (double)b[i + 3];
+    }
+    for (; i < n; i++) s0 += (double)a[i] * (double)b[i];
+    return (s0 + s1) + (s2 + s3);
+}
+
+static void gemv_scalar_rows(gemv_scalar_job *j, int r0, int r1) {
+    int r, t;
+
+    for (r = r0; r < r1; r++) {
+        double sum = 0.0;
+        if (j->transposed) {
+            for (t = 0; t < j->cols; t++)
+                sum += (double)j->w[(size_t)t * (size_t)j->rows + (size_t)r]
+                     * (double)j->x[t];
+        } else {
+            sum = gemv_dot_scalar(j->w + (size_t)r * (size_t)j->cols, j->x,
+                                  j->cols);
+        }
+        j->y[r] = (float)sum;
+    }
+}
+
+static void gemv_scalar_worker(void *p, int tid, int r0, int r1) {
+    (void)tid;
+    gemv_scalar_rows((gemv_scalar_job *)p, r0, r1);
+}
+
+int vtm_scalar_gemv_f32(float *y, const float *w, const float *x,
+                        int rows, int cols, int transposed) {
+    gemv_scalar_job job;
+
+    if (!y || !w || !x) return -1;
+    if (rows < 0 || cols < 0) return -1;
+    if (rows == 0) return 0;
+    if (cols == 0) {
+        memset(y, 0, (size_t)rows * sizeof(float));
+        return 0;
+    }
+    job.y = y;
+    job.w = w;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    job.transposed = transposed;
+    vtm_parallel_rows(rows, (double)rows * (double)cols, gemv_scalar_worker,
+                      &job);
+    return 0;
+}
+
+typedef struct {
+    float       *y;
+    const float *w;
+    const float *x;
+    int          rows;
+    int          cols;
+    int          ntok;
+    int          transposed;
+    double      *acc_all;   // vt * ntok
+} dense_batch_scalar_job;
+
+// y[r*N+j] = sum_t W[r,t] · x[t*N+j]; сумма по t — в double, как в прежнем
+// цикле interp.c (поэтому результат побитово равен скалярному прогону по
+// токену).
+static void dense_batch_scalar_rows(dense_batch_scalar_job *j, int tid,
+                                    int r0, int r1) {
+    const int cols = j->cols;
+    const int ntok = j->ntok;
+    const int rows = j->rows;
+    const float *w = j->w;
+    const float *x = j->x;
+    double *acc = j->acc_all + (size_t)tid * (size_t)ntok;
+    int r, t, jj;
+
+    for (r = r0; r < r1; r++) {
+        memset(acc, 0, (size_t)ntok * sizeof(double));
+        for (t = 0; t < cols; t++) {
+            double wv = j->transposed
+                      ? (double)w[(size_t)t * (size_t)rows + (size_t)r]
+                      : (double)w[(size_t)r * (size_t)cols + (size_t)t];
+            const float *xp = x + (size_t)t * (size_t)ntok;
+            for (jj = 0; jj < ntok; jj++)
+                acc[jj] += wv * (double)xp[jj];
+        }
+        for (jj = 0; jj < ntok; jj++)
+            j->y[(size_t)r * (size_t)ntok + (size_t)jj] = (float)acc[jj];
+    }
+}
+
+static void dense_batch_scalar_worker(void *p, int tid, int r0, int r1) {
+    dense_batch_scalar_rows((dense_batch_scalar_job *)p, tid, r0, r1);
+}
+
+int vtm_scalar_dense_batch(float *y, const float *w, const float *x,
+                           int rows, int cols, int n_tokens, int transposed) {
+    dense_batch_scalar_job job;
+    int vt;
+
+    if (!y || !w || !x) return -1;
+    if (rows < 0 || cols < 0 || n_tokens < 0) return -1;
+    if (rows == 0 || cols == 0 || n_tokens == 0) return 0;
+    vt = vtm_threads();
+    job.acc_all = (double *)calloc((size_t)vt * (size_t)n_tokens,
+                                   sizeof(double));
+    if (!job.acc_all) return -1;
+    job.y = y;
+    job.w = w;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    job.ntok = n_tokens;
+    job.transposed = transposed;
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)n_tokens,
+                      dense_batch_scalar_worker, &job);
+    free(job.acc_all);
+    return 0;
+}
+
 // --- Q4 (kind 5): ленивая деквантизация на лету (задача 0152) --------------
 //
 // 7B в Q4 — это 4,4 ГБ файла; материализация в fp32 дала бы ~28,7 ГБ, то есть
@@ -866,6 +1021,11 @@ extern int vtm_neon_q4_dequant_row(float *y, const uint8_t *q,
 #define VTM_Q4_NEON 0
 #endif
 
+// На не-NEON сборках функция не нужна (все вызовы под #if VTM_Q4_NEON), но
+// остаётся определённой — иначе clang с -Werror падает на unused-function.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((unused))
+#endif
 static int q4_simd_enabled(void) {
 #if VTM_Q4_NEON
     static int cached = -1;

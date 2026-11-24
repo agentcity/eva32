@@ -72,14 +72,52 @@ int vtm_simd_mm_batch(float *y, const uint8_t *w, const float *scales,
                       int scale_block);
 
 // Плотные (fp32) варианты — интерфейс батчевого пути interp.c: он батчит и
-// нетернарные TMV/MM (эмбеддинги, tied lm_head). Сейчас это скалярный
-// double-эталон без SIMD-ускорения: в графе Qwen-формы плотных матриц нет,
-// а трогать горячий путь ради редкого случая — лишний риск.
+// нетернарные TMV/MM (эмбеддинги, tied lm_head). Ядро векторизует по токенам
+// пачки: x[t*N + j], y[r*N + j] (токен — младший индекс), вес W[r,t] — скаляр,
+// поэтому на один t уходит broadcast и N/4 FMA. По t копится блок 64 и
+// сворачивается в double — так же, как у GEMV ниже, чтобы f32-ошибка не росла
+// на длинной строке. Это не «скалярный эталон»: у 3B Q4 tied lm_head —
+// плотная [151936,2048], и в prefill именно этот путь был самым дорогим
+// (задача 0159).
+//
 // transposed != 0 — W хранится как [cols, rows] (VTM_FLAG_TMV_TRANSPOSED).
+// При n_tokens == 1 зовётся vtm_simd_gemv_f32 (та же арифметика).
 int vtm_simd_tmv_f32_batch(float *y, const float *w, const float *x,
                            int rows, int cols, int n_tokens, int transposed);
 int vtm_simd_mm_f32_batch(float *y, const float *a, const float *b,
                           int m, int k, int n_tokens);
+
+// --- плотный GEMV: один столбец (n == 1), задача 0159 -----------------------
+//
+//   y[r] = sum_t W[r,t]·x[t]        (transposed == 0, W — [rows, cols])
+//   y[r] = sum_t W[t,r]·x[t]        (transposed != 0, W — [cols, rows])
+//
+// Горячий случай — tied lm_head (3B Q4: 311М MAC, ~треть времени декода):
+// у vtm_simd_mm_f32 нет векторизации при n == 1 (цикл по 4 столбца не
+// выполняется ни разу), поэтому один столбец считает отдельное ядро.
+// Внутри — 4 f32-ленты по блоку 64 элемента, блок сворачивается в double.
+// Порядок сложений иной, чем у скалярного double-цикла, поэтому результат не
+// побитовый: расхождение на logits 3B Q4 ≤ 2e-6 (порог 1e-5); от числа
+// потоков не зависит (строки делятся пулом, каждая считается тем же кодом).
+//
+// 0 — успех, -1 — неверные аргументы (NULL, отрицательные размеры).
+int vtm_simd_gemv_f32(float *y, const float *w, const float *x,
+                      int rows, int cols, int transposed);
+
+// Переносимые скалярные откаты тех же ядер (backend_scalar.c; SIMD не нужен).
+//
+// vtm_scalar_gemv_f32 — откат vtm_simd_gemv_f32, когда SIMD в сборке нет или
+// CPU его не умеет: 4 double-аккумулятора вместо одной цепи FMA, поэтому
+// расхождение с скалярным double-циклом — единицы ulp.
+//
+// vtm_scalar_dense_batch — эталон батчевого плотного TMV/MM (double, порядок
+// сложений — по t). Его зовёт interp.c для скалярных бэкендов: там побитовость
+// с прогоном по токену — контракт (это прежний цикл interp.c, перенесённый в
+// бэкенд). 0 — успех, -1 — неверные аргументы.
+int vtm_scalar_gemv_f32(float *y, const float *w, const float *x,
+                        int rows, int cols, int transposed);
+int vtm_scalar_dense_batch(float *y, const float *w, const float *x,
+                           int rows, int cols, int n_tokens, int transposed);
 
 // --- kind 5 (Q4): ленивая деквантизация на лету (задача 0152) --------------
 //
@@ -120,10 +158,9 @@ int vtm_q4_dequant_row(float *y, const uint8_t *q, const float *scales,
 
 // --- MM: SIMD-ядра вне `vtm_backend` ---------------------------------------
 //
-// В `vtm_backend` (vtm.h) поля MM нет, а op_mm() в interp.c сейчас считает
-// MM скалярно, поэтому ядра MM доступны отдельными функциями: их можно
-// подключить к interp.c одной строкой, когда это будет позволено зоной
-// (см. docs/vtm-perf.md, «Что не сделано»).
+// В `vtm_backend` (vtm.h) поля MM нет, поэтому ядра MM — отдельные функции.
+// op_mm() в interp.c зовёт их при SIMD-бэкенде: тритовую A — vtm_simd_mm_trit,
+// плотную A — vtm_simd_mm_f32, а при n == 1 (один столбец) — vtm_simd_gemv_f32.
 //
 //   y[r*n + c] = sum_t A[r*k + t] * B[t*n + c]
 //

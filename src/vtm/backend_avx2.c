@@ -603,6 +603,317 @@ VTM_AVX2 int vtm_avx2_mm_f32(float *y, const float *a, const float *b,
     return 0;
 }
 
+// --- AVX2: плотный GEMV (n == 1), задача 0159 ------------------------------
+//
+// Как в backend_neon.c (задача 0158): внутри блока VTM_GEMV_CHUNK элементов —
+// 4 f32-аккумулятора по 8 значений, блок сворачивается в double, чтобы
+// f32-ошибка не копилась на длинной строке (lm_head 3B Q4: cols = 2048).
+// Порядок сложений иной, чем у скалярного double-цикла, — расхождение в
+// пределах 1e-5 (bench_backend --check), от числа потоков не зависит.
+#define VTM_GEMV_CHUNK 64
+// Блок батчевого ядра короче: на каждый токен-лейн приходится
+// вдвое меньше f32-слагаемых до свёртки в double — запас по
+// точности больше (порог 1e-5 на больших формах).
+#define VTM_DENSE_BATCH_CHUNK 32
+
+VTM_AVX2 static double gemv_dot_f32_avx2(const float *a, const float *b,
+                                         int n) {
+    double sum = 0.0;
+    int i = 0;
+
+    for (; i + 8 <= n; ) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+        int len = n - i;
+        int j = 0;
+
+        if (len > VTM_GEMV_CHUNK) len = VTM_GEMV_CHUNK;
+        for (; j + 32 <= len; j += 32) {
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + j),
+                                 _mm256_loadu_ps(b + i + j), a0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + j + 8),
+                                 _mm256_loadu_ps(b + i + j + 8), a1);
+            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + j + 16),
+                                 _mm256_loadu_ps(b + i + j + 16), a2);
+            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + j + 24),
+                                 _mm256_loadu_ps(b + i + j + 24), a3);
+        }
+        for (; j + 8 <= len; j += 8)
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + j),
+                                 _mm256_loadu_ps(b + i + j), a0);
+        sum += acc_f64(_mm256_add_ps(_mm256_add_ps(a0, a1),
+                                     _mm256_add_ps(a2, a3)));
+        for (; j < len; j++)
+            sum += (double)a[i + j] * (double)b[i + j];
+        i += len;
+    }
+    for (; i < n; i++)
+        sum += (double)a[i] * (double)b[i];
+    return sum;
+}
+
+// W — [cols, rows]: 8 выходов за шаг, блок по t — в double.
+VTM_AVX2 static void gemv_f32_avx2_transposed_rows(const float *w,
+                                                   const float *x, float *y,
+                                                   int rows, int cols,
+                                                   int r0, int r1) {
+    int r = r0, t;
+
+    for (; r + 8 <= r1; r += 8) {
+        __m256d acc0 = _mm256_setzero_pd();
+        __m256d acc1 = _mm256_setzero_pd();
+        int c;
+
+        for (c = 0; c < cols; c += VTM_GEMV_CHUNK) {
+            __m256 part = _mm256_setzero_ps();
+            int end = c + VTM_GEMV_CHUNK;
+
+            if (end > cols) end = cols;
+            for (t = c; t < end; t++)
+                part = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(w + (size_t)t * (size_t)rows
+                                    + (size_t)r),
+                    _mm256_set1_ps(x[t]), part);
+            acc0 = _mm256_add_pd(acc0,
+                                 _mm256_cvtps_pd(_mm256_castps256_ps128(part)));
+            acc1 = _mm256_add_pd(
+                acc1, _mm256_cvtps_pd(_mm256_extractf128_ps(part, 1)));
+        }
+        {
+            double lo[4], hi[4];
+            _mm256_storeu_pd(lo, acc0);
+            _mm256_storeu_pd(hi, acc1);
+            y[r + 0] = (float)lo[0];
+            y[r + 1] = (float)lo[1];
+            y[r + 2] = (float)lo[2];
+            y[r + 3] = (float)lo[3];
+            y[r + 4] = (float)hi[0];
+            y[r + 5] = (float)hi[1];
+            y[r + 6] = (float)hi[2];
+            y[r + 7] = (float)hi[3];
+        }
+    }
+    for (; r < r1; r++) {
+        double sum = 0.0;
+        for (t = 0; t < cols; t++)
+            sum += (double)w[(size_t)t * (size_t)rows + (size_t)r]
+                 * (double)x[t];
+        y[r] = (float)sum;
+    }
+}
+
+typedef struct {
+    float       *y;
+    const float *w;
+    const float *x;
+    int          rows;
+    int          cols;
+    int          transposed;
+} gemv_f32_avx2_job;
+
+VTM_AVX2 static void gemv_f32_avx2_rows(gemv_f32_avx2_job *j, int r0,
+                                        int r1) {
+    int r;
+
+    if (j->transposed) {
+        gemv_f32_avx2_transposed_rows(j->w, j->x, j->y, j->rows, j->cols,
+                                      r0, r1);
+        return;
+    }
+    for (r = r0; r < r1; r++)
+        j->y[r] = (float)gemv_dot_f32_avx2(
+            j->w + (size_t)r * (size_t)j->cols, j->x, j->cols);
+}
+
+// Колбэк пула — без target-атрибута (его тип общий vtm_rows_fn).
+static void gemv_f32_avx2_worker(void *p, int tid, int r0, int r1) {
+    (void)tid;
+    gemv_f32_avx2_rows((gemv_f32_avx2_job *)p, r0, r1);
+}
+
+VTM_AVX2 int vtm_avx2_gemv_f32(float *y, const float *w, const float *x,
+                               int rows, int cols, int transposed) {
+    gemv_f32_avx2_job job;
+
+    if (!y || !w || !x) return -1;
+    if (rows < 0 || cols < 0) return -1;
+    if (rows == 0) return 0;
+    if (cols == 0) {
+        memset(y, 0, (size_t)rows * sizeof(float));
+        return 0;
+    }
+    job.y = y;
+    job.w = w;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    job.transposed = transposed;
+    vtm_parallel_rows(rows, (double)rows * (double)cols,
+                      gemv_f32_avx2_worker, &job);
+    return 0;
+}
+
+// --- AVX2: батчевый плотный TMV/MM (задача 0159) ---------------------------
+//
+// y[r*N + j] = sum_t W[r,t] · x[t*N + j] (transposed == 0) / W[t,r].
+// По вектору (8 значений) — токены пачки, вес W[r,t] — broadcast; блок
+// VTM_DENSE_BATCH_CHUNK по t копится в f32 и сворачивается в double.
+// Расхождение с батчевым double-эталоном ≤1e-5 (bench_backend --check).
+typedef struct {
+    float       *y;
+    const float *w;
+    const float *x;
+    int          rows;
+    int          cols;
+    int          ntok;
+    int          transposed;
+    double      *acc_all;   // vt * ntok
+} dense_batch_avx2_job;
+
+VTM_AVX2 static void dense_batch_avx2_rows(dense_batch_avx2_job *j, int tid,
+                                           int r0, int r1) {
+    const int ntok = j->ntok;
+    const int cols = j->cols;
+    const int rows = j->rows;
+    const float *w = j->w;
+    const float *x = j->x;
+    double *acc = j->acc_all + (size_t)tid * (size_t)ntok;
+    int r, jj, t, c;
+
+    for (r = r0; r < r1; r++) {
+        memset(acc, 0, (size_t)ntok * sizeof(double));
+        // 16 токенов за шаг: два вектора по 8.
+        for (jj = 0; jj + 16 <= ntok; jj += 16) {
+            const float *base = x + (size_t)jj;
+            for (c = 0; c < cols; c += VTM_DENSE_BATCH_CHUNK) {
+                __m256 a0 = _mm256_setzero_ps();
+                __m256 a1 = _mm256_setzero_ps();
+                int end = c + VTM_DENSE_BATCH_CHUNK;
+
+                if (end > cols) end = cols;
+                for (t = c; t < end; t++) {
+                    const float *xp = base + (size_t)t * (size_t)ntok;
+                    float wv = j->transposed
+                             ? w[(size_t)t * (size_t)rows + (size_t)r]
+                             : w[(size_t)r * (size_t)cols + (size_t)t];
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xp),
+                                         _mm256_set1_ps(wv), a0);
+                    a1 = _mm256_fmadd_ps(_mm256_loadu_ps(xp + 8),
+                                         _mm256_set1_ps(wv), a1);
+                }
+                {
+                    double lo[8], hi[8];
+                    int k;
+                    _mm256_storeu_pd(lo,
+                                     _mm256_cvtps_pd(
+                                         _mm256_castps256_ps128(a0)));
+                    _mm256_storeu_pd(hi,
+                                     _mm256_cvtps_pd(
+                                         _mm256_extractf128_ps(a0, 1)));
+                    for (k = 0; k < 4; k++) {
+                        acc[jj + k] += lo[k];
+                        acc[jj + 4 + k] += hi[k];
+                    }
+                    _mm256_storeu_pd(lo,
+                                     _mm256_cvtps_pd(
+                                         _mm256_castps256_ps128(a1)));
+                    _mm256_storeu_pd(hi,
+                                     _mm256_cvtps_pd(
+                                         _mm256_extractf128_ps(a1, 1)));
+                    for (k = 0; k < 4; k++) {
+                        acc[jj + 8 + k] += lo[k];
+                        acc[jj + 12 + k] += hi[k];
+                    }
+                }
+            }
+        }
+        for (; jj + 8 <= ntok; jj += 8) {
+            const float *base = x + (size_t)jj;
+            for (c = 0; c < cols; c += VTM_DENSE_BATCH_CHUNK) {
+                __m256 a0 = _mm256_setzero_ps();
+                int end = c + VTM_DENSE_BATCH_CHUNK;
+
+                if (end > cols) end = cols;
+                for (t = c; t < end; t++) {
+                    const float *xp = base + (size_t)t * (size_t)ntok;
+                    float wv = j->transposed
+                             ? w[(size_t)t * (size_t)rows + (size_t)r]
+                             : w[(size_t)r * (size_t)cols + (size_t)t];
+                    a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xp),
+                                         _mm256_set1_ps(wv), a0);
+                }
+                {
+                    double lo[4], hi[4];
+                    int k;
+                    _mm256_storeu_pd(lo,
+                                     _mm256_cvtps_pd(
+                                         _mm256_castps256_ps128(a0)));
+                    _mm256_storeu_pd(hi,
+                                     _mm256_cvtps_pd(
+                                         _mm256_extractf128_ps(a0, 1)));
+                    for (k = 0; k < 4; k++) {
+                        acc[jj + k] += lo[k];
+                        acc[jj + 4 + k] += hi[k];
+                    }
+                }
+            }
+        }
+        for (; jj < ntok; jj++) {
+            double sum = 0.0;
+            for (t = 0; t < cols; t++) {
+                double wv = j->transposed
+                          ? (double)w[(size_t)t * (size_t)rows + (size_t)r]
+                          : (double)w[(size_t)r * (size_t)cols + (size_t)t];
+                sum += wv * (double)x[(size_t)t * (size_t)ntok
+                                      + (size_t)jj];
+            }
+            acc[jj] += sum;
+        }
+        for (jj = 0; jj < ntok; jj++)
+            j->y[(size_t)r * (size_t)ntok + (size_t)jj] = (float)acc[jj];
+    }
+}
+
+static void dense_batch_avx2_worker(void *p, int tid, int r0, int r1) {
+    dense_batch_avx2_rows((dense_batch_avx2_job *)p, tid, r0, r1);
+}
+
+VTM_AVX2 static int dense_batch_avx2(float *y, const float *w, const float *x,
+                                     int rows, int cols, int ntok,
+                                     int transposed) {
+    dense_batch_avx2_job job;
+    int vt;
+
+    if (!y || !w || !x) return -1;
+    if (rows < 0 || cols < 0 || ntok < 0) return -1;
+    if (rows == 0 || cols == 0 || ntok == 0) return 0;
+    vt = vtm_threads();
+    job.acc_all = (double *)calloc((size_t)vt * (size_t)ntok,
+                                   sizeof(double));
+    if (!job.acc_all) return -1;
+    job.y = y;
+    job.w = w;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    job.ntok = ntok;
+    job.transposed = transposed;
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok,
+                      dense_batch_avx2_worker, &job);
+    free(job.acc_all);
+    return 0;
+}
+
+VTM_AVX2 int vtm_avx2_tmv_f32_batch(float *y, const float *w, const float *x,
+                                    int rows, int cols, int n_tokens,
+                                    int transposed) {
+    return dense_batch_avx2(y, w, x, rows, cols, n_tokens, transposed);
+}
+
+VTM_AVX2 int vtm_avx2_mm_f32_batch(float *y, const float *a, const float *b,
+                                   int m, int k, int n_tokens) {
+    return dense_batch_avx2(y, a, b, m, k, n_tokens, 0);
+}
+
 // --- батчевые TMV/MM (задача 0122) -----------------------------------------
 //
 // y[r*N + j] = sum_t trit(W)[r,t] * x[t*N + j]. Как в NEON-версии

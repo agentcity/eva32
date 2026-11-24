@@ -23,15 +23,6 @@
 #include <string.h>
 #include <time.h>
 
-// Плотный GEMV для одного столбца (tied lm_head) — см. dense_gemv().
-// На ARM64 это NEON; на остальных арх — переносимый double-путь.
-#if defined(__ARM_NEON) || defined(__aarch64__)
-#include <arm_neon.h>
-#define VTM_GEMV_NEON 1
-#else
-#define VTM_GEMV_NEON 0
-#endif
-
 // --- диагностика -----------------------------------------------------------
 
 static vtm_status fail(vtm_t *m, uint32_t idx, vtm_status st,
@@ -166,196 +157,23 @@ static int trit_weight_at(const vtm_tensor *t, size_t index, float *out) {
     return 0;
 }
 
-// --- плотный GEMV fp32 (один столбец), задача 0158 -------------------------
+// --- плотность: плотный GEMV (n == 1) считает бэкенд, задача 0159 --------
 //
-// SIMD-ядра MM подключаются, только если выбран SIMD-бэкенд и он доступен.
-// Но `vtm_simd_mm_f32` (backend_neon.c) векторизует MM блоками по 4 столбца:
-// при n == 1 цикл `for (c = 0; c + 4 <= n; ...)` не выполняется ни разу, и
-// ядро уходит в скалярный double-хвост — побитово тот же цикл, что был в
-// op_mm. А n == 1 — это tied lm_head: A = emb.w [vocab, hidden], B = [hidden,1];
-// на 3B Q4 это 311М MAC и ~33% времени декода. То есть подключение уже есть
-// (78c0552), а на lm_head оно не даёт ничего.
+// Раньше один столбец (tied lm_head: A = emb.w [vocab, hidden], B = [hidden,1];
+// на 3B Q4 это 311М MAC и ~треть времени декода) считался здесь, intrinsics
+// NEON жили в этом файле — слой был нарушен. Теперь ядро (NEON/AVX2, с
+// переносимым откатом в backend_scalar.c) — vtm_simd_gemv_f32() в
+// vtm_backend.h: interp.c про ISA не знает.
 //
-// Поэтому один столбец считаем здесь, в зоне interp.c: 4 f32-ленты по блоку
-// VTM_GEMV_CHUNK элементов, блок сворачивается в double. Порядок сложений
-// иной, чем у скалярного double-цикла, поэтому результат не побитовый:
-// расхождение на logits 3B Q4 ≤ 2e-6 (порог 1e-5), см. отчёт задачи.
-// Скалярный бэкенд сюда не заходит вовсе — у него остаётся прежний цикл
-// (побитовость скалярного пути сохраняется). На не-ARM — переносимый путь
-// с 4 double-аккумуляторами: он снимает цепочку зависимостей FMA и даёт
-// ~2,5x без изменения точности.
-//
-// Строки делятся пулом vtm_parallel_rows: каждая строка (для
-// транспонированной раскладки — каждая группа из 4 строк) считается одним
-// и тем же кодом, поэтому результат не зависит от числа потоков (побитово).
-
-#define VTM_GEMV_CHUNK 64
-
+// simd_mm_enabled() — прежнее условие подключения SIMD-ядер: бэкенд `simd` и
+// доступный SIMD. На скалярном бэкенде ниже остаётся прежний double-цикл,
+// побитовый прогону по токену.
 static int simd_mm_enabled(const vtm_t *m) {
     return m && m->backend && m->backend->name
         && strncmp(m->backend->name, "simd", 4) == 0
         && vtm_simd_available();
 }
 
-#if VTM_GEMV_NEON
-// a·b: внутри блока — f32-ленты (4 аккумулятора), блок в double. Длина блока
-// ограничена, чтобы f32-ошибка не накапливалась на всей строке 2048.
-static double dense_dot_f32(const float *a, const float *b, int n) {
-    double sum = 0.0;
-    int i = 0;
-
-    for (; i + 4 <= n; ) {
-        float32x4_t a0 = vdupq_n_f32(0.0f);
-        float32x4_t a1 = a0, a2 = a0, a3 = a0;
-        int len = n - i;
-        int j = 0;
-
-        if (len > VTM_GEMV_CHUNK) len = VTM_GEMV_CHUNK;
-        for (; j + 16 <= len; j += 16) {
-            a0 = vfmaq_f32(a0, vld1q_f32(a + i + j),
-                           vld1q_f32(b + i + j));
-            a1 = vfmaq_f32(a1, vld1q_f32(a + i + j + 4),
-                           vld1q_f32(b + i + j + 4));
-            a2 = vfmaq_f32(a2, vld1q_f32(a + i + j + 8),
-                           vld1q_f32(b + i + j + 8));
-            a3 = vfmaq_f32(a3, vld1q_f32(a + i + j + 12),
-                           vld1q_f32(b + i + j + 12));
-        }
-        for (; j + 4 <= len; j += 4)
-            a0 = vfmaq_f32(a0, vld1q_f32(a + i + j),
-                           vld1q_f32(b + i + j));
-        {
-            float64x2_t lo = vaddq_f64(vcvt_f64_f32(vget_low_f32(a0)),
-                                       vcvt_f64_f32(vget_low_f32(a1)));
-            float64x2_t hi = vaddq_f64(vcvt_f64_f32(vget_high_f32(a0)),
-                                       vcvt_f64_f32(vget_high_f32(a1)));
-            float64x2_t lo2 = vaddq_f64(vcvt_f64_f32(vget_low_f32(a2)),
-                                        vcvt_f64_f32(vget_low_f32(a3)));
-            float64x2_t hi2 = vaddq_f64(vcvt_f64_f32(vget_high_f32(a2)),
-                                        vcvt_f64_f32(vget_high_f32(a3)));
-            sum += vgetq_lane_f64(lo, 0) + vgetq_lane_f64(lo, 1)
-                 + vgetq_lane_f64(hi, 0) + vgetq_lane_f64(hi, 1)
-                 + vgetq_lane_f64(lo2, 0) + vgetq_lane_f64(lo2, 1)
-                 + vgetq_lane_f64(hi2, 0) + vgetq_lane_f64(hi2, 1);
-        }
-        for (; j < len; j++)
-            sum += (double)a[i + j] * (double)b[i + j];
-        i += len;
-    }
-    for (; i < n; i++)
-        sum += (double)a[i] * (double)b[i];
-    return sum;
-}
-#else
-// Без SIMD: 4 независимых double-аккумулятора вместо одной цепочки FMA.
-static double dense_dot_f32(const float *a, const float *b, int n) {
-    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
-    int i = 0;
-
-    for (; i + 4 <= n; i += 4) {
-        s0 += (double)a[i] * (double)b[i];
-        s1 += (double)a[i + 1] * (double)b[i + 1];
-        s2 += (double)a[i + 2] * (double)b[i + 2];
-        s3 += (double)a[i + 3] * (double)b[i + 3];
-    }
-    for (; i < n; i++) s0 += (double)a[i] * (double)b[i];
-    return (s0 + s1) + (s2 + s3);
-}
-#endif
-
-// y[r] = sum_t Wᵀ[r,t]·x[t] при W, хранящейся как [cols, rows]: r — младший
-// индекс, поэтому строки выхода читаются подряд и складываются в f32-ленты
-// (4 выхода за шаг), блок по t — в double.
-static void dense_gemv_transposed_rows(const float *w, const float *x, float *y,
-                                       int rows, int cols, int r0, int r1) {
-    int r = r0, t;
-
-#if VTM_GEMV_NEON
-    for (; r + 4 <= r1; r += 4) {
-        double acc[4] = {0.0, 0.0, 0.0, 0.0};
-        int c;
-
-        for (c = 0; c < cols; c += VTM_GEMV_CHUNK) {
-            float32x4_t part = vdupq_n_f32(0.0f);
-            int end = c + VTM_GEMV_CHUNK;
-
-            if (end > cols) end = cols;
-            for (t = c; t < end; t++)
-                part = vfmaq_n_f32(part,
-                                   vld1q_f32(w + (size_t)t * (size_t)rows
-                                             + (size_t)r),
-                                   x[t]);
-            {
-                float64x2_t lo = vcvt_f64_f32(vget_low_f32(part));
-                float64x2_t hi = vcvt_f64_f32(vget_high_f32(part));
-                acc[0] += vgetq_lane_f64(lo, 0);
-                acc[1] += vgetq_lane_f64(lo, 1);
-                acc[2] += vgetq_lane_f64(hi, 0);
-                acc[3] += vgetq_lane_f64(hi, 1);
-            }
-        }
-        y[r] = (float)acc[0];
-        y[r + 1] = (float)acc[1];
-        y[r + 2] = (float)acc[2];
-        y[r + 3] = (float)acc[3];
-    }
-#endif
-    for (; r < r1; r++) {
-        double sum = 0.0;
-        for (t = 0; t < cols; t++)
-            sum += (double)w[(size_t)t * (size_t)rows + (size_t)r]
-                 * (double)x[t];
-        y[r] = (float)sum;
-    }
-}
-
-typedef struct {
-    const float *w;
-    const float *x;
-    float       *y;
-    int          rows;
-    int          cols;
-    int          transposed;
-} dense_gemv_job;
-
-static void dense_gemv_worker(void *p, int tid, int r0, int r1) {
-    dense_gemv_job *j = (dense_gemv_job *)p;
-    int r;
-
-    (void)tid;
-    if (j->transposed) {
-        dense_gemv_transposed_rows(j->w, j->x, j->y, j->rows, j->cols,
-                                   r0, r1);
-        return;
-    }
-    for (r = r0; r < r1; r++)
-        j->y[r] = (float)dense_dot_f32(j->w + (size_t)r * (size_t)j->cols,
-                                       j->x, j->cols);
-}
-
-// y = W·x (transposed == 0, W — [rows, cols]) или Wᵀ·x (transposed != 0,
-// W — [cols, rows]). 0 — успех, -1 — неверные аргументы.
-static int dense_gemv(float *y, const float *w, const float *x,
-                      int rows, int cols, int transposed) {
-    dense_gemv_job job;
-
-    if (!y || !w || !x) return -1;
-    if (rows < 0 || cols < 0) return -1;
-    if (rows == 0) return 0;
-    if (cols == 0) {
-        memset(y, 0, (size_t)rows * sizeof(float));
-        return 0;
-    }
-    job.w = w;
-    job.x = x;
-    job.y = y;
-    job.rows = rows;
-    job.cols = cols;
-    job.transposed = transposed;
-    vtm_parallel_rows(rows, (double)rows * (double)cols,
-                      dense_gemv_worker, &job);
-    return 0;
-}
 
 // --- TMV -------------------------------------------------------------------
 
@@ -425,11 +243,12 @@ static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
             return fail(m, ins, VTM_E_SHAPE,
                         "y: элементов %u, у W rows=%d", y->n_elements, rows);
 
-        // SIMD-бэкенд: одно-столбцовый GEMV через dense_gemv (см. комментарий
-        // выше). Точность — не побитовая, ≤2e-6 на logits 3B Q4; на скалярном
-        // бэкенде ниже остаётся прежний double-цикл.
+        // SIMD-бэкенд: одно-столбцовый GEMV (vtm_simd_gemv_f32, backend_neon.c/
+        // backend_avx2.c). Точность — не побитовая, ≤2e-6 на logits 3B Q4; на
+        // скалярном бэкенде ниже остаётся прежний double-цикл.
         if (simd_mm_enabled(m) &&
-            dense_gemv(y->f32, w->f32, x->f32, rows, cols, transposed) == 0)
+            vtm_simd_gemv_f32(y->f32, w->f32, x->f32, rows, cols,
+                              transposed) == 0)
             return VTM_OK;
 
         for (r = 0; r < rows; r++) {
@@ -486,8 +305,8 @@ static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 // матрицы в fp32 не делаем — у словаря Qwen это 233 М элементов.
 // SIMD-ядра MM подключаются, только если выбран SIMD-бэкенд и он доступен:
 // результат тот же (порядок сложения иной, расхождение ~1e-7), но в 6–15 раз быстрее.
-// Для n == 1 (tied lm_head) зовём dense_gemv(): vtm_simd_mm_f32 на одном
-// столбце векторизации не имеет (см. комментарий у dense_gemv).
+// Для n == 1 (tied lm_head) зовём vtm_simd_gemv_f32(): у vtm_simd_mm_f32 на
+// одном столбце векторизации нет (см. vtm_backend.h).
 static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     vtm_status st;
     const vtm_tensor *a = need(m, in->a, ins, "a (A)", &st);
@@ -572,8 +391,8 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 
     if (simd_mm_enabled(m)) {
         if (nn == 1) {
-            // tied lm_head: один столбец, у vtm_simd_mm_f32 нет векторизации.
-            if (dense_gemv(y->f32, a->f32, b->f32, mm, kk, 0) == 0)
+            // tied lm_head: один столбец — отдельное GEMV-ядро (0159).
+            if (vtm_simd_gemv_f32(y->f32, a->f32, b->f32, mm, kk, 0) == 0)
                 return VTM_OK;
         } else if (vtm_simd_mm_f32(y->f32, a->f32, b->f32, mm, kk, nn) == 0) {
             return VTM_OK;
@@ -2180,6 +1999,10 @@ vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
 // 0122 (vtm_simd_tmv_blocks_batch/vtm_simd_mm_batch, backend_neon.c/
 // backend_avx2.c): вес читается и распаковывается один раз на пачку,
 // расхождение с батчевым скаляром ≤1e-5 (проверяет bench_backend --check).
+// Плотные (fp32) матрицы идут туда же — в ядра 0159 vtm_simd_*_f32_batch
+// (вектор по токенам пачки), а на скалярном бэкенде — в
+// vtm_scalar_dense_batch: тот повторяет double-цикл скалярного пути, поэтому
+// побитовость там сохраняется.
 // Остальные операции (EMB/ROPE/KVW/ATTN/RMSN/SAMP/...) дешёвые и считаются
 // по токену прежними функциями: это сохраняет их семантику (позиция, окно,
 // эмбеддинг) без дублирования кода.
@@ -2189,6 +2012,11 @@ vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
 // поступает трассировка: записи vtm_set_trace остаются «инструкция на токен».
 
 #define VTM_BATCH_TOKENS        16
+// Минимальная пачка для батчевого плотного (fp32) TMV/MM: ядро 0159
+// векторизует по токенам, и меньше 4 токенов четвёрка лент не набирается.
+// Такие пачки считаются по токену через vtm_simd_gemv_f32 — это быстрее
+// скалярного double-цикла и не требует отдельной ветки в ядре.
+#define VTM_DENSE_BATCH_MIN     4
 #define VTM_BATCH_SCRATCH_BYTES ((size_t)96u << 20)
 
 // Слова/масштабы в TRT1 лежат со смещением 2 mod 4 (см. backend_scalar.c):
@@ -2365,10 +2193,12 @@ static int batch_backend_enabled(const vtm_t *m) {
     return 0;
 }
 
-// 1 — TMV/MM в пачке считает SIMD-ядро 0122, 0 — батчевые ядра interp.c
-// (скалярный бэкенд) или путь по токену. Решение принимается на каждую
-// инструкцию: если ядро вернёт -1 (неверные аргументы), batch_tmv_kernel/
-// batch_mm_kernel тихо уходят в батчевые скалярные строки ниже.
+// 1 — TMV/MM в пачке считает SIMD-ядро 0122 (триты) или 0159 (плотные), 0 —
+// батчевые ядра interp.c (скалярный бэкенд) или путь по токену. Решение
+// принимается на каждую инструкцию: если тритовое ядро вернёт -1 (неверные
+// аргументы), batch_tmv_kernel/batch_mm_kernel тихо уходят в батчевые
+// скалярные строки ниже; у плотных отказ невозможен (аргументы проверены в
+// ready), поэтому они уходят в скалярный эталон только при use_simd == 0.
 static int batch_use_simd(const vtm_t *m) {
     const vtm_backend *be = m->backend;
     return be && be->name && strncmp(be->name, "simd", 4) == 0
@@ -2481,24 +2311,6 @@ static void batch_tmv_trit_rows(const vtm_tensor *w, const float *xt, int C,
     }
 }
 
-static void batch_tmv_dense_rows(const vtm_tensor *w, const float *xt, int C,
-                                 int rows, int cols, int transposed,
-                                 float *yt, int r0, int r1) {
-    int r, t, j;
-    for (r = r0; r < r1; r++) {
-        double acc[VTM_BATCH_TOKENS];
-        for (j = 0; j < C; j++) acc[j] = 0.0;
-        for (t = 0; t < cols; t++) {
-            double wv = transposed
-                      ? (double)w->f32[(size_t)t * (size_t)rows + (size_t)r]
-                      : (double)w->f32[(size_t)r * (size_t)cols + (size_t)t];
-            const float *xp = xt + (size_t)t * (size_t)C;
-            for (j = 0; j < C; j++) acc[j] += wv * (double)xp[j];
-        }
-        for (j = 0; j < C; j++) yt[(size_t)r * C + j] = (float)acc[j];
-    }
-}
-
 // Батчевый MM: Y[r][j] = sum_t A[r,t] * B[j][t] (n == 1, как в графе
 // tied lm_head). Порядок сложений — как у скалярного op_mm.
 static void batch_mm_trit_rows(const vtm_tensor *a, const float *bt, int C,
@@ -2523,86 +2335,82 @@ static void batch_mm_trit_rows(const vtm_tensor *a, const float *bt, int C,
     }
 }
 
-static void batch_mm_dense_rows(const vtm_tensor *a, const float *bt, int C,
-                                int mm, int kk, float *yt,
-                                int r0, int r1) {
-    int r, t, j;
-    (void)mm;
-    for (r = r0; r < r1; r++) {
-        double acc[VTM_BATCH_TOKENS];
-        for (j = 0; j < C; j++) acc[j] = 0.0;
-        for (t = 0; t < kk; t++) {
-            double wv = (double)a->f32[(size_t)r * (size_t)kk + (size_t)t];
-            const float *bp = bt + (size_t)t * (size_t)C;
-            for (j = 0; j < C; j++) acc[j] += wv * (double)bp[j];
-        }
-        for (j = 0; j < C; j++) yt[(size_t)r * C + j] = (float)acc[j];
-    }
-}
-
 static void batch_tmv_worker(void *p, int tid, int r0, int r1) {
     batch_mm_job *j = (batch_mm_job *)p;
     (void)tid;
-    if (j->w->kind == VTM_TENSOR_TRIT)
-        batch_tmv_trit_rows(j->w, j->xt, j->C, j->rows, j->cols, j->yt,
-                            r0, r1);
-    else
-        batch_tmv_dense_rows(j->w, j->xt, j->C, j->rows, j->cols,
-                             j->transposed, j->yt, r0, r1);
+    batch_tmv_trit_rows(j->w, j->xt, j->C, j->rows, j->cols, j->yt, r0, r1);
 }
 
 static void batch_mm_worker(void *p, int tid, int r0, int r1) {
     batch_mm_job *j = (batch_mm_job *)p;
     (void)tid;
-    if (j->w->kind == VTM_TENSOR_TRIT)
-        batch_mm_trit_rows(j->w, j->xt, j->C, j->rows, j->cols, j->yt,
-                           r0, r1);
-    else
-        batch_mm_dense_rows(j->w, j->xt, j->C, j->rows, j->cols, j->yt,
-                            r0, r1);
+    batch_mm_trit_rows(j->w, j->xt, j->C, j->rows, j->cols, j->yt, r0, r1);
 }
 
+// Батчевый TMV. Тритовые веса на SIMD — ядро 0122 (вес читается и
+// распаковывается один раз на пачку), иначе — батчевые скалярные строки.
+// Плотные (fp32) — ядро 0159 vtm_simd_tmv_f32_batch (вектор по токенам
+// пачки), а на скалярном бэкенде — vtm_scalar_dense_batch: там побитовость с
+// прогоном по токену — контракт, и это прежний double-цикл interp.c,
+// перенесённый в бэкенд. Аргументы уже проверены batch_tmv_ready(), поэтому
+// отказ ядра здесь — только NULL/отрицательные размеры, которых нет.
 static void batch_tmv_kernel(const vtm_tensor *w, const float *xt, int C,
                              int rows, int cols, int transposed, float *yt,
                              int use_simd) {
     batch_mm_job job;
 
-    // Тритовые веса на SIMD — ядро 0122: вес читается и распаковывается
-    // один раз на пачку. Плотные (fp32) остаются на скалярных батчевых
-    // строках ниже: в Qwen-форме их нет, а порядок сложений там уже double.
-    if (use_simd && w->kind == VTM_TENSOR_TRIT
-        && vtm_simd_tmv_blocks_batch(yt, (const uint8_t *)w->words,
-                                     w->scales, xt, rows, cols, C,
-                                     (int)w->scale_block) == 0)
+    if (w->kind == VTM_TENSOR_TRIT) {
+        if (use_simd && vtm_simd_tmv_blocks_batch(yt,
+                                                  (const uint8_t *)w->words,
+                                                  w->scales, xt, rows, cols,
+                                                  C, (int)w->scale_block) == 0)
+            return;
+        job.w = w;
+        job.xt = xt;
+        job.C = C;
+        job.rows = rows;
+        job.cols = cols;
+        job.transposed = transposed;
+        job.yt = yt;
+        vtm_parallel_rows(rows, (double)rows * (double)cols * (double)C,
+                          batch_tmv_worker, &job);
         return;
-    job.w = w;
-    job.xt = xt;
-    job.C = C;
-    job.rows = rows;
-    job.cols = cols;
-    job.transposed = transposed;
-    job.yt = yt;
-    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)C,
-                      batch_tmv_worker, &job);
+    }
+    if (use_simd
+        && vtm_simd_tmv_f32_batch(yt, w->f32, xt, rows, cols, C,
+                                  transposed) == 0)
+        return;
+    // Сюда попадаем и при нехватке памяти в SIMD-ядре: скалярный эталон
+    // даёт тот же результат по смыслу (double-порядок) и доводит пачку.
+    (void)vtm_scalar_dense_batch(yt, w->f32, xt, rows, cols, C, transposed);
 }
 
+// Батчевый MM: тритовая A — ядро 0122 или батчевые скалярные строки;
+// плотная A — ядро 0159 (vtm_simd_mm_f32_batch) или скалярный эталон.
 static void batch_mm_kernel(const vtm_tensor *a, const float *bt, int C,
                             int mm, int kk, float *yt, int use_simd) {
     batch_mm_job job;
 
-    if (use_simd && a->kind == VTM_TENSOR_TRIT
-        && vtm_simd_mm_batch(yt, (const uint8_t *)a->words, a->scales, bt,
-                             mm, kk, C, (int)a->scale_block) == 0)
+    if (a->kind == VTM_TENSOR_TRIT) {
+        if (use_simd && vtm_simd_mm_batch(yt, (const uint8_t *)a->words,
+                                          a->scales, bt, mm, kk, C,
+                                          (int)a->scale_block) == 0)
+            return;
+        job.w = a;
+        job.xt = bt;
+        job.C = C;
+        job.rows = mm;
+        job.cols = kk;
+        job.transposed = 0;
+        job.yt = yt;
+        vtm_parallel_rows(mm, (double)mm * (double)kk * (double)C,
+                          batch_mm_worker, &job);
         return;
-    job.w = a;
-    job.xt = bt;
-    job.C = C;
-    job.rows = mm;
-    job.cols = kk;
-    job.transposed = 0;
-    job.yt = yt;
-    vtm_parallel_rows(mm, (double)mm * (double)kk * (double)C,
-                      batch_mm_worker, &job);
+    }
+    if (use_simd
+        && vtm_simd_mm_f32_batch(yt, a->f32, bt, mm, kk, C) == 0)
+        return;
+    (void)vtm_scalar_dense_batch(yt, a->f32, bt, mm, kk, C, 0);
 }
 
 static int batch_buf(float **p, size_t *cap, size_t need) {
@@ -2656,6 +2464,11 @@ static int batch_tmv_ready(vtm_t *m, const vtm_instr *in,
         if (w->kind < VTM_TENSOR_F32 || w->kind > VTM_TENSOR_BF16
             || !w->f32)
             return 0;
+        // Мелкая пачка плотных весов: ядро 0159 векторизует по токенам
+        // (минимум 4 ленты). На 2-3 токенах выгоднее GEMV по токену —
+        // поэтому не берём инструкцию в батч, и batch_token_op посчитает её
+        // через op_tmv/vtm_simd_gemv_f32 (вес читается N раз, но SIMD).
+        if (b->C < VTM_DENSE_BATCH_MIN) return 0;
         tr = (in->flags & VTM_FLAG_TMV_TRANSPOSED) != 0;
         *rows = tr ? (int)w->dims[1] : (int)w->dims[0];
         *cols = tr ? (int)w->dims[0] : (int)w->dims[1];
@@ -2734,6 +2547,10 @@ static int batch_mm_ready(vtm_t *m, const vtm_instr *in,
             return 0;
     } else if (a->kind < VTM_TENSOR_F32 || a->kind > VTM_TENSOR_BF16
                || !a->f32) {
+        return 0;
+    } else if (b->C < VTM_DENSE_BATCH_MIN) {
+        // Мелкая пачка плотной A — по токену через GEMV: батчевое ядро 0159
+        // векторизует по токенам (4 ленты), на 2-3 токенах это дороже.
         return 0;
     }
     return 1;
