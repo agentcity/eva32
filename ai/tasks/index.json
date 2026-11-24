@@ -940,7 +940,7 @@
   {
     "id": "0142",
     "title": "3B холодной третизацией: уменьшается ли урон с размером",
-    "status": "in_progress",
+    "status": "done",
     "file": "0142-cold-3b.md",
     "assignee": "agent:cold-3b"
   },
@@ -982,7 +982,7 @@
   {
     "id": "0148",
     "title": "Два трита на вес (≈2 бита): стоит ли овчинка",
-    "status": "in_progress",
+    "status": "done",
     "file": "0148-exp-2bit.md",
     "assignee": "agent:exp-2bit"
   },
@@ -996,22 +996,29 @@
   {
     "id": "0151",
     "title": "Формат: 4-битный тензор (Q4) с масштабами",
-    "status": "in_progress",
+    "status": "done",
     "file": "0151-fmt-q4.md",
     "assignee": "agent:fmt-q4"
   },
   {
     "id": "0152",
     "title": "Ядра: ленивая деквантизация Q4 на лету (без fp32-арены)",
-    "status": "in_progress",
+    "status": "done",
     "file": "0152-kernel-q4.md",
     "assignee": "agent:kernel-q4"
   },
   {
     "id": "0153",
     "title": "Импорт GGUF: Q4_0/Q4_1/Q8_0 → наш контейнер",
-    "status": "in_progress",
+    "status": "done",
     "file": "0153-gguf-import.md",
     "assignee": "agent:gguf-import"
+  },
+  {
+    "id": "0154",
+    "title": "Компилятор: Q4-тензоры в граф (чтение q4.bin импорта)",
+    "status": "in_progress",
+    "file": "0154-compile-q4.md",
+    "assignee": "agent:compile-q4"
   }
 ]
