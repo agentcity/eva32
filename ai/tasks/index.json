@@ -898,7 +898,7 @@
   {
     "id": "0136",
     "title": "Паритет холодного экспорта и урон от третизации",
-    "status": "in_progress",
+    "status": "done",
     "file": "0136-cold-parity.md",
     "assignee": "agent:cold-parity"
   },
