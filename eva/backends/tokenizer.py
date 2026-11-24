@@ -249,11 +249,42 @@ class BPETokenizer:
         # (как resolve_model_token() в C++).
         tokenizer.unk_id = tokenizer._resolve_model_token(model.get("unk_token"))
         tokenizer.eos_id = tokenizer._resolve_model_token(model.get("eos_token"))
+        if tokenizer.eos_id < 0:
+            # У Qwen (и др.) eos в tokenizer.json не задан: он лежит рядом в
+            # tokenizer_config.json как строка "<|im_end|>". Без этого генерация
+            # не останавливается и модель зацикливается до max_tokens.
+            tokenizer.eos_id = tokenizer._eos_from_config(source)
         if tokenizer.eos_id >= 0:
             tokenizer._eos_content = tokenizer._id_to_token.get(tokenizer.eos_id)
         if bool(model.get("ignore_merges", False)):
             tokenizer._merge_rank.clear()
         return tokenizer
+
+
+    def _eos_from_config(self, source: Any) -> int:
+        """EOS из соседнего ``tokenizer_config.json`` (Qwen: ``<|im_end|>``).
+
+        В ``tokenizer.json`` у Qwen ``model.eos_token`` пуст, поэтому без этого
+        чтения ``eos_id`` остаётся -1 и генерация идёт до лимита токенов,
+        повторяя один и тот же текст.
+        """
+        import json as _json
+        import os as _os
+        from pathlib import Path as _Path
+
+        try:
+            path = _Path(str(source)).resolve().parent / "tokenizer_config.json"
+            if not path.is_file():
+                return -1
+            config = _json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return -1
+        raw = config.get("eos_token_id")
+        if raw is None:
+            raw = config.get("eos_token")
+        if isinstance(raw, list) and raw:
+            raw = raw[0]
+        return self._resolve_model_token(raw)
 
     def _resolve_model_token(self, raw: Any) -> int:
         """Строка словаря/added_token или числовой id -> id (или -1)."""

@@ -747,6 +747,11 @@ class VtmChatBackend(ChatBackend):
         completion = 0
         finish = "stop"
         eos_seen = False
+        # Страж зацикливания: слабо квантованная модель иногда не выдаёт EOS и
+        # повторяет одну и ту же фразу до лимита. Ловим трёхкратный повтор
+        # последних 40 символов и останавливаемся — лучше короткий ответ, чем
+        # полотно с эхом.
+        guard_text = ""
         try:
             for token in inner.stream_ids(prompt_ids, max_new_tokens=max_tokens):
                 if eos_id >= 0 and int(token) == eos_id:
@@ -756,7 +761,17 @@ class VtmChatBackend(ChatBackend):
                 completion += 1
                 chunk = decoder.push(int(token))
                 if chunk:
-                    yield StreamEvent(text=chunk)
+                    stopped_by_marker = _hit_stop_marker(chunk)
+                    if stopped_by_marker:
+                        # Не отдаём служебный маркер в текст ответа.
+                        chunk = _strip_stop_markers(chunk)
+                    guard_text = (guard_text + chunk)[-400:]
+                    if chunk:
+                        yield StreamEvent(text=chunk)
+                    if stopped_by_marker or _looks_like_loop(guard_text):
+                        finish = "stop" if stopped_by_marker else "repeat"
+                        eos_seen = True
+                        break
             tail = decoder.finish()
             if tail:
                 yield StreamEvent(text=tail)
@@ -1460,6 +1475,48 @@ def _non_negative_float(value: str) -> float:
         raise argparse.ArgumentTypeError(f"ожидалось >= 0, получено {number}")
     return number
 
+
+
+
+
+#: Служебные маркеры конца: слабо квантованная модель иногда выдаёт их как
+#: обычный текст (``<|endoftext|>Human:``), а не через eos_token_id.
+_STOP_MARKERS = ("<|endoftext|>", "<|im_end|>", "<|im_start|>user")
+
+
+def _hit_stop_marker(chunk: str) -> bool:
+    return any(marker in chunk for marker in _STOP_MARKERS)
+
+
+def _strip_stop_markers(chunk: str) -> str:
+    """Убрать служебный маркер и всё, что модель «дописала» после него."""
+    cut = len(chunk)
+    for marker in _STOP_MARKERS:
+        index = chunk.find(marker)
+        if index >= 0:
+            cut = min(cut, index)
+    return chunk[:cut]
+
+
+def _looks_like_loop(text: str, *, words: int = 3, repeats: int = 3,
+                     window: int = 400) -> bool:
+    """Похоже ли на зацикливание: короткая фраза повторяется много раз подряд.
+
+    Слабо квантованная модель может не выдать EOS и накручивать одну и ту же
+    фразу, слегка меняя окружение. Точное совпадение хвоста это не ловит,
+    поэтому ищем повтор n-граммы из слов в скользящем окне.
+    """
+    tail = text[-window:]
+    parts = tail.split()
+    if len(parts) < words * repeats:
+        return False
+    counts: dict[str, int] = {}
+    for i in range(len(parts) - words + 1):
+        key = " ".join(parts[i:i + words])
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] >= repeats:
+            return True
+    return False
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
