@@ -71,6 +71,7 @@ import argparse
 import ctypes
 import ctypes.util
 import json
+import pathlib
 import logging
 import os
 import queue
@@ -140,12 +141,10 @@ DEFAULT_OLLAMA_MODELS: tuple[tuple[str, str], ...] = (
     ("qwen2.5:1.5b", "Qwen2.5 1.5B"),
     ("qwen3:8b", "Qwen3 8B"),
 )
-#: Демо-модели ВТМ: обе лежат в репозитории и используют тестовый BPE.
-DEFAULT_VTM_MODELS: tuple[tuple[str, str], ...] = (
-    ("runs/tiny/model.vtm", "runs/tiny/model.vtm — наша мини-модель (текст)"),
-    ("demo/model.vtm", "demo/model.vtm — демо (vocab=128, без текста)"),
-    ("model.vtm", "model.vtm — копия демо (vocab=128, без текста)"),
-)
+#: Где искать локальные модели. Список не фиксированный: иначе новые `.vtm`
+#: появляются на диске и остаются невидимыми в чате (так и случилось с холодным
+#: экспортом). Обходим каталоги, а не перечисляем файлы.
+VTM_SEARCH_DIRS: tuple[str, ...] = ("runs", "export", "demo")
 #: Токенизатор-заглушка: фикстура BPE (287) совпадает с ``runs/tiny``.
 #: Для демо-модели (vocab=128) она не подходит — чат вернёт понятную ошибку.
 FALLBACK_TOKENIZER = ROOT / "tests" / "vtm" / "fixtures" / "tokenizer.json"
@@ -217,6 +216,35 @@ def _resolve_tokenizer(model_path: Path, explicit: str | None = None) -> str:
     return ""
 
 
+def _discover_vtm_models() -> list[pathlib.Path]:
+    """Найти локальные `.vtm` в рабочих каталогах (стабильный порядок)."""
+    found: list[pathlib.Path] = []
+    for base in VTM_SEARCH_DIRS:
+        root = ROOT / base
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*.vtm")):
+            if path.is_file():
+                found.append(path)
+    return found
+
+
+def _model_label(path: pathlib.Path) -> str:
+    """Человекочитаемая подпись: путь, размер и подсказка о содержимом."""
+    size_mb = path.stat().st_size / (1024 * 1024)
+    relative = path.relative_to(ROOT).as_posix()
+    hint = ""
+    if "cold" in relative:
+        hint = " — холодный экспорт"
+    elif "bench_shape" in relative:
+        hint = " — случайные веса (только скорость)"
+    elif relative.startswith("demo/"):
+        hint = " — демо (vocab=128, без текста)"
+    elif "tiny" in relative:
+        hint = " — мини-модель (тест)"
+    return f"{relative} — {size_mb:.1f} МБ{hint}"
+
+
 def default_registry(
     *,
     vtm_tokenizer: str | None = None,
@@ -228,14 +256,12 @@ def default_registry(
     предлагал бы заведомо нерабочий вариант. Порядок фиксирован.
     """
     vtm: list[ModelSpec] = []
-    for relative, label in DEFAULT_VTM_MODELS:
-        path = ROOT / relative
-        if not path.is_file():
-            continue
+    for path in _discover_vtm_models():
+        relative = path.relative_to(ROOT).as_posix()
         vtm.append(
             ModelSpec(
                 id=relative,
-                label=label,
+                label=_model_label(path),
                 target=str(path),
                 tokenizer=_resolve_tokenizer(path, vtm_tokenizer),
             )
