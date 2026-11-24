@@ -635,7 +635,8 @@ class Q4ImportTests(GgufTestBase):
         self.assertEqual(manifest["format"], "eva32.ternary.manifest")
         self.assertEqual(manifest["format_version"], 2)
         self.assertTrue(manifest["non_ternary"]["stored_in_this_export"])
-        self.assertFalse(manifest["compiler"]["ready"])
+        # 0154 научил компилятор kind 5 — манифест q4 собирается как есть.
+        self.assertTrue(manifest["compiler"]["ready"])
         self.assertIn("lm_head", manifest["architecture"])
         self.assertEqual(manifest["architecture"]["lm_head"], "q4")
         self.assertEqual(manifest["architecture"]["embed"], "int8")
@@ -678,43 +679,46 @@ class Q4ImportTests(GgufTestBase):
             offset = entry["q4_offset"]
             self.assertEqual(offset % 32, 0)
             segment = raw_q4[offset: offset + entry["q4_length"]]
+            # 0160: импорт пишет Q4_1 (asym) — заголовок 22 байта с n_mins.
             magic, version, flags, n_values, n_groups = struct.unpack(
                 "<4sBBQI", segment[:18]
             )
-            self.assertEqual(magic, b"Q4_0")
+            (n_mins,) = struct.unpack("<I", segment[18:22])
+            self.assertEqual(magic, b"Q4_1")
             self.assertEqual(version, 1)
             self.assertEqual(flags, 0x01)
             self.assertEqual(n_values, entry["params"])
             self.assertEqual(
                 n_groups, (entry["params"] + 31) // 32
             )
+            self.assertEqual(n_mins, n_groups)
+            self.assertEqual(entry["dtype"], "q4_1")
             if HAS_Q4_REF:
                 qdata, scales, scale_dtype, asymmetric, mins = (
                     vtm_ref.decode_q4_segment_ex(segment)
                 )
                 self.assertEqual(scale_dtype, "float32")
-                self.assertFalse(asymmetric)
-                self.assertIsNone(mins)
+                self.assertTrue(asymmetric)
+                self.assertIsNotNone(mins)
                 self.assertEqual(len(qdata), entry["params"])
                 self.assertEqual(len(scales), n_groups)
+                self.assertEqual(len(mins), n_groups)
                 self.assertTrue(all(scale >= 0 for scale in scales))
-                # Сверка с эталонным квантователем 0151 на тех же значениях.
+                # Сверка с эталонным квантователем 0151 на тех же значениях:
+                # асимметричное правило обязано совпасть побитово.
                 info = gguf.tensor(entry["source_tensor"])
                 values = [
                     value
                     for chunk in gguf.iter_tensor_chunks(info, entry["params"])
                     for value in chunk
                 ]
-                ref_q, ref_scales = vtm_ref.quantize_q4(values)
-                self.assertEqual(len(ref_q), len(qdata))
-                mismatches = sum(
-                    1 for left, right in zip(ref_q, qdata) if left != right
+                ref_q, ref_scales, ref_mins = vtm_ref.quantize_q4(
+                    values, symmetric=False
                 )
-                self.assertLessEqual(
-                    mismatches / len(qdata), 0.001,
-                    "квантователь разошёлся с vtm_ref.quantize_q4",
-                )
+                self.assertEqual(ref_q, list(qdata))
                 for left, right in zip(ref_scales, scales):
+                    self.assertAlmostEqual(left, right, places=6)
+                for left, right in zip(ref_mins, mins):
                     self.assertAlmostEqual(left, right, places=6)
                 checked += 1
                 if checked >= 3:

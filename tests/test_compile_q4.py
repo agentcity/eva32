@@ -95,7 +95,8 @@ class Q4CompileTests(CompileQ4Base):
         manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["architecture"]["lm_head"], "q4")
         self.assertFalse(manifest["architecture"]["tie_word_embeddings"])
-        self.assertTrue(any(entry.get("dtype") == "q4_0"
+        # 0160: импорт пишет Q4_1 (asym) — dtype в манифесте "q4_1".
+        self.assertTrue(any(str(entry.get("dtype", "")).startswith("q4")
                             for entry in manifest["tensors"]))
 
         export = vtm_compile.load_export(out / "manifest.json")
@@ -225,7 +226,7 @@ class Q4RefusalTests(CompileQ4Base):
         _, out = self.import_tiny(tie=False, layers=1)
         manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
         entry = dict(next(item for item in manifest["tensors"]
-                          if item.get("dtype") == "q4_0"))
+                          if str(item.get("dtype", "")).startswith("q4")))
         entry["name"] = "model.layers.0.input_layernorm.weight"
         manifest["tensors"].append(entry)
         path = out / "manifest-norm.json"

@@ -36,51 +36,118 @@ Ollama отдаёт модели в GGUF. Чтобы Qwen из `~/.ollama/models
 
 `--format q4` (по умолчанию для Linear):
 
-* `q4.bin` — Q4-сегменты kind 5 (контракт 0151, формат задан
-  `tools/vtm_ref.py:encode_q4_segment`): magic `"Q4_0"`, 18-байтовый
-  заголовок, fp32-масштабы на группу **32**, затем нибблы в раскладке GGML
-  (байт `j` = значение `j` в младшем ниббле, `j+16` — в старшем),
-  `w = (q-8)·scale`, `scale = absmax(группа)/7`, `q = clamp(round_half_away(w/scale), -8, 7) + 8`;
-* `non_ternary.bin` — эмбеддинг INT8-сегментом kind 4 (блок 128,
-  `scale = absmax/127`, `q ∈ -127..127`, `w = q·scale`; при
-  `tie_word_embeddings` таблица одна и для `EMB`, и для `lm_head`),
-  нормы и bias — fp32. Нормы/bias — меньше 0,1 % параметров, поэтому fp32
+* `q4.bin` — Q4-сегменты kind 5 (контракт 0151/0152, формат задан
+  `tools/vtm_ref.py:encode_q4_segment`). По умолчанию — **Q4_1** (задача
+  0160): magic `"Q4_1"`, 22-байтовый заголовок (`n_groups` + явное
+  `n_mins u32`), затем масштабы и min'ы на группу **32** (fp32 или fp16 —
+  `--q4-scale-dtype`), затем нибблы в раскладке GGML (байт `j` = значение
+  `j` в младшем ниббле, `j+16` — в старшем),
+  `min = min(группа)`, `scale = (max-min)/15`,
+  `q = clamp(round_half_away((w-min)/scale), 0, 15)`, `w = q·scale + min`.
+  `--q4-kind q4_0` возвращает прежний симметричный вид (`"Q4_0"`, 18 байт
+  заголовка, `scale = absmax/7`, `q = clamp(round_half_away(w/scale),-8,7)+8`,
+  `w = (q-8)·scale`) — он нужен 7B, см. «7B и 4 ГиБ»;
+* `non_ternary.bin` — таблица словаря INT8-сегментом kind 4 (блок 128,
+  `scale = absmax/127`, `q ∈ -127..127`, `w = q·scale`) при `--embed int8`,
+  плотная fp32/fp16 при `--embed fp32|fp16` или отсутствует при
+  `--embed trit` (тогда таблица — TRT1-сегмент в `ternary.trit`); нормы и
+  bias — всегда fp32. Нормы/bias — меньше 0,1 % параметров, поэтому fp32
   (точность важнее байтов); эмбеддинг — int8, потому что у 7B это
   544 МЭ против 2,2 ГЭ в fp32 и 1,1 ГЭ в fp16.
 
-Q4 — это одна ступень потери относительно исходного Q4_K: K-блок хранит
-свой масштаб **и минимум** на под-блок 32, а наш Q4_0 — только масштаб
-(симметрично, `absmax/7`). Шаг переквантования неизбежен: значения K-блока
-расквантовываются в fp32 и квантуются заново по нашему правилу.
-`--stats` печатает относительную RMS-ошибку реконструкции по ролям —
-численную оценку этой ступени. Замер на реальном `qwen2.5:3b` (Q4_K_M,
-1 слой + срез словаря): Q4_K→Q4_0 — **10,0 %** rel-RMS (max|Δ|=0,049),
-int8-эмбеддинг из Q6_K — **0,6 %**. Ошибка велика именно из-за потерянного
-`min` под-блока K-кванта; асимметричный Q4_1 (kind 5, `q4_asymmetric`)
-сохранил бы его почти без потерь — это возможное продолжение, но контракт
-задачи просил симметричный Q4 для Linear.
+Почему два флага, а не один
+===========================
+
+Предел контейнера — u32-смещения, то есть 4 ГиБ (ADR 0016). 7B Qwen2.5
+Q4_K_M — это 7,07 млрд весов в Linear+lm_head и ещё 0,545 млрд в таблице
+словаря:
+
+| Вариант | Размер | Доля от 4 ГиБ |
+|---|---|---|
+| fp32-масштабы + int8-эмбеддинг (было) | 4,98 ГБ | 116 % |
+| fp16-масштабы + int8-эмбеддинг | 4,54 ГБ | 105,7 % |
+| fp16-масштабы + тритовый эмбеддинг | 4,10 ГБ | 95 % |
+
+Оба варианта поддержаны форматом (флаг fp16-масштабов в Q4-сегменте,
+TRT1-таблица словаря с `quantize_embeddings: trit`), но импортёр писал
+только fp32-масштабы и int8-эмбеддинг. Отсюда `--q4-scale-dtype fp32|fp16`
+и `--embed int8|trit|fp16`: fp16 экономит 0,44 ГБ, триты в таблице — ещё
+0,44 ГБ. Для 7B без обоих 4 ГиБ не достигаются — это не «настройка на
+вкус», а единственная достижимая комбинация.
+
+Q4_1 вместо Q4_0: откуда 10 % и куда они делись
+==============================================
+
+Шаг переквантования неизбежен: значения K-блока расквантовываются в fp32 и
+квантуются заново по нашему правилу. Но правило решает, сколько при этом
+теряется. K-блок хранит масштаб **и минимум** на под-блок 32; симметричный
+Q4_0 (`scale = absmax/7`, `w = (q-8)·scale`) минимум выбрасывает. Если 32
+веса лежат узкой полосой вдали от нуля (у под-блоков Q4_K это обычное дело),
+из 16 уровней работают 3–6, шаг сетки в разы больше нужного — отсюда 10 %
+rel-RMS и «Столица Франции - это Пгврф» вместо Парижа (задача 0160).
+
+Q4_1 (`w = q·scale + min`) возвращает минимум: `min = min(32)`,
+`scale = (max-min)/15`. Цена — второй массив (4 байта на группу 32 при
+fp32-масштабах, 2 при fp16). `--stats` печатает относительную RMS-ошибку
+реконструкции по ролям — численную оценку ступени.
+
+Замер на реальном `qwen2.5:3b` (Q4_K_M), одни и те же де-квантованные
+веса, два правила:
+
+| Множество | Q4_K→Q4_0 (sym) | Q4_K→Q4_1 (asym) |
+|---|---|---|
+| 1 слой + срез словаря 4096 (77,1 МЭ) | 9,96 % (макс. ошибка 0,049) | **5,63 %** (макс. ошибка 0,040) |
+| полная модель (2,77 млрд весов Linear) | — | **5,1 %** (макс. ошибка 0,049) |
+
+То есть ошибка падает почти вдвое, а текст оживает: «Столица Франции - это
+Пгврф» (Q4_0) → «Столицей Франции является Париж.» (Q4_1), ровно как у
+ollama. Глобальный rel-RMS при этом меняется в 1,8 раза, а не в 10: ошибка
+симметричного правила **неравномерна** — она сосредоточена в тех группах,
+где полоса весов далеко от нуля, и таких групп достаточно, чтобы сломать
+несколько слоёв, но мало для среднего по всем весам. Отсюда правило: на
+rel-RMS смотреть как на индикатор, а текст проверять отдельно.
+int8-эмбеддинг из Q6_K — **0,6 %** (не менялся: int8-сетка симметрична, но
+у неё на блок 128 ступеней вчетверо больше).
+
 Для F16/BF16/F32/Q4_0/Q4_1/Q8_0 потерь меньше: это та же сетка, но с
 другим масштабом.
 
-`--format trit` — сквозной путь, который **сегодняшний** компилятор
-собирает целиком: Linear расквантовываются в fp32 и тернаризуются
+7B и 4 ГиБ
+==========
+
+Предел контейнера — u32-смещения, 4 ГиБ (ADR 0016). Q4_1 стоит +2 байта
+min на группу 32 при fp16-масштабах (+0,0625 Б/вес) и +4 байта при fp32
+(+0,125 Б/вес). Для 3B (2,36 млрд весов в Linear) это ~+0,15 ГБ, для 7B —
+~+0,44 ГБ: единственная схема, влезавшая у 7B (fp16-масштабы + тритовый
+эмбеддинг, 4,10 ГБ), с Q4_1 даёт 4,54 ГБ, то есть 106 % предела. Поэтому
+умолчание Q4_1, а 7B импортируется явным `--q4-kind q4_0` — это осознанная
+плата за качество на моделях, которые влезают, а не «настройка на вкус».
+
+fp16-масштаб выбирается **до** квантования нибблов: контейнер хранит
+округлённый до fp16 масштаб, и C-ядро считает `w = (q-8)·scale_fp16`.
+Квантовать по fp32-масштабу и хранить fp16 — значит сложить две ступени
+ошибки вместо одной. Переполнение fp16 (> 65504) — отказ с числом, а не
+`inf` в контейнере.
+
+`--format trit` — Linear расквантовываются в fp32 и тернаризуются
 (масштаб absmax на блок 128, `trit = clamp(round_half_away(w/scale), -1, 1)`)
-в TRT1-сегменты `ternary.trit` (kind 0, `packed20`), эмбеддинг — int8,
-нормы/bias — fp32. Это проверка «импорт → компиляция → 1 токен»; качество
-здесь не цель (триты — грубее Q4), а формат и сквозная проводка. Полный 7B
-в тритах — ~1,5 ГиБ вместо ~4,4 ГиБ Q4_K.
+в TRT1-сегменты `ternary.trit` (kind 0, `packed20`); эмбеддинг — int8 или
+триты (`--embed`), нормы/bias — fp32. Для таблицы словаря берётся правило
+TWN (`scale = 1,5·mean(|w|)`): постичь-absmax на Q6_K-эмбеддинге 7B даёт
+rel-RMS 77 %, а TWN — 43–49 % при тех же байтах сегмента (формат правило не
+фиксирует). Качество здесь не цель (триты грубее Q4), а формат и сквозная
+проводка. Полный 7B в тритах — ~1,5 ГиБ вместо ~4,4 ГиБ Q4_K.
 
 Компилятор и kind 5
 ===================
 
-`tools/vtm_compile.py` в этом спринте не меняется (задача 0153 прямо
-запрещает), а он ещё не знает `dtype: "q4_0"`/`lm_head: "q4"`. Поэтому
-манифест `--format q4` **не компилируется** до задачи, которая добавит
-kind 5 в компилятор: он останавливается на `architecture.lm_head='q4'`
-с внятным текстом. Формат сегментов при этом уже канонический (его пишет
-`tools/vtm_ref.py`), так что компилятору останется прочитать `q4.bin` тем
-же `decode_q4_segment_ex` и отдать `Tensor(kind=KIND_Q4)`. Манифест
-сообщает это в разделе `compiler` (`ready`, `missing`).
+`tools/vtm_compile.py` (задача 0154) читает `q4.bin`: запись с
+`dtype: "q4_1"` (или `"q4_0"`), `q4_offset`/`q4_length` разбирается
+`vtm_ref.decode_q4_segment_ex` и становится `Tensor(kind=KIND_Q4)`;
+`architecture.lm_head='q4'` — `TMV` по kind 5. TRT1- и int8-таблица словаря
+компилятор тоже знает (`architecture.embed` = `trit`/`int8`). Поэтому
+манифест импорта в обеих схемах собирается без правок компилятора, о чём
+раздел `compiler` (`ready`, `missing`) и сообщает.
 
 Память и потоковость
 ====================
@@ -111,11 +178,15 @@ CLI
 ```
 python3 tools/gguf_import.py info ~/.ollama/models/blobs/sha256-... [--json]
 python3 tools/gguf_import.py import model.gguf --out export/gguf-qwen --format q4
+python3 tools/gguf_import.py import model.gguf --out export/gguf-7b --format q4 \
+    --q4-kind q4_0 --q4-scale-dtype fp16 --embed trit   # 7B Q4 в предел 4 ГиБ
+python3 tools/gguf_import.py import model.gguf --out export/gguf-3b --format q4 \
+    --stats                                      # Q4_1 (asym) — умолчание
 python3 tools/gguf_import.py import model.gguf --out /tmp/slice --format trit \
     --limit-layers 1 --limit-vocab 4096 --stats
 ```
 
-Затем (для `--format trit`):
+Затем:
 
 ```
 python3 tools/vtm_compile.py --manifest /tmp/slice/manifest.json --out /tmp/slice/model.vtm
@@ -158,18 +229,33 @@ CHUNK_VALUES = 1 << 20
 SPOOL_LIMIT = 64 << 20
 
 Q4_MAGIC = b"Q4_0"
+#: Асимметричный Q4_1 (ADR 0017): `w = q·scale + min`, min на группу 32.
+Q4_MAGIC_ASYM = b"Q4_1"
 Q4_VERSION = 1
 Q4_HEADER_SIZE = 18
+#: У Q4_1 после `n_groups` идёт явное `n_mins u32` (== n_groups): без него
+#: отсутствие min не отличить от выравнивающего padding'а.
+Q4_ASYM_HEADER_SIZE = 22
 Q4_SCALE_BLOCK = 32
 Q4_GROUP_BYTES = 16
 Q4_ZERO_NIBBLE = 8
+#: Крайние нибблы Q4_1: 0 — это min группы, 15 — max.
+Q4_NIBBLE_MIN = 0
+Q4_NIBBLE_MAX = 15
 Q4_SCALE_MAX = 7.0
+#: Бит 0 flags Q4-сегмента: 1 — масштабы fp32, 0 — fp16 (ADR 0017).
+Q4_FLAG_F32_SCALES = 0x01
+#: Сколько байт занимает один масштаб Q4-сегмента.
+Q4_SCALE_BYTES = {"float32": 4, "float16": 2}
 TRT1_MAGIC = b"TRT1"
 TRT1_VERSION = 1
 TRT1_HEADER_SIZE = 18
 TRITS_PER_WORD = 20
 TRITS_PER_STORAGE_BLOCK = 160
 TRIT_SCALE_BLOCK = 128
+#: Множитель правила TWN для тритового эмбеддинга: scale = 1,5·mean(|w|).
+#: На реальном Qwen2.5-7B эмбеддинге даёт rel-RMS 49 % против 77 % у absmax.
+TRIT_MEAN_FACTOR = 1.5
 INT8_MAGIC = b"INT8"
 INT8_VERSION = 1
 INT8_SCALE_BLOCK = 128
@@ -187,6 +273,51 @@ MANIFEST_VERSION = 2
 Q4_FILE = "q4.bin"
 NON_TERNARY_FILE = "non_ternary.bin"
 MANIFEST_FILE = "manifest.json"
+
+#: Предел контейнера: смещения u32, то есть 4 ГиБ (ADR 0016). По нему
+#: выбирается `--q4-kind auto`: Q4_1 дороже на 2–4 байта на группу 32, и у 7B
+#: эта цена выводит за предел.
+CONTAINER_LIMIT = 1 << 32
+#: Запас на заголовок графа, инструкции, integrity-хэши и выравнивание.
+CONTAINER_MARGIN = 16 << 20
+
+#: Допустимые хранилища таблицы словаря: int8 (kind 4), триты (kind 0) и
+#: плотные fp32/fp16 (kind 1/2). Имена-синонимы понимает CLI.
+EMBED_MODES = ("int8", "trit", "float32", "float16")
+#: Вид Q4-сегмента (kind 5): Q4_1 — импорт по умолчанию (минимум группы,
+#: 4 байта/группа дороже), Q4_0 — симметричный, нужен 7B: у него бюджет
+#: 4 ГиБ (ADR 0016) не сходится с min'ами (см. докстроку модуля).
+Q4_KINDS = ("q4_0", "q4_1")
+_Q4_KIND_ALIASES = {
+    "q4_0": "q4_0",
+    "q4-0": "q4_0",
+    "q40": "q4_0",
+    "sym": "q4_0",
+    "symmetric": "q4_0",
+    "q4_1": "q4_1",
+    "q4-1": "q4_1",
+    "q41": "q4_1",
+    "asym": "q4_1",
+    "asymmetric": "q4_1",
+}
+_EMBED_ALIASES = {
+    "int8": "int8",
+    "trit": "trit",
+    "fp32": "float32",
+    "float32": "float32",
+    "f32": "float32",
+    "fp16": "float16",
+    "float16": "float16",
+    "f16": "float16",
+}
+_SCALE_DTYPE_ALIASES = {
+    "fp32": "float32",
+    "float32": "float32",
+    "f32": "float32",
+    "fp16": "float16",
+    "float16": "float16",
+    "f16": "float16",
+}
 
 
 class GgufError(ValueError):
@@ -736,6 +867,99 @@ def _f32(value: float) -> float:
     return _F32.unpack(_F32.pack(float(value)))[0]
 
 
+def _f16(value: float) -> float:
+    """Округлить до float16 (как это сделает формат при записи масштаба).
+
+    Переполнение — не «обрезать до inf»: масштаб `absmax/7 > 65504` означает,
+    что в fp16 тензор не записать, и импорт должен отказать с числом, а не
+    положить inf в контейнер.
+    """
+    try:
+        return _F16.unpack(_F16.pack(float(value)))[0]
+    except (OverflowError, struct.error) as exc:
+        raise GgufError(
+            f"масштаб {value!r} не влезает в float16 (максимум 65504): "
+            "для этого тензора нужен --q4-scale-dtype fp32"
+        ) from exc
+
+
+def _normalize_embed_mode(mode: str) -> str:
+    normalized = _EMBED_ALIASES.get(str(mode).lower())
+    if normalized is None:
+        raise GgufError(
+            f"embed={mode!r}, допустимо int8|trit|fp16|fp32 "
+            "(синонимы: float16/float32)"
+        )
+    return normalized
+
+
+def _normalize_scale_dtype(dtype: str) -> str:
+    normalized = _SCALE_DTYPE_ALIASES.get(str(dtype).lower())
+    if normalized is None:
+        raise GgufError(
+            f"q4_scale_dtype={dtype!r}, допустимо fp32|fp16 "
+            "(синонимы: float32/float16)"
+        )
+    return normalized
+
+
+def _normalize_q4_kind(kind: str) -> str:
+    """Нормализовать вид Q4: q4_1/q4_0 или "auto" (выбрать по размеру)."""
+    text = str(kind).lower()
+    if text in ("auto", "", "none"):
+        return "auto"
+    normalized = _Q4_KIND_ALIASES.get(text)
+    if normalized is None:
+        raise GgufError(
+            f"q4_kind={kind!r}, допустимо auto (по умолчанию: q4_1, если "
+            "контейнер влезает в 4 ГиБ, иначе q4_0) | q4_1 (asym) | q4_0 "
+            "(sym; синонимы: asym/q4-1 и sym/q4-0)"
+        )
+    return normalized
+
+
+def estimate_container_bytes(
+    plans: Iterable["PlannedTensor"],
+    *,
+    q4_asym: bool,
+    scale_dtype: str,
+) -> int:
+    """Оценка суммы payload'ов контейнера в байтах (для выбора q4_kind).
+
+    Считается по плану импорта, до чтения весов: Q4-сегменты (заголовок,
+    масштабы [+ min], нибблы), INT8/TRT1-сегменты, плотные fp32/fp16 и
+    выравнивание сегментов по 32 байта. Это именно оценка бюджета
+    (ADR 0016: u32-смещения), а не размер готового файла.
+    """
+    scale_bytes = Q4_SCALE_BYTES[scale_dtype]
+    total = 0
+    for plan in plans:
+        n_values = plan.n_values
+        if plan.target == "q4":
+            groups = (n_values + Q4_SCALE_BLOCK - 1) // Q4_SCALE_BLOCK
+            total += (
+                (Q4_ASYM_HEADER_SIZE if q4_asym else Q4_HEADER_SIZE)
+                + groups * scale_bytes * (2 if q4_asym else 1)
+                + groups * Q4_GROUP_BYTES
+            )
+        elif plan.target == "int8":
+            blocks = (n_values + INT8_SCALE_BLOCK - 1) // INT8_SCALE_BLOCK
+            total += Q4_HEADER_SIZE + blocks * 4 + n_values
+        elif plan.target == "trit":
+            scales = (n_values + TRIT_SCALE_BLOCK - 1) // TRIT_SCALE_BLOCK
+            words = (
+                (n_values + TRITS_PER_STORAGE_BLOCK - 1)
+                // TRITS_PER_STORAGE_BLOCK * 8
+            )
+            total += TRT1_HEADER_SIZE + scales * 4 + words * 4
+        elif plan.target == "f16":
+            total += n_values * 2
+        else:  # f32
+            total += n_values * 4
+        total += 32  # выравнивание сегмента
+    return total
+
+
 def _round_half_away(value: float) -> int:
     if value >= 0:
         return int(math.floor(value + 0.5))
@@ -788,8 +1012,35 @@ def _q4_nibble(value: float, scale: float) -> int:
     return signed + Q4_ZERO_NIBBLE
 
 
-def _q4_encode_block(block: array) -> tuple[float, bytes]:
-    """Один блок Q4_0 из 32 значений: (fp32-масштаб, 16 байт нибблов)."""
+def _q4_nibble_asym(value: float, scale: float, minimum: float) -> int:
+    """Ниббл Q4_1: w = q·scale + min, q в 0..15 (как `quantize_q4` asym).
+
+    Как и у Q4_0, отношение приводится к float32 до округления: эталон
+    `vtm_ref.quantize_q4` делает `_f32((w - min) / scale)`, и без этого
+    редкие значения на границе .5 дали бы другой ниббл.
+    """
+    q = _round_half_away(_f32((value - minimum) / scale))
+    if q < Q4_NIBBLE_MIN:
+        return Q4_NIBBLE_MIN
+    if q > Q4_NIBBLE_MAX:
+        return Q4_NIBBLE_MAX
+    return q
+
+
+def _q4_encode_block(
+    block: array, scale_dtype: str = "float32"
+) -> tuple[float, bytes]:
+    """Один блок Q4_0 (симметричный) из 32 значений: (масштаб, 16 байт).
+
+    Импорт это правило **не** использует: Q4_K несёт минимум под-блока, и
+    отбрасывать его — та самая ступень в 10 % rel-RMS (см. докстроку модуля).
+    Функция остаётся эталоном для сравнения и для тестов формата Q4_0.
+
+    При `scale_dtype="float16"` масштаб округляется до fp16 **до** выбора
+    нибблов: контейнер хранит fp16-масштаб, и C-ядро считает
+    `w = (q-8)·scale_fp16`. Если квантовать по fp32-масштабу, а хранить fp16,
+    ошибка сложилась бы из двух ступеней.
+    """
     top = max(block)
     bottom = min(block)
     absmax = top if top > -bottom else -bottom
@@ -800,9 +1051,65 @@ def _q4_encode_block(block: array) -> tuple[float, bytes]:
     if absmax == 0.0:
         return 0.0, bytes([0x88]) * Q4_GROUP_BYTES
     scale = _f32(absmax / Q4_SCALE_MAX)
+    if scale_dtype == "float16":
+        scale = _f16(scale)
+    if scale == 0.0:
+        # absmax > 0, но масштаб не представим (fp16-субнормал): все веса
+        # блока ниже разрешения сетки, единственное честное приближение — 0.
+        return 0.0, bytes([0x88]) * Q4_GROUP_BYTES
     low = bytes(_q4_nibble(value, scale) for value in block[:16])
     high = bytes(_q4_nibble(value, scale) for value in block[16:])
     return scale, _pack_nibbles(low, high)
+
+
+def _q4_encode_asym_block(
+    block: array, scale_dtype: str = "float32"
+) -> tuple[float, float, bytes]:
+    """Один блок Q4_1 из 32 значений: (min, масштаб, 16 байт нибблов).
+
+    Правило то же, что у `vtm_ref.quantize_q4(..., symmetric=False)`:
+    `min = min(блок)`, `scale = (max - min)/15`,
+    `q = clamp(round_half_away((w - min)/scale), 0, 15)`. Ноль группы —
+    вырожденный случай: `scale = 0`, `min` равен значению блока, все нибблы
+    0 — реконструкция `0·0 + min` точная (терять нечего, в отличие от Q4_0,
+    где нулевой блок не представим без потери знака).
+
+    Q4_K-подблок хранит и масштаб, и минимум 32 значений; поэтому `min`
+    группы возвращает почти всю информацию, которую терял Q4_0 (`absmax/7`
+    без минимума).
+
+    При `scale_dtype="float16"` масштаб и min округляются до fp16 **до**
+    выбора нибблов: контейнер хранит именно эти числа, и C-ядро считает
+    `w = q·scale_fp16 + min_fp16`.
+    """
+    top = max(block)
+    bottom = min(block)
+    if not (math.isfinite(top) and math.isfinite(bottom)):
+        raise GgufError(
+            "Q4_1: в блоке неконечное значение — исходный тензор повреждён"
+        )
+    if top == bottom:
+        # Вырожденная группа: одна точка, q=0, реконструкция точная.
+        minimum = _f32(bottom)
+        if scale_dtype == "float16":
+            minimum = _f16(minimum)
+        return minimum, 0.0, bytes(Q4_GROUP_BYTES)
+    minimum = _f32(bottom)
+    scale = _f32((_f32(top) - minimum) / (Q4_NIBBLE_MAX - Q4_NIBBLE_MIN))
+    if scale_dtype == "float16":
+        scale = _f16(scale)
+        minimum = _f16(minimum)
+    if scale == 0.0:
+        # (max-min) не представим в fp16-субнормалах: все веса блока лежат
+        # ниже разрешения сетки, единственное честное приближение — min.
+        return minimum, 0.0, bytes(Q4_GROUP_BYTES)
+    low = bytes(
+        _q4_nibble_asym(value, scale, minimum) for value in block[:16]
+    )
+    high = bytes(
+        _q4_nibble_asym(value, scale, minimum) for value in block[16:]
+    )
+    return minimum, scale, _pack_nibbles(low, high)
 
 
 @dataclass
@@ -838,18 +1145,43 @@ class _Stats:
 class _TritEncoder:
     """Накопитель TRT1-сегмента kind 0 (packed20) для формата компилятора.
 
-    Масштаб — absmax на блок 128 (как `qat/ternary.py` и Python-эталон VTM),
-    трит — `clamp(round_half_away(w/scale), -1, 1)`. Слова pack20 идут после
-    масштабов, поэтому сначала копятся в spool, а заголовок пишется в конце.
+    Масштаб — на блок 128, трит — `clamp(round_half_away(w/scale), -1, 1)`.
+    Правило масштаба задаётся `scale_rule`:
+
+    * `absmax` — как `qat/ternary.py` и Python-эталон VTM (Linear `--format
+      trit`);
+    * `mean` — `scale = 1,5 · mean(|w|)` (TWN). Для таблицы словаря это
+      заметно точнее: у 7B Q6_K-эмбеддинга постичь absmax даёт rel-RMS 77 %,
+      а mean — 49 % (обучать таблицу мы не можем, это размен формата, а не
+      качества обучения). Формат не фиксирует правило — только то, что
+      масштаб конечен и неотрицателен, — поэтому обе схемы читаются
+      компилятором и C одинаково.
+
+    Слова pack20 идут после масштабов, поэтому сначала копятся в spool, а
+    заголовок пишется в конце.
     """
 
-    def __init__(self, collect_stats: bool = False):
+    def __init__(self, collect_stats: bool = False, scale_rule: str = "absmax"):
+        if scale_rule not in ("absmax", "mean"):
+            raise ValueError(f"scale_rule={scale_rule!r}")
         self.scales = array("f")
         self.body = tempfile.SpooledTemporaryFile(max_size=SPOOL_LIMIT)
         self.n_values = 0
         self.collect_stats = bool(collect_stats)
+        self.scale_rule = scale_rule
         self.stats = _Stats()
         self._pending: list[int] = []
+
+    def _block_scale(self, block: array) -> float:
+        if self.scale_rule == "mean":
+            total = 0.0
+            for value in block:
+                total += value if value >= 0.0 else -value
+            return _f32(total / len(block) * TRIT_MEAN_FACTOR) if total else 0.0
+        absmax = max(max(block), -min(block))
+        if not math.isfinite(absmax):
+            raise GgufError("триты: в блоке неконечное значение")
+        return _f32(absmax) if absmax > 0 else 0.0
 
     def add_values(self, values: array) -> None:
         if len(values) % TRIT_SCALE_BLOCK:
@@ -861,10 +1193,7 @@ class _TritEncoder:
         body = self.body
         for start in range(0, len(values), TRIT_SCALE_BLOCK):
             block = values[start:start + TRIT_SCALE_BLOCK]
-            absmax = max(max(block), -min(block))
-            if not math.isfinite(absmax):
-                raise GgufError("триты: в блоке неконечное значение")
-            scale = _f32(absmax) if absmax > 0 else 0.0
+            scale = self._block_scale(block)
             append_scale(scale)
             for value in block:
                 if scale == 0.0:
@@ -927,17 +1256,64 @@ class _TritEncoder:
 
 
 class _SegmentEncoder:
-    """Накопитель сегмента kind 4/5: масштабы + хвост в spool-файле."""
+    """Накопитель сегмента kind 4/5: масштабы (+ min Q4_1) и хвост в spool.
 
-    def __init__(self, kind: str, collect_stats: bool = False):
+    `scale_dtype` относится к Q4 (kind 5): fp32 (flags 0x01) или fp16
+    (flags 0x00). У INT8 маска флагов та же по смыслу, но импортёр всегда
+    пишет fp32 — менять там нечего (int8-эмбеддинг и так вдвое меньше Q4).
+
+    `asymmetric` — писать Q4_1 вместо Q4_0: у каждой группы 32 значения
+    появляется свой `min` (`w = q·scale + min`). Импорт GGUF Q4_K/Q6_K
+    использует именно его: исходный K-блок несёт минимум под-блока, и
+    симметричный Q4_0 его выбрасывает — отсюда 10 % rel-RMS (см. докстроку
+    модуля). `min` копится в `array("f")` параллельно масштабам: у самого
+    большого тензора 3B это ~10 млн чисел на массив (40 МБ), а не fp32-копия
+    весов.
+    """
+
+    def __init__(
+        self,
+        kind: str,
+        collect_stats: bool = False,
+        scale_dtype: str = "float32",
+        asymmetric: bool = False,
+    ):
         if kind not in ("q4", "int8"):
             raise ValueError(kind)
+        if scale_dtype not in Q4_SCALE_BYTES:
+            raise ValueError(f"scale_dtype={scale_dtype!r}")
+        if asymmetric and kind != "q4":
+            raise ValueError(
+                f"asymmetric=True имеет смысл только для Q4, а kind={kind!r}"
+            )
         self.kind = kind
+        self.scale_dtype = scale_dtype
+        self.asymmetric = bool(asymmetric)
         self.scales = array("f")
+        #: min'ы Q4_1 (по одному на группу 32); у Q4_0/INT8 — пусто.
+        self.mins = array("f")
         self.body = tempfile.SpooledTemporaryFile(max_size=SPOOL_LIMIT)
         self.n_values = 0
         self.collect_stats = bool(collect_stats)
         self.stats = _Stats()
+
+    @property
+    def magic(self) -> bytes:
+        """Magic сегмента Q4: "Q4_1" у асимметричного, иначе "Q4_0"."""
+        if self.kind != "q4":
+            return INT8_MAGIC
+        return Q4_MAGIC_ASYM if self.asymmetric else Q4_MAGIC
+
+    @property
+    def header_size(self) -> int:
+        if self.kind == "q4" and self.asymmetric:
+            return Q4_ASYM_HEADER_SIZE
+        return Q4_HEADER_SIZE
+
+    @property
+    def flags(self) -> int:
+        """Байт flags сегмента: бит 0 — масштабы fp32."""
+        return Q4_FLAG_F32_SCALES if self.scale_dtype == "float32" else 0x00
 
     def add_values(self, values: array) -> None:
         if not values:
@@ -953,22 +1329,38 @@ class _SegmentEncoder:
                 "Q4: длина куска не кратна 32 — внутренняя ошибка нарезки"
             )
         append_scale = self.scales.append
+        append_min = self.mins.append
         body = self.body
+        asymmetric = self.asymmetric
         for start in range(0, len(values), Q4_SCALE_BLOCK):
             block = values[start:start + Q4_SCALE_BLOCK]
-            scale, packed = _q4_encode_block(block)
+            if asymmetric:
+                minimum, scale, packed = _q4_encode_asym_block(
+                    block, self.scale_dtype
+                )
+                append_min(minimum)
+            else:
+                scale, packed = _q4_encode_block(block, self.scale_dtype)
             append_scale(scale)
             body.write(packed)
             if self.collect_stats:
-                if scale != 0.0:
-                    for index, value in enumerate(block):
-                        nibble = (
-                            (packed[index & 15] & 0x0F)
-                            if index < 16 else (packed[index & 15] >> 4)
-                        )
-                        self.stats.add(value, (nibble - Q4_ZERO_NIBBLE) * scale)
-                else:
-                    self.stats.values += len(block)
+                zero = minimum if asymmetric else Q4_ZERO_NIBBLE
+                for index, value in enumerate(block):
+                    nibble = (
+                        (packed[index & 15] & 0x0F)
+                        if index < 16 else (packed[index & 15] >> 4)
+                    )
+                    if asymmetric:
+                        # Нулевой масштаб у Q4_1 не теряет min: реконструкция
+                        # `0·0 + min` — это значение вырожденной группы.
+                        self.stats.add(value, nibble * scale + minimum)
+                    elif scale != 0.0:
+                        self.stats.add(value, (nibble - zero) * scale)
+                    else:
+                        # Нулевой/непредставимый масштаб Q4_0: реконструкция —
+                        # 0, но ошибку надо учесть, иначе stats занижает
+                        # потерю.
+                        self.stats.add(value, 0.0)
         self.n_values += len(values)
 
     def _add_int8(self, values: array) -> None:
@@ -1005,10 +1397,20 @@ class _SegmentEncoder:
             return (self.n_values + Q4_SCALE_BLOCK - 1) // Q4_SCALE_BLOCK
         return (self.n_values + INT8_SCALE_BLOCK - 1) // INT8_SCALE_BLOCK
 
-    def write_to(self, sink: "_Sink", *, magic: bytes, flags: int) -> int:
-        """Записать сегмент в приёмник и вернуть его длину в байтах."""
+    def write_to(self, sink: "_Sink", *, magic: bytes, flags: int | None = None) -> int:
+        """Записать сегмент в приёмник и вернуть его длину в байтах.
+
+        `flags=None` — взять из `scale_dtype` (Q4); для INT8 вызывающий
+        передаёт 0x01 явно, как раньше. У Q4_1 порядок байт — как в
+        `vtm_ref.encode_q4_segment`: заголовок 22 байта (magic, version,
+        flags, n_values, n_groups, n_mins), масштабы, min'ы, нибблы.
+        """
         if self.n_values == 0:
             raise GgufError("пустой сегмент Q4/INT8")
+        if self.kind == "q4" and flags is None:
+            flags = self.flags
+        if flags is None:
+            raise GgufError("сегмент: flags не заданы")
         n_scale = self.n_scale()
         if len(self.scales) != n_scale:
             raise GgufError(
@@ -1018,12 +1420,22 @@ class _SegmentEncoder:
         header = _SEGMENT_HEADER.pack(
             magic, Q4_VERSION, flags, self.n_values, n_scale
         )
+        if self.kind == "q4" and self.asymmetric:
+            if len(self.mins) != n_scale:
+                raise GgufError(
+                    f"сегмент Q4_1: min {len(self.mins)}, ожидалось {n_scale} "
+                    f"на {self.n_values} значений"
+                )
+            # Явное число min: читатель (и C-загрузчик) обязан сверить его с
+            # ceil(n/32), иначе отсутствие min можно спутать с padding'ом.
+            header += struct.pack("<I", n_scale)
         start = sink.offset
         sink.write(header)
-        scales = array("f", self.scales)
-        if sys.byteorder != "little":
-            scales.byteswap()
-        sink.write(scales.tobytes())
+        for chunk in self._aux_bytes(self.scales):
+            sink.write(chunk)
+        if self.kind == "q4" and self.asymmetric:
+            for chunk in self._aux_bytes(self.mins):
+                sink.write(chunk)
         self.body.seek(0)
         while True:
             chunk = self.body.read(1 << 20)
@@ -1031,6 +1443,25 @@ class _SegmentEncoder:
                 break
             sink.write(chunk)
         return sink.offset - start
+
+    def _aux_bytes(self, values: array) -> Iterator[bytes]:
+        """Байты массива масштабов/min: fp32 — как есть, fp16 — через struct.
+
+        Значения уже приведены к целевому типу при квантовании блока, поэтому
+        здесь только сериализация. fp16 пишется кусками: у 7B на один тензор
+        приходится до 2,1 млн масштабов, и `struct.pack` на них целиком — это
+        лишние сотни мегабайт пика.
+        """
+        if self.scale_dtype == "float32":
+            payload = array("f", values)
+            if sys.byteorder != "little":
+                payload.byteswap()
+            yield payload.tobytes()
+            return
+        chunk = 1 << 16
+        for start in range(0, len(values), chunk):
+            part = values[start:start + chunk]
+            yield struct.pack(f"<{len(part)}e", *part)
 
     def close(self) -> None:
         self.body.close()
@@ -1376,16 +1807,25 @@ def plan_import(
     fmt: str,
     embed_mode: str,
 ) -> list[PlannedTensor]:
-    """Проверить имена/формы всех тензоров и решить, что куда писать."""
+    """Проверить имена/формы всех тензоров и решить, что куда писать.
+
+    `embed_mode` — уже нормализованный (`_normalize_embed_mode`):
+    int8 | trit | float32 | float16. `trit` кладёт таблицу словаря
+    TRT1-сегментом в `ternary.trit` (kind 0), как это делает QAT-экспорт с
+    `quantize_embeddings: trit`; так 7B Q4 с fp16-масштабами влезает в 4 ГиБ
+    (ADR 0016): int8-таблица стоит 0,53 ГиБ против 0,12 ГиБ у тритов.
+    """
     if fmt not in ("q4", "trit"):
         raise GgufError(f"format={fmt!r}, допустимо q4|trit")
-    if embed_mode not in ("int8", "float32", "float16"):
-        raise GgufError(f"embed={embed_mode!r}, допустимо int8|float32|float16")
+    if embed_mode not in EMBED_MODES:
+        raise GgufError(
+            f"embed={embed_mode!r}, допустимо int8|trit|fp16|fp32"
+        )
     if cfg.tie_word_embeddings and embed_mode == "float16":
         raise GgufError(
-            "tie_word_embeddings=true, а --embed float16: компилятор требует "
-            "для tied-таблицы fp32 или int8 (fp16 он отвергает) — "
-            "выберите --embed int8 или float32"
+            "tie_word_embeddings=true, а --embed fp16: компилятор требует "
+            "для tied-таблицы fp32, int8 или триты (fp16 он отвергает) — "
+            "выберите --embed int8, trit или fp32"
         )
 
     # Типы и имена проверяются до записи: частично записанный экспорт хуже,
@@ -1455,8 +1895,8 @@ def plan_import(
                 f"{Q4_SCALE_BLOCK} — такой тензор нельзя записать как kind 5"
             )
         if (
-            fmt == "trit"
-            and role in ("matrix", "lm_head")
+            (fmt == "trit" or embed_mode == "trit")
+            and role in ("matrix", "lm_head", "embed")
             and n_values % TRIT_SCALE_BLOCK
         ):
             raise GgufError(
@@ -1465,6 +1905,8 @@ def plan_import(
             )
         if embed_mode == "int8" and role == "embed":
             target = "int8"
+        elif embed_mode == "trit" and role == "embed":
+            target = "trit"
         elif role in ("norm", "final_norm", "bias"):
             target = "f32"
         elif embed_mode in ("float32", "float16") and role == "embed":
@@ -1662,6 +2104,8 @@ def import_gguf(
     *,
     fmt: str = "q4",
     embed_mode: str = "int8",
+    q4_scale_dtype: str = "float32",
+    q4_kind: str = "auto",
     tie: str = "auto",
     limit_layers: int | None = None,
     limit_vocab: int | None = None,
@@ -1671,17 +2115,86 @@ def import_gguf(
 ) -> ImportResult:
     """Прочитать GGUF и записать манифест + веса VTM в `out_dir`.
 
-    `fmt="q4"` — Linear в kind 5 (`q4.bin`), манифест ждёт поддержки kind 5 в
-    компиляторе; `fmt="trit"` — Linear в триты (`ternary.trit`, kind 0),
-    единственный формат, который сегодняшний `tools/vtm_compile.py` собирает
-    целиком.
+    `fmt="q4"` — Linear в kind 5 (`q4.bin`); `fmt="trit"` — Linear в триты
+    (`ternary.trit`, kind 0). Компилятор (0154) читает оба.
+
+    `q4_scale_dtype` — fp32 или fp16 для масштабов Q4-сегмента: цена fp32 —
+    1 бит на вес (у 7B это +0,44 ГиБ, то есть выход за 4 ГиБ, ADR 0016).
+
+    `q4_kind` — `auto` (по умолчанию) | `q4_1` | `q4_0`. Q4_1 пишет `min`
+    на группу 32 и почти не теряет точность на Q4_K-подблоках; цена — 2–4
+    байта на группу 32. `auto` выбирает Q4_1, если оценка контейнера
+    влезает в предел 4 ГиБ (ADR 0016), иначе Q4_0 — и сообщает выбор с
+    числами в stderr: у 7B Q4_1 с fp16-масштабами и тритовым эмбеддингом
+    даёт ~4,55 ГБ (106 % предела), у 3B — ~2,4 ГБ.
+
+    `embed_mode` — int8 | trit | float32 | float16. `trit` кладёт таблицу
+    словаря TRT1-сегментом в `ternary.trit` (kind 0) и уменьшает её с 0,53
+    до ~0,12 ГиБ у 7B — это и есть разница между 105,7 % и 95 % предела.
     """
     started = time.time()
+    fmt = str(fmt).lower()
+    if fmt not in ("q4", "trit"):
+        raise GgufError(f"format={fmt!r}, допустимо q4|trit")
+    embed_mode = _normalize_embed_mode(embed_mode)
+    q4_scale_dtype = _normalize_scale_dtype(q4_scale_dtype)
+    q4_kind = _normalize_q4_kind(q4_kind)
     gguf = read_gguf(source)
     cfg = infer_config(
         gguf, tie=tie, limit_layers=limit_layers, limit_vocab=limit_vocab
     )
     plans = plan_import(gguf, cfg, fmt=fmt, embed_mode=embed_mode)
+
+    # Вид Q4 зависит от бюджета: 3B Q4_1 влезает с запасом, 7B — нет.
+    auto_kind = q4_kind == "auto"
+    if fmt == "q4":
+        asym_bytes = estimate_container_bytes(
+            plans, q4_asym=True, scale_dtype=q4_scale_dtype
+        )
+        if q4_kind == "auto":
+            if asym_bytes + CONTAINER_MARGIN <= CONTAINER_LIMIT:
+                q4_kind = "q4_1"
+                reason = (
+                    f"оценка контейнера {asym_bytes / 2**30:.2f} ГиБ "
+                    f"≤ {CONTAINER_LIMIT / 2**30:.0f} ГиБ — берём Q4_1 "
+                    "(min на группу 32)"
+                )
+            else:
+                sym_bytes = estimate_container_bytes(
+                    plans, q4_asym=False, scale_dtype=q4_scale_dtype
+                )
+                q4_kind = "q4_0"
+                reason = (
+                    f"оценка Q4_1 {asym_bytes / 2**30:.2f} ГиБ > "
+                    f"{CONTAINER_LIMIT / 2**30:.0f} ГиБ (ADR 0016), Q4_0 — "
+                    f"{sym_bytes / 2**30:.2f} ГиБ — берём Q4_0"
+                )
+            print(f"gguf_import: q4_kind=auto → {q4_kind}: {reason}",
+                  file=sys.stderr)
+        chosen_bytes = (
+            asym_bytes if q4_kind == "q4_1"
+            else estimate_container_bytes(
+                plans, q4_asym=False, scale_dtype=q4_scale_dtype
+            )
+        )
+        if chosen_bytes + CONTAINER_MARGIN > CONTAINER_LIMIT:
+            # Даже выбранный вид не влезает: подсказка, что менять, а не
+            # «сборка упала на 4 ГиБ» через час.
+            hint = (
+                "уменьшите вес: --q4-scale-dtype fp16 (−0,44 ГБ у 7B)"
+                if q4_scale_dtype == "float32" else "уменьшите вес"
+            )
+            if embed_mode == "int8":
+                hint += ", --embed trit (−0,44 ГБ у 7B)"
+            explicit = "задан явно" if not auto_kind else "выбран auto"
+            print(
+                f"gguf_import: q4_kind={q4_kind} ({explicit}), но оценка "
+                f"контейнера {chosen_bytes / 2**30:.2f} ГиБ > "
+                f"{CONTAINER_LIMIT / 2**30:.0f} ГиБ (ADR 0016, u32-смещения): "
+                f"{hint}",
+                file=sys.stderr,
+            )
+    q4_asym = q4_kind == "q4_1"
 
     out = Path(out_dir).expanduser()
     if out.exists():
@@ -1731,7 +2244,7 @@ def import_gguf(
             "key": plan.key,
             "shape": list(plan.shape),
             "kind": kind,
-            "dtype": "q4_0" if kind == "q4" else "trit",
+            "dtype": q4_kind if kind == "q4" else "trit",
             "offset": offset,
             "length": length,
             ("q4_offset" if kind == "q4" else "trit_offset"): offset,
@@ -1746,11 +2259,14 @@ def import_gguf(
             total_params += plan.n_values
             if plan.target == "q4":
                 assert q4_sink is not None
-                encoder = _SegmentEncoder("q4", collect_stats=stats)
+                encoder = _SegmentEncoder(
+                    "q4", collect_stats=stats, scale_dtype=q4_scale_dtype,
+                    asymmetric=q4_asym,
+                )
                 for chunk in gguf.iter_tensor_chunks(plan.info, plan.n_values):
                     encoder.add_values(chunk)
                 q4_sink.align(32)
-                length = encoder.write_to(q4_sink, magic=Q4_MAGIC, flags=0x01)
+                length = encoder.write_to(q4_sink, magic=encoder.magic)
                 encoder.close()
                 q4_params += plan.n_values
                 source_values_q4 += plan.info.n_bytes
@@ -1767,7 +2283,12 @@ def import_gguf(
                     )
             elif plan.target == "trit":
                 assert trit_sink is not None
-                encoder = _TritEncoder(collect_stats=stats)
+                encoder = _TritEncoder(
+                    collect_stats=stats,
+                    # Таблица словаря — единственный тензор, где absmax-правило
+                    # теряет слишком много: см. docstring _TritEncoder.
+                    scale_rule="mean" if plan.role == "embed" else "absmax",
+                )
                 for chunk in gguf.iter_tensor_chunks(plan.info, plan.n_values):
                     encoder.add_values(chunk)
                 trit_sink.align(32)
@@ -1779,7 +2300,12 @@ def import_gguf(
                     _entry(plan, trit_sink.offset - length, length, "trit")
                 )
                 if stats:
-                    stats_by_role.setdefault("trit", _Stats()).merge(encoder.stats)
+                    # Ошибка тритовой таблицы словаря — отдельная ступень:
+                    # её надо мерить против int8, а не смешивать с матрицами.
+                    key = "embed(trit)" if plan.role == "embed" else "trit"
+                    stats_by_role.setdefault(key, _Stats()).merge(
+                        encoder.stats
+                    )
                 if progress:
                     print(
                         f"  trit {plan.hf_name:<47} "
@@ -1839,9 +2365,21 @@ def import_gguf(
 
         # tied lm_head: отдельного тензора нет, компилятор читает ту же таблицу.
         if cfg.tie_word_embeddings:
+            # Таблица может лежать и в non_ternary.bin (int8/fp), и в
+            # ternary.trit (триты): ищем её в обоих списках, а ссылку кладём в
+            # non_ternary — компилятор пропускает записи с tied_to, не читая
+            # по ним байт.
             embed_entry = next(
-                entry for entry in non_entries if entry["role"] == "embed"
+                (entry for entry in non_entries if entry["role"] == "embed"),
+                None,
             )
+            if embed_entry is None:
+                embed_entry = next(
+                    (entry for entry in segment_entries
+                     if entry["role"] == "embed"),
+                    None,
+                )
+            assert embed_entry is not None  # план гарантирует embed
             non_entries.append({
                 "name": "lm_head.weight",
                 "role": "lm_head",
@@ -1868,7 +2406,7 @@ def import_gguf(
 
     # Структурная проверка записанного: заголовки сегментов и границы.
     if q4_path is not None:
-        _verify_q4_file(q4_path, segment_entries)
+        _verify_q4_file(q4_path, segment_entries, q4_scale_dtype, q4_asym)
     if trit_plans:
         _verify_trit_file(trit_path, segment_entries)
     _verify_int8_file(non_path, non_entries)
@@ -1906,49 +2444,110 @@ def import_gguf(
         architecture["lm_head"] = "q4"
     else:
         architecture["lm_head"] = "mm" if cfg.tie_word_embeddings else "tmv"
-    architecture["embed"] = "int8" if embed_mode == "int8" else "none"
+    # Компилятор понимает три значения: int8 (kind 4 в non_ternary.bin),
+    # trit (TRT1 в ternary.trit) и none (плотная fp32/fp16-таблица).
+    architecture["embed"] = (
+        embed_mode if embed_mode in ("int8", "trit") else "none"
+    )
+
+    embed_rule = {
+        "int8": (
+            "int8 (kind 4): scale=absmax(128)/127; "
+            "q=clamp(round(w/scale),-127,127); w=q*scale"
+        ),
+        "trit": (
+            "триты (kind 0): scale=1.5*mean(|w|) на блок 128 (TWN); "
+            "trit=clamp(round_half_away(w/scale),-1,1); w=trit*scale"
+        ),
+        "float32": "плотная fp32-таблица (kind 1), без квантования",
+        "float16": "плотная fp16-таблица (kind 2), без квантования",
+    }[embed_mode]
 
     quantization = {
         "block_size": 128,
         "scale_dtype": "float32",
         "target": fmt,
         "rule": (
-            "Linear -> Q4_0 (kind 5): scale=absmax(32)/7; "
-            "q=clamp(round_half_away(w/scale),-8,7)+8; w=(q-8)*scale"
+            ("Linear -> Q4_1 (kind 5, asym): min=min(32); "
+             "scale=(max-min)/15; "
+             "q=clamp(round_half_away((w-min)/scale),0,15); w=q*scale+min")
+            if fmt == "q4" and q4_asym else
+            ("Linear -> Q4_0 (kind 5, sym): scale=absmax(32)/7; "
+             "q=clamp(round_half_away(w/scale),-8,7)+8; w=(q-8)*scale")
             if fmt == "q4" else
             "Linear -> триты (kind 0): scale=absmax(128); "
             "trit=clamp(round_half_away(w/scale),-1,1); w=trit*scale"
         ),
         "q4_block_size": Q4_SCALE_BLOCK,
-        "q4_scale_dtype": "float32",
+        "q4_kind": q4_kind if fmt == "q4" else None,
+        "q4_scale_dtype": q4_scale_dtype,
+        "q4_scale_bytes": Q4_SCALE_BYTES[q4_scale_dtype],
+        "q4_flags": Q4_FLAG_F32_SCALES if q4_scale_dtype == "float32" else 0,
+        "q4_asymmetric": bool(q4_asym) if fmt == "q4" else None,
+        "q4_estimated_bytes": (
+            estimate_container_bytes(
+                plans, q4_asym=q4_asym, scale_dtype=q4_scale_dtype
+            )
+            if fmt == "q4" else None
+        ),
+        "container_limit_bytes": CONTAINER_LIMIT,
         "q4_layout": "ggml: байт j = значение j (low), j+16 (high)",
         "trit_block_size": TRIT_SCALE_BLOCK,
         "trit_layout": "packed20: 20 тритов в u32, 160 тритов в 32 байтах",
-        "embed_rule": (
-            "int8 (kind 4): scale=absmax(128)/127; "
-            "q=clamp(round(w/scale),-127,127); w=q*scale"
+        "trit_scale_rule": (
+            "Linear — absmax(128) (как qat/ternary.py); "
+            "эмбеддинг — 1.5*mean(|w|) (TWN, меньше потерь на Q6_K-таблице)"
+            if embed_mode == "trit" else
+            "absmax(128) (как qat/ternary.py)"
         ),
+        "embed_rule": embed_rule,
         "source_types": sorted({plan.info.spec.name for plan in plans}),
     }
+    scale_label = "f32" if q4_scale_dtype == "float32" else "f16"
     q4_section = None
     if q4_path is not None:
         q4_section = {
             "file": Q4_FILE,
             "kind": 5,
             "block_size": Q4_SCALE_BLOCK,
-            "scale_dtype": "float32",
-            "layout": "ggml: байт j = значение j (low), j+16 (high); "
-                      "w = (q-8)*scale",
-            "nibble_min": 0,
-            "nibble_max": 15,
-            "nibble_zero": Q4_ZERO_NIBBLE,
+            "scale_dtype": q4_scale_dtype,
+            "flags": Q4_FLAG_F32_SCALES if q4_scale_dtype == "float32" else 0,
+            "asymmetric": bool(q4_asym),
+            "layout": (
+                "ggml: байт j = значение j (low), j+16 (high); "
+                "w = q*scale + min" if q4_asym else
+                "ggml: байт j = значение j (low), j+16 (high); "
+                "w = (q-8)*scale"
+            ),
+            "nibble_min": Q4_NIBBLE_MIN,
+            "nibble_max": Q4_NIBBLE_MAX,
+            "nibble_zero": None if q4_asym else Q4_ZERO_NIBBLE,
+            "nibble_note": (
+                "у Q4_1 min группы — это ниббл 0, max — ниббл 15; "
+                "фиксированного «нуля» нет" if q4_asym else
+                "у Q4_0 ниббл 8 — ноль, диапазон -8..7"
+            ),
             "segment": {
-                "magic": "Q4_0",
+                "magic": "Q4_1" if q4_asym else "Q4_0",
                 "version": Q4_VERSION,
-                "header_bytes": Q4_HEADER_SIZE,
-                "order": "header, scales f32, nibbles",
+                "header_bytes": (
+                    Q4_ASYM_HEADER_SIZE if q4_asym else Q4_HEADER_SIZE
+                ),
+                "n_mins": (
+                    "n_groups (u32 после n_groups)" if q4_asym else None
+                ),
+                "order": (
+                    f"header, scales {scale_label}, mins {scale_label}, "
+                    "nibbles" if q4_asym else
+                    f"header, scales {scale_label}, nibbles"
+                ),
                 "aligned": 32,
-                "note": "ровно tools/vtm_ref.py:encode_q4_segment (0151)",
+                "note": (
+                    "ровно tools/vtm_ref.py:encode_q4_segment "
+                    "(Tensor.q4(..., asymmetric=True))" if q4_asym else
+                    "ровно tools/vtm_ref.py:encode_q4_segment "
+                    "(Tensor.q4(..., asymmetric=False))"
+                ),
             },
             "tensors": len(q4_plans),
             "params": q4_params,
@@ -1971,32 +2570,60 @@ def import_gguf(
                 "aligned": 32,
                 "note": "tools/vtm_ref.py:encode_trit_segment (kind 0)",
             },
+            "contains_embed": embed_mode == "trit",
             "tensors": len(trit_plans),
             "params": trit_params,
         }
+    # Запись таблицы словаря — в том файле, куда её положил план: int8/fp
+    # в non_ternary.bin, триты — в ternary.trit (tensors[]).
     embed_entry = next(
         (entry for entry in non_entries if entry["role"] == "embed"), None
     )
+    embed_segment = None
+    if embed_entry is None:
+        embed_segment = next(
+            (entry for entry in segment_entries if entry["role"] == "embed"),
+            None,
+        )
+    embed_dtype = {
+        "int8": "int8",
+        "trit": "trit",
+        "float32": "float32",
+        "float16": "float16",
+    }[embed_mode]
+    embed_bytes = 0
+    if embed_entry is not None:
+        embed_bytes = int(embed_entry["length"])
+    elif embed_segment is not None:
+        embed_bytes = int(embed_segment["length"])
     embeddings = {
-        "mode": "int8" if embed_mode == "int8" else "none",
+        "mode": embed_mode if embed_mode in ("int8", "trit") else "none",
         "tensor": "model.embed_tokens.weight",
-        "storage": NON_TERNARY_FILE,
-        "dtype": "int8" if embed_mode == "int8" else (
-            "float32" if embed_mode == "float32" else "float16"
+        "storage": NON_TERNARY_FILE if embed_entry is not None else "ternary.trit",
+        "dtype": embed_dtype,
+        "params": (
+            embed_entry["params"] if embed_entry is not None
+            else (embed_segment or {}).get("params", 0)
         ),
-        "params": embed_entry["params"] if embed_entry else 0,
-        "bytes": embed_entry["length"] if embed_entry else 0,
-        "block_size": INT8_SCALE_BLOCK,
+        "bytes": embed_bytes,
+        "block_size": (
+            INT8_SCALE_BLOCK if embed_mode == "int8"
+            else (TRIT_SCALE_BLOCK if embed_mode == "trit" else None)
+        ),
         "rule": quantization["embed_rule"],
     }
+    if embed_segment is not None:
+        embeddings["segment"] = {
+            "magic": "TRT1",
+            "version": TRT1_VERSION,
+            "kind": 0,
+            "storage": "packed20",
+            "trit_offset": embed_segment["trit_offset"],
+            "trit_length": embed_segment["trit_length"],
+        }
+    # Компилятор 0154 читает и q4.bin (kind 5), и TRT1/int8-эмбеддинг:
+    # манифест импорта собирается без правок компилятора.
     compiler_missing: list[str] = []
-    if fmt == "q4":
-        compiler_missing = [
-            "tools/vtm_compile.py: чтение q4.bin (dtype q4_0, "
-            "decode_q4_segment_ex) в Tensor(kind=KIND_Q4)",
-            "tools/vtm_compile.py: lm_head='q4' и TMV по kind 5",
-            "src/vtm/loader.c: разбор сегмента Q4_0 (kind 5, задача 0151)",
-        ]
     manifest = {
         "format": MANIFEST_FORMAT,
         "format_version": MANIFEST_VERSION,
@@ -2048,24 +2675,43 @@ def import_gguf(
             "params": int8_params + fp_params,
             "tensors": non_entries,
             "note": (
-                "эмбеддинг — INT8-сегмент (kind 4, блок 128); нормы/bias — "
-                "fp32; квантованные матрицы — в "
+                "эмбеддинг — "
+                + (
+                    "INT8-сегмент (kind 4, блок 128)"
+                    if embed_mode == "int8" else
+                    "в ternary.trit, триты (kind 0)"
+                    if embed_mode == "trit" else
+                    f"плотный {embed_dtype}"
+                )
+                + "; нормы/bias — fp32; квантованные матрицы — в "
                 + ("q4.bin" if fmt == "q4" else "ternary.trit")
                 + " и описаны в tensors[]"
             ),
         },
         "compiler": {
-            "ready": fmt == "trit",
+            "ready": True,
             "format": fmt,
             "missing": compiler_missing,
             "note": (
-                "манифест --format q4 описывает kind 5 и НЕ компилируется "
-                "текущим tools/vtm_compile.py (он не знает dtype q4_0 и "
-                "lm_head='q4'); сегменты побайтово совпадают с "
-                "tools/vtm_ref.py:encode_q4_segment"
-                if fmt == "q4" else
-                "манифест --format trit: TRT1-сегменты + int8-эмбеддинг; "
-                "tools/vtm_compile.py собирает его без изменений"
+                "манифест читается tools/vtm_compile.py без изменений: "
+                + (
+                    "q4.bin (kind 5, Q4_1/asym) в Tensor(kind=Q4, "
+                    "q4_asymmetric=True), lm_head='q4' → TMV"
+                    if fmt == "q4" and q4_asym else
+                    "q4.bin (kind 5, Q4_0/sym) в Tensor(kind=Q4), "
+                    "lm_head='q4' → TMV"
+                    if fmt == "q4" else
+                    "Linear в TRT1, lm_head='tmv'"
+                )
+                + (
+                    ", эмбеддинг — TRT1-сегмент (kind 0)"
+                    if embed_mode == "trit" else
+                    ", эмбеддинг — INT8-сегмент (kind 4)"
+                    if embed_mode == "int8" else
+                    f", эмбеддинг — плотный {embed_dtype}"
+                )
+                + ("" if q4_scale_dtype == "float32" else
+                   "; fp16-масштабы Q4 разбираются decode_q4_segment_ex")
             ),
         },
         "partial": bool(partial),
@@ -2133,25 +2779,60 @@ def _verify_trit_file(path: Path, entries: Sequence[dict[str, Any]]) -> None:
                 )
 
 
-def _verify_q4_file(path: Path, entries: Sequence[dict[str, Any]]) -> None:
-    """Проверить, что каждый Q4-сегмент на месте и его заголовок согласован."""
+def _verify_q4_file(
+    path: Path,
+    entries: Sequence[dict[str, Any]],
+    scale_dtype: str = "float32",
+    asymmetric: bool = True,
+) -> None:
+    """Проверить, что каждый Q4-сегмент на месте и его заголовок согласован.
+
+    `scale_dtype` входит в проверку длины: fp16-масштабы вдвое короче, и
+    «сегмент длиной как у fp32» у fp16 означал бы лишние байты (или чужой
+    flags), то есть рассинхрон манифеста с файлом.
+
+    Импорт по умолчанию пишет Q4_1: magic `"Q4_1"`, заголовок 22 байта с
+    явным `n_mins`, после масштабов ещё массив min. Проверка повторяет то,
+    что сделает C-загрузчик (`loader.c`): неверный `n_mins` — отказ, а не
+    «прочитать как Q4_0». `asymmetric=False` — старый симметричный Q4_0
+    (`--q4-kind q4_0`, нужен 7B ради предела 4 ГиБ).
+    """
+    scale_bytes = Q4_SCALE_BYTES[scale_dtype]
+    expected_flags = Q4_FLAG_F32_SCALES if scale_dtype == "float32" else 0
+    expected_magic = Q4_MAGIC_ASYM if asymmetric else Q4_MAGIC
+    header_size = Q4_ASYM_HEADER_SIZE if asymmetric else Q4_HEADER_SIZE
+    aux_arrays = 2 if asymmetric else 1
     size = path.stat().st_size
     with open(path, "rb") as handle:
         for entry in entries:
+            if entry.get("kind") != "q4":
+                continue  # в tensors[] может быть и TRT1-эмбеддинг
             offset = int(entry["q4_offset"])
             length = int(entry["q4_length"])
-            if offset < 0 or length < Q4_HEADER_SIZE or offset + length > size:
+            if offset < 0 or length < header_size or offset + length > size:
                 raise GgufError(
                     f"{entry['name']}: сегмент [{offset}, {offset + length}) "
                     f"вне {path.name} ({size} байт)"
                 )
             handle.seek(offset)
-            header = handle.read(Q4_HEADER_SIZE)
-            magic, version, flags, n_values, n_groups = _SEGMENT_HEADER.unpack(header)
-            if magic != Q4_MAGIC or version != Q4_VERSION:
+            header = handle.read(header_size)
+            magic, version, flags, n_values, n_groups = _SEGMENT_HEADER.unpack(
+                header[:Q4_HEADER_SIZE]
+            )
+            if magic != expected_magic or version != Q4_VERSION:
                 raise GgufError(
                     f"{entry['name']}: чужой заголовок Q4-сегмента {magic!r}/"
-                    f"{version}"
+                    f"{version} (ожидался {expected_magic!r})"
+                )
+            n_mins = (
+                struct.unpack("<I", header[Q4_HEADER_SIZE:])[0]
+                if asymmetric else 0
+            )
+            if flags != expected_flags:
+                raise GgufError(
+                    f"{entry['name']}: flags Q4-сегмента 0x{flags:02x}, "
+                    f"ожидалось 0x{expected_flags:02x} для масштабов "
+                    f"{scale_dtype}"
                 )
             if n_values != entry["params"]:
                 raise GgufError(
@@ -2164,8 +2845,14 @@ def _verify_q4_file(path: Path, entries: Sequence[dict[str, Any]]) -> None:
                     f"{entry['name']}: групп {n_groups}, ожидалось "
                     f"{expected_groups}"
                 )
+            if asymmetric and n_mins != expected_groups:
+                raise GgufError(
+                    f"{entry['name']}: n_mins={n_mins}, ожидалось "
+                    f"{expected_groups}"
+                )
             expected_length = (
-                Q4_HEADER_SIZE + n_groups * 4 + n_groups * Q4_GROUP_BYTES
+                header_size + n_groups * scale_bytes * aux_arrays
+                + n_groups * Q4_GROUP_BYTES
             )
             if length < expected_length:
                 raise GgufError(
@@ -2354,13 +3041,30 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--out", required=True, help="каталог результата")
     imp.add_argument(
         "--format", choices=("q4", "trit"), default="q4",
-        help="q4 — kind 5 в q4.bin (по умолчанию, ждёт поддержки в "
-             "компиляторе); trit — TRT1/kind 0 в ternary.trit, который "
-             "сегодняшний tools/vtm_compile.py собирает целиком",
+        help="q4 — kind 5 в q4.bin (по умолчанию); trit — TRT1/kind 0 в "
+             "ternary.trit; компилятор читает оба",
     )
     imp.add_argument(
-        "--embed", choices=("int8", "float32", "float16"), default="int8",
-        help="хранение таблицы словаря (по умолчанию int8, kind 4)",
+        "--q4-scale-dtype", choices=("fp32", "fp16", "float32", "float16"),
+        default="fp32",
+        help="масштабы Q4-сегментов: fp32 (1 бит/вес, по умолчанию) или "
+             "fp16 (0,5 бита/вес; для 7B — единственный способ влезть в "
+             "4 ГиБ, ADR 0016)",
+    )
+    imp.add_argument(
+        "--q4-kind", choices=("auto", "q4_1", "q4_0", "asym", "sym"),
+        default="auto",
+        help="вид Q4-сегмента (kind 5): auto (по умолчанию) — q4_1, если "
+             "оценка контейнера влезает в 4 ГиБ (3B), иначе q4_0 (7B: Q4_1 "
+             "даёт 106 %% предела); q4_1 — min на группу 32, почти без потерь "
+             "на Q4_K-подблоках (+2–4 байта/группа); q4_0 — симметричный",
+    )
+    imp.add_argument(
+        "--embed", choices=("int8", "trit", "fp16", "fp32", "float16", "float32"),
+        default="int8",
+        help="хранение таблицы словаря: int8 (kind 4, по умолчанию), trit "
+             "(TRT1/kind 0 в ternary.trit; 7B — 0,12 ГиБ вместо 0,53 ГиБ), "
+             "fp16/fp32 — плотная (kind 2/1). Синонимы: float16/float32",
     )
     imp.add_argument(
         "--tie", choices=("auto", "yes", "no"), default="auto",
@@ -2405,25 +3109,32 @@ def _print_result(result: ImportResult) -> None:
     q4 = result.manifest.get("q4")
     trit = result.manifest.get("trit")
     if q4:
+        kind = "Q4_1 (asym, min на группу)" if q4["asymmetric"] else "Q4_0 (sym)"
         print(
-            f"  Linear → Q4_0 (kind 5): {q4['params'] / 1e6:.1f} МЭ, "
+            f"  Linear → {kind}, kind 5, масштабы {q4['scale_dtype']}: "
+            f"{q4['params'] / 1e6:.1f} МЭ, "
             f"q4.bin {_human_bytes(result.q4_bytes)}"
         )
     if trit:
         trit_bytes = result.manifest["files"]["ternary.trit"]["bytes"]
+        where = "триты + эмбеддинг" if trit.get("contains_embed") else "триты"
         print(
-            f"  Linear → триты (kind 0): {trit['params'] / 1e6:.1f} МЭ, "
+            f"  Linear → {where} (kind 0): {trit['params'] / 1e6:.1f} МЭ, "
             f"ternary.trit {_human_bytes(trit_bytes)}"
         )
     embed = result.manifest["embeddings"]
     print(
         f"  эмбеддинг → {embed['dtype']}: {embed['params'] / 1e6:.1f} МЭ, "
-        f"non_ternary.bin {_human_bytes(result.non_ternary_bytes)}"
+        f"{embed.get('storage')} {_human_bytes(embed['bytes'])}"
+    )
+    total_bytes = (
+        result.q4_bytes + result.non_ternary_bytes
+        + int(result.manifest["files"]["ternary.trit"]["bytes"])
     )
     print(
         f"  исходник {_human_bytes(result.source_bytes)} → "
-        f"файлы {_human_bytes(result.q4_bytes + result.non_ternary_bytes)} "
-        f"({(result.q4_bytes + result.non_ternary_bytes) / result.source_bytes:.2f}×)"
+        f"файлы {_human_bytes(total_bytes)} "
+        f"({total_bytes / result.source_bytes:.2f}×)"
     )
     if result.manifest.get("partial"):
         print(
@@ -2461,6 +3172,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.out,
             fmt=args.format,
             embed_mode=args.embed,
+            q4_scale_dtype=args.q4_scale_dtype,
+            q4_kind=args.q4_kind,
             tie=args.tie,
             limit_layers=args.limit_layers,
             limit_vocab=args.limit_vocab,

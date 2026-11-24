@@ -1059,7 +1059,7 @@
   {
     "id": "0160",
     "title": "Импорт Q4 как Q4_1 (с минимумами)",
-    "status": "in_progress",
+    "status": "done",
     "file": "0160-q4-asym-import.md",
     "assignee": "agent:q4-asym"
   },
