@@ -1322,6 +1322,264 @@ done:
     free(y_cand);
 }
 
+// --- Q4_K/Q6_K (kind 6/7, задачи 0165/0167) --------------------------------
+//
+// Синтетические блоки GGML: d/dmin — fp16 из малых значений, 6-битные
+// scale/min, нибблы и ql/qh — случайные. Эталон — независимая деквантизация
+// в double по формулам ADR 0018, поэтому проверка не повторяет код ядра
+// (как q4_ref_value для kind 5).
+
+static uint8_t *make_q4k(int n_values, uint32_t seed) {
+    int64_t nblocks = ((int64_t)n_values + 255) / 256;
+    size_t bytes = (size_t)nblocks * VTM_Q4K_BLOCK_BYTES;
+    uint8_t *b = (uint8_t *)calloc(bytes ? bytes : 1u, 1);
+    int64_t i;
+    if (!b) return NULL;
+    for (i = 0; i < nblocks; i++) {
+        uint8_t *bp = b + (size_t)i * VTM_Q4K_BLOCK_BYTES;
+        // d/dmin подобраны так, чтобы |w| было порядка 0,02, как у весов
+        // Linear 3B Q4_K: d·sc·q <= 2e-5·63·15 ≈ 0,019. Абсолютный порог
+        // CHECK_TOL тогда имеет тот же смысл, что на логитах модели.
+        uint16_t d = vtm_float_to_half(1.8e-5f
+                                       + (float)(rng_next(&seed) % 40u) * 1e-7f);
+        uint16_t dm = vtm_float_to_half(8e-6f
+                                        + (float)(rng_next(&seed) % 40u) * 1e-7f);
+        int j;
+        memcpy(bp, &d, sizeof d);
+        memcpy(bp + 2, &dm, sizeof dm);
+        for (j = 0; j < 12; j++) bp[4 + j] = (uint8_t)rng_next(&seed);
+        for (j = 0; j < 128; j++) bp[16 + j] = (uint8_t)rng_next(&seed);
+    }
+    return b;
+}
+
+static uint8_t *make_q6k(int n_values, uint32_t seed) {
+    int64_t nblocks = ((int64_t)n_values + 255) / 256;
+    size_t bytes = (size_t)nblocks * VTM_Q6K_BLOCK_BYTES;
+    uint8_t *b = (uint8_t *)calloc(bytes ? bytes : 1u, 1);
+    int64_t i;
+    if (!b) return NULL;
+    for (i = 0; i < nblocks; i++) {
+        uint8_t *bp = b + (size_t)i * VTM_Q6K_BLOCK_BYTES;
+        // |w| = d·sc·(q−32) <= 1e-5·127·32 ≈ 0,04 — как у Q6_K 3B (ffn_down).
+        uint16_t d = vtm_float_to_half(8e-6f
+                                       + (float)(rng_next(&seed) % 40u) * 1e-7f);
+        int j;
+        for (j = 0; j < 128; j++) bp[j] = (uint8_t)rng_next(&seed);
+        for (j = 0; j < 64; j++) bp[128 + j] = (uint8_t)rng_next(&seed);
+        for (j = 0; j < 16; j++) bp[192 + j] = (uint8_t)rng_next(&seed);
+        memcpy(bp + 208, &d, sizeof d);
+    }
+    return b;
+}
+
+// get_scale_min_k4 из ggml (независимая копия, как в эталоне ADR).
+static void q4k_ref_scmin(const uint8_t *scales, unsigned j, unsigned *sc,
+                          unsigned *mn) {
+    if (j < 4u) {
+        *sc = (unsigned)scales[j] & 0x3Fu;
+        *mn = (unsigned)scales[j + 4u] & 0x3Fu;
+    } else {
+        *sc = ((unsigned)scales[j + 4u] & 0x0Fu)
+            | (((unsigned)scales[j - 4u] >> 6) << 4);
+        *mn = ((unsigned)scales[j + 4u] >> 4)
+            | (((unsigned)scales[j] >> 6) << 4);
+    }
+}
+
+// Вес j плоского массива kind 6/7 в double (w = d·sc·q − dmin·m | d·sc·(q−32)).
+static double qk_ref_value(const uint8_t *blocks, int64_t idx, int q6) {
+    int64_t blk = idx >> 8;
+    unsigned within = (unsigned)idx & 255u;
+    if (!q6) {
+        const uint8_t *bp = blocks + (size_t)blk * VTM_Q4K_BLOCK_BYTES;
+        unsigned sub = within / 32u, off = within % 32u;
+        uint16_t dh, dmh;
+        unsigned sc, mn;
+        double d, dmin, q;
+        memcpy(&dh, bp, sizeof dh);
+        memcpy(&dmh, bp + 2, sizeof dmh);
+        d = (double)vtm_half_to_float(dh);
+        dmin = (double)vtm_half_to_float(dmh);
+        q4k_ref_scmin(bp + 4, sub, &sc, &mn);
+        {
+            unsigned byte = bp[16u + (size_t)(sub >> 1) * 32u + off];
+            q = (double)((sub & 1u) ? (byte >> 4) : (byte & 0x0Fu));
+        }
+        return d * (double)sc * q - dmin * (double)mn;
+    }
+    {
+        const uint8_t *bp = blocks + (size_t)blk * VTM_Q6K_BLOCK_BYTES;
+        unsigned sub = within / 16u, off = within % 16u;
+        unsigned chunk = sub >> 3, in = sub & 7u;
+        unsigned quad = in >> 1, half = in & 1u;
+        const uint8_t *ql = bp + (size_t)chunk * 64u
+                          + (size_t)(quad & 1u) * 32u + (size_t)half * 16u;
+        const uint8_t *qh = bp + 128u + (size_t)chunk * 32u
+                          + (size_t)half * 16u;
+        unsigned nib = (quad >= 2u) ? (unsigned)(ql[off] >> 4)
+                                    : (unsigned)(ql[off] & 0x0Fu);
+        unsigned q = nib | ((((unsigned)qh[off] >> (quad * 2u)) & 3u) << 4);
+        double d = (double)vtm_half_to_float(
+            (uint16_t)(bp[208] | ((uint16_t)bp[209] << 8)));
+        int sc = (int)(int8_t)bp[192u + sub];
+        return d * (double)sc * ((double)q - 32.0);
+    }
+}
+
+static void qk_tmv_ref(float *y, const uint8_t *blocks, const float *x,
+                       int rows, int cols, int q6) {
+    int r, j;
+    for (r = 0; r < rows; r++) {
+        double acc = 0.0;
+        for (j = 0; j < cols; j++)
+            acc += qk_ref_value(blocks, (int64_t)r * cols + j, q6)
+                 * (double)x[j];
+        y[r] = acc;
+    }
+}
+
+static void qk_mm_ref(float *y, const uint8_t *blocks, const float *b, int m,
+                      int k, int n, int q6) {
+    int r, c, t;
+    for (r = 0; r < m; r++) {
+        for (c = 0; c < n; c++) {
+            double acc = 0.0;
+            for (t = 0; t < k; t++)
+                acc += qk_ref_value(blocks, (int64_t)r * k + t, q6)
+                     * (double)b[(size_t)t * n + c];
+            y[(size_t)r * n + c] = acc;
+        }
+    }
+}
+
+// Поштучное ядро kind 6/7 против независимой double-деквантизации.
+static void check_q4k_tmv_case(int rows, int cols, int q6) {
+    int n = rows * cols;
+    uint32_t seed = 0x7a00u + (uint32_t)rows * 17u + (uint32_t)cols
+                  + (uint32_t)q6 * 5u;
+    uint8_t *blocks = q6 ? make_q6k(n, seed) : make_q4k(n, seed);
+    float *x = make_vec((size_t)cols, seed ^ 0x2bu);
+    float *y_ref = (float *)calloc((size_t)rows, sizeof(float));
+    float *y = (float *)calloc((size_t)rows, sizeof(float));
+    char label[112];
+    double ref = 0.0;
+    int rc;
+
+    if (!blocks || !x || !y_ref || !y) {
+        fprintf(stderr, "check_q4k_tmv_case: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    qk_tmv_ref(y_ref, blocks, x, rows, cols, q6);
+    rc = q6 ? vtm_q6k_tmv(y, blocks, x, rows, cols)
+            : vtm_q4k_tmv(y, blocks, x, rows, cols);
+    if (rc != 0) {
+        fprintf(stderr, "check_q4k_tmv_case: ядро вернуло ошибку\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "%s TMV %dx%d", q6 ? "Q6_K" : "Q4_K",
+             rows, cols);
+    report(label, max_diff(y, y_ref, (size_t)rows, &ref), ref, CHECK_TOL);
+done:
+    free(blocks);
+    free(x);
+    free(y_ref);
+    free(y);
+}
+
+static void check_q4k_mm_case(int m, int k, int n, int q6) {
+    int n_el = m * k;
+    uint32_t seed = 0x5c00u + (uint32_t)m * 13u + (uint32_t)k * 3u
+                  + (uint32_t)n + (uint32_t)q6 * 7u;
+    uint8_t *blocks = q6 ? make_q6k(n_el, seed) : make_q4k(n_el, seed);
+    float *b = make_vec((size_t)k * (size_t)n, seed ^ 0x3du);
+    float *y_ref = (float *)calloc((size_t)m * (size_t)n, sizeof(float));
+    float *y = (float *)calloc((size_t)m * (size_t)n, sizeof(float));
+    char label[112];
+    double ref = 0.0;
+    int rc;
+
+    if (!blocks || !b || !y_ref || !y) {
+        fprintf(stderr, "check_q4k_mm_case: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    qk_mm_ref(y_ref, blocks, b, m, k, n, q6);
+    rc = q6 ? vtm_q6k_mm(y, blocks, b, m, k, n)
+            : vtm_q4k_mm(y, blocks, b, m, k, n);
+    if (rc != 0) {
+        fprintf(stderr, "check_q4k_mm_case: ядро вернуло ошибку\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "%s MM %dx%dx%d", q6 ? "Q6_K" : "Q4_K",
+             m, k, n);
+    report(label, max_diff(y, y_ref, (size_t)m * (size_t)n, &ref), ref,
+           CHECK_TOL);
+done:
+    free(blocks);
+    free(b);
+    free(y_ref);
+    free(y);
+}
+
+// Батчевое ядро kind 6/7 (задача 0167) против поштучного пути — критерий
+// приёмки: y[r*N+j] пачки = N вызовов поштучного ядра на contiguous вход
+// токена j. Поштучное ядро уже сверено с double-эталоном выше.
+static void check_q4k_batch_case(int rows, int cols, int ntok, int q6) {
+    int n = rows * cols;
+    uint32_t seed = 0x3e00u + (uint32_t)rows * 29u + (uint32_t)cols * 7u
+                  + (uint32_t)ntok + (uint32_t)q6 * 3u;
+    uint8_t *blocks = q6 ? make_q6k(n, seed) : make_q4k(n, seed);
+    float *x = make_vec((size_t)cols * (size_t)ntok, seed ^ 0x71u);
+    float *y_ref = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    float *y_bat = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    float *xt = (float *)malloc((size_t)cols * sizeof(float));
+    float *yt = (float *)malloc((size_t)rows * sizeof(float));
+    char label[128];
+    double ref = 0.0;
+    int j, r, t, rc;
+
+    if (!blocks || !x || !y_ref || !y_bat || !xt || !yt) {
+        fprintf(stderr, "check_q4k_batch_case: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    for (j = 0; j < ntok; j++) {
+        for (t = 0; t < cols; t++)
+            xt[t] = x[(size_t)t * (size_t)ntok + (size_t)j];
+        rc = q6 ? vtm_q6k_tmv(yt, blocks, xt, rows, cols)
+                : vtm_q4k_tmv(yt, blocks, xt, rows, cols);
+        if (rc != 0) {
+            fprintf(stderr, "check_q4k_batch_case: поштучное ядро — ошибка\n");
+            failures++;
+            goto done;
+        }
+        for (r = 0; r < rows; r++)
+            y_ref[(size_t)r * (size_t)ntok + (size_t)j] = yt[r];
+    }
+    rc = q6 ? vtm_q6k_tmv_batch(y_bat, blocks, x, rows, cols, ntok)
+            : vtm_q4k_tmv_batch(y_bat, blocks, x, rows, cols, ntok);
+    if (rc != 0) {
+        fprintf(stderr, "check_q4k_batch_case: батчевое ядро — ошибка\n");
+        failures++;
+        goto done;
+    }
+    snprintf(label, sizeof label, "%s TMV-батч %dx%dx%d",
+             q6 ? "Q6_K" : "Q4_K", rows, cols, ntok);
+    report(label, max_diff(y_bat, y_ref, (size_t)rows * (size_t)ntok, &ref),
+           ref, CHECK_TOL);
+done:
+    free(blocks);
+    free(x);
+    free(y_ref);
+    free(y_bat);
+    free(xt);
+    free(yt);
+}
+
 static int run_checks(const vtm_backend *cand) {
     static const int shapes[][2] = {
         {1, 1}, {1, 20}, {7, 37}, {5, 53}, {17, 128}, {33, 41}, {64, 160},
@@ -1450,6 +1708,40 @@ static int run_checks(const vtm_backend *cand) {
                                    q4bmmshapes[bi][2], 1, 0.02f);
         }
         check_q4_batch_args();
+    }
+
+    // Q4_K/Q6_K (kind 6/7, задачи 0165/0167): поштучное ядро против
+    // независимой double-деквантизации, батчевое — против поштучного пути.
+    // cols 256/512/2048/11008 — реальные формы 3B; 320 и 200 — строка не
+    // кратна блоку 256 (ядро отказывает, работает поштучный путь).
+    {
+        static const int qkshapes[][2] = {
+            {1, 256}, {7, 256}, {5, 512}, {17, 320}, {64, 2048}, {3, 200}
+        };
+        static const int qkmshapes[][3] = {
+            {5, 7, 3}, {8, 16, 8}, {3, 256, 4}, {16, 32, 16}
+        };
+        static const int qkbshapes[][3] = {
+            {5, 512, 4}, {7, 256, 3}, {1, 256, 16}, {64, 2048, 16},
+            {32, 320, 5}, {2048, 2048, 16}, {11008, 2048, 8}, {2048, 11008, 4}
+        };
+        size_t qi;
+        for (qi = 0; qi < sizeof(qkshapes) / sizeof(qkshapes[0]); qi++) {
+            check_q4k_tmv_case(qkshapes[qi][0], qkshapes[qi][1], 0);
+            check_q4k_tmv_case(qkshapes[qi][0], qkshapes[qi][1], 1);
+        }
+        for (qi = 0; qi < sizeof(qkmshapes) / sizeof(qkmshapes[0]); qi++) {
+            check_q4k_mm_case(qkmshapes[qi][0], qkmshapes[qi][1],
+                              qkmshapes[qi][2], 0);
+            check_q4k_mm_case(qkmshapes[qi][0], qkmshapes[qi][1],
+                              qkmshapes[qi][2], 1);
+        }
+        for (qi = 0; qi < sizeof(qkbshapes) / sizeof(qkbshapes[0]); qi++) {
+            check_q4k_batch_case(qkbshapes[qi][0], qkbshapes[qi][1],
+                                 qkbshapes[qi][2], 0);
+            check_q4k_batch_case(qkbshapes[qi][0], qkbshapes[qi][1],
+                                 qkbshapes[qi][2], 1);
+        }
     }
 
     if (failures) {
@@ -2657,6 +2949,102 @@ static int run_logits(const char *explicit_path, const vtm_backend *cand) {
     return 0;
 }
 
+// --- Q4_K/Q6_K: поштучное против батчевого ядра (задача 0167) --------------
+//
+// Прямой замер на синтетических блоках: N вызовов поштучного ядра (вес
+// читается N раз) против батчевого (строка деквантизуется один раз на пачку).
+// G MAC/s = rows·cols·ntok / t. Форма cols кратна 256 — работает NEON-ядро;
+// иначе оно отказывает и считается скалярный откат (медленнее, но верно).
+static int run_q4k_bench(int rows, int cols, int iters, int ntok) {
+    int n = rows * cols;
+    failures = 0;
+    uint8_t *blocks[2];
+    float *x = NULL, *y_ref = NULL, *y_bat = NULL, *xt = NULL, *yt = NULL;
+    int kind, i, j, t;
+    double mac = (double)rows * (double)cols * (double)ntok;
+
+    if (n <= 0 || n > 0x3fffffff || ntok < 1 || ntok > 128) {
+        fprintf(stderr, "q4k: плохая форма %dx%d/%d токенов\n", rows, cols,
+                ntok);
+        return 2;
+    }
+    blocks[0] = make_q4k(n, 0x5150u);
+    blocks[1] = make_q6k(n, 0x6150u);
+    x = make_vec((size_t)cols * (size_t)ntok, 0x123u);
+    y_ref = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    y_bat = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    xt = (float *)malloc((size_t)cols * sizeof(float));
+    yt = (float *)malloc((size_t)rows * sizeof(float));
+    if (!blocks[0] || !blocks[1] || !x || !y_ref || !y_bat || !xt || !yt) {
+        fprintf(stderr, "q4k: нет памяти на форму %dx%d\n", rows, cols);
+        goto done;
+    }
+    printf("Q4_K/Q6_K: %dx%d, %d токенов, %d итераций (порог точности %.0e)\n",
+           rows, cols, ntok, iters, CHECK_TOL);
+    for (kind = 0; kind < 2; kind++) {
+        const char *nm = kind ? "Q6_K" : "Q4_K";
+        double t_tok = 1e300, t_bat = 1e300;
+        double maxd = 0.0, maxr = 0.0;
+        int rc;
+
+        for (j = 0; j < ntok; j++) {
+            for (t = 0; t < cols; t++)
+                xt[t] = x[(size_t)t * (size_t)ntok + (size_t)j];
+            rc = kind ? vtm_q6k_tmv(yt, blocks[kind], xt, rows, cols)
+                      : vtm_q4k_tmv(yt, blocks[kind], xt, rows, cols);
+            if (rc != 0) {
+                fprintf(stderr, "q4k: поштучное ядро вернуло ошибку\n");
+                goto done;
+            }
+            for (i = 0; i < rows; i++)
+                y_ref[(size_t)i * (size_t)ntok + (size_t)j] = yt[i];
+        }
+        for (i = 0; i < iters; i++) {
+            double t0 = now_ms(), dt;
+            for (j = 0; j < ntok; j++) {
+                for (t = 0; t < cols; t++)
+                    xt[t] = x[(size_t)t * (size_t)ntok + (size_t)j];
+                if (kind)
+                    vtm_q6k_tmv(yt, blocks[kind], xt, rows, cols);
+                else
+                    vtm_q4k_tmv(yt, blocks[kind], xt, rows, cols);
+            }
+            dt = now_ms() - t0;
+            if (dt < t_tok) t_tok = dt;
+        }
+        rc = kind ? vtm_q6k_tmv_batch(y_bat, blocks[kind], x, rows, cols, ntok)
+                  : vtm_q4k_tmv_batch(y_bat, blocks[kind], x, rows, cols, ntok);
+        if (rc != 0) {
+            fprintf(stderr, "q4k: батчевое ядро вернуло ошибку\n");
+            goto done;
+        }
+        for (i = 0; i < iters; i++) {
+            double t0 = now_ms(), dt;
+            if (kind)
+                vtm_q6k_tmv_batch(y_bat, blocks[kind], x, rows, cols, ntok);
+            else
+                vtm_q4k_tmv_batch(y_bat, blocks[kind], x, rows, cols, ntok);
+            dt = now_ms() - t0;
+            if (dt < t_bat) t_bat = dt;
+        }
+        maxd = max_diff(y_bat, y_ref, (size_t)rows * (size_t)ntok, &maxr);
+        printf("  %s: поштучно %8.2f мс (%5.1f G MAC/s) | пачкой %8.2f мс "
+               "(%5.1f G MAC/s) | %4.2fx | max|batch-token|=%.2e %s\n",
+               nm, t_tok, mac / t_tok / 1e6, t_bat, mac / t_bat / 1e6,
+               t_tok / t_bat, maxd, maxd <= (double)CHECK_TOL ? "ok" : "FAIL");
+        if (maxd > (double)CHECK_TOL) failures++;
+    }
+done:
+    free(blocks[0]);
+    free(blocks[1]);
+    free(x);
+    free(y_ref);
+    free(y_bat);
+    free(xt);
+    free(yt);
+    return failures ? 1 : 0;
+}
+
 // --- prefill-проверка на настоящей модели (задача 0162) --------------------
 //
 // Сквозной критерий приёмки: состояние после одной пачки vtm_run_batch должно
@@ -2893,6 +3281,7 @@ static void usage(const char *prog) {
            "          [--backend auto|scalar|simd|direct] [--check] "
            "[--threads] [--pool] [--logits PATH] [--no-mm]\n"
            "          [--gemv-rows N] [--gemv-cols N]\n"
+           "          [--q4k [--rows N] [--cols N] [--iters N] [--batch-tokens N]]\n"
            "          [--batch] [--batch-tokens N] "
            "[--q4 [--q4-rows N] [--q4-cols N] [--q4-iters N] "
            "[--q4-batch]]\n"
@@ -2910,6 +3299,7 @@ int main(int argc, char **argv) {
     int check = 0, no_mm = 0, threads = 0, pool = 0, batch = 0;
     int batch_tokens = 16;
     int q4 = 0, q4_batch = 0, q4_rows = 151936, q4_cols = 896, q4_iters = 3;
+    int q4k = 0;
     // Форма плотного GEMV (f32 n == 1): по умолчанию — уменьшенный аналог
     // tied lm_head 3B Q4 ([151936, 2048]); реальную задают флагами.
     int gemv_rows = 16384, gemv_cols = 2048;
@@ -2931,6 +3321,8 @@ int main(int argc, char **argv) {
             gemv_rows = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--gemv-cols") == 0 && i + 1 < argc) {
             gemv_cols = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--q4k") == 0) {
+            q4k = 1;
         } else if (strcmp(argv[i], "--q4") == 0) {
             q4 = 1;
         } else if (strcmp(argv[i], "--q4-rows") == 0 && i + 1 < argc) {
@@ -3014,6 +3406,8 @@ int main(int argc, char **argv) {
     if (prefill_check_path)
         return run_prefill_check(*prefill_check_path ? prefill_check_path
                                                      : NULL, batch_tokens);
+    if (q4k)
+        return run_q4k_bench(rows, cols, iters, batch_tokens);
     if (q4)
         return q4_batch ? run_q4_batch_bench(q4_rows, q4_cols, batch_tokens,
                                              q4_iters)

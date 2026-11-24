@@ -2477,6 +2477,14 @@ static int batch_tmv_kernel(const vtm_tensor *w, const float *xt, int C,
             return -1;
         return 0;
     }
+    if (w->kind == VTM_TENSOR_Q4K || w->kind == VTM_TENSOR_Q6K) {
+        // kind 6/7 (задача 0167): строка блоков GGML разворачивается один раз
+        // на пачку. Отказ ядра (-1) — на поштучный путь (batch_token_op).
+        int rc = (w->kind == VTM_TENSOR_Q4K)
+            ? vtm_q4k_tmv_batch(yt, qk_blocks(w), xt, rows, cols, C)
+            : vtm_q6k_tmv_batch(yt, qk_blocks(w), xt, rows, cols, C);
+        return rc == 0 ? 0 : -1;
+    }
     if (w->kind == VTM_TENSOR_TRIT) {
         if (use_simd && vtm_simd_tmv_blocks_batch(yt,
                                                   (const uint8_t *)w->words,
@@ -2517,6 +2525,12 @@ static int batch_mm_kernel(const vtm_tensor *a, const float *bt, int C,
                             a->q4_is_asym ? 1 : 0) != 0)
             return -1;
         return 0;
+    }
+    if (a->kind == VTM_TENSOR_Q4K || a->kind == VTM_TENSOR_Q6K) {
+        int rc = (a->kind == VTM_TENSOR_Q4K)
+            ? vtm_q4k_mm_batch(yt, qk_blocks(a), bt, mm, kk, C)
+            : vtm_q6k_mm_batch(yt, qk_blocks(a), bt, mm, kk, C);
+        return rc == 0 ? 0 : -1;
     }
     if (a->kind == VTM_TENSOR_TRIT) {
         if (use_simd && vtm_simd_mm_batch(yt, (const uint8_t *)a->words,
@@ -2596,6 +2610,20 @@ static int batch_tmv_ready(vtm_t *m, const vtm_instr *in,
         if ((uint64_t)w->n_scales < ng) return 0;
         *rows = (int)w->dims[0];
         *cols = (int)w->dims[1];
+    } else if (w->kind == VTM_TENSOR_Q4K || w->kind == VTM_TENSOR_Q6K) {
+        uint64_t nb;
+        // kind 6/7 (задача 0167): блоки GGML, ядро vtm_q4k/q6k_*_batch
+        // деквантизует строку один раз на пачку. Условия — как у поштучного
+        // req_q4k, плюс кратность cols блоку 256: иначе строка начинается не
+        // с границы блока, и ядро отказывает (поштучный путь умеет).
+        if ((in->flags & VTM_FLAG_TMV_TRANSPOSED) != 0) return 0;
+        if (!w->qblocks || w->scale_block != VTM_Q4K_BLOCK_VALUES) return 0;
+        nb = ((uint64_t)w->n_elements + VTM_Q4K_BLOCK_VALUES - 1u)
+           / VTM_Q4K_BLOCK_VALUES;
+        if ((uint64_t)w->n_qblocks != nb) return 0;
+        *rows = (int)w->dims[0];
+        *cols = (int)w->dims[1];
+        if (*cols % (int)VTM_Q4K_BLOCK_VALUES != 0) return 0;
     } else if (w->kind == VTM_TENSOR_TRIT) {
         if (!w->words || !w->scales) return 0;
         if (w->scale_block != VTM_SCALE_BLOCK_128
@@ -2690,6 +2718,14 @@ static int batch_mm_ready(vtm_t *m, const vtm_instr *in,
         if ((uint64_t)a->n_elements < n) return 0;
         if ((uint64_t)a->n_scales
             < (n + VTM_Q4_GROUP_SIZE - 1u) / VTM_Q4_GROUP_SIZE) return 0;
+    } else if (a->kind == VTM_TENSOR_Q4K || a->kind == VTM_TENSOR_Q6K) {
+        uint64_t n = (uint64_t)*mm * (uint64_t)*kk;
+        uint64_t nb = ((uint64_t)a->n_elements + VTM_Q4K_BLOCK_VALUES - 1u)
+                    / VTM_Q4K_BLOCK_VALUES;
+        if (!a->qblocks || a->scale_block != VTM_Q4K_BLOCK_VALUES) return 0;
+        if ((uint64_t)a->n_qblocks != nb) return 0;
+        if ((uint64_t)a->n_elements < n) return 0;
+        if (*kk % (int)VTM_Q4K_BLOCK_VALUES != 0) return 0;
     } else if (a->kind == VTM_TENSOR_TRIT) {
         uint64_t n = (uint64_t)*mm * (uint64_t)*kk;
         if (!a->words || !a->scales) return 0;

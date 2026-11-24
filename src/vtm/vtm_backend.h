@@ -156,6 +156,58 @@ int vtm_q4_mm(float *y, const uint8_t *q, const float *scales,
 int vtm_q4_dequant_row(float *y, const uint8_t *q, const float *scales,
                        const float *mins, int64_t base, int cols, int asym);
 
+// --- Q4_K/Q6_K (kind 6/7): блоки GGML как есть (задача 0165, ADR 0018) -----
+//
+// Сегмент несёт блоки байт-в-байт: Q4_K — 144 байта на 256 значений
+// (d fp16, dmin fp16, 12 байт 6-битных scale/min, 128 байт нибблов;
+// w = d*sc*q - dmin*m), Q6_K — 210 байт (ql 128, qh 64, scales 16*int8,
+// d fp16; w = d*sc*(q-32)). Ядро деквантизует под-блок (32 у Q4_K, 16 у
+// Q6_K) в стековый scratch и сразу умножает: fp32-копии матрицы нет.
+//
+// Те же раскладки аргументов, что у vtm_q4_*: y[r] = sum_j w[r,j]*x[j]
+// (TMV), y[r*n+c] = sum_t w[r,t]*b[t*n+c] (MM), dequant_row — одна строка
+// таблицы словаря с глобального индекса base (EMB).
+//
+// Эталон — backend_scalar.c (double); Q4_K на NEON считает быстрее
+// (backend_neon.c), расхождение — единицы 1e-7 на строку, как у Q4.
+// 0 — успех, -1 — неверные аргументы/NULL/отрицательные размеры.
+int vtm_q4k_tmv(float *y, const uint8_t *blocks, const float *x,
+                int rows, int cols);
+int vtm_q4k_mm(float *y, const uint8_t *blocks, const float *b,
+               int m, int k, int n);
+int vtm_q4k_dequant_row(float *y, const uint8_t *blocks, int64_t base,
+                        int cols);
+int vtm_q6k_tmv(float *y, const uint8_t *blocks, const float *x,
+                int rows, int cols);
+int vtm_q6k_mm(float *y, const uint8_t *blocks, const float *b,
+               int m, int k, int n);
+int vtm_q6k_dequant_row(float *y, const uint8_t *blocks, int64_t base,
+                        int cols);
+
+// Батчевые Q4_K/Q6_K (задача 0167): N токенов против одной матрицы kind 6/7.
+//
+// Раскладка — как у прочих батчевых ядер: x[t*N + j] (вход токена j по
+// индексу t), y[r*N + j] (выход токена j по r). Строка весов деквантизуется
+// один раз на пачку, поэтому prefill перестаёт читать блоки N раз.
+//
+// Арифметика — f32 внутри группы 32 значения (4 аккумулятора по токенам),
+// свёртка группы и сумма по группам — в double; d·sc/−dmin·m применяются к
+// развёрнутым весам (f32). Расхождение с поштучным vtm_q4k_tmv/vtm_q6k_tmv —
+// доли 1e-6 на logits 3B (порог 1e-5; проверяет bench_backend --q4k).
+// Отказ (-1): NULL/отрицательные размеры, cols не кратен 256 (тогда строка
+// не начинается с границы блока) или нет памяти — вызывающий обязан пойти
+// поштучным путём. При N == 1 уходит в поштучное ядро.
+//
+// MM: A[m,k] (kind 6/7) * B[k,N] -> Y[m,N].
+int vtm_q4k_tmv_batch(float *y, const uint8_t *blocks, const float *x,
+                      int rows, int cols, int n_tokens);
+int vtm_q4k_mm_batch(float *y, const uint8_t *blocks, const float *b, int m,
+                     int k, int n_tokens);
+int vtm_q6k_tmv_batch(float *y, const uint8_t *blocks, const float *x,
+                      int rows, int cols, int n_tokens);
+int vtm_q6k_mm_batch(float *y, const uint8_t *blocks, const float *b, int m,
+                     int k, int n_tokens);
+
 // Батчевые Q4 TMV/MM (задача 0162): N токенов против одной Q4-матрицы.
 //
 // Раскладка — как у прочих батчевых ядер (см. vtm_simd_*_batch выше):

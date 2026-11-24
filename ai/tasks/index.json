@@ -1108,7 +1108,7 @@
   {
     "id": "0167",
     "title": "Скорость Q4_K: f32 и батчевый prefill",
-    "status": "in_progress",
+    "status": "done",
     "file": "0167-q4k-speed.md",
     "assignee": "agent:q4k-speed"
   }

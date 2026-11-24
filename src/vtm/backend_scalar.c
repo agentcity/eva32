@@ -1117,6 +1117,11 @@ extern int vtm_neon_q4k_tmv_rows(float *y, const uint8_t *blocks,
                                  const float *x, int r0, int r1, int cols);
 extern int vtm_neon_q6k_tmv_rows(float *y, const uint8_t *blocks,
                                  const float *x, int r0, int r1, int cols);
+// Батчевые Q4_K/Q6_K (задача 0167): x[t*ntok + j], y[r*ntok + j].
+extern int vtm_neon_q4k_batch(float *y, const uint8_t *blocks, const float *x,
+                              int rows, int cols, int ntok);
+extern int vtm_neon_q6k_batch(float *y, const uint8_t *blocks, const float *x,
+                              int rows, int cols, int ntok);
 #define VTM_Q4_NEON 1
 #else
 #define VTM_Q4_NEON 0
@@ -2159,6 +2164,70 @@ int vtm_q6k_mm(float *y, const uint8_t *blocks, const float *b, int m, int k,
 int vtm_q6k_dequant_row(float *y, const uint8_t *blocks, int64_t base,
                         int cols) {
     return qk_dequant_row_impl(y, blocks, base, cols, VTM_TENSOR_Q6K);
+}
+
+// --- батчевые kind 6/7 (задача 0167) --------------------------------------
+//
+// Контракт — как у vtm_q4_*_batch (vtm_backend.h): x[t*N + j], y[r*N + j],
+// строка W разворачивается один раз на пачку. NEON-ядро (backend_neon.c)
+// держит развёрнутую строку в f32; скалярный откат — qk_mm: он деквантизует
+// строку один раз на n столбцов в double, то есть по смыслу это то же самое,
+// только активации в double (медленнее, зато побитово как поштучный путь).
+// Отказ ядра (-1) — нет памяти или cols не кратен 256; тогда работает откат.
+// VTM_Q4K_BATCH=0 — выключить батчевое ядро kind 6/7 (A/B-замер и откат на
+// скалярный эталон qk_mm). По умолчанию включено.
+//
+// VTM_Q4K_STRICT=1 (см. backend_neon.c) — эталонное f64-накопление: батчевое
+// ядро тоже не включается, пачка идёт через qk_mm (double). Так strict-режим
+// остаётся полностью эталонным — как в 0165, до f32-ядер.
+static int q4k_batch_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("VTM_Q4K_BATCH");
+        const char *st = getenv("VTM_Q4K_STRICT");
+        int strict = (st && *st && *st != '0') ? 1 : 0;
+        cached = (e && *e && *e == '0') || strict ? 0 : 1;
+    }
+    return cached;
+}
+
+static int qk_tmv_batch(float *y, const uint8_t *blocks, const float *x,
+                        int rows, int cols, int ntok, int kind) {
+    if (!y || !blocks || !x || rows < 0 || cols < 0 || ntok < 0) return -1;
+    if (rows == 0 || cols == 0 || ntok == 0) return 0;
+    if (ntok == 1) return qk_tmv(y, blocks, x, rows, cols, kind);
+#if VTM_Q4_NEON
+    if (q4k_batch_enabled() && q4_simd_enabled() && vtm_simd_available()) {
+        int rc;
+        if (kind == VTM_TENSOR_Q4K)
+            rc = vtm_neon_q4k_batch(y, blocks, x, rows, cols, ntok);
+        else
+            rc = vtm_neon_q6k_batch(y, blocks, x, rows, cols, ntok);
+        if (rc == 0) return 0;
+    }
+#endif
+    return qk_mm(y, blocks, x, rows, cols, ntok, kind);
+}
+
+int vtm_q4k_tmv_batch(float *y, const uint8_t *blocks, const float *x,
+                      int rows, int cols, int n_tokens) {
+    return qk_tmv_batch(y, blocks, x, rows, cols, n_tokens, VTM_TENSOR_Q4K);
+}
+
+int vtm_q4k_mm_batch(float *y, const uint8_t *blocks, const float *b, int m,
+                     int k, int n_tokens) {
+    // Раскладка и арифметика те же, что у TMV: A[m,k] против N столбцов.
+    return qk_tmv_batch(y, blocks, b, m, k, n_tokens, VTM_TENSOR_Q4K);
+}
+
+int vtm_q6k_tmv_batch(float *y, const uint8_t *blocks, const float *x,
+                      int rows, int cols, int n_tokens) {
+    return qk_tmv_batch(y, blocks, x, rows, cols, n_tokens, VTM_TENSOR_Q6K);
+}
+
+int vtm_q6k_mm_batch(float *y, const uint8_t *blocks, const float *b, int m,
+                     int k, int n_tokens) {
+    return qk_tmv_batch(y, blocks, b, m, k, n_tokens, VTM_TENSOR_Q6K);
 }
 
 // --- публичные описатели бэкендов -----------------------------------------
