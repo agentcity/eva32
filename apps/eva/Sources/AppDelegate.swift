@@ -19,10 +19,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let settingsWindow = SettingsWindowController()
     private let recorder = SpeechRecorder()
     private let answer = AnswerController()
+    /// Фоновое ожидание «Привет, Ева» (задача 0187): живёт только в idle.
+    private let wake = WakeWordListener()
 
     private var isRecording = false
     private var isSpeaking = false
     private var isTerminating = false
+
+    /// Отложенное включение/выключение wake-слушателя: после стопа записи
+    /// нужно дать `onFinal` уйти в чат, иначе ожидание поднимется на миг и
+    /// тут же погаснет. Одна задача — одно актуальное намерение.
+    private var wakeSync: Task<Void, Never>?
+    /// Ожидание не поднялось (нет прав/офлайн-модели): не долбим системные
+    /// API на каждый переход состояния. Снимается при смене настроек.
+    private var wakeSuppressed = false
 
     // Большой круг: одно место, где решается, что он показывает. Флаги
     // обновляют `wireRecorder`/`wireAnswer`/`ask`, а `refreshVisualState`
@@ -45,6 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installHotKey()
         wireRecorder()
         wireAnswer()
+        wireWake()
         wireWindow()
         observeSettings()
 
@@ -57,9 +68,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let voice = Settings.shared.voice
         let speak = Settings.shared.speakReplies
         let animate = Settings.shared.animateCircle
+        let wakeWord = Settings.shared.wakeWord
         log("настройки: сервер=\(server) модель=\(model) голос=\(voice) озвучка=\(speak) "
-            + "анимация=\(animate)")
+            + "анимация=\(animate) ожидание=\(wakeWord)")
 
+        if Launch.ask == nil {
+            // При `--ask` вопрос уйдёт через 0,4 с: поднимать ожидание на этот
+            // миг незачем.
+            syncWake("запуск")
+        }
         startRequestedQuestionIfAny()
         // Показываем окно при обычном запуске: без иконки в доке (accessory)
         // пользователь иначе не понимает, что приложение вообще открылось.
@@ -72,6 +89,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         log("выход")
         isTerminating = true
+        wakeSync?.cancel()
+        wakeSync = nil
+        wake.stop()
+        window.setWakeWaiting(false)
         window.stopCircleAnimation()
         recorder.stop()
         answer.stop()
@@ -280,6 +301,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.window.setStatus(recording ? "слушаю…" : "готово", isError: false)
             self.updateStatusIcon()
             self.refreshVisualState(recording ? "микрофон включён" : "микрофон выключен")
+            // После стопа запись ещё не значит «idle»: `onFinal` придёт сразу
+            // за `onState(false)` и отправит вопрос. Небольшая пауза убирает
+            // дребезг «включили ожидание — тут же выключили».
+            self.syncWake(
+                recording ? "микрофон включён" : "микрофон выключен",
+                after: recording ? 0 : 0.45
+            )
         }
         recorder.onLevel = { [weak self] level in
             self?.window.setCircleLevel(CGFloat(level))
@@ -297,6 +325,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.window.setStatus("речь: \(message)", isError: true)
             self.window.showPartial("")
             self.showVisualError(message)
+            self.syncWake("ошибка речи")
         }
     }
 
@@ -309,6 +338,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startListening() {
+        // Двух захватов одновременно быть не должно: ожидание отпускает
+        // микрофон до того, как запись его займёт.
+        wakeSync?.cancel()
+        if wake.isRunning {
+            wake.stop()
+        }
+        window.setWakeWaiting(false)
         window.show()
         window.showPartial("")
         recorder.start()
@@ -340,6 +376,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.awaitingAudio = false
             }
             self.refreshVisualState("ответ завершён")
+            self.syncWake("ответ завершён")
+            self.scheduleVoiceFallback()
         }
         answer.onSpeakingChanged = { [weak self] speaking in
             guard let self else { return }
@@ -350,9 +388,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self.updateStatusIcon()
             self.refreshVisualState(speaking ? "озвучка пошла" : "озвучка кончилась")
+            // Пока играет голос, микрофон ожидания выключен: иначе Ева
+            // услышит собственное «Ева» и зациклится (задача 0187).
+            self.syncWake(speaking ? "озвучка пошла" : "озвучка кончилась")
         }
         answer.onLevel = { [weak self] level in
             self?.window.setCircleLevel(CGFloat(level))
+        }
+    }
+
+    /// Страховка: если озвучка включена, но звук так и не начался (TTS упал),
+    /// круг не должен навсегда остаться «думаю», а ожидание — не вернуться.
+    private func scheduleVoiceFallback() {
+        guard expectsVoice else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard let self, !self.isTerminating else { return }
+            guard self.awaitingAudio, !self.isSpeaking, !self.isRecording else { return }
+            self.awaitingAudio = false
+            self.refreshVisualState("озвучка не началась")
+            self.syncWake("озвучка не началась")
         }
     }
 
@@ -362,6 +417,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         window.onStop = { [weak self] in
             guard let self else { return }
+            // Серверу — явный POST /api/cancel (задача 0185): обрыв SSE тоже
+            // отменяет, но флаг в C-рантайме надёжнее и виден в метриках.
+            self.cancelServerGeneration()
             self.recorder.stop()
             self.answer.stop()
             self.isSpeaking = false
@@ -371,6 +429,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.window.setCircleLevel(0)
             self.refreshVisualState("стоп по кнопке")
             self.updateStatusIcon()
+            self.syncWake("стоп по кнопке", after: 0.2)
             log("стоп по кнопке")
         }
         window.onSettings = { [weak self] in
@@ -392,9 +451,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func settingsChanged() {
         window.reloadFromSettings()
+        // Человек мог включить галочку уже после отказа в правах — даём
+        // ожиданию ещё один шанс.
+        wakeSuppressed = false
         if !Settings.shared.speakReplies {
             answer.stopVoice()
         }
+        syncWake("настройки")
     }
 
     /// Единая точка «вопрос ушёл»: и голос, и клавиатура, и `--ask`.
@@ -425,6 +488,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         awaitingAudio = false
         clearVisualError()
         refreshVisualState("вопрос ушёл")
+        syncWake("вопрос ушёл")
         answer.ask(
             trimmed,
             config: config,
@@ -460,6 +524,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func quit() {
         log("выход из меню")
         NSApp.terminate(nil)
+    }
+
+    // MARK: - Ожидание «Привет, Ева»
+
+    private func wireWake() {
+        wake.onWake = { [weak self] text in
+            guard let self else { return }
+            self.handleWake(text)
+        }
+        wake.onIssue = { [weak self] message in
+            guard let self else { return }
+            self.wakeSuppressed = true
+            self.window.setWakeWaiting(false)
+            guard Settings.shared.wakeWord else { return }
+            self.window.setStatus("ожидание: \(message)", isError: true)
+        }
+        // Подъём слушателя асинхронный (сначала права и офлайн-модель),
+        // поэтому пульсацию круга включает именно это событие.
+        wake.onState = { [weak self] running in
+            self?.window.setWakeWaiting(running)
+        }
+    }
+
+    /// Услышали фразу: слушатель отпускает микрофон, дальше — обычная запись
+    /// с авто-стопом по тишине, как после ⌥Space.
+    private func handleWake(_ text: String) {
+        guard !isTerminating, Settings.shared.wakeWord else { return }
+        guard !isRecording, !isSpeaking else { return }
+        wake.stop()
+        window.setWakeWaiting(false)
+        log("wake: перехожу к записи (\(text.prefix(80)))")
+        startListening()
+    }
+
+    /// Единая точка решения «должно ли сейчас работать ожидание». Причина
+    /// попадает только в отладочный журнал: сами строки «ожидание включено/
+    /// выключено» пишет `WakeWordListener`.
+    private func syncWake(_ reason: String, after delay: Double = 0) {
+        wakeSync?.cancel()
+        wakeSync = Task { @MainActor [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.applyWake(reason)
+        }
+    }
+
+    private func applyWake(_ reason: String) {
+        guard !isTerminating else { return }
+        let desired = Settings.shared.wakeWord
+            && !wakeSuppressed
+            && !isRecording
+            && !isSpeaking
+            && !awaitingFirstToken
+            && !awaitingAudio
+            && !errorActive
+        if desired {
+            if !wake.isRunning {
+                log("wake: ожидание просит включиться — \(reason)")
+                wake.start()
+            }
+        } else if wake.isRunning {
+            log("wake: ожидание выключается — \(reason)")
+            wake.stop()
+        }
+        window.setWakeWaiting(wake.isRunning)
+    }
+
+    /// «Стоп» сообщает серверу, что генерацию пора бросить.
+    private func cancelServerGeneration() {
+        guard let server = effectiveServerURL else { return }
+        log("отмена: POST \(server.appendingPathComponent("api/cancel").absoluteString) {\"side\":0}")
+        Task {
+            let result = await ChatSession.cancelRemote(base: server, side: 0)
+            log("отмена: \(result)")
+        }
     }
 
     // MARK: - Большой круг
@@ -511,6 +652,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, self.errorToken == token else { return }
             self.errorActive = false
             self.refreshVisualState("вспышка ошибки прошла")
+            self.syncWake("вспышка ошибки прошла")
         }
     }
 

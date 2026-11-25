@@ -46,7 +46,19 @@ final class CircleView: NSView {
             } else if oldValue == .error {
                 errorFlash = 0
             }
-            setAccessibilityLabel("Состояние Евы: \(visualState.caption)")
+            setAccessibilityLabel("Состояние Евы: \(captionText)")
+            needsDisplay = true
+            syncTimer()
+        }
+    }
+
+    /// Ожидание фразы «Привет, Ева» (задача 0187): в `idle` круг едва заметно
+    /// пульсирует, чтобы было видно, что микрофон слушает. На другие состояния
+    /// флаг не влияет — они рисуются как раньше.
+    var wakeWaiting = false {
+        didSet {
+            guard wakeWaiting != oldValue else { return }
+            setAccessibilityLabel("Состояние Евы: \(captionText)")
             needsDisplay = true
             syncTimer()
         }
@@ -94,7 +106,7 @@ final class CircleView: NSView {
         translatesAutoresizingMaskIntoConstraints = false
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
-        setAccessibilityLabel("Состояние Евы: \(visualState.caption)")
+        setAccessibilityLabel("Состояние Евы: \(captionText)")
     }
 
     @available(*, unavailable)
@@ -233,7 +245,9 @@ final class CircleView: NSView {
         case .thinking:
             drawThinkingPulse(ctx, center: center, radius: radius, color: color)
         case .idle:
-            break
+            if wakeWaiting {
+                drawWakePulse(ctx, center: center, radius: radius, color: color, breath: breath)
+            }
         case .error:
             break
         }
@@ -355,6 +369,21 @@ final class CircleView: NSView {
             ctx.setLineWidth(1 + 2.4 * level)
             ctx.strokeEllipse(in: CircleView.rect(center: center, radius: waveRadius))
         }
+    }
+
+    /// Едва заметное кольцо-дыхание вокруг диска: alpha ≈0,04–0,09, поэтому
+    /// оно читается как «микрофон ждёт», но не спорит с состояниями записи.
+    private func drawWakePulse(
+        _ ctx: CGContext,
+        center: CGPoint,
+        radius: CGFloat,
+        color: NSColor,
+        breath: CGFloat
+    ) {
+        let spread = radius * (1.02 + 0.03 * breath)
+        ctx.setStrokeColor(color.withAlphaComponent(0.04 + 0.05 * breath).cgColor)
+        ctx.setLineWidth(1)
+        ctx.strokeEllipse(in: CircleView.rect(center: center, radius: spread))
     }
 
     private func drawListeningBars(
@@ -514,13 +543,19 @@ final class CircleView: NSView {
         ctx.strokeEllipse(in: CircleView.rect(center: center, radius: waveRadius))
     }
 
+    /// Подпись под кругом; в ожидании wake она говорит, чего именно ждём.
+    private var captionText: String {
+        if visualState == .idle, wakeWaiting { return "жду „Привет, Ева“" }
+        return visualState.caption
+    }
+
     private func drawCaption(in bounds: NSRect) {
         let isError = visualState == .error
         let text: String
         if isError {
             text = errorText ?? visualState.caption
         } else {
-            text = visualState.caption
+            text = captionText
         }
         let color: NSColor = isError
             ? NSColor(srgbRed: 0.92, green: 0.24, blue: 0.26, alpha: 1)

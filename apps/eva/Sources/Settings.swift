@@ -60,6 +60,9 @@ final class Settings {
     static let maxTokensKey = "eva.maxTokens"
     /// Галочка «Анимация»: без неё большой круг статичен (слабые машины).
     static let animateCircleKey = "eva.animateCircle"
+    /// Фоновое ожидание «Привет, Ева»: постоянно включённый микрофон, поэтому
+    /// по умолчанию выключено (батарея и приватность).
+    static let wakeWordKey = "eva.wakeWord"
 
     static let defaultServer = "http://127.0.0.1:8765"
     static let defaultMaxTokens = 256
@@ -78,6 +81,7 @@ final class Settings {
             Settings.speakKey: true,
             Settings.maxTokensKey: Settings.defaultMaxTokens,
             Settings.animateCircleKey: true,
+            Settings.wakeWordKey: false,
         ])
     }
 
@@ -114,6 +118,13 @@ final class Settings {
     var animateCircle: Bool {
         get { defaults.bool(forKey: Settings.animateCircleKey) }
         set { store(Settings.animateCircleKey, newValue) }
+    }
+
+    /// Ждать фразу «Привет, Ева» в `idle` (задача 0187). Выключено по
+    /// умолчанию: это постоянный микрофон и расход батареи.
+    var wakeWord: Bool {
+        get { defaults.bool(forKey: Settings.wakeWordKey) }
+        set { store(Settings.wakeWordKey, newValue) }
     }
 
     /// Нормализованный базовый URL сервера без хвостового слэша.

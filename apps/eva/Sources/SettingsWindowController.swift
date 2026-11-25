@@ -10,6 +10,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var voicePopup: NSPopUpButton!
     private var speakCheck: NSButton!
     private var animateCheck: NSButton!
+    private var wakeCheck: NSButton!
     private var statusLabel: NSTextField!
 
     /// Список моделей, полученный от сервера; текущая настройка добавляется
@@ -35,7 +36,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private func build() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 320),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 430),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -87,6 +88,21 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         )
         animateCheck.controlSize = .small
 
+        wakeCheck = NSButton(
+            checkboxWithTitle: "Слушать „Привет, Ева“",
+            target: self,
+            action: #selector(wakeChanged)
+        )
+        wakeCheck.controlSize = .small
+
+        // Приватность важна: человек должен видеть, что микрофон не отправляет
+        // звук в сеть, даже когда ожидание включено постоянно.
+        let wakeHint = NSTextField(
+            wrappingLabelWithString: "распознавание локальное, звук никуда не уходит"
+        )
+        wakeHint.font = .systemFont(ofSize: 11)
+        wakeHint.textColor = .secondaryLabelColor
+
         let hint = NSTextField(
             wrappingLabelWithString: "Модель и голос берутся у сервера. "
                 + "Если список моделей пуст — сервер выключен, но адрес и голос "
@@ -121,6 +137,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             row("Голос", voicePopup),
             row("", speakCheck),
             row("", animateCheck),
+            row("", wakeCheck),
+            row("", wakeHint),
             hint,
             statusLabel,
             buttons,
@@ -164,6 +182,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         serverField.stringValue = Settings.shared.serverText
         speakCheck.state = Settings.shared.speakReplies ? .on : .off
         animateCheck.state = Settings.shared.animateCircle ? .on : .off
+        wakeCheck.state = Settings.shared.wakeWord ? .on : .off
         let voiceID = Settings.shared.voice
         if let index = VoicePresets.all.firstIndex(where: { $0.id == voiceID }) {
             voicePopup.selectItem(at: index)
@@ -275,11 +294,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         Settings.shared.speakReplies = speakCheck.state == .on
         Settings.shared.animateCircle = animateCheck.state == .on
+        Settings.shared.wakeWord = wakeCheck.state == .on
         statusLabel.stringValue = "сохранено"
         statusLabel.textColor = .secondaryLabelColor
         log("настройки: сервер=\(base.absoluteString) модель=\(Settings.shared.model.storageValue) "
             + "голос=\(Settings.shared.voice) озвучка=\(Settings.shared.speakReplies) "
-            + "анимация=\(Settings.shared.animateCircle)")
+            + "анимация=\(Settings.shared.animateCircle) "
+            + "ожидание=\(Settings.shared.wakeWord)")
     }
 
     @objc private func check() {
@@ -332,5 +353,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     @objc private func animateChanged() {
         Settings.shared.animateCircle = animateCheck.state == .on
         log("настройки: анимация круга=\(Settings.shared.animateCircle ? "включена" : "выключена")")
+    }
+
+    /// Ожидание «Привет, Ева» применяется сразу: `AppDelegate` слушает
+    /// `Settings.didChange` и поднимает/опускает слушатель без перезапуска.
+    @objc private func wakeChanged() {
+        Settings.shared.wakeWord = wakeCheck.state == .on
+        log("настройки: ожидание „Привет, Ева“=\(Settings.shared.wakeWord ? "включено" : "выключено")")
     }
 }

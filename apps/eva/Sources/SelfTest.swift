@@ -15,6 +15,8 @@ enum SelfTest {
         case backends
         case speech
         case text
+        case wake
+        case wakeAudio(Double)
         case version
     }
 
@@ -31,6 +33,10 @@ enum SelfTest {
             return runSpeech()
         case .text:
             return runTextTools()
+        case .wake:
+            return runWakeWord()
+        case .wakeAudio(let seconds):
+            return await runWakeAudio(seconds: seconds)
         case .version:
             print("EVA voice app 0.1.0 (Swift 6.2, AppKit/SwiftUI-free)")
             return 0
@@ -260,6 +266,182 @@ enum SelfTest {
 
         print(failures == 0 ? "все проверки текста прошли" : "провалено: \(failures)")
         return failures == 0 ? 0 : 1
+    }
+
+    // MARK: - Wake-word без микрофона
+
+    /// Проверяет то, что можно проверить без живого микрофона: нормализацию
+    /// фразы, триггер и кольцевой буфер. Само распознавание проверяет человек
+    /// (сказать «Привет, Ева» — см. docs/voice-app.md).
+    private static func runWakeWord() -> Int32 {
+        var failures = 0
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            print((ok ? "OK   " : "FAIL ") + name + (detail.isEmpty ? "" : " — " + detail))
+            if !ok { failures += 1 }
+        }
+
+        check("нормализация «Привет, Ева!»",
+              WakeWordListener.normalized("Привет, Ева!") == "привет ева",
+              WakeWordListener.normalized("Привет, Ева!").debugDescription)
+
+        let phrases = [
+            "Привет, Ева!",
+            "привет ева",
+            "Привет! Ева, ты здесь?",
+            "эй ева",
+            "Эй, Ева!",
+        ]
+        for phrase in phrases {
+            check("триггер: \(phrase.debugDescription)",
+                  WakeWordListener.isWakePhrase(phrase))
+        }
+
+        let negatives = [
+            "привет",
+            "ева",
+            "привет как дела",
+            "новая ева",
+            "привет дева",
+            "эй",
+            "как тебя зовут",
+        ]
+        for phrase in negatives {
+            check("не триггер: \(phrase.debugDescription)",
+                  !WakeWordListener.isWakePhrase(phrase))
+        }
+
+        // Кольцевой буфер: порядок сэмплов и переполнение.
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1) else {
+            print("FAIL кольцевой буфер: формат не создался")
+            return 1
+        }
+        let ring = WakeAudioRing(format: format, capacity: 2048)
+        for start in [0, 100, 200] {
+            guard let buffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: 100
+            ), let data = buffer.floatChannelData else {
+                print("FAIL кольцевой буфер: буфер не создался")
+                return 1
+            }
+            buffer.frameLength = 100
+            for index in 0..<100 { data[0][index] = Float(start + index) }
+            ring.append(buffer)
+        }
+        guard let drained = ring.take(maxFrames: 1000), let samples = drained.floatChannelData else {
+            print("FAIL кольцевой буфер: ничего не отдал")
+            return 1
+        }
+        let values = (0..<Int(drained.frameLength)).map { samples[0][$0] }
+        let ordered = Int(drained.frameLength) == 300
+            && values.first == 0
+            && values.last == 299
+            && values[150] == 150
+        check("кольцевой буфер: порядок и 300 кадров", ordered,
+              "кадров=\(drained.frameLength), первый=\(values.first ?? -1), последний=\(values.last ?? -1)")
+        check("кольцевой буфер: после чтения пусто", ring.take() == nil)
+
+        // Переполнение: пишем больше ёмкости — остаются последние кадры.
+        let small = WakeAudioRing(format: format, capacity: 1024)
+        for start in [0, 1024] {
+            guard let buffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                frameCapacity: 700
+            ), let data = buffer.floatChannelData else { return 1 }
+            buffer.frameLength = 700
+            for index in 0..<700 { data[0][index] = Float(start + index) }
+            small.append(buffer)
+        }
+        guard let wrapped = small.take(maxFrames: 4096), let wrappedData = wrapped.floatChannelData else {
+            print("FAIL кольцевой буфер: переполнение")
+            return 1
+        }
+        let wrappedValues = (0..<Int(wrapped.frameLength)).map { wrappedData[0][$0] }
+        check("кольцевой буфер: переполнение хранит последние 1024 кадра",
+              Int(wrapped.frameLength) == 1024
+                && wrappedValues.last == 1723
+                && wrappedValues.first == 376,
+              "кадров=\(wrapped.frameLength), первый=\(wrappedValues.first ?? -1), последний=\(wrappedValues.last ?? -1)")
+
+        print(failures == 0 ? "все проверки wake-слова прошли" : "провалено: \(failures)")
+        return failures == 0 ? 0 : 1
+    }
+
+    // MARK: - Аудио-путь ожидания без распознавания
+
+    /// Держит микрофон, кольцевой буфер и насос N секунд, но не создаёт
+    /// `SFSpeechRecognizer` — поэтому не требует прав на распознавание речи и
+    /// не показывает системный запрос. Нужен, чтобы замерить CPU и убедиться,
+    /// что `AVAudioEngine` честно останавливается и отпускает микрофон.
+    @MainActor
+    private static func runWakeAudio(seconds: Double) async -> Int32 {
+        let microphone = AVCaptureDevice.authorizationStatus(for: .audio)
+        guard microphone == .authorized else {
+            print("микрофон недоступен (статус \(microphone.rawValue)); "
+                + "дайте Еве доступ к микрофону в Системных настройках")
+            return 1
+        }
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0,
+              let standard = AVAudioFormat(
+                  standardFormatWithSampleRate: format.sampleRate,
+                  channels: format.channelCount
+              )
+        else {
+            print("микрофон не найден (нет входного устройства)")
+            return 1
+        }
+        let ring = WakeAudioRing(
+            format: standard,
+            capacity: Int(format.sampleRate * 2)
+        )
+        let sink: @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void = { buffer, _ in
+            ring.append(buffer)
+        }
+        input.installTap(onBus: 0, bufferSize: 2048, format: format, block: sink)
+        engine.prepare()
+        let cpuBefore = cpuSeconds()
+        do {
+            try engine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            print("не удалось включить микрофон: \(error.localizedDescription)")
+            return 1
+        }
+        // Запрос-заглушка: насос переносит звук в неё, чтобы путь был тем же,
+        // что и в боевом слушателе (без SFSpeech).
+        let box = WakeRequestBox()
+        box.set(nil)
+        let pump = WakeAudioPump(ring: ring, request: box)
+        pump.start()
+        print("аудио-путь ожидания: \(Int(format.sampleRate)) Гц, "
+            + "каналов \(format.channelCount), \(String(format: "%.0f", seconds)) с")
+        let started = Date()
+        try? await Task.sleep(nanoseconds: UInt64(max(seconds, 0.5) * 1_000_000_000))
+        pump.stop()
+        engine.stop()
+        input.removeTap(onBus: 0)
+        let elapsed = Date().timeIntervalSince(started)
+        let cpu = cpuSeconds() - cpuBefore
+        let frames = ring.writtenFrames
+        let rate = elapsed > 0 ? Double(frames) / elapsed : 0
+        let percent = elapsed > 0 ? cpu / elapsed * 100 : 0
+        print("кадров: \(frames) за \(String(format: "%.1f", elapsed)) с "
+            + "(\(Int(rate)) кадр/с), движок остановлен: \(!engine.isRunning)")
+        print("CPU процесса за интервал: \(String(format: "%.2f", percent)) % "
+            + "(пользователь+\(String(format: "%.2f", cpu)) с)")
+        return frames > 0 && !engine.isRunning ? 0 : 1
+    }
+
+    /// Пользовательское и системное время процесса: свой замер CPU без
+    /// внешних `top`/`ps` (в этой среде они недоступны).
+    private static func cpuSeconds() -> Double {
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        return Double(usage.ru_utime.tv_sec) + Double(usage.ru_utime.tv_usec) / 1_000_000
+            + Double(usage.ru_stime.tv_sec) + Double(usage.ru_stime.tv_usec) / 1_000_000
     }
 
     // MARK: - Значения

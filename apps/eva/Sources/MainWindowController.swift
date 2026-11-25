@@ -21,6 +21,9 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     private var thinking = ""
     private var expandedThinking = false
+    /// Запоминаем ожидание «Привет, Ева» до сборки окна: слушатель может
+    /// подняться раньше, чем пользователь откроет окно из статус-бара.
+    private var wakeWaiting = false
 
     /// Отправить текст (голосом или с клавиатуры) в чат.
     var onAsk: ((String) -> Void)?
@@ -98,6 +101,12 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         circleView?.showError(message)
     }
 
+    /// Включено фоновое ожидание «Привет, Ева»: круг в `idle` пульсирует.
+    func setWakeWaiting(_ waiting: Bool) {
+        wakeWaiting = waiting
+        circleView?.wakeWaiting = waiting
+    }
+
     /// При закрытии приложения/окна не оставляем тикающий таймер.
     func stopCircleAnimation() {
         circleView?.stopAnimation()
@@ -142,6 +151,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         // окна (круг масштабируется), но не больше 240 pt и не меньше 110 pt.
         let circle = CircleView(frame: .zero)
         circle.animationEnabled = Settings.shared.animateCircle
+        circle.wakeWaiting = wakeWaiting
         circleView = circle
 
         transcriptLabel = NSTextField(wrappingLabelWithString: "")

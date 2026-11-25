@@ -9,7 +9,10 @@ import Foundation
 /// * `--selftest-tts "текст"` — получить WAV из `/api/tts`;
 /// * `--selftest-backends` — распечатать реестр моделей сервера;
 /// * `--selftest-speech` — права и офлайн-доступность Apple Speech;
-/// * `--selftest-text` — скрытие `<think>` и нарезка фраз для озвучки.
+/// * `--selftest-text` — скрытие `<think>` и нарезка фраз для озвучки;
+/// * `--selftest-wake` — триггер «Привет, Ева» и кольцевой буфер (без микрофона);
+/// * `--selftest-wake-audio N` — N секунд держать микрофон и кольцевой буфер
+///   без распознавания: замер CPU и проверка остановки `AVAudioEngine`.
 enum Launch {
     static let arguments = CommandLine.arguments
 
@@ -33,6 +36,10 @@ enum Launch {
         if arguments.contains("--selftest-backends") { return .backends }
         if arguments.contains("--selftest-speech") { return .speech }
         if arguments.contains("--selftest-text") { return .text }
+        if arguments.contains("--selftest-wake") { return .wake }
+        if let raw = value("--selftest-wake-audio") {
+            return .wakeAudio(Double(raw) ?? 10)
+        }
         if arguments.contains("--version") { return .version }
         return nil
     }

@@ -177,4 +177,32 @@ final class ChatSession {
         if trimmed.isEmpty { return "HTTP \(status) без тела ответа" }
         return "HTTP \(status): \(String(trimmed.prefix(300)))"
     }
+
+    /// `POST /api/cancel {"side": 0}` — остановить идущую генерацию на сервере
+    /// (задача 0185), а не только закрыть SSE. Кнопка «Стоп» в приложении
+    /// шлёт это явно: обрыв потока тоже отменяет, но флаг в C-рантайме
+    /// ставится сразу, поэтому модель не договаривает в пустоту.
+    ///
+    /// Возвращает короткую строку для журнала; сетевые ошибки глотаются —
+    /// «Стоп» уже сработал локально.
+    nonisolated static func cancelRemote(base: URL, side: Int = 0) async -> String {
+        var request = URLRequest(url: base.appendingPathComponent("api/cancel"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["side": side])
+        request.timeoutInterval = 3
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard code == 200 else { return "сервер ответил HTTP \(code)" }
+            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let count = object["cancelled"] as? Int
+            {
+                return "сервер отменил \(count)"
+            }
+            return "сервер принял отмену"
+        } catch {
+            return "сервер не ответил (\(error.localizedDescription))"
+        }
+    }
 }

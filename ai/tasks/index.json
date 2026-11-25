@@ -1248,7 +1248,7 @@
   {
     "id": "0187",
     "title": "Wake-word «Привет, Ева»",
-    "status": "in_progress",
+    "status": "done",
     "file": "0187-wake-word.md",
     "assignee": "agent:wake-word"
   },
