@@ -2725,8 +2725,10 @@ PAGE_HTML = """<!doctype html>
     generation: 0,
     queue: [],
     playing: false,
-    audio: null,
-    current: null
+    ctx: null,
+    source: null,
+    current: null,
+    blocked: null
   };
 
   function ttsBox(side) { return byId("tts-" + side); }
@@ -2741,25 +2743,36 @@ PAGE_HTML = """<!doctype html>
     if (note) { note.textContent = text || ""; }
   }
 
-  function ttsAudio() {
-    if (!tts.audio) {
-      tts.audio = new Audio();
-      tts.audio.preload = "auto";
+  // Web Audio вместо <audio>: политика автоплея проверяется один раз — при
+  // resume() в жесте пользователя, — а дальше любые буферы играют без
+  // ограничений. С <audio> play() после fetch отклонялся стабильно, и клик по
+  // плашке не помогал: элемент уже «сжёг» отказ, повторный play() молчал.
+  function audioCtx() {
+    if (tts.ctx) { return tts.ctx; }
+    var C = window.AudioContext || window.webkitAudioContext;
+    if (!C) { return null; }
+    try { tts.ctx = new C(); } catch (ignored) { tts.ctx = null; }
+    return tts.ctx;
+  }
+
+  function unlockSpeech() {
+    var ctx = audioCtx();
+    if (!ctx) { return null; }
+    if (ctx.state === "suspended" && typeof ctx.resume === "function") {
+      try { ctx.resume(); } catch (ignored) { /* уже */ }
     }
-    return tts.audio;
+    return ctx;
   }
 
   function releaseSpeech() {
-    if (!tts.current) { tts.playing = false; return; }
-    var audio = ttsAudio();
-    try { audio.pause(); } catch (ignored) { /* уже остановлено */ }
-    if (tts.current.url) {
+    if (tts.source) {
+      tts.source.onended = null;
+      try { tts.source.stop(); } catch (ignored) { /* уже */ }
+      tts.source = null;
+    }
+    if (tts.current && tts.current.url) {
       try { URL.revokeObjectURL(tts.current.url); } catch (ignored) { /* уже */ }
     }
-    audio.onended = null;
-    audio.onerror = null;
-    audio.removeAttribute("src");
-    try { audio.load(); } catch (ignored) { /* не критично */ }
     tts.current = null;
     tts.playing = false;
   }
@@ -2785,95 +2798,79 @@ PAGE_HTML = """<!doctype html>
     }
   }
 
-  // Политика автоплея разрешает звук только после жеста пользователя.
-  // Проигрываем беззвучный WAV на том же <audio> — элемент «разблокирован»,
-  // и следующие фразы играют уже с голосом.
-  var SILENT_WAV = "data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA=";
-
-  function unlockSpeech() {
-    var audio = ttsAudio();
-    audio.muted = true;
-    audio.src = SILENT_WAV;
-    var started = null;
-    try { started = audio.play(); } catch (ignored) { started = null; }
-    var done = function () {
-      audio.muted = false;
-      var note = byId("tts-note-0");
-      if (note) { note.textContent = ""; note.onclick = null; note.classList.remove("clickable"); }
-      var note1 = byId("tts-note-1");
-      if (note1) { note1.textContent = ""; note1.onclick = null; note1.classList.remove("clickable"); }
-      tts.available = true;
-      pumpSpeech();
-    };
-    if (started && typeof started.then === "function") {
-      started.then(done, function () { audio.muted = false; });
-    } else {
-      setTimeout(done, 50);
-    }
+  // Играем WAV через декодер Web Audio: onDone — конец, onError(имя ошибки).
+  function playSpeech(url, side, onDone, onError) {
+    var ctx = unlockSpeech();
+    if (!ctx) { onError("нет AudioContext"); return; }
+    fetch(url).then(function (resp) {
+      if (!resp.ok) { throw new Error("blob " + resp.status); }
+      return resp.arrayBuffer();
+    }).then(function (data) {
+      return new Promise(function (resolve, reject) {
+        var decoded = ctx.decodeAudioData(data, resolve, reject);
+        if (decoded && typeof decoded.then === "function") { decoded.then(resolve, reject); }
+      });
+    }).then(function (buffer) {
+      if (!buffer) { throw new Error("декодер вернул пусто"); }
+      var src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+      src.onended = function () { tts.source = null; onDone(); };
+      tts.source = src;
+      src.start(0);
+    }).catch(function (err) {
+      var name = (err && (err.name || err.message)) || String(err);
+      onError(name);
+    });
   }
 
-  function showUnlockNote(side) {
+  function showUnlockNote(side, detail) {
     var note = byId("tts-note-" + side);
     if (!note) { return; }
-    note.textContent = "нажмите, чтобы включить звук";
+    note.textContent = "нажмите «▶ звук», чтобы включить" + (detail ? " (" + detail + ")" : "");
     note.classList.add("clickable");
     note.onclick = function () { speakCheck(side); };
   }
 
-  // Проверка звука по клику: сначала беззвучная разблокировка (жест), затем
-  // короткая фраза. Так видно и слышно, что голос включился, и не нужно
-  // ждать следующего ответа модели.
+  // Проверка звука: разблокировка контекста прямо в жесте, затем короткая
+  // фраза. Так слышно, что голос включился, не дожидаясь ответа модели.
   function speakCheck(side) {
-    var audio = ttsAudio();
-    audio.muted = true;
-    audio.src = SILENT_WAV;
-    var start = null;
-    try { start = audio.play(); } catch (ignored) { start = null; }
-    var proceed = function () {
-      audio.muted = false;
-      fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: "Звук включён. Я Ева, слушайте ответы." })
-      }).then(function (resp) {
-        if (!resp.ok) { throw new Error("tts http " + resp.status); }
-        return resp.blob();
-      }).then(function (blob) {
-        var url = URL.createObjectURL(blob);
-        var player = ttsAudio();
-        tts.current = { url: url, side: side, check: true };
-        player.onended = function () {
-          try { URL.revokeObjectURL(url); } catch (ignored) { /* уже */ }
-          tts.current = null;
-          tts.playing = false;
-          var note = byId("tts-note-" + side);
-          if (note) { note.textContent = ""; note.onclick = null; note.classList.remove("clickable"); }
-          tts.available = true;
-          if (tts.blocked) {
-            var blocked = tts.blocked;
-            tts.blocked = null;
-            tts.queue.unshift({ side: blocked.side, url: blocked.url, ready: Promise.resolve(blocked.url), generation: tts.generation });
-          }
-          pumpSpeech();
-        };
-        player.src = url;
-        tts.playing = true;
-        var played = player.play();
-        if (played && typeof played.catch === "function") {
-          played.catch(function () {
-            var note = byId("tts-note-" + side);
-            if (note) { note.textContent = "звук всё ещё заблокирован — проверьте настройки сайта"; }
-            tts.playing = false;
+    var ctx = unlockSpeech();
+    if (!ctx) { setVoiceNote(side, "браузер не поддерживает Web Audio"); return; }
+    setVoiceNote(side, "проверяю звук…");
+    fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "Звук включён. Я Ева, слушайте ответы." })
+    }).then(function (resp) {
+      if (!resp.ok) { throw new Error("tts " + resp.status); }
+      return resp.blob();
+    }).then(function (blob) {
+      var url = URL.createObjectURL(blob);
+      tts.current = { url: url, side: side };
+      tts.playing = true;
+      playSpeech(url, side, function () {
+        releaseSpeech();
+        setVoiceNote(side, "");
+        tts.available = true;
+        if (tts.blocked) {
+          var blocked = tts.blocked;
+          tts.blocked = null;
+          tts.queue.unshift({
+            side: blocked.side, url: blocked.url, generation: tts.generation,
+            ready: Promise.resolve(blocked.url)
           });
         }
-      }).catch(function () {
-        var note = byId("tts-note-" + side);
-        if (note) { note.textContent = "синтез недоступен"; }
-        tts.playing = false;
+        pumpSpeech();
+      }, function (name) {
+        releaseSpeech();
+        tts.available = false;
+        setVoiceNote(side, "звук не пошёл: " + name);
       });
-    };
-    if (start && typeof start.then === "function") { start.then(proceed, proceed); }
-    else { setTimeout(proceed, 50); }
+    }).catch(function (err) {
+      var note = byId("tts-note-" + side);
+      if (note) { note.textContent = "синтез недоступен: " + (err && err.message ? err.message : err); }
+    });
   }
 
   function pumpSpeech() {
@@ -2883,39 +2880,25 @@ PAGE_HTML = """<!doctype html>
     tts.playing = true;
     job.ready.then(function (url) {
       if (job.generation !== tts.generation) {
-        // Пока фраза синтезировалась, её ответили «стопом» или новым
-        // вопросом: звук уже не нужен, ссылку освобождаем.
         if (url) { try { URL.revokeObjectURL(url); } catch (ignored) { /* уже */ } }
         tts.playing = false;
         pumpSpeech();
         return;
       }
       if (!url) { tts.playing = false; pumpSpeech(); return; }
-      var audio = ttsAudio();
       tts.current = { url: url, side: job.side };
-      audio.onended = function () { releaseSpeech(); pumpSpeech(); };
-      audio.onerror = function () {
+      playSpeech(url, job.side, function () {
         releaseSpeech();
-        setVoiceNote(job.side, "не удалось проиграть озвучку");
         pumpSpeech();
-      };
-      audio.src = url;
-      var started = null;
-      try { started = audio.play(); } catch (ignored) { started = null; }
-      if (started && typeof started.catch === "function") {
-        started.catch(function () {
-          // Автоплей запрещён политикой браузера. Не выключаем голос насовсем:
-          // возвращаем фразу в голову очереди и просим один клик — он и есть
-          // «жест пользователя», после которого звук разрешён.
-          if (job.generation !== tts.generation) {
-            if (url) { try { URL.revokeObjectURL(url); } catch (ignored) { /* уже */ } }
-            return;
-          }
-          tts.playing = false;
-          tts.blocked = { url: url, side: job.side };
-          showUnlockNote(job.side);
-        });
-      }
+      }, function (name) {
+        releaseSpeech();
+        // Не выбрасываем фразу: держим её до клика «▶ звук» или следующего жеста.
+        tts.blocked = { url: url, side: job.side };
+        showUnlockNote(job.side, name);
+      });
+    }).catch(function () {
+      tts.playing = false;
+      pumpSpeech();
     });
   }
 

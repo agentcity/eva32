@@ -2618,8 +2618,12 @@ class TestTtsPage(ServerTestCase):
             "голос недоступен",
         ):
             self.assertIn(fragment, page)
-        # Одно <audio> на страницу: фразы играют последовательно.
-        self.assertEqual(page.count("new Audio("), 1, "ожидался один Audio")
+        # Web Audio, а не <audio>: автоплей блокировал play() после fetch, а
+        # AudioContext разблокируется один раз в жесте пользователя. Один
+        # источник звука на страницу — фразы играют последовательно.
+        self.assertEqual(page.count("new Audio("), 0, "остался элемент <audio>")
+        self.assertIn("AudioContext", page)
+        self.assertEqual(page.count("decodeAudioData"), 1, "ожидался один декодер")
         self.assertIn('byId("stop").addEventListener("click", stopAll)', page)
 
     def test_new_question_and_stop_clear_speech(self):
