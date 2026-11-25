@@ -60,6 +60,16 @@ static double now_ms(void) {
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
 }
 
+// CPU-время процесса (сумма по потокам): на загруженной машине wall
+// непригоден для сравнения путей — планировщик отнимает процессор у обоих
+// по-разному. CPU-время стабильно и сравнимо, поэтому prefill-замеры ниже
+// печатают его рядом с wall (задача 0168).
+static double now_cpu_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0) return -1.0;
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
 static uint32_t rng_next(uint32_t *s) {
     uint32_t x = *s;
     x ^= x << 13;
@@ -1472,16 +1482,44 @@ static void check_q4k_tmv_case(int rows, int cols, int q6) {
         goto done;
     }
     qk_tmv_ref(y_ref, blocks, x, rows, cols, q6);
-    rc = q6 ? vtm_q6k_tmv(y, blocks, x, rows, cols)
-            : vtm_q4k_tmv(y, blocks, x, rows, cols);
-    if (rc != 0) {
-        fprintf(stderr, "check_q4k_tmv_case: ядро вернуло ошибку\n");
-        failures++;
-        goto done;
+    {
+        // f32-ядро 0167 проверяется с порогом 1e-5 отдельно от int8-пути
+        // (0169): у того ошибка от квантования активаций, свой порог.
+        const int saved = vtm_q4k_i8_set_mode(0);
+        int pl;
+
+        (void)saved;
+        rc = q6 ? vtm_q6k_tmv(y, blocks, x, rows, cols)
+                : vtm_q4k_tmv(y, blocks, x, rows, cols);
+        if (rc != 0) {
+            fprintf(stderr, "check_q4k_tmv_case: ядро вернуло ошибку\n");
+            failures++;
+            vtm_q4k_i8_set_mode(-1);
+            goto done;
+        }
+        snprintf(label, sizeof label, "%s TMV %dx%d", q6 ? "Q6_K" : "Q4_K",
+                 rows, cols);
+        report(label, max_diff(y, y_ref, (size_t)rows, &ref), ref, CHECK_TOL);
+        // int8-dot GEMV декода: плоскости 1..3. Эталон тот же (f64), порог —
+        // CHECK_TOL_I8. Плоскость 1 в проверку не берётся: она для A/B.
+        for (pl = 2; pl <= 3; pl++) {
+            if (vtm_q4k_i8_set_mode(pl) != pl) break;   // нет int8-dot на CPU
+            memset(y, 0, (size_t)rows * sizeof(float));
+            rc = q6 ? vtm_q6k_tmv(y, blocks, x, rows, cols)
+                    : vtm_q4k_tmv(y, blocks, x, rows, cols);
+            if (rc != 0) {
+                fprintf(stderr, "check_q4k_tmv_case: int8-ядро вернуло "
+                                "ошибку\n");
+                failures++;
+                break;
+            }
+            snprintf(label, sizeof label, "%s TMV int8/%d %dx%d",
+                     q6 ? "Q6_K" : "Q4_K", pl, rows, cols);
+            report(label, max_diff(y, y_ref, (size_t)rows, &ref), ref,
+                   CHECK_TOL_I8);
+        }
+        vtm_q4k_i8_set_mode(-1);
     }
-    snprintf(label, sizeof label, "%s TMV %dx%d", q6 ? "Q6_K" : "Q4_K",
-             rows, cols);
-    report(label, max_diff(y, y_ref, (size_t)rows, &ref), ref, CHECK_TOL);
 done:
     free(blocks);
     free(x);
@@ -2955,6 +2993,95 @@ static int run_logits(const char *explicit_path, const vtm_backend *cand) {
 // читается N раз) против батчевого (строка деквантизуется один раз на пачку).
 // G MAC/s = rows·cols·ntok / t. Форма cols кратна 256 — работает NEON-ядро;
 // иначе оно отказывает и считается скалярный откат (медленнее, но верно).
+// --- int8-dot декод kind 6/7: скорость и точность по плоскостям (0169) -----
+//
+// Одна и та же матрица и один и тот же вектор активаций считаются f32-ядром
+// (плоскостей 0) и int8-ядром с 1/2/3 плоскостями. Время — min из iters,
+// ошибка — max|Δ| против f32-ядра (это и есть цена квантования активаций:
+// веса представимы в int8 точно). Форма cols должна быть кратна 256, иначе
+// int8-ядро отказывает и в колонке int8 будет то же время, что у f32.
+static int run_q4k_i8_bench(int rows, int cols, int iters) {
+    int n = rows * cols;
+    uint8_t *blocks[2];
+    float *x = NULL, *y_ref = NULL, *y = NULL;
+    double mac = (double)rows * (double)cols;
+    int kind, pl, i;
+
+    if (rows <= 0 || cols <= 0 || n <= 0 || n > 0x3fffffff || iters <= 0) {
+        fprintf(stderr, "q4k-i8: плохая форма %dx%d\n", rows, cols);
+        return 2;
+    }
+    if (cols % 256 != 0) {
+        fprintf(stderr, "q4k-i8: cols должно быть кратно 256 (сейчас %d): "
+                        "иначе int8-ядро отказывает\n", cols);
+        return 2;
+    }
+    if (!vtm_q4_i8_hw()) {
+        printf("q4k-i8: int8-dot на этом CPU/в этой сборке недоступен\n");
+        return 0;
+    }
+    blocks[0] = make_q4k(n, 0x1690u);
+    blocks[1] = make_q6k(n, 0x1691u);
+    x = make_vec((size_t)cols, 0x1692u);
+    y_ref = (float *)calloc((size_t)rows, sizeof(float));
+    y = (float *)calloc((size_t)rows, sizeof(float));
+    if (!blocks[0] || !blocks[1] || !x || !y_ref || !y) {
+        fprintf(stderr, "q4k-i8: нет памяти на форму %dx%d\n", rows, cols);
+        goto done;
+    }
+    printf("int8-dot декод: %dx%d (%.1f МБ блоков), %d итераций\n", rows, cols,
+           (double)n * 0.5625 / 1e6, iters);
+    for (kind = 0; kind < 2; kind++) {
+        const char *nm = kind ? "Q6_K" : "Q4_K";
+        double t_f32 = 1e300, ref_abs = 0.0;
+
+        vtm_q4k_i8_set_mode(0);
+        for (i = 0; i < iters; i++) {
+            double t0 = now_ms(), dt;
+
+            if (kind) vtm_q6k_tmv(y_ref, blocks[kind], x, rows, cols);
+            else vtm_q4k_tmv(y_ref, blocks[kind], x, rows, cols);
+            dt = now_ms() - t0;
+            if (dt < t_f32) t_f32 = dt;
+        }
+        for (i = 0; i < rows; i++)
+            if (fabs((double)y_ref[i]) > ref_abs) ref_abs = fabs((double)y_ref[i]);
+        printf("  %s: f32 %7.2f мс (%5.1f G MAC/s, 100%%)", nm, t_f32,
+               mac / t_f32 / 1e6);
+        for (pl = 1; pl <= 3; pl++) {
+            double t = 1e300, d = 0.0, rel;
+
+            vtm_q4k_i8_set_mode(pl);
+            if (vtm_q4k_i8_mode() != pl) continue;
+            for (i = 0; i < iters; i++) {
+                double t0 = now_ms(), dt;
+
+                if (kind) vtm_q6k_tmv(y, blocks[kind], x, rows, cols);
+                else vtm_q4k_tmv(y, blocks[kind], x, rows, cols);
+                dt = now_ms() - t0;
+                if (dt < t) t = dt;
+            }
+            for (i = 0; i < rows; i++) {
+                const double dd = fabs((double)y[i] - (double)y_ref[i]);
+                if (dd > d) d = dd;
+            }
+            rel = ref_abs > 0.0 ? d / ref_abs : 0.0;
+            printf(" | int8/%d %6.2f мс (%5.1f G, %.2fx) Δ=%.1e (%.1e отн.)",
+                   pl, t, mac / t / 1e6, t_f32 / t, d, rel);
+            if (rel > 1e-2) failures++;
+        }
+        printf("\n");
+        vtm_q4k_i8_set_mode(-1);
+    }
+done:
+    free(blocks[0]);
+    free(blocks[1]);
+    free(x);
+    free(y_ref);
+    free(y);
+    return 0;
+}
+
 static int run_q4k_bench(int rows, int cols, int iters, int ntok) {
     int n = rows * cols;
     failures = 0;
@@ -3169,6 +3296,446 @@ fail:
     return 1;
 }
 
+// --- декод kind 6/7: int8-dot против f32 (задача 0169) ---------------------
+//
+// Один процесс, одна загрузка модели: 3B Q4_K в памяти — 3,2 ГиБ RSS, и
+// повторная загрузка на каждый прогон съедает больше, чем сам замер. Поэтому
+// оба пути (f32 и int8) считаются подряд на одних и тех же промптах, а
+// сравнение идёт по СЫРЫМ логитам каждого шага greedy-декода: это ровно те
+// числа, которых требуют критерии 0169 — argmax, top-5 и Δlogits.
+//
+// Промпты — файл, строка = id через запятую (или пробел). Строки берутся
+// подряд, не больше --decode-limit.
+
+typedef struct {
+    int *toks;
+    int n;
+    int cap;
+} tok_trace;
+
+static int dec_emit(void *user, int token, int position) {
+    tok_trace *t = (tok_trace *)user;
+    (void)position;
+    if (t->n < t->cap) t->toks[t->n++] = token;
+    return 0;
+}
+
+// Пять самых больших логитов (id по убыванию значения). n_logits не меньше 5.
+static void top5_of(const float *v, int n, int out[5]) {
+    int i, k;
+
+    for (k = 0; k < 5; k++) out[k] = -1;
+    for (i = 1; i < n; i++) {
+        int j, pos = -1;
+        for (j = 0; j < 5; j++)
+            if (out[j] < 0 || v[i] > v[out[j]]) { pos = j; break; }
+        if (pos < 0) continue;
+        for (j = 4; j > pos; j--) out[j] = out[j - 1];
+        out[pos] = i;
+    }
+}
+
+static int argmax_of(const float *v, int n) {
+    int i, best = 0;
+
+    for (i = 1; i < n; i++)
+        if (v[i] > v[best]) best = i;
+    return best;
+}
+
+// Greedy-декод промпта в текущем режиме int8: как в main.c — все токены
+// промпта, кроме последнего, только наполняют KV-кэш; последний даёт первый
+// сгенерированный, дальше каждый следующий выводится из предыдущего.
+// Сырые логиты после каждого шага кладутся в logits_out (max_new × n_logits).
+// Возвращает 0, -1 — ошибка прогона; *t_run_ms — время прогона.
+static int decode_run(vtm_t *m, const int32_t *ids, int n_ids, int max_new,
+                      float *logits_out, int *n_logits, tok_trace *tr,
+                      double *t_run_ms) {
+    const vtm_tensor *lg;
+    double t0;
+    int step, i;
+
+    if (n_ids < 1 || max_new < 1) return -1;
+    vtm_reset(m);
+    tr->n = 0;
+    *n_logits = 0;
+    t0 = now_ms();
+    for (i = 0; i + 1 < n_ids; i++) {
+        vtm_set_position(m, i);
+        vtm_set_token(m, ids[i]);
+        if (vtm_run(m, NULL, NULL) != VTM_OK) return -1;
+    }
+    for (step = 0; step < max_new; step++) {
+        const int32_t feed = (step == 0) ? ids[n_ids - 1]
+                                         : (int32_t)tr->toks[tr->n - 1];
+
+        vtm_set_position(m, n_ids - 1 + step);
+        vtm_set_token(m, feed);
+        if (vtm_run(m, dec_emit, tr) != VTM_OK) return -1;
+        lg = vtm_tensor_by_name(m, "logits");
+        if (!lg || !lg->f32 || lg->n_elements == 0) return -1;
+        if (*n_logits == 0) *n_logits = (int)lg->n_elements;
+        else if (*n_logits != (int)lg->n_elements) return -1;
+        memcpy(logits_out + (size_t)step * (size_t)(*n_logits), lg->f32,
+               (size_t)(*n_logits) * sizeof(float));
+        if (tr->n <= step) return -1;   // SAMP не сработал
+    }
+    *t_run_ms = now_ms() - t0;
+    return 0;
+}
+
+static int read_prompt_file(const char *path, int32_t ***out, int *n_out,
+                            int **lens_out) {
+    FILE *f = fopen(path, "rb");
+    int32_t **ids = NULL;
+    int *lens = NULL;
+    int n = 0, cap = 0;
+    char line[8192];
+
+    if (!f) {
+        fprintf(stderr, "не открыть промпты: %s\n", path);
+        return -1;
+    }
+    while (fgets(line, sizeof line, f)) {
+        int32_t *v = NULL;
+        int k = 0, c = 0;
+        char *p = line;
+
+        while (*p) {
+            long id;
+            char *end = NULL;
+            if (*p < '0' || *p > '9') { p++; continue; }
+            id = strtol(p, &end, 10);
+            if (end == p) { p++; continue; }
+            if (k == c) {
+                int nc = c ? c * 2 : 16;
+                int32_t *nv = (int32_t *)realloc(v, (size_t)nc * sizeof *nv);
+                if (!nv) { free(v); fclose(f); goto fail; }
+                v = nv;
+                c = nc;
+            }
+            v[k++] = (int32_t)id;
+            p = end;
+        }
+        if (k == 0) { free(v); continue; }
+        if (n == cap) {
+            int nc = cap ? cap * 2 : 8;
+            int32_t **ni = (int32_t **)realloc(ids, (size_t)nc * sizeof *ni);
+            int *nl = (int *)realloc(lens, (size_t)nc * sizeof *nl);
+            if (!ni || !nl) { free(ni ? ni : ids); free(nl ? nl : lens);
+                              free(v); fclose(f); goto fail; }
+            ids = ni;
+            lens = nl;
+            cap = nc;
+        }
+        ids[n] = v;
+        lens[n] = k;
+        n++;
+    }
+    fclose(f);
+    *out = ids;
+    *n_out = n;
+    *lens_out = lens;
+    return 0;
+fail:
+    while (n-- > 0) free(ids[n]);
+    free(ids);
+    free(lens);
+    return -1;
+}
+
+// Сравнение двух прогонов одного промпта: Δlogits, argmax, top-5 и первый шаг
+// расхождения последовательностей.
+typedef struct {
+    int steps_cmp;          // шагов, где префиксы совпали
+    int argmax_ok;          // из них argmax совпал
+    double top5_hits;       // сумма |top5 ∩ top5| по шагам
+    double max_dlogit;      // max|Δlogits| по шагам
+    double max_ref;         // max|logits| эталона (для относительной ошибки)
+    int diverge_step;       // шаг, на котором токены разошлись (-1 — нет)
+    double t_ref, t_new;    // время прогона, мс
+} dec_cmp;
+
+static void decode_compare(const float *l_ref, const float *l_new, int n_logits,
+                           const tok_trace *tr_ref, const tok_trace *tr_new,
+                           int max_new, dec_cmp *c) {
+    int step;
+
+    memset(c, 0, sizeof *c);
+    c->diverge_step = -1;
+    for (step = 0; step < max_new; step++) {
+        const float *a = l_ref + (size_t)step * (size_t)n_logits;
+        const float *b = l_new + (size_t)step * (size_t)n_logits;
+        int am_a = argmax_of(a, n_logits), am_b = argmax_of(b, n_logits);
+        int t5a[5], t5b[5], i, j, hits = 0;
+        double d = 0.0, ref = 0.0;
+
+        for (i = 0; i < n_logits; i++) {
+            const double dd = fabs((double)b[i] - (double)a[i]);
+            if (dd > d) d = dd;
+            if (fabs((double)a[i]) > ref) ref = fabs((double)a[i]);
+        }
+        if (d > c->max_dlogit) c->max_dlogit = d;
+        if (ref > c->max_ref) c->max_ref = ref;
+        top5_of(a, n_logits, t5a);
+        top5_of(b, n_logits, t5b);
+        for (i = 0; i < 5; i++)
+            for (j = 0; j < 5; j++)
+                if (t5a[i] == t5b[j]) { hits++; break; }
+        c->steps_cmp++;
+        if (am_a == am_b) c->argmax_ok++;
+        c->top5_hits += (double)hits / 5.0;
+        if (c->diverge_step < 0
+            && (tr_ref->toks[step] != tr_new->toks[step]))
+            c->diverge_step = step;
+    }
+}
+
+// --- декод: tok/s f32 против int8 (задача 0169) -----------------------------
+//
+// Парный замер в одном процессе: один и тот же промпт и число новых токенов,
+// пути чередуются (f32 → int8 в одном повторе, int8 → f32 в следующем), берётся
+// min по повторам. На общей машине одиночные прогоны расходятся в разы, а
+// page cache нагревается первым прогоном, поэтому без чередования сравнение
+// бессмысленно.
+static int run_decode_bench(const char *explicit_path, const char *prompts_path,
+                            int ntok, int reps) {
+    const char *path = find_model(explicit_path);
+    const char *pp = prompts_path ? prompts_path : NULL;
+    int32_t **ids = NULL;
+    int *lens = NULL;
+    int n_prompts = 0, np;
+    tok_trace tr;
+    float *lg = NULL;
+    int n_logits = 0, n_logits2 = 0;
+    vtm_t *m;
+    double t0_best = 1e300, t3_best = 1e300, mb0 = 0.0, mb3 = 0.0;
+    int i, rep;
+
+    if (!path) {
+        fprintf(stderr, "модель не найдена (--decode-bench PATH)\n");
+        return 2;
+    }
+    if (!pp) {
+        fprintf(stderr, "--decode-bench требует --prompts FILE\n");
+        return 2;
+    }
+    if (read_prompt_file(pp, &ids, &n_prompts, &lens) != 0) return 2;
+    if (n_prompts == 0) return 2;
+    if (ntok < 1) ntok = 1;
+    if (reps < 1) reps = 1;
+    m = vtm_load(path);
+    if (!m) {
+        fprintf(stderr, "vtm_load(%s): %s\n", path, vtm_last_error());
+        return 1;
+    }
+    vtm_set_backend(m, &vtm_backend_simd);
+    {
+        const vtm_tensor *lgt = vtm_tensor_by_name(m, "logits");
+
+        if (!lgt || !lgt->f32 || lgt->n_elements == 0) {
+            fprintf(stderr, "в модели нет тензора logits\n");
+            vtm_free(m);
+            return 1;
+        }
+        n_logits = (int)lgt->n_elements;
+    }
+    lg = (float *)malloc((size_t)ntok * (size_t)n_logits * sizeof(float));
+    tr.toks = (int *)malloc((size_t)ntok * sizeof(int));
+    tr.cap = ntok;
+    if (!lg || !tr.toks) {
+        fprintf(stderr, "decode-bench: нет памяти\n");
+        free(lg);
+        free(tr.toks);
+        vtm_free(m);
+        return 1;
+    }
+    printf("модель: %s\ndecode-bench: %d токенов, %d повторов, чередование путей "
+           "(int8-плоскостей %d, %s)\n", path, ntok, reps,
+           vtm_q4k_i8_mode(), vtm_q4k_i8_name());
+    for (rep = 0; rep < reps; rep++) {
+        double t;
+        int order;
+
+        for (order = 0; order < 2; order++) {
+            const int mode = (order == (rep & 1)) ? 0 : vtm_q4k_i8_mode();
+            const int eff = vtm_q4k_i8_set_mode(mode);
+            double ms;
+
+            (void)eff;
+            // Промпты идут по кругу: на каждый повтор — свой, чтобы кэш не
+            // решал за нас (все они короткие и одинаковой формы).
+            np = rep % n_prompts;
+            n_logits2 = 0;
+            if (decode_run(m, ids[np], lens[np], ntok, lg, &n_logits2, &tr,
+                           &ms) != 0) {
+                fprintf(stderr, "decode-bench: прогон не удался\n");
+                goto fail;
+            }
+
+            t = ms / (double)ntok;
+            if (order == (rep & 1)) {
+                if (t < t0_best) { t0_best = t; mb0 = ms; }
+            } else if (t < t3_best) {
+                t3_best = t;
+                mb3 = ms;
+            }
+            printf("  повтор %d: %s %8.2f мс/токен (%6.1f ток/с)\n", rep + 1,
+                   order == (rep & 1) ? "f32  " : "int8 ", t,
+                   1000.0 / (t > 0.0 ? t : 1.0));
+        }
+    }
+    vtm_q4k_i8_set_mode(-1);
+    printf("итого (min): f32 %.2f мс/токен = %.1f ток/с | int8 %.2f мс/токен "
+           "= %.1f ток/с | ускорение %.2fx\n", t0_best, 1000.0 / t0_best,
+           t3_best, 1000.0 / t3_best, t0_best / (t3_best > 0.0 ? t3_best : 1.0));
+    (void)mb0;
+    (void)mb3;
+    free(lg);
+    free(tr.toks);
+    for (i = 0; i < n_prompts; i++) free(ids[i]);
+    free(ids);
+    free(lens);
+    vtm_free(m);
+    return 0;
+fail:
+    free(lg);
+    free(tr.toks);
+    vtm_free(m);
+    return 1;
+}
+
+static int run_decode_check(const char *explicit_path, const char *prompts_path,
+                            int max_new, int planes, int limit) {
+    const char *path = find_model(explicit_path);
+    int32_t **ids = NULL;
+    int *lens = NULL;
+    int n_prompts = 0, np;
+    tok_trace tr_ref, tr_new;
+    float *l_ref = NULL, *l_new = NULL;
+    int n_logits = 0, n_logits2 = 0;
+    vtm_t *m;
+    int bad_prompts = 0, seq_ok = 0;
+    double sum_top5 = 0.0, max_dl = 0.0, max_ref_all = 0.0;
+    int steps_all = 0, argmax_all = 0;
+
+    if (!path) {
+        fprintf(stderr, "модель не найдена (--decode-check PATH)\n");
+        return 2;
+    }
+    if (!prompts_path) {
+        fprintf(stderr, "--decode-check требует --prompts FILE\n");
+        return 2;
+    }
+    if (read_prompt_file(prompts_path, &ids, &n_prompts, &lens) != 0) return 2;
+    if (n_prompts == 0) {
+        fprintf(stderr, "в %s нет промптов\n", prompts_path);
+        return 2;
+    }
+    if (limit > 0 && limit < n_prompts) n_prompts = limit;
+    if (max_new < 1) max_new = 1;
+    if (max_new > 32) max_new = 32;
+
+    printf("модель: %s\n", path);
+    printf("decode-check: %d промптов × %d токенов; int8-плоскостей: %d; "
+           "эталон — f32-путь (режим 0), раньше в этом прогоне — %s\n",
+           n_prompts, max_new, planes, vtm_q4k_i8_name());
+    m = vtm_load(path);
+    if (!m) {
+        fprintf(stderr, "vtm_load(%s): %s\n", path, vtm_last_error());
+        return 1;
+    }
+    vtm_set_backend(m, &vtm_backend_simd);
+    {
+        // Размер логитов известен из тензора модели до прогона: буфер под
+        // max_new шагов выделяется один раз на все промпты.
+        const vtm_tensor *lg = vtm_tensor_by_name(m, "logits");
+
+        if (!lg || !lg->f32 || lg->n_elements == 0) {
+            fprintf(stderr, "в модели нет тензора logits\n");
+            vtm_free(m);
+            return 1;
+        }
+        n_logits = (int)lg->n_elements;
+    }
+    l_ref = (float *)malloc((size_t)max_new * (size_t)n_logits
+                            * sizeof(float));
+    l_new = (float *)malloc((size_t)max_new * (size_t)n_logits
+                            * sizeof(float));
+    tr_ref.toks = (int *)malloc((size_t)max_new * sizeof(int));
+    tr_new.toks = (int *)malloc((size_t)max_new * sizeof(int));
+    tr_ref.cap = tr_new.cap = max_new;
+    if (!l_ref || !l_new || !tr_ref.toks || !tr_new.toks) {
+        fprintf(stderr, "decode-check: нет памяти (логитов %d × %d)\n",
+                max_new, n_logits);
+        free(l_ref);
+        free(l_new);
+        free(tr_ref.toks);
+        free(tr_new.toks);
+        vtm_free(m);
+        return 1;
+    }
+    printf("  %4s %7s %7s %8s %9s %13s %6s  %s\n", "N", "prompt", "argmax",
+           "top-5", "Δlogits", "мс/ток", "ускор.", "расхождение");
+    for (np = 0; np < n_prompts; np++) {
+        dec_cmp c;
+        double t_ref = 0.0, t_new = 0.0;
+
+        vtm_q4k_i8_set_mode(0);
+        if (decode_run(m, ids[np], lens[np], max_new, l_ref, &n_logits2,
+                       &tr_ref, &t_ref) != 0 || n_logits2 != n_logits) {
+            fprintf(stderr, "decode-check: f32-прогон промпта %d не удался\n",
+                    np);
+            bad_prompts++;
+            continue;
+        }
+        vtm_q4k_i8_set_mode(planes);
+        if (decode_run(m, ids[np], lens[np], max_new, l_new, &n_logits2,
+                       &tr_new, &t_new) != 0 || n_logits2 != n_logits) {
+            fprintf(stderr, "decode-check: int8-прогон промпта %d не удался\n",
+                    np);
+            bad_prompts++;
+            continue;
+        }
+        vtm_q4k_i8_set_mode(-1);
+        decode_compare(l_ref, l_new, n_logits, &tr_ref, &tr_new, max_new, &c);
+        // decode_compare заполняет c с нуля, поэтому времена — снаружи.
+        c.t_ref = t_ref / (double)max_new;
+        c.t_new = t_new / (double)max_new;
+        printf("  %4d %7d %5d/%-2d %7.1f%% %9.2e %6.1f/%5.1f %5.2fx  %s\n",
+               np + 1, lens[np], c.argmax_ok, c.steps_cmp,
+               100.0 * c.top5_hits / (double)c.steps_cmp, c.max_dlogit,
+               c.t_ref, c.t_new, c.t_ref / (c.t_new > 0.0 ? c.t_new : 1.0),
+               c.diverge_step < 0 ? "нет" : "есть");
+        steps_all += c.steps_cmp;
+        argmax_all += c.argmax_ok;
+        sum_top5 += c.top5_hits;
+        if (c.max_dlogit > max_dl) max_dl = c.max_dlogit;
+        if (c.max_ref > max_ref_all) max_ref_all = c.max_ref;
+        if (c.diverge_step < 0) seq_ok++;
+    }
+    if (steps_all > 0) {
+        printf("итого: последовательность совпала у %d/%d промптов, "
+               "argmax %d/%d шагов, top-5 %.2f%%, max|Δlogits| = %.2e "
+               "(max|ref|=%.2f, порог 1e-2)\n", seq_ok, n_prompts,
+               argmax_all, steps_all,
+               100.0 * sum_top5 / (double)steps_all, max_dl, max_ref_all);
+        printf("decode-check: %s\n",
+               (max_dl <= 1e-2 && argmax_all == steps_all && seq_ok == n_prompts)
+                   ? "ok (argmax и последовательности совпали, Δlogits ≤ 1e-2)"
+                   : "FAIL (argmax/последовательность/Δlogits вне допуска)");
+    }
+    free(l_ref);
+    free(l_new);
+    for (np = 0; np < n_prompts; np++) free(ids[np]);
+    free(ids);
+    free(lens);
+    free(tr_ref.toks);
+    free(tr_new.toks);
+    vtm_free(m);
+    return (bad_prompts || steps_all == 0) ? 1 : 0;
+}
+
 // --- TTFT prefill на настоящей модели: по токену против пачки (0162) --------
 //
 // Один процесс, чередование: для каждой длины промпта сначала один путь,
@@ -3179,23 +3746,26 @@ fail:
 // Считается только prefill (последний токен промпта включён): ровно то, что
 // ждёт хост до первого токена ответа. ids синтетические (одинаковый поток для
 // обоих путей), модель настоящая.
-static double prefill_token(vtm_t *m, const int32_t *ids, int n) {
-    double t0 = now_ms();
+static double prefill_token(vtm_t *m, const int32_t *ids, int n, double *cpu) {
+    double t0 = now_ms(), c0 = now_cpu_ms();
     int i;
     for (i = 0; i < n; i++) {
         vtm_set_position(m, i);
         vtm_set_token(m, ids[i]);
         if (vtm_run(m, NULL, NULL) != VTM_OK) return -1.0;
     }
+    if (cpu) *cpu = now_cpu_ms() - c0;
     return now_ms() - t0;
 }
 
-static double prefill_batch(vtm_t *m, const int32_t *ids, int n) {
-    double t0;
+static double prefill_batch(vtm_t *m, const int32_t *ids, int n, double *cpu) {
+    double t0, c0;
     vtm_reset(m);
     vtm_set_position(m, 0);
     t0 = now_ms();
+    c0 = now_cpu_ms();
     if (vtm_run_batch(m, ids, n) != VTM_OK) return -1.0;
+    if (cpu) *cpu = now_cpu_ms() - c0;
     return now_ms() - t0;
 }
 
@@ -3244,20 +3814,21 @@ static int run_prefill_ttft(const char *explicit_path) {
            "пачка режется ядром по VTM_BATCH_TOKENS):\n", path);
     printf("int8-dot: %s (VTM_Q4_I8=%d)\n", vtm_q4_i8_name(),
            vtm_q4_i8_mode());
-    printf("  %6s %12s %12s %9s\n", "токенов", "по токену, с", "пачкой, с",
-           "ускорение");
+    printf("  %6s %11s %11s %9s %11s %11s %9s\n", "токенов", "токен wall",
+           "пачка wall", "ускор.", "токен CPU", "пачка CPU", "ускор.CPU");
     for (li = 0; li < (size_t)nlens; li++) {
         const int n = lens[li];
         double t_tok = 1e300, t_bat = 1e300;
+        double c_tok = 1e300, c_bat = 1e300;
         int rep;
         for (rep = 0; rep < g_ttft_reps; rep++) {
-            double a, b;
+            double a, b, ca = -1.0, cb = -1.0;
             if (rep == 0) {
-                a = prefill_token(m, ids, n);
-                b = prefill_batch(m, ids, n);
+                a = prefill_token(m, ids, n, &ca);
+                b = prefill_batch(m, ids, n, &cb);
             } else {
-                b = prefill_batch(m, ids, n);
-                a = prefill_token(m, ids, n);
+                b = prefill_batch(m, ids, n, &cb);
+                a = prefill_token(m, ids, n, &ca);
             }
             if (a < 0.0 || b < 0.0) {
                 fprintf(stderr, "prefill-ttft: прогон вернул ошибку\n");
@@ -3266,9 +3837,12 @@ static int run_prefill_ttft(const char *explicit_path) {
             }
             if (a < t_tok) t_tok = a;
             if (b < t_bat) t_bat = b;
+            if (ca >= 0.0 && ca < c_tok) c_tok = ca;
+            if (cb >= 0.0 && cb < c_bat) c_bat = cb;
         }
-        printf("  %6d %12.2f %12.2f %8.2fx\n", n, t_tok / 1e3, t_bat / 1e3,
-               t_tok / t_bat);
+        printf("  %6d %11.2f %11.2f %8.2fx %11.2f %11.2f %8.2fx\n", n,
+               t_tok / 1e3, t_bat / 1e3, t_tok / t_bat, c_tok / 1e3,
+               c_bat / 1e3, c_tok / c_bat);
     }
     vtm_free(m);
     return 0;
@@ -3282,15 +3856,21 @@ static void usage(const char *prog) {
            "[--threads] [--pool] [--logits PATH] [--no-mm]\n"
            "          [--gemv-rows N] [--gemv-cols N]\n"
            "          [--q4k [--rows N] [--cols N] [--iters N] [--batch-tokens N]]\n"
+           "          [--q4k-i8 [--rows N] [--cols N] [--iters N]]\n"
            "          [--batch] [--batch-tokens N] "
            "[--q4 [--q4-rows N] [--q4-cols N] [--q4-iters N] "
            "[--q4-batch]]\n"
            "          [--prefill-check PATH] [--prefill-ttft PATH]\n"
            "          [--prefill-lens 64,256,512] [--prefill-reps N]\n"
+           "          [--decode-bench PATH --prompts FILE [--decode-new N]\n"
+           "           [--decode-reps N]]\n"
+           "          [--decode-check PATH --prompts FILE [--decode-new N]\n"
+           "           [--decode-limit N] [--planes 1|2|3]]\n"
            "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
            "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8);\n"
-           "  env VTM_Q4_I8 — int8-dot (SDOT/VNNI) для батчевого Q4: 0 — выкл.\n"
-           "    (по умолчанию), 1 — один проход, 2 — два (точнее, ~2x SDOT);\n",
+           "  env VTM_Q4_I8 — int8-dot (SDOT/VNNI): 0 — выключить; 1/2/3 —\n"
+           "    плоскости активаций (декод kind 6/7, задача 0169; по умолчанию\n"
+           "    2); у батчевого Q4 (0163) 1 — один проход, 2|3 — два;\n",
            prog);
 }
 
@@ -3299,13 +3879,18 @@ int main(int argc, char **argv) {
     int check = 0, no_mm = 0, threads = 0, pool = 0, batch = 0;
     int batch_tokens = 16;
     int q4 = 0, q4_batch = 0, q4_rows = 151936, q4_cols = 896, q4_iters = 3;
-    int q4k = 0;
+    int q4k = 0, q4k_i8 = 0;
     // Форма плотного GEMV (f32 n == 1): по умолчанию — уменьшенный аналог
     // tied lm_head 3B Q4 ([151936, 2048]); реальную задают флагами.
     int gemv_rows = 16384, gemv_cols = 2048;
     const char *logits_path = NULL;
     const char *prefill_check_path = NULL;
     const char *prefill_ttft_path = NULL;
+    const char *decode_check_path = NULL;
+    const char *decode_bench_path = NULL;
+    int decode_reps = 2;
+    const char *decode_prompts_path = NULL;
+    int decode_new = 8, decode_limit = 0, planes = 2;
     const char *backend_name = NULL;
     const vtm_backend *cand;
     int i;
@@ -3323,6 +3908,8 @@ int main(int argc, char **argv) {
             gemv_cols = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--q4k") == 0) {
             q4k = 1;
+        } else if (strcmp(argv[i], "--q4k-i8") == 0) {
+            q4k_i8 = 1;
         } else if (strcmp(argv[i], "--q4") == 0) {
             q4 = 1;
         } else if (strcmp(argv[i], "--q4-rows") == 0 && i + 1 < argc) {
@@ -3361,6 +3948,20 @@ int main(int argc, char **argv) {
             g_ttft_reps = atoi(argv[++i]);
             if (g_ttft_reps < 1) g_ttft_reps = 1;
             if (g_ttft_reps > 8) g_ttft_reps = 8;
+        } else if (strcmp(argv[i], "--decode-check") == 0 && i + 1 < argc) {
+            decode_check_path = argv[++i];
+        } else if (strcmp(argv[i], "--prompts") == 0 && i + 1 < argc) {
+            decode_prompts_path = argv[++i];
+        } else if (strcmp(argv[i], "--decode-bench") == 0 && i + 1 < argc) {
+            decode_bench_path = argv[++i];
+        } else if (strcmp(argv[i], "--decode-reps") == 0 && i + 1 < argc) {
+            decode_reps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--decode-new") == 0 && i + 1 < argc) {
+            decode_new = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--decode-limit") == 0 && i + 1 < argc) {
+            decode_limit = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--planes") == 0 && i + 1 < argc) {
+            planes = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
@@ -3400,12 +4001,21 @@ int main(int argc, char **argv) {
     if (!backend_name && (!getenv("VTM_BACKEND") || !*getenv("VTM_BACKEND")))
         cand = &vtm_backend_simd;  // бенчмарк по умолчанию меряет SIMD
 
+    if (decode_bench_path)
+        return run_decode_bench(*decode_bench_path ? decode_bench_path : NULL,
+                                decode_prompts_path, decode_new, decode_reps);
+    if (decode_check_path)
+        return run_decode_check(*decode_check_path ? decode_check_path : NULL,
+                                decode_prompts_path, decode_new, planes,
+                                decode_limit);
     if (prefill_ttft_path)
         return run_prefill_ttft(*prefill_ttft_path ? prefill_ttft_path
                                                    : NULL);
     if (prefill_check_path)
         return run_prefill_check(*prefill_check_path ? prefill_check_path
                                                      : NULL, batch_tokens);
+    if (q4k_i8)
+        return run_q4k_i8_bench(rows, cols, iters);
     if (q4k)
         return run_q4k_bench(rows, cols, iters, batch_tokens);
     if (q4)

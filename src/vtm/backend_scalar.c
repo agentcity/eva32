@@ -1122,6 +1122,9 @@ extern int vtm_neon_q4k_batch(float *y, const uint8_t *blocks, const float *x,
                               int rows, int cols, int ntok);
 extern int vtm_neon_q6k_batch(float *y, const uint8_t *blocks, const float *x,
                               int rows, int cols, int ntok);
+// int8-dot GEMV для декода (задача 0169): n == 1, int8-плоскости активаций.
+extern int vtm_neon_qk_gemv_i8(float *y, const uint8_t *blocks, const float *x,
+                               int rows, int cols, int q6, int planes);
 #define VTM_Q4_NEON 1
 #else
 #define VTM_Q4_NEON 0
@@ -1544,48 +1547,81 @@ extern int vtm_avx2_q4_batch_vnni(float *y, const uint8_t *q,
 // Определена в backend_neon.c (там же — где ядра).
 extern int vtm_q4_i8_hw(void);
 
-// Режим int8-dot. VTM_Q4_I8: 0/off — выключить (f32-ядро 0162),
-// 1 — один проход int8, 2 — два прохода (int8 + остаток, точнее).
-// По умолчанию 2: на 3B Q4 один проход int8 даёт ошибку логитов ~1e-2
-// (замер — в отчёте 0163), два прохода — ~1e-4 при цене ~2x SDOT.
-// Значение запоминается при первом обращении (горячий путь).
-static int g_q4_i8_mode = -2;    // -2 — env ещё не читали
+// Режим int8-dot. VTM_Q4_I8 (общий для обоих int8-путей, задача 0169):
+//   0/off — выключить int8-dot целиком (f32-путь, откат);
+//   1     — один проход int8 (грубая точность, только для A/B);
+//   2     — два прохода: int8 + остаток (по умолчанию);
+//   3     — три плоскости: у декода остаток второй плоскости (шаг sx/127²),
+//           у батчевого Q4 — то же, что 2 (там третьей плоскости нет).
+// Не задано: декод kind 6/7 — VTM_Q4_I8_DECODE_DEFAULT плоскостей (0169),
+// батчевый Q4 — выключен (как решено в 0163: порог 1e-4 там не достигнут).
+// Почему по умолчанию 3, а не 2: на golden 20/20 обе дают argmax 20/20 и
+// top-5 100%, но у 2 плоскостей max|Δlogits| = 2,2e-2 (порог 1e-2 в двух
+// промптах из 20), у 3 — 1,7e-4. Третья плоскость стоит ~10% скорости ядра
+// (1,38x против 1,58x на 2048x2048) и покупает 130-кратный запас точности.
+// Значение запоминается при первом обращении (горячий путь): env читается
+// один раз, как и раньше.
+#define VTM_Q4_I8_DECODE_DEFAULT 3
+static int g_q4_i8_mode = -2;      // батчевый Q4 (prefill), -2 — env не читали
+static int g_q4k_i8_dec = -2;      // декод kind 6/7
 #define VTM_Q4_I8_UNSET (-2)
 
-// По умолчанию int8-dot ВЫКЛЮЧЕН: на 3B Q4 он даёт ошибку логитов ~7,6e-2
-// (режим 2) против порога 1e-4 из задачи 0163 — это решение продакта, а не
-// тихий дефолт ядра. VTM_Q4_I8=1|2 включает, =0 выключает.
-static int q4_i8_mode_from_env(void) {
+// Значение VTM_Q4_I8: -1 — не задано, иначе 0..3 (мусор — 0, как в 0163).
+static int q4_i8_env_value(void) {
     const char *e = getenv("VTM_Q4_I8");
 
-    if (e && *e) {
-        if (*e == '1') return 1;
-        if (*e == '2') return 2;
-    }
+    if (!e || !*e) return -1;
+    if (*e >= '0' && *e <= '3') return *e - '0';
     return 0;
 }
 
+// Режим int8-dot батчевого Q4 (задача 0163): 0 — выкл., 1 — один проход,
+// 2 — два (третьей плоскости у этого ядра нет).
 int vtm_q4_i8_mode(void) {
-    int m;
+    int m, v;
 
     if (g_q4_i8_mode != VTM_Q4_I8_UNSET) return g_q4_i8_mode;
-    m = q4_i8_mode_from_env();
+    v = q4_i8_env_value();
+    m = (v < 0) ? 0 : (v >= 2 ? 2 : v);
     if (!vtm_q4_i8_hw()) m = 0;   // CPU/сборка не умеют int8-dot
     g_q4_i8_mode = m;
     return m;
 }
 
+// Режим int8-dot декода kind 6/7 (задача 0169): число int8-плоскостей 0..3.
+// Декодный GEMV на int8 есть только в NEON-сборке (backend_neon.c); на x86
+// ядра нет, поэтому режим там всегда 0 — иначе имя "vnni3" обещало бы путь,
+// которого в сборке не существует (VNNI-ядро 0163 — батчевое, не декодное).
+int vtm_q4k_i8_mode(void) {
+    int m, v;
+
+#if !VTM_Q4_I8_NEON
+    return 0;
+#endif
+    if (g_q4k_i8_dec != VTM_Q4_I8_UNSET) return g_q4k_i8_dec;
+    v = q4_i8_env_value();
+    m = (v < 0) ? VTM_Q4_I8_DECODE_DEFAULT : v;
+    if (!vtm_q4_i8_hw()) m = 0;
+    g_q4k_i8_dec = m;
+    return m;
+}
+
 int vtm_q4_i8_set_mode(int mode) {
-    int m;
+    int v;
 
     if (mode < 0) {
         g_q4_i8_mode = VTM_Q4_I8_UNSET;
         return vtm_q4_i8_mode();
     }
-    m = mode > 2 ? 2 : mode;
-    if (!vtm_q4_i8_hw()) m = 0;
-    g_q4_i8_mode = m;
-    return m;
+    v = mode > 3 ? 3 : mode;
+    g_q4_i8_mode = vtm_q4_i8_hw() ? (v >= 2 ? 2 : v) : 0;
+    return g_q4_i8_mode;
+}
+
+int vtm_q4k_i8_set_mode(int mode) {
+    if (mode < 0) g_q4k_i8_dec = VTM_Q4_I8_UNSET;
+    else g_q4k_i8_dec = vtm_q4_i8_hw() ? (mode > 3 ? 3 : mode) : 0;
+    return vtm_q4k_i8_mode();
 }
 
 const char *vtm_q4_i8_name(void) {
@@ -1596,6 +1632,19 @@ const char *vtm_q4_i8_name(void) {
     return m == 2 ? "sdot2" : "sdot";
 #elif VTM_Q4_I8_X86
     return m == 2 ? "vnni2" : "vnni";
+#else
+    return "off";
+#endif
+}
+
+const char *vtm_q4k_i8_name(void) {
+    const int m = vtm_q4k_i8_mode();
+
+    if (m == 0) return "off";
+#if VTM_Q4_I8_NEON
+    return m == 3 ? "sdot3" : (m == 2 ? "sdot2" : "sdot");
+#elif VTM_Q4_I8_X86
+    return m == 3 ? "vnni3" : (m == 2 ? "vnni2" : "vnni");
 #else
     return "off";
 #endif
@@ -2094,6 +2143,17 @@ static void qk_tmv_neon_worker(void *p, int tid, int r0, int r1) {
 }
 #endif
 
+// VTM_Q4K_STRICT=1 (см. backend_neon.c) — эталонное f64-накопление: int8-путь
+// декода и батчевое ядро выключаются, всё идёт через qk_mm (double).
+static int q4k_strict_env(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *st = getenv("VTM_Q4K_STRICT");
+        cached = (st && *st && *st != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 static int qk_tmv(float *y, const uint8_t *blocks, const float *x, int rows,
                   int cols, int kind) {
     qk_tmv_job job;
@@ -2107,8 +2167,18 @@ static int qk_tmv(float *y, const uint8_t *blocks, const float *x, int rows,
     job.cols = cols;
     job.kind = kind;
 #if VTM_Q4_NEON
-    if (q4_simd_enabled() && vtm_simd_available())
+    if (q4_simd_enabled() && vtm_simd_available()) {
+        // int8-dot декод (0169): активации квантуются один раз на токен,
+        // строка — SDOT по под-блокам. Любой отказ ядра (-1: CPU без
+        // FEAT_DotProd, cols не кратен 256, нет памяти) — f32-ядро 0167.
+        const int planes = q4k_strict_env() ? 0 : vtm_q4k_i8_mode();
+
+        if (planes > 0
+            && vtm_neon_qk_gemv_i8(y, blocks, x, rows, cols,
+                                   kind == VTM_TENSOR_Q6K, planes) == 0)
+            return 0;
         fn = qk_tmv_neon_worker;
+    }
 #endif
     vtm_parallel_rows(rows, (double)rows * (double)cols, fn, &job);
     return 0;

@@ -1122,7 +1122,7 @@
   {
     "id": "0169",
     "title": "Декод на int8-dot с сохранением argmax",
-    "status": "in_progress",
+    "status": "done",
     "file": "0169-decode-int8.md",
     "assignee": "agent:decode-int8"
   }
