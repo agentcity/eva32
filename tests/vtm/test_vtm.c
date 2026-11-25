@@ -5821,6 +5821,98 @@ static void test_run_batch(void) {
                " ok\n");
 }
 
+// --- отмена пачки prefill (задача 0185) -----------------------------------
+//
+// До 0185 vtm_run_batch() был неделим: «стоп» на промпте ждал всю пачку (до
+// 256 токенов), а серверный клиент всё это время не мог занять контекст.
+// Теперь интерпретатор опрашивает vtm_cancel_fn перед инструкциями пачки.
+// Проверяем три вещи:
+//   * хук, который никогда не просит остановки, не меняет результат —
+//     побитово то же, что прогон без хука;
+//   * хук, который просит остановку, возвращает VTM_E_CANCELLED и правда
+//     прерывает пачку (предикат вызван, но инструкции не все);
+//   * после отмены полный прогон с нуля даёт побитово эталонный результат:
+//     частичное состояние машины не отравляет следующий запрос.
+typedef struct {
+    int calls;
+    int stop_after;
+} cancel_probe;
+
+static int cancel_probe_fn(void *user) {
+    cancel_probe *p = (cancel_probe *)user;
+    p->calls++;
+    return p->calls > p->stop_after;
+}
+
+static void test_run_batch_cancel(void) {
+    batch_cfg gqa;
+    int32_t ids[64];
+    cancel_probe never = {0, 1 << 30};
+    cancel_probe doomed = {0, 3};
+    vtm_t *m, *ref;
+    int i;
+
+    printf("  -- отмена пачки prefill: vtm_set_cancel\n");
+    gqa.ctx = 256; gqa.hidden = 32; gqa.vocab = 32; gqa.inter = 64;
+    gqa.heads = 4; gqa.kv_heads = 2; gqa.head_dim = 8; gqa.window = 0;
+    for (i = 0; i < 64; i++) ids[i] = (int32_t)((i * 7 + 1) % 32);
+
+    m = batch_model(&gqa);
+    ref = batch_model(&gqa);
+    CHECK(m != NULL && ref != NULL);
+    if (!m || !ref) {
+        vtm_free(m);
+        vtm_free(ref);
+        return;
+    }
+    vtm_set_backend(m, &vtm_backend_scalar_lut);
+    vtm_set_backend(ref, &vtm_backend_scalar_lut);
+
+    // (1) Хук есть, отмены нет — ответ тот же, что без хука.
+    vtm_set_cancel(m, cancel_probe_fn, &never);
+    vtm_set_position(m, 0);
+    CHECK(vtm_run_batch(m, ids, 32) == VTM_OK);
+    CHECK(never.calls > 0); // хук действительно опрашивается
+    cache_run_plain(ref, ids, 32);
+    batch_check_same(ref, m, "хук без отмены == обычный прогон", 0.0);
+
+    // (2) Отмена на третьей проверке: пачка возвращает VTM_E_CANCELLED.
+    vtm_set_cancel(m, cancel_probe_fn, &doomed);
+    vtm_reset(m);
+    vtm_set_position(m, 0);
+    CHECK(vtm_run_batch(m, ids, 64) == VTM_E_CANCELLED);
+    CHECK(doomed.calls > 3);
+
+    // (3) Хук снят, прогон с нуля — побитово эталон (64 токена).
+    vtm_set_cancel(m, NULL, NULL);
+    vtm_reset(ref);
+    cache_run_plain(ref, ids, 64);
+    vtm_reset(m);
+    vtm_set_position(m, 0);
+    CHECK(vtm_run_batch(m, ids, 64) == VTM_OK);
+    batch_check_same(ref, m, "после отмены полный прогон == эталон", 0.0);
+
+    // (4) Поштучный путь пачки (batch_sequential): трассировка выключает
+    // батчевые ядра, и vtm_run_batch идёт по токену — отмена тоже видна.
+    {
+        cancel_probe one = {0, 0};
+        trace_probe trace = {0};
+        vtm_set_trace(m, trace_cb, &trace);
+        vtm_set_cancel(m, cancel_probe_fn, &one);
+        vtm_reset(m);
+        vtm_set_position(m, 0);
+        CHECK(vtm_run_batch(m, ids, 4) == VTM_E_CANCELLED);
+        CHECK(one.calls > 0);
+        vtm_set_cancel(m, NULL, NULL);
+        vtm_set_trace(m, NULL, NULL);
+    }
+
+    vtm_free(m);
+    vtm_free(ref);
+    if (!g_fail)
+        printf("  -- отмена пачки prefill (vtm_set_cancel): ok\n");
+}
+
 // --- замер кэша префикса (задача 0081) ------------------------------------
 //
 // Сценарий из задачи: 128-токенный префикс + 16 новых токенов.
@@ -7139,6 +7231,7 @@ int main(void) {
     test_cache_prefix_ring();
     test_cache_batch();
     test_run_batch();
+    test_run_batch_cancel();
     test_gated_delta();
     test_moe_pread_cache();
     test_moe_prefetch();

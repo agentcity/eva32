@@ -21,6 +21,7 @@ import os
 import pathlib
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -2667,6 +2668,231 @@ class TestTtsPage(ServerTestCase):
         for phrase in result["after"]:
             self.assertLessEqual(len(phrase), chat_server.TTS_MAX_CHARS)
         self.assertEqual(" ".join(result["after"]), words)
+
+
+# --------------------------------------------------------------------------- #
+# Отмена генерации: стоп/обрыв/новый вопрос (задача 0185)
+# --------------------------------------------------------------------------- #
+
+
+class CancellableAdapter:
+    """Заглушка с отменой: prefill без токенов и медленный декод.
+
+    Повторяет поведение настоящего бэкенда в той части, которая нужна
+    серверу: ``cancel_active()`` поднимает событие и возвращает ``True``
+    (есть что отменять), ``stream()`` проверяет его на prefill и между
+    токенами и прекращает выдачу. Как ``VtmBackend``, новая генерация
+    начинается с чистого события.
+    """
+
+    def __init__(
+        self,
+        *,
+        prefill: float = 0.05,
+        delay: float = 0.03,
+        pieces: tuple[str, ...] = ("ток ",) * 40,
+        finish_reason: str = "stop",
+    ) -> None:
+        self.prefill = float(prefill)
+        self.delay = float(delay)
+        self.pieces = tuple(pieces)
+        self.finish_reason = finish_reason
+        self.kind = ""
+        self.loaded = True
+        self.load_stats = {}
+        self.cancelled = threading.Event()
+        self.started = threading.Event()
+        self.cancel_calls = 0
+        self.finished = 0
+
+    def cancel_active(self) -> bool:
+        if self.cancelled.is_set():
+            return False
+        self.cancel_calls += 1
+        self.cancelled.set()
+        return True
+
+    def cancel(self) -> bool:
+        return self.cancel_active()
+
+    def stream(self, messages, *, max_tokens):
+        self.cancelled.clear()
+        self.started.set()
+        try:
+            end = time.monotonic() + self.prefill
+            while time.monotonic() < end:
+                if self.cancelled.is_set():
+                    return
+                time.sleep(0.01)
+            produced = 0
+            for text in self.pieces:
+                if self.cancelled.is_set():
+                    return
+                yield chat_server.StreamPiece(text=text)
+                produced += 1
+                if produced >= max_tokens:
+                    break
+                time.sleep(self.delay)
+            yield chat_server.StreamPiece(
+                done=True,
+                usage={
+                    "prompt_tokens": 5,
+                    "completion_tokens": produced,
+                    "total_tokens": 5 + produced,
+                },
+                finish_reason=self.finish_reason,
+            )
+        finally:
+            self.finished += 1
+
+
+class TestCancellation(ServerTestCase):
+    """«Стоп» и обрыв клиента останавливают генерацию, а не только чтение."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.vtm = CancellableAdapter()
+        self.ollama = CancellableAdapter(pieces=("б",) * 40)
+        self.server.adapters[("vtm", "mock-vtm")] = self.vtm
+        self.server.adapters[("ollama", "mock-qwen")] = self.ollama
+
+    # -- помощники ---------------------------------------------------------
+
+    def _chat_in_thread(self, payload):
+        """Запустить /api/chat в отдельном потоке; вернуть (поток, результат)."""
+        box: dict[str, Any] = {}
+
+        def run() -> None:
+            try:
+                status, headers, raw = self.post_chat(payload, timeout=30)
+                box["status"] = status
+                box["headers"] = headers
+                box["raw"] = raw
+            except BaseException as exc:  # noqa: BLE001 — тест проверит сам
+                box["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, box
+
+    def _events(self, box):
+        raw = box.get("raw")
+        self.assertIsNotNone(raw, f"нет ответа: {box.get('error')}")
+        events, done = parse_sse(raw)
+        return events, done
+
+    def _done(self, events, side=0):
+        return next(
+            (event for event in events
+             if event["type"] == "done" and event["side"] == side),
+            None,
+        )
+
+    def _post_cancel(self, side=None):
+        body = json.dumps({} if side is None else {"side": side}).encode("utf-8")
+        status, _, raw = self.request(
+            "POST", "/api/cancel", body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200, raw)
+        return json.loads(raw)
+
+    # -- тесты -------------------------------------------------------------
+
+    def test_cancel_endpoint_cancels_side_and_reports_metrics(self):
+        thread, box = self._chat_in_thread(make_stream_payload())
+        self.assertTrue(self.vtm.started.wait(5.0), "генерация не началась")
+        self.assertTrue(self.ollama.started.wait(5.0))
+        time.sleep(0.15)
+        answer = self._post_cancel(side=0)
+        self.assertEqual(answer["cancelled"], 1)
+        thread.join(10.0)
+        self.assertFalse(thread.is_alive(), "запрос не завершился после отмены")
+        events, done = self._events(box)
+        self.assertTrue(done)
+        left = self._done(events, 0)
+        self.assertIsNotNone(left)
+        self.assertTrue(left["cancelled"], "колонка не отметила отмену")
+        self.assertEqual(left["finish_reason"], "cancelled")
+        self.assertIsNotNone(left["cancel_ms"], "нет времени до остановки")
+        # Заглушка останавливается сразу: метрика — единицы мс, не секунды.
+        self.assertLess(left["cancel_ms"], 100.0)
+        self.assertLess(left["completion_tokens"], len(self.vtm.pieces))
+        # Отменённый ответ в историю не попадает.
+        self.assertEqual(self.server.history.messages(0), [])
+        # Вторая колонка не тронута: она доработала до done и не отменена.
+        right = self._done(events, 1)
+        self.assertIsNotNone(right)
+        self.assertFalse(right.get("cancelled"))
+        self.assertEqual(self.ollama.cancel_calls, 0)
+
+    def test_cancel_without_active_generation_is_noop(self):
+        answer = self._post_cancel()
+        self.assertEqual(answer["cancelled"], 0)
+        # Следующий запрос не отменён «поздней» отменой.
+        events, _headers, _raw = self.post_chat_ok(make_stream_payload())
+        self.assertTrue(_raw.endswith(b"data: [DONE]\n\n") or b"[DONE]" in _raw)
+        self.assertFalse(self._done(events, 0).get("cancelled"))
+
+    def test_disconnected_client_cancels_without_waiting_for_token(self):
+        # Prefill длиной 3 с: ни одного токена ещё нет, и раньше сервер узнал
+        # бы об обрыве только на первой записи, т.е. после prefill (0185).
+        self.vtm.prefill = 3.0
+        conn = http.client.HTTPConnection(HOST, self.port, timeout=10)
+        payload = json.dumps(make_stream_payload()).encode("utf-8")
+        conn.request(
+            "POST", "/api/chat", body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertTrue(self.vtm.started.wait(5.0))
+        moment = time.monotonic()
+        # Жёсткий RST: клиент ушёл, как закрытое окно / прерванный fetch.
+        conn.sock.setsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+        )
+        conn.sock.close()
+        conn.close()
+        self.assertTrue(
+            self.vtm.cancelled.wait(2.0),
+            "обрыв клиента не дошёл до бэкенда за 2 с",
+        )
+        elapsed_ms = (time.monotonic() - moment) * 1000.0
+        self.assertLess(elapsed_ms, 1000.0, f"отмена ждала {elapsed_ms:.0f} мс")
+        # Новый вопрос стартует, не дожидаясь брошенного prefill (3 с).
+        self.vtm.prefill = 0.0
+        started = time.monotonic()
+        events, _headers, _raw = self.post_chat_ok(make_stream_payload(question="новый"))
+        self.assertIn(b"[DONE]", _raw)
+        self.assertLess(
+            time.monotonic() - started, 2.0,
+            "следующий запрос ждал брошенную генерацию",
+        )
+        self.assertFalse(self._done(events, 0).get("cancelled"))
+
+    def test_new_question_preempts_previous_same_adapter(self):
+        # Новый вопрос на той же модели: адаптер отменяет прежнюю генерацию,
+        # а не ждёт её до max_tokens (задача 0185).
+        inner = CancellableAdapter(prefill=0.05, delay=0.03, pieces=("x",) * 60)
+        adapter = chat_server.ChatCliAdapter(lambda: inner)
+        self.server.adapters[("vtm", "mock-vtm")] = adapter
+
+        first, box1 = self._chat_in_thread(make_stream_payload(question="первый"))
+        self.assertTrue(inner.started.wait(5.0))
+        started = time.monotonic()
+        second, box2 = self._chat_in_thread(make_stream_payload(question="второй"))
+        first.join(10.0)
+        second.join(10.0)
+        self.assertFalse(first.is_alive(), "первый вопрос не остановился")
+        self.assertFalse(second.is_alive(), "второй вопрос не завершился")
+        self.assertGreaterEqual(inner.cancel_calls, 1)
+        events1, _ = self._events(box1)
+        self.assertTrue(self._done(events1, 0)["cancelled"])
+        events2, done2 = self._events(box2)
+        self.assertTrue(done2)
+        self.assertFalse(self._done(events2, 0).get("cancelled"))
+        self.assertLess(time.monotonic() - started, 10.0)
 
 
 if __name__ == "__main__":

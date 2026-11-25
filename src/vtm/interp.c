@@ -5594,6 +5594,12 @@ static int batch_chunk_len(int rem, int cmax) {
     return C;
 }
 
+// Признак отмены (0185) опрашивается в пачке prefill. Один указатель на
+// инструкцию (или токен в поштучном пути) — цена выключенной отмены.
+static int run_cancelled(vtm_t *m) {
+    return m->cancel_fn != NULL && m->cancel_fn(m->cancel_user) != 0;
+}
+
 // Пачка: по инструкциям, внутри инструкции — по токенам.
 static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
                               int C, int pos0) {
@@ -5611,6 +5617,13 @@ static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
         const vtm_instr *in = &m->instr[pc];
         int handled = 0;
         uint64_t t0 = bt_trace ? moe_now_ns() : 0u;
+
+        // Отмена (0185): проверяем перед каждой инструкцией, а не только
+        // между пачками — иначе «стоп» на промпте ждал бы весь prefill.
+        if (run_cancelled(m)) {
+            st = VTM_E_CANCELLED;
+            break;
+        }
 
         switch (in->opcode) {
         case VTM_OP_TMV:
@@ -5660,6 +5673,8 @@ static vtm_status batch_sequential(vtm_t *m, const int32_t *ids, int n,
     int i;
     for (i = 0; i < n; i++) {
         vtm_status st;
+        // Отмена (0185) — до токена: поштучный путь тоже должен слушаться.
+        if (run_cancelled(m)) return VTM_E_CANCELLED;
         vtm_set_position(m, pos0 + i);
         vtm_set_token(m, ids[i]);
         st = vtm_run(m, NULL, NULL);
@@ -5728,6 +5743,12 @@ vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
         int C = n - off;
         vtm_status st;
 
+        // Отмена (0185): перед каждой пачкой. Внутри пачки признак
+        // опрашивается в batch_chunk() перед инструкциями.
+        if (run_cancelled(m)) {
+            batch_free(&b);
+            return VTM_E_CANCELLED;
+        }
         C = batch_chunk_len(C, cmax);
         if (win != INT_MAX) {
             int64_t room = (int64_t)win - pos0;
@@ -5800,6 +5821,12 @@ void vtm_set_trace(vtm_t *m, vtm_trace_fn cb, void *user) {
     if (!m) return;
     m->trace_cb = cb;
     m->trace_user = cb ? user : NULL;
+}
+
+void vtm_set_cancel(vtm_t *m, vtm_cancel_fn should_stop, void *user) {
+    if (!m) return;
+    m->cancel_fn = should_stop;
+    m->cancel_user = should_stop ? user : NULL;
 }
 
 vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {

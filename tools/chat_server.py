@@ -20,9 +20,16 @@ Qwen одновременно, с временем и скоростью. Скр
 * ``POST /api/chat`` — SSE-поток ``text/event-stream``. События:
   ``start`` (какая модель отвечает, первый токен холодный/тёплый),
   ``delta`` (кусок текста), ``done`` (время, токены, TTFT/prefill/декод,
-  RSS-дельта, причина остановки, кэш префикса), ``end`` (CPU-время запроса и
+  RSS-дельта, причина остановки, кэш префикса, ``cancelled``/``cancel_ms``),
+  ``end`` (CPU-время запроса и
   снимок системы), ``error`` (человеческий текст). Терминальное событие —
   ``data: [DONE]``, как у ``eva/server.py``;
+* ``POST /api/cancel`` — остановить идущую генерацию (задача 0185):
+  ``{"side": 0}`` / ``{"side": 1}`` — одну колонку, ``{}`` — обе. Отмена идёт
+  до C-рантайма (``vtm_api_cancel`` → ``VTM_API_CANCELLED``), а не только
+  «клиент перестал читать»; обрыв SSE и новый вопрос по той же модели
+  отменяют генерацию тем же путём. В ``done`` — ``cancelled``, ``cancel_ms``
+  и ``cancel_reason``;
 * память диалога (задача 0182) — своя история ``user``/``assistant`` на
   колонку: в запрос уходит ``[system, ...история, user]``, ответ дописывается
   в историю после ``done`` (пустой/ошибочный — не дописывается). Бюджет —
@@ -104,7 +111,9 @@ import logging
 import os
 import queue
 import re
+import select
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -211,6 +220,15 @@ DEFAULT_PROMPT_PATH = COMPACT_PROMPT_PATH
 
 #: Ошибки записи, означающие уход клиента: стрим прекращаем, не шумим в лог.
 _CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+#: Как часто HTTP-поток проверяет, не закрыл ли клиент соединение, пока
+#: генерация молчит (prefill может идти десятки секунд — писать тогда нечего,
+#: и обрыв раньше замечался только на первой записи, задача 0185).
+CLIENT_POLL_S = 0.05
+#: Сколько ждать отменённую генерацию, прежде чем занять контекст новым
+#: вопросом. Отмена — атомарный флаг в C (штатно <100 мс), запас на медленный
+#: токен и закрытие потока адаптера.
+PREEMPT_TIMEOUT_S = 5.0
 
 
 # --------------------------------------------------------------------------- #
@@ -429,6 +447,64 @@ def _close_backend(backend: Any) -> None:
             logger.warning("закрытие бэкенда %r: %s", target, exc)
 
 
+def _cancel_backend(backend: Any) -> bool:
+    """Попросить текущую генерацию бэкенда остановиться (задача 0185).
+
+    Идём по цепочке (``VtmChatBackend`` -> ``VtmBackend``) и предпочитаем
+    ``cancel_active()``: он отменяет только идущую генерацию и ничего не
+    делает, если её уже нет. Иначе отмена, пришедшая на миллисекунду позже
+    конца ответа, «протекла» бы в следующий запрос: у C-ABI ``vtm_api_cancel``
+    флаг доходит до ближайшего ``generate()``, если генерации нет.
+
+    ``cancel()`` (без ``cancel_active``) — откат для бэкендов, у которых этот
+    метод единственный. Возврат ``True`` — отмену приняли (или запомнили).
+    """
+    targets = [backend]
+    nested = getattr(backend, "_inner", None)
+    while (
+        nested is not None
+        and nested is not backend
+        and nested not in targets
+        and len(targets) < 3
+    ):
+        targets.insert(0, nested)
+        backend = nested
+        nested = getattr(nested, "_inner", None)
+    # cancel_active — «отменить только идущее». Если он есть хотя бы на одном
+    # уровне, отката на sticky cancel() быть не должно: False здесь значит
+    # «отменять нечего», а cancel() в этот момент поставил бы C-флаг, который
+    # достанется следующему generate() (проверено: новый вопрос отменялся сам).
+    if any(callable(getattr(target, "cancel_active", None)) for target in targets):
+        for target in targets:
+            action = getattr(target, "cancel_active", None)
+            if not callable(action):
+                continue
+            try:
+                return action() is not False
+            except Exception as exc:  # noqa: BLE001 - отмена не должна ронять сервер
+                logger.warning("отмена %r: %s", target, exc)
+        return False
+    # Откат для бэкендов без cancel_active (только sticky cancel()).
+    for target in targets:
+        action = getattr(target, "cancel", None)
+        if not callable(action):
+            continue
+        try:
+            result = action()
+        except Exception as exc:  # noqa: BLE001 - отмена не должна ронять сервер
+            logger.warning("отмена %r: %s", target, exc)
+            continue
+        if result is not False:
+            return True
+    return False
+
+
+def _looks_cancelled(exc: BaseException) -> bool:
+    """Похоже ли исключение на штатную отмену, а не на сбой бэкенда."""
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    return "VtmCancelled" in names or "CancelledError" in names
+
+
 class ChatCliAdapter:
     """Адаптер к бэкенду из ``tools/chat.py`` (общая библиотека чата).
 
@@ -638,10 +714,20 @@ class ChatCliAdapter:
     def stream(
         self, messages: Sequence[Mapping[str, str]], *, max_tokens: int
     ) -> Iterator[StreamPiece]:
-        with self._lock:
+        # Одна генерация на адаптер (у ВТМ один C-контекст). Новый вопрос при
+        # идущей генерации — сначала отменяем прежнюю (задача 0185): иначе он
+        # ждал бы её до max_tokens, как было до отмены. Ждём не больше
+        # PREEMPT_TIMEOUT_S: отмена в C — атомарный флаг, обычно <100 мс.
+        terminal = False
+        if not self._lock.acquire(blocking=False):
+            self.cancel()
+            if not self._lock.acquire(timeout=PREEMPT_TIMEOUT_S):
+                raise ModelBusy(
+                    "модель занята: предыдущая генерация не остановилась"
+                )
+        try:
             loaded_before = self._inner is not None
             inner = self._ensure()
-            terminal = False
             iterator = inner.stream(list(messages), max_tokens=max_tokens)
             try:
                 for event in iterator:
@@ -680,6 +766,26 @@ class ChatCliAdapter:
                 raise RuntimeError(
                     "бэкенд завершил поток без терминального события"
                 )
+        finally:
+            # Потребитель ушёл («стоп», обрыв SSE, новый вопрос) — не оставляем
+            # C-машину дорабатывать ответ: закрытие генератора уже остановило
+            # поток, а cancel_active страхует бэкенды без cancel-on-close.
+            if not terminal:
+                _cancel_backend(self._inner)
+            self._lock.release()
+
+    def cancel(self) -> bool:
+        """Отменить идущую генерацию (задача 0185).
+
+        ``True`` — у бэкенда была активная генерация и отмена принята;
+        ``False`` — отменять нечего (или бэкенд не умеет отмену). Вызывается
+        из HTTP-потока (``POST /api/cancel``) и из ``stream`` перед новым
+        вопросом; на VTM это атомарный ``vtm_api_cancel``.
+        """
+        inner = self._inner
+        if inner is None:
+            return False
+        return _cancel_backend(inner)
 
 
 def _chat_cli_factory(
@@ -1938,6 +2044,64 @@ def _validate_model_target(
 # --------------------------------------------------------------------------- #
 
 
+class _CancelState:
+    """Кто и когда попросил остановку — для метрик и для колонок.
+
+    Один объект на запрос ``/api/chat``. Отмена бывает:
+      * общая — клиент закрыл SSE или пришёл ``POST /api/cancel`` без ``side``;
+      * по колонке — ``POST /api/cancel {"side": 0}``: вторая колонка при этом
+        продолжает работать (у неё своя модель и свой ``stop``).
+    Времена запроса (``requested_at``) и фактической остановки (``stopped_at``)
+    дают ``cancel_ms`` в метриках ``done`` — «сколько шло до реальной остановки»,
+    а не только «сколько клиент не читал».
+    """
+
+    def __init__(self, sides: int) -> None:
+        self._lock = threading.Lock()
+        self.all = threading.Event()
+        self.sides = {index: threading.Event() for index in range(max(1, sides))}
+        self.reason = ""
+        self.requested_at: dict[int, float] = {}
+        self.stopped_at: dict[int, float] = {}
+
+    def request_side(self, side: int, reason: str) -> bool:
+        """Отметить отмену колонки; ``True`` — это первая отмена."""
+        with self._lock:
+            event = self.sides.setdefault(side, threading.Event())
+            first = not event.is_set()
+            self.requested_at.setdefault(side, time.monotonic())
+            self.reason = self.reason or reason
+            event.set()
+            return first
+
+    def request_all(self, reason: str) -> None:
+        for side in list(self.sides):
+            self.request_side(side, reason)
+        with self._lock:
+            self.all.set()
+
+    def requested(self, side: int) -> bool:
+        event = self.sides.get(side)
+        return self.all.is_set() or (event is not None and event.is_set())
+
+    def stopped(self, side: int) -> None:
+        """Зафиксировать фактическую остановку колонки (после закрытия потока)."""
+        with self._lock:
+            self.stopped_at.setdefault(side, time.monotonic())
+
+    def cancel_ms(self, side: int) -> float | None:
+        """Сколько прошло от запроса отмены до реальной остановки, мс."""
+        with self._lock:
+            started = self.requested_at.get(side)
+            finished = self.stopped_at.get(side)
+        if started is None or finished is None:
+            return None
+        return round(max(0.0, finished - started) * 1000.0, 1)
+
+    def was_cancelled(self, side: int) -> bool:
+        return side in self.requested_at
+
+
 class _SideDone:
     """Внутренний маркер очереди: колонка закончила (в SSE не уходит).
 
@@ -1959,7 +2123,7 @@ def _run_side(
     max_tokens: int,
     started: float,
     events: "queue.Queue[Any]",
-    stop: threading.Event,
+    cancel: "_CancelState",
     server: Any = None,
     prompt_text: str = "",
 ) -> None:
@@ -1972,6 +2136,11 @@ def _run_side(
     (время до первого токена), декод = остаток, причина остановки, был ли
     первый токен холодным (модель грузилась в этом запросе), попадание в кэш
     префикса ВТМ и ``/api/ps`` для Ollama.
+
+    Отмена (задача 0185): колонка проверяет ``cancel.requested(index)`` перед
+    каждым куском и закрывает поток адаптера. Это и есть фактическая остановка
+    C-рантайма (``vtm_api_cancel`` -> ``VTM_API_CANCELLED``): время от запроса
+    до неё попадает в ``cancel_ms`` метрик ``done``.
     """
     adapter = side["adapter"]
     key = (side["backend"], side["model"])
@@ -1997,6 +2166,7 @@ def _run_side(
     request_load_ms: float | None = None
     char_count = 0
     completed = False
+    cancelled = False
     # Полный текст ответа — для истории диалога (задача 0182). Складываем
     # здесь, а не по delta в HTTP-потоке: склейка кусков живёт в этом же
     # цикле, и ответ известен целиком к моменту ``done``.
@@ -2007,37 +2177,56 @@ def _run_side(
     try:
         iterator = iter(adapter.stream(messages, max_tokens=max_tokens))
         try:
-            for piece in iterator:
-                if stop.is_set():
-                    break
-                text = piece.text if isinstance(piece, StreamPiece) else str(piece)
-                if text:
-                    char_count += len(text)
-                    answer_parts.append(text)
-                    if first_token_ms is None:
-                        first_token_ms = max(
-                            0, int((time.monotonic() - started) * 1000)
+            try:
+                for piece in iterator:
+                    if cancel.requested(index):
+                        cancelled = True
+                        break
+                    text = piece.text if isinstance(piece, StreamPiece) else str(piece)
+                    if text:
+                        char_count += len(text)
+                        answer_parts.append(text)
+                        if first_token_ms is None:
+                            first_token_ms = max(
+                                0, int((time.monotonic() - started) * 1000)
+                            )
+                        # Склеиваем куски перед отправкой: у ВТМ токен — это
+                        # 1–3 символа русского слова (BPE), и посимвольная
+                        # выдача выглядит как «печатает по буквам». Копим до
+                        # 60 мс или до границы слова, чтобы глаз видел слова,
+                        # а не буквы.
+                        delta_buffer.append(text)
+                        now = time.monotonic()
+                        boundary = text.endswith(
+                            (" ", ".", ",", "!", "?", ":", ";", "\n")
                         )
-                    # Склеиваем куски перед отправкой: у ВТМ токен — это 1–3
-                    # символа русского слова (BPE), и посимвольная выдача
-                    # выглядит как «печатает по буквам». Копим до 60 мс или до
-                    # границы слова, чтобы глаз видел слова, а не буквы.
-                    delta_buffer.append(text)
-                    now = time.monotonic()
-                    boundary = text.endswith((" ", ".", ",", "!", "?", ":", ";", "\n"))
-                    if boundary or (now - delta_flushed) >= 0.06:
-                        events.put({
-                            "type": "delta",
-                            "side": index,
-                            "text": "".join(delta_buffer),
-                        })
-                        delta_buffer.clear()
-                        delta_flushed = now
-                if isinstance(piece, StreamPiece) and piece.done:
-                    usage = dict(piece.usage or {})
-                    finish_reason = piece.finish_reason or finish_reason
-                    request_load_ms = piece.load_ms
-                    break
+                        if boundary or (now - delta_flushed) >= 0.06:
+                            events.put({
+                                "type": "delta",
+                                "side": index,
+                                "text": "".join(delta_buffer),
+                            })
+                            delta_buffer.clear()
+                            delta_flushed = now
+                    if isinstance(piece, StreamPiece) and piece.done:
+                        usage = dict(piece.usage or {})
+                        finish_reason = piece.finish_reason or finish_reason
+                        request_load_ms = piece.load_ms
+                        break
+            except BaseException as exc:
+                # Отмена закрывает поток адаптера: он вправе ответить
+                # VtmCancelled/CancelledError. Это штатная остановка, а не
+                # сбой колонки — ошибку клиенту не шлём. VtmCancelled без
+                # запроса сервера (бэкенд отменили напрямую) тоже считаем
+                # остановкой, а не ошибкой.
+                if not cancel.requested(index) and not _looks_cancelled(exc):
+                    raise
+                cancelled = True
+            # Бэкенд мог сам корректно закончить поток после отмены (ВТМ:
+            # vtm_api_cancel -> VtmCancelled; Ollama: конец ответа): это всё
+            # равно остановка по запросу, а не штатный конец генерации.
+            if not cancelled and cancel.requested(index):
+                cancelled = True
             if delta_buffer:
                 events.put({"type": "delta", "side": index,
                             "text": "".join(delta_buffer)})
@@ -2053,7 +2242,7 @@ def _run_side(
                         "text": "".join(delta_buffer)})
             delta_buffer.clear()
         logger.warning("колонка %d (%s): ошибка: %s", index, side["model"], exc)
-        if not stop.is_set():
+        if not cancel.requested(index):
             events.put(
                 {
                     "type": "error",
@@ -2067,7 +2256,11 @@ def _run_side(
                 }
             )
     else:
-        if completed and not stop.is_set():
+        if completed:
+            if cancelled:
+                # Время фактической остановки — до сборки метрик: cancel_ms
+                # должен попасть в done этого же ответа.
+                cancel.stopped(index)
             elapsed_ms = max(1, int((time.monotonic() - started) * 1000))
             prompt_tokens = _as_int(usage.get("prompt_tokens"))
             completion_tokens = _as_int(usage.get("completion_tokens"))
@@ -2149,7 +2342,13 @@ def _run_side(
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "estimated": estimated,
-                "finish_reason": finish_reason or None,
+                "finish_reason": "cancelled" if cancelled else (finish_reason or None),
+                # Отмена (0185): флаг для панели и время до фактической
+                # остановки, а не до конца ответа. У непринятой отмены —
+                # cancelled=False, cancel_ms=None.
+                "cancelled": bool(cancelled),
+                "cancel_ms": cancel.cancel_ms(index),
+                "cancel_reason": cancel.reason or None if cancelled else None,
                 "first_token": (
                     "холодный" if cold else "тёплый"
                 ) if cold is not None else None,
@@ -2167,7 +2366,8 @@ def _run_side(
                     server.last_answers[key] = dict(metrics)
             # done уходит в поток как есть (формат события не меняется), а
             # полный текст запомним для истории — её допишет HTTP-поток.
-            answer_for_history = "".join(answer_parts)
+            # Отменённый ответ в историю не идёт: он недописан (0185).
+            answer_for_history = "" if cancelled else "".join(answer_parts)
             events.put(
                 {
                     "type": "done",
@@ -2178,6 +2378,10 @@ def _run_side(
                 }
             )
     finally:
+        # Фактическая остановка: поток адаптера закрыт (C-рантайм уже
+        # отпустил токен — vtm_api_cancel). Время до неё — в cancel_ms.
+        if cancelled:
+            cancel.stopped(index)
         # Маркер — всегда последним: HTTP-поток закрывает стрим, только
         # когда обе колонки прислали и done/error, и маркер. Пустой ответ
         # (ошибка, отмена, пустая генерация) в историю не дописывается.
@@ -3698,6 +3902,18 @@ PAGE_HTML = """<!doctype html>
 
   // «Стоп» глушит и генерацию, и звук: новый вопрос делает то же самое сам.
   function stopAll() {
+    // «Стоп» уходит и по HTTP, а не только закрытием соединения: сервер
+    // отменит генерацию в C-рантайме сразу (задача 0185). keepalive — чтобы
+    // запрос ушёл даже при закрытии вкладки; ошибку глотаем: если ответ уже
+    // кончился, отменять нечего.
+    try {
+      fetch("/api/cancel", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({}),
+        keepalive: true
+      }).catch(function (ignored) { /* отменять нечего */ });
+    } catch (ignored) { /* старый браузер без keepalive */ }
     if (controller) {
       try { controller.abort(); } catch (ignored) { /* уже завершён */ }
     }
@@ -4186,9 +4402,70 @@ class ChatHTTPServer(ThreadingHTTPServer):
         self.keep_alive = None if keep_alive is None else float(keep_alive)
         self._reaper_stop = threading.Event()
         self._reaper: threading.Thread | None = None
+        # Активные SSE-запросы (задача 0185): по ним POST /api/cancel находит,
+        # что отменять. Ключ — id(_CancelState); значение — (sides, state).
+        self._active_lock = threading.Lock()
+        self._active_chats: dict[int, tuple[tuple[Any, ...], Any]] = {}
         super().__init__(server_address, ChatRequestHandler)
         if self.keep_alive is not None and self.keep_alive > 0:
             self.start_reaper()
+
+    # -- отмена идущих генераций (задача 0185) ------------------------------
+
+    def register_chat(self, sides: Sequence[Mapping[str, Any]], cancel: Any) -> int:
+        """Запомнить активный запрос, чтобы его можно было отменить по HTTP."""
+        token = id(cancel)
+        with self._active_lock:
+            self._active_chats[token] = (tuple(sides), cancel)
+        return token
+
+    def unregister_chat(self, token: int) -> None:
+        with self._active_lock:
+            self._active_chats.pop(token, None)
+
+    def cancel_chats(self, side: int | None = None, reason: str = "stop") -> int:
+        """Отменить идущие генерации: все колонки или только ``side``.
+
+        Возврат — сколько бэкендов приняли отмену (у Ollama отмены нет: её
+        колонка просто перестаёт читать поток). ``reason`` попадает в метрики
+        ``done`` (``cancel_reason``).
+        """
+        with self._active_lock:
+            chats = list(self._active_chats.values())
+        accepted = 0
+        for sides, cancel in chats:
+            targets = range(len(sides)) if side is None else (side,)
+            for index in targets:
+                if index < 0 or index >= len(sides) or sides[index].get("disabled"):
+                    continue
+                cancel.request_side(index, reason)
+                adapter = sides[index].get("adapter")
+                if adapter is not None and _cancel_backend(adapter):
+                    accepted += 1
+        return accepted
+
+    def cancel_model(self, backend: str, model: str, reason: str = "superseded") -> int:
+        """Отменить идущие генерации этой модели (новый вопрос вместо старого).
+
+        Один C-контекст на модель: пока брошенная генерация считает, новый
+        вопрос ждал бы её до ``max_tokens``. Поэтому перед стартом нового
+        запроса активные запросы этой же модели отменяются — со штатными
+        метриками ``cancelled=true`` у старого запроса (задача 0185).
+        """
+        with self._active_lock:
+            chats = list(self._active_chats.values())
+        accepted = 0
+        for sides, cancel in chats:
+            for index, side in enumerate(sides):
+                if side.get("backend") != backend or side.get("model") != model:
+                    continue
+                if side.get("disabled"):
+                    continue
+                cancel.request_side(index, reason)
+                adapter = side.get("adapter")
+                if adapter is not None and _cancel_backend(adapter):
+                    accepted += 1
+        return accepted
 
     # -- автовыгрузка по бездействию ---------------------------------------
 
@@ -4330,6 +4607,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/reset":
                 self._handle_reset()
+                return
+            if path == "/api/cancel":
+                self._handle_cancel()
                 return
             if path == "/api/tts":
                 self._handle_tts()
@@ -4547,6 +4827,44 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             {"reset": sides, "history": _history_json(self.server)},
         )
 
+    # -- отмена (задача 0185) -------------------------------------------------
+
+    def _handle_cancel(self) -> None:
+        """``POST /api/cancel``: остановить идущую генерацию.
+
+        Тело — JSON-объект: ``{"side": 0}`` / ``{"side": 1}`` — отменить одну
+        колонку, ``{}`` или без поля — обе. Ответ ``{"cancelled": n, ...}``,
+        где ``n`` — сколько бэкендов приняли отмену (у Ollama своего cancel
+        нет: её колонка закрывает поток и прекращает читать ответ).
+
+        Это тот же путь, что и обрыв SSE: отмена доходит до C-рантайма
+        атомарным флагом (``VTM_API_CANCELLED``), а не «клиент перестал
+        читать». Метрики ``done`` получают ``cancelled=true`` и ``cancel_ms`` —
+        время до фактической остановки.
+        """
+        payload: Any = {}
+        if self.headers.get("Content-Length") not in (None, "0"):
+            payload = self._read_json_body()
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, Mapping):
+            raise ClientError("Тело запроса должно быть JSON-объектом.")
+        raw_side = payload.get("side")
+        if raw_side is not None and (
+            isinstance(raw_side, bool)
+            or not isinstance(raw_side, int)
+            or raw_side not in (0, 1)
+        ):
+            raise ClientError(
+                "Поле side: ожидалось 0 (слева), 1 (справа) или отсутствие "
+                "поля — тогда отменяются обе колонки."
+            )
+        accepted = self.server.cancel_chats(side=raw_side, reason="stop")
+        self._send_json(
+            200,
+            {"cancelled": accepted, "side": raw_side, "reason": "stop"},
+        )
+
     # -- озвучка (задача 0183) -----------------------------------------------
 
     def _handle_tts(self) -> None:
@@ -4668,7 +4986,18 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         # им хватает start+done, которые отдаются сразу после открытия SSE.
         disabled = [i for i, side in enumerate(sides) if side.get("disabled")]
         active = [i for i in range(len(sides)) if i not in disabled]
-        stop = threading.Event()
+        cancel = _CancelState(len(sides))
+        # Сначала отменяем брошенные запросы к тем же моделям, и только потом
+        # регистрируем свой: иначе cancel_model отменил бы сам себя (0185).
+        for index in active:
+            side = sides[index]
+            try:
+                self.server.cancel_model(
+                    side["backend"], side["model"], reason="superseded"
+                )
+            except Exception:  # noqa: BLE001 — отмена старого не должна рвать новый
+                logger.exception("отмена предыдущего запроса не удалась")
+        chat_token = self.server.register_chat(sides, cancel)
         started = time.monotonic()
         # CPU-время процесса на запрос: ``process_time`` считает все потоки
         # этого процесса, поэтому снимаем его вокруг всего запроса, а не
@@ -4688,7 +5017,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                     max_tokens,
                     started,
                     events,
-                    stop,
+                    cancel,
                     self.server,
                     _prompt_text(messages),
                 ),
@@ -4699,6 +5028,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             threads.append(thread)
 
         remaining = len(active)
+        finished_normally = False
         try:
             self._open_sse()
             for index in disabled:
@@ -4724,19 +5054,36 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                     }
                 )
             while remaining > 0:
-                item = events.get()
+                try:
+                    # Ждём событие коротко: пока генерация молчит (prefill
+                    # бывает десятки секунд), писать нечего, и обрыв клиента
+                    # раньше замечался только на первой записи — то есть уже
+                    # после первого токена (задача 0185).
+                    item = events.get(timeout=CLIENT_POLL_S)
+                except queue.Empty:
+                    if self._client_gone():
+                        logger.info(
+                            "SSE: клиент закрыл соединение — отменяю генерацию"
+                        )
+                        # Соединение закрыто: keep-alive-цикл не должен
+                        # читать следующий запрос из мёртвого сокета.
+                        self.close_connection = True
+                        self._cancel_sides(sides, active, cancel, "client_gone")
+                        break
+                    continue
                 if isinstance(item, _SideDone):
                     remaining -= 1
                     # Ответ дописан — только теперь, после done (и только
                     # непустой и без ошибки; см. _SideDone.answer).
                     self._remember(item.side, questions, item.answer)
                     continue
-                if stop.is_set():
+                if cancel.all.is_set():
                     break
                 if not self._send_sse_data(item):
-                    stop.set()
+                    self._cancel_sides(sides, active, cancel, "client_gone")
                     break
             else:
+                finished_normally = True
                 wall_ms = max(1, int((time.monotonic() - started) * 1000))
                 cpu_ms = round((time.process_time() - cpu_started) * 1000.0, 1)
                 try:
@@ -4766,15 +5113,65 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                     "start_memory": self.server.start_memory,
                 }
                 if not self._send_sse_data({"type": "end", "metrics": metrics}):
-                    stop.set()
+                    self._cancel_sides(sides, active, cancel, "client_gone")
                 else:
                     self._send_sse_done()
         except _CLIENT_GONE:
             self.close_connection = True
         finally:
-            stop.set()
+            self.server.unregister_chat(chat_token)
+            # Если стрим не дошёл до конца (обрыв, отмена, исключение), C-рантайм
+            # не должен дорабатывать ответ до max_tokens: отменяем и ждём
+            # колонки. Отмена идёт через атомарный флаг C-API, поэтому join
+            # короткий (штатно <100 мс), запас — на медленный токен.
+            if not finished_normally and remaining > 0:
+                self._cancel_sides(sides, active, cancel, "teardown")
             for thread in threads:
                 thread.join(timeout=2.0)
+
+    def _cancel_sides(
+        self,
+        sides: Sequence[Mapping[str, Any]],
+        indices: Sequence[int],
+        cancel: "_CancelState",
+        reason: str,
+    ) -> int:
+        """Попросить колонки остановиться и вернуть число принятых отмен.
+
+        ``cancel.request_side`` нужен и тогда, когда бэкенд отменять нечего
+        (Ollama без cancel): колонка увидит запрос и закроет поток.
+        """
+        accepted = 0
+        for index in indices:
+            cancel.request_side(index, reason)
+            adapter = sides[index].get("adapter")
+            if adapter is not None and _cancel_backend(adapter):
+                accepted += 1
+        return accepted
+
+    def _client_gone(self) -> bool:
+        """Закрыл ли клиент соединение — без ожидания следующей записи.
+
+        ``select`` говорит «читаемо», если пришёл EOF (или RST): после тела
+        POST клиент больше ничего не присылает, поэтому читаемость == обрыв.
+        ``MSG_PEEK`` не забирает байты: данные (если вдруг пришли) остаются
+        сокету, а нам важен только факт EOF.
+        """
+        sock = getattr(self, "connection", None)
+        if sock is None:
+            return False
+        try:
+            readable, _, _ = select.select([sock], [], [], 0)
+        except (OSError, ValueError):
+            return True
+        if not readable:
+            return False
+        try:
+            return sock.recv(1, socket.MSG_PEEK) == b""
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError:
+            return True
 
     def _remember(
         self, side: int, questions: Sequence[str], answer: str

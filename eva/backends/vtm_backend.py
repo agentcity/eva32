@@ -499,6 +499,13 @@ class _Library:
             ]
             self.cdll.vtm_api_cancel.restype = None
             self.cdll.vtm_api_cancel.argtypes = [ctypes.c_void_p]
+            # Добавлено в 0185; у старой собранной библиотеки символа может не
+            # быть — тогда флаг снимается только следующим generate().
+            clear = getattr(self.cdll, "vtm_api_cancel_clear", None)
+            if clear is not None:
+                clear.restype = None
+                clear.argtypes = [ctypes.c_void_p]
+            self.clear_cancel = clear
             self.cdll.vtm_api_close.restype = None
             self.cdll.vtm_api_close.argtypes = [ctypes.c_void_p]
             self.cdll.vtm_api_last_error.restype = ctypes.c_char_p
@@ -567,6 +574,11 @@ class _VtmContext:
     ) -> None:
         self._lib = library
         self._handle: int | None = None
+        # Замок «идёт ли C-генерация»: нужен, чтобы «поздняя» отмена не
+        # оставила флаг в C и не отменила следующий запуск (0185).
+        self._state = threading.Lock()
+        self._running = False
+        self._stop_requested = False
         self.model = str(model)
         self._max_new = int(max_new_tokens) if max_new_tokens > 0 else 0
         options = _VtmApiOptions()
@@ -604,8 +616,24 @@ class _VtmContext:
         return _decode_error(self._lib.cdll.vtm_api_last_error(self._handle))
 
     def cancel(self) -> None:
+        """Атомарный флаг отмены: идущую генерацию или ближайшую."""
         if self._handle is not None:
             self._lib.cdll.vtm_api_cancel(self._handle)
+
+    def cancel_active(self) -> bool:
+        """Отменить только идущую генерацию; ``False`` — нечего отменять.
+
+        В отличие от :meth:`cancel`, не ставит флаг, если C-вызов уже
+        вернулся: иначе «поздний» стоп отменил бы следующий запрос. Замок
+        закрывает окно между возвратом ``vtm_api_generate()`` и снятием
+        ``_running``: отмена либо попадает внутрь вызова, либо не ставится.
+        """
+        with self._state:
+            if self._handle is None or not self._running:
+                return False
+            self._stop_requested = True
+            self._lib.cdll.vtm_api_cancel(self._handle)
+            return True
 
     def generate(
         self,
@@ -653,11 +681,24 @@ class _VtmContext:
 
         callback = _TOKEN_CALLBACK(_callback)
         prompt = (ctypes.c_int32 * len(ids))(*ids)
-        status = int(
-            self._lib.cdll.vtm_api_generate(
-                self._handle, prompt, ctypes.c_size_t(len(ids)), callback, None
+        with self._state:
+            self._running = True
+            self._stop_requested = False
+        try:
+            status = int(
+                self._lib.cdll.vtm_api_generate(
+                    self._handle, prompt, ctypes.c_size_t(len(ids)), callback, None
+                )
             )
-        )
+        finally:
+            # Отмена, пришедшая после возврата C, не должна ждать следующий
+            # запрос: снимаем оставшийся флаг (0185).
+            with self._state:
+                self._running = False
+                late = self._stop_requested
+                self._stop_requested = False
+            if late and self._lib.clear_cancel is not None and self._handle is not None:
+                self._lib.clear_cancel(self._handle)
         if failure:
             # Исключение из колбэка нельзя бросить через C: оно уже остановило
             # генерацию (STOPPED), здесь поднимаем исходное.
@@ -1023,8 +1064,10 @@ class VtmBackend:
         finally:
             if thread.is_alive():
                 # Потребитель ушёл (break/close): не оставляем C-машину работать.
+                # cancel_active, а не cancel: если генерация уже закончилась,
+                # флаг не должен «протечь» в следующий запрос (0185).
                 abort.set()
-                self.cancel()
+                self.cancel_active()
                 thread.join(timeout=5.0)
         if failure:
             raise failure[0]
@@ -1079,6 +1122,33 @@ class VtmBackend:
             context = self._context
         if context is not None and not context.closed:
             context.cancel()
+
+    def cancel_active(self) -> bool:
+        """Отменить только идущую генерацию; ``False`` — отменять нечего.
+
+        Отличие от :meth:`cancel`: флаг в C-ABI живёт до ближайшего
+        ``generate()``, поэтому «поздняя» отмена (сервер прислал её через
+        миллисекунду после конца ответа) отменила бы следующий запрос. Здесь
+        флаг ставится только пока бэкенд занят (``_busy``), а если генерации
+        нет — вызов ничего не делает. Именно этот метод зовёт сервер
+        (``tools/chat_server.py``) при обрыве SSE и «Стопе».
+
+        Потокобезопасен: ``_busy`` читается под тем же замком, под которым его
+        выставляют :meth:`generate_result`/:meth:`stream_ids`.
+        """
+        with self._state:
+            busy = self._busy
+            context = self._context
+        if not busy or context is None or context.closed:
+            return False
+        # Точная проверка «C ещё внутри generate()» — в контексте: окно между
+        # возвратом vtm_api_generate() и снятием _busy иначе оставило бы флаг
+        # следующему запросу.
+        cancel_active = getattr(context, "cancel_active", None)
+        if callable(cancel_active):
+            return bool(cancel_active())
+        context.cancel()
+        return True
 
     # -- клиентский интерфейс (для eva.router) ------------------------------
 

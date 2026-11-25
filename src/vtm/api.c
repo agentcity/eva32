@@ -144,6 +144,15 @@ static int open_fail(const char *fmt, ...) {
     return 0;
 }
 
+// Признак отмены для ядра (0185, vtm_set_cancel): пачка prefill больше не
+// неделима — интерпретатор опрашивает этот callback перед инструкциями
+// пачки, поэтому «стоп» не ждёт конца промпта. Только атомарное чтение:
+// функция зовётся с потока генерации, а пишет флаг любой другой поток.
+static int api_cancel_pred(void *user) {
+    const vtm_api_t *ctx = (const vtm_api_t *)user;
+    return atomic_load_explicit(&ctx->cancel, memory_order_acquire) != 0;
+}
+
 // --- open ------------------------------------------------------------------
 
 vtm_api_t *vtm_api_open(const char *path, const vtm_api_options *opts) {
@@ -234,6 +243,9 @@ vtm_api_t *vtm_api_open(const char *path, const vtm_api_options *opts) {
         free(ctx);
         return NULL;
     }
+    // Отмена доходит до пачки prefill (0185): ядро опрашивает флаг между
+    // инструкциями пачки, а не только между токенами генерации.
+    vtm_set_cancel(ctx->m, api_cancel_pred, ctx);
     // vtm_load() уже применил VTM_BACKEND; явная опция его перекрывает.
     if (backend != NULL) vtm_set_backend(ctx->m, backend);
     return ctx;
@@ -259,7 +271,7 @@ static int api_emit_cb(void *user, int token, int position) {
 }
 
 static int api_cancelled(const vtm_api_t *ctx) {
-    return atomic_load_explicit(&ctx->cancel, memory_order_acquire) != 0;
+    return api_cancel_pred((void *)ctx);
 }
 
 // Выдать cap->token хосту и крутить цикл до лимита/eos/остановки.
@@ -376,6 +388,11 @@ static int api_run(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
             }
             vtm_set_position(m, (int)i);
             st = vtm_run_batch(m, prompt_ids + i, (int)len);
+            if (st == VTM_E_CANCELLED) {
+                // 0185: отмена внутри пачки prefill (ядро опросило флаг перед
+                // инструкцией). Это не сбой: код штатной остановки.
+                return api_stop(ctx, VTM_API_CANCELLED);
+            }
             if (st != VTM_OK) {
                 return api_fail(ctx, (int)st,
                                 "vtm_api_generate: промпт[%zu..%zu): %s: %s",
@@ -480,13 +497,19 @@ static int api_run_cached(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
         st = vtm_run_cached_ex(m, prompt_ids, (int)prefill,
                                ctx->prefill_batch);
     }
+    if (st == VTM_E_CANCELLED) {
+        // 0185: отмена внутри префикса (пачка или поштучный путь). Снимок
+        // кэша при этом не создаётся (cache_store не дошёл), поэтому
+        // следующий запрос пересчитает префикс заново — отравы нет.
+        return api_stop(ctx, VTM_API_CANCELLED);
+    }
     if (st != VTM_OK) {
         return api_fail(ctx, (int)st,
                         "vtm_api_generate: промпт[0..%zu): %s: %s", prefill,
                         vtm_strerror(st), vtm_error_message(m));
     }
-    // Отмена во время префикса приходит уже после прогона (vtm_run_cached()
-    // неделим): проверяем здесь, чтобы не начинать генерацию.
+    // Отмена во время префикса, пришедшая уже после прогона: проверяем
+    // здесь, чтобы не начинать генерацию.
     if (api_cancelled(ctx)) {
         return api_stop(ctx, VTM_API_CANCELLED);
     }
@@ -725,6 +748,16 @@ void vtm_api_cancel(vtm_api_t *ctx) {
     // Только атомарная запись: никаких блокировок, аллокаций и обращений к
     // машине — функция безопасна из любого потока и в любой момент.
     atomic_store_explicit(&ctx->cancel, 1, memory_order_release);
+}
+
+void vtm_api_cancel_clear(vtm_api_t *ctx) {
+    if (ctx == NULL) return;
+    // Добавлено в 0185 для хостов с асинхронной отменой: если «стоп» пришёл
+    // уже после возврата generate(), флаг остался бы и отменил следующий
+    // запуск. Хост знает, что генерации нет (его поток вернулся), и снимает
+    // флаг сам. Гонки с новым generate() быть не должно: вызывающий не
+    // стартует его, пока не снимет флаг.
+    atomic_store_explicit(&ctx->cancel, 0, memory_order_release);
 }
 
 void vtm_api_close(vtm_api_t *ctx) {

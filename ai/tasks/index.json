@@ -1234,7 +1234,7 @@
   {
     "id": "0185",
     "title": "Отмена генерации в C-рантайме",
-    "status": "in_progress",
+    "status": "done",
     "file": "0185-cancel-propagation.md",
     "assignee": "agent:cancel"
   },
