@@ -2226,6 +2226,7 @@ PAGE_HTML = """<!doctype html>
   .check.tts { font-size: 12px; gap: 5px; white-space: nowrap; }
   .check.tts input { width: 14px; height: 14px; }
   .tts-note { color: var(--danger); font-size: 11.5px; }
+  .tts-note.clickable { cursor: pointer; text-decoration: underline dotted; }
   .tts-note:empty { display: none; }
   button {
     border: 0; border-radius: 9px; padding: 10px 20px; font: inherit;
@@ -2782,6 +2783,41 @@ PAGE_HTML = """<!doctype html>
     }
   }
 
+  // Политика автоплея разрешает звук только после жеста пользователя.
+  // Проигрываем беззвучный WAV на том же <audio> — элемент «разблокирован»,
+  // и следующие фразы играют уже с голосом.
+  var SILENT_WAV = "data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA=";
+
+  function unlockSpeech() {
+    var audio = ttsAudio();
+    audio.muted = true;
+    audio.src = SILENT_WAV;
+    var started = null;
+    try { started = audio.play(); } catch (ignored) { started = null; }
+    var done = function () {
+      audio.muted = false;
+      var note = byId("tts-note-0");
+      if (note) { note.textContent = ""; note.onclick = null; note.classList.remove("clickable"); }
+      var note1 = byId("tts-note-1");
+      if (note1) { note1.textContent = ""; note1.onclick = null; note1.classList.remove("clickable"); }
+      tts.available = true;
+      pumpSpeech();
+    };
+    if (started && typeof started.then === "function") {
+      started.then(done, function () { audio.muted = false; });
+    } else {
+      setTimeout(done, 50);
+    }
+  }
+
+  function showUnlockNote(side) {
+    var note = byId("tts-note-" + side);
+    if (!note) { return; }
+    note.textContent = "нажмите, чтобы включить звук";
+    note.classList.add("clickable");
+    note.onclick = function () { note.onclick = null; unlockSpeech(); };
+  }
+
   function pumpSpeech() {
     if (tts.playing) { return; }
     var job = tts.queue.shift();
@@ -2810,17 +2846,30 @@ PAGE_HTML = """<!doctype html>
       try { started = audio.play(); } catch (ignored) { started = null; }
       if (started && typeof started.catch === "function") {
         started.catch(function () {
-          // Автоплей запрещён политикой браузера: текст ответа это не
-          // задерживает, просто звука нет до следующего включения.
-          if (job.generation !== tts.generation) { return; }
+          // Автоплей запрещён политикой браузера. Не выключаем голос насовсем:
+          // возвращаем фразу в голову очереди и просим один клик — он и есть
+          // «жест пользователя», после которого звук разрешён.
+          if (job.generation !== tts.generation) {
+            if (url) { try { URL.revokeObjectURL(url); } catch (ignored) { /* уже */ } }
+            return;
+          }
           releaseSpeech();
-          setVoiceNote(job.side, "браузер не дал включить звук");
-          tts.available = false;
-          tts.queue = [];
+          tts.queue.unshift(job);
+          showUnlockNote(job.side);
         });
       }
     });
   }
+
+  // Любой клик по «озвучивать» — жест, разрешающий звук: сразу разблокируем.
+  [0, 1].forEach(function (side) {
+    var box = byId("tts-" + side);
+    if (box) { box.addEventListener("change", function () { if (this.checked) { unlockSpeech(); } }); }
+  });
+  (function () {
+    var ask = byId("ask");
+    if (ask) { ask.addEventListener("click", function () { unlockSpeech(); }, { once: false }); }
+  })();
 
   function enqueueSpeech(side, phrase) {
     if (!ttsEnabled(side)) { return; }
