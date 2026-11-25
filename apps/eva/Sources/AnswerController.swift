@@ -21,6 +21,10 @@ final class AnswerController {
     var onStatus: ((String, Bool) -> Void)?
     var onAnswer: ((String, String) -> Void)?
     var onSpeakingChanged: ((Bool) -> Void)?
+    /// Громкость озвучки 0…1 — для большого круга.
+    var onLevel: ((Float) -> Void)?
+    /// Поток ответа закончился (успешно или с ошибкой): круг перестаёт «думать».
+    var onFinished: (() -> Void)?
 
     init() {
         voice.onIssue = { [weak self] message in
@@ -28,6 +32,9 @@ final class AnswerController {
         }
         voice.onSpeakingChanged = { [weak self] speaking in
             self?.onSpeakingChanged?(speaking)
+        }
+        voice.onLevel = { [weak self] level in
+            self?.onLevel?(level)
         }
     }
 
@@ -84,6 +91,7 @@ final class AnswerController {
                     + "\(self.filter.visible.count), размышления "
                     + "\(self.filter.thinking.count)")
                 log("ответ: \(self.filter.visible.prefix(400))")
+                self.onFinished?()
                 self.finishStatus()
             }
         }

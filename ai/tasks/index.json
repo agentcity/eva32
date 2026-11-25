@@ -1241,14 +1241,14 @@
   {
     "id": "0186",
     "title": "Большой круг Евы: волна/думаю/говорю",
-    "status": "in_progress",
+    "status": "done",
     "file": "0186-eva-circle-visual.md",
     "assignee": "agent:eva-circle"
   },
   {
     "id": "0187",
     "title": "Wake-word «Привет, Ева»",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0187-wake-word.md",
     "assignee": "agent:wake-word"
   }

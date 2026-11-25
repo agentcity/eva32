@@ -19,6 +19,9 @@ final class SpeechRecorder {
     var onPartial: ((String) -> Void)?
     var onFinal: ((String) -> Void)?
     var onError: ((String) -> Void)?
+    /// Уровень микрофона 0…1 для большого круга. Обновляется с главного
+    /// актора 30 раз в секунду, а RMS считается в аудио-тапе (см. `LevelMeter`).
+    var onLevel: ((Float) -> Void)?
 
     private var generation = 0
     private var engine: AVAudioEngine?
@@ -29,6 +32,18 @@ final class SpeechRecorder {
     private var lastText = ""
     private var delivered = true
     private var timeout: Task<Void, Never>?
+    /// RMS, посчитанный в realtime-тапе, и тикер, который читает его на
+    /// главном акторе. Сам тап @MainActor-состояние не захватывает.
+    private var levelMeter: LevelMeter?
+    private var levelPump: Task<Void, Never>?
+    /// Авто-стоп по тишине: не заставляем пользователя жать ⌥Space второй раз.
+    private var silence: Task<Void, Never>?
+    /// Сколько секунд тишины терпим, если уже есть распознанный текст.
+    private let silenceLimit: Double = 2.2
+    /// Пока ни одного слова не расслышано — ждём дольше, но не бесконечно.
+    private let silenceWarmup: Double = 6.0
+    /// Когда последний раз приходил текст (или началась запись).
+    private var lastVoiceAt = Date()
 
     /// Дольше минуты не слушаем: забытый микрофон — это и батарея, и приватность.
     private let maxDuration: UInt64 = 60
@@ -128,10 +143,23 @@ final class SpeechRecorder {
         // Тап на родном формате микрофона: Apple Speech сам приводит звук
         // к 16 кГц внутри распознавателя, внешний конвертер только добавил бы
         // точку отказа.
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in
-            request.append(buffer)
+        // Колбэк тапа AVAudioEngine приходит на realtime-очереди аудио, а НЕ на
+        // главном акторе. Замыкание внутри @MainActor-класса Swift 6 считает
+        // изолированным и роняет процесс через dispatch_assert_queue — поэтому
+        // оно объявлено @Sendable и работает только с захваченным request.
+        // Класс-обёртка: замыкание тапа не должно захватывать @MainActor-состояние,
+        // а SFSpeechAudioBufferRecognitionRequest не Sendable — передаём его через
+        // неизолированный контейнер (append потокобезопасен). Туда же кладём
+        // RMS для круга: 2048 кадров ≈ 43 мс при 48 кГц, реакция <100 мс.
+        let meter = LevelMeter()
+        let sinkBox = RequestSink(request: request, meter: meter)
+        let sink: @Sendable (AVAudioPCMBuffer, AVAudioTime) -> Void = { buffer, _ in
+            sinkBox.append(buffer)
         }
+        input.installTap(onBus: 0, bufferSize: 2048, format: format, block: sink)
         tapInstalled = true
+        lastVoiceAt = Date()
+        startSilenceWatch()
         engine.prepare()
         do {
             try engine.start()
@@ -142,6 +170,8 @@ final class SpeechRecorder {
         }
         self.engine = engine
         self.request = request
+        self.levelMeter = meter
+        startLevelPump(run: run, meter: meter)
         log("речь: микрофон \(Int(format.sampleRate)) Гц, каналов \(format.channelCount), on-device")
 
         self.task = recognizer.recognitionTask(with: request) { [weak self] result, error in
@@ -160,6 +190,7 @@ final class SpeechRecorder {
         guard run == generation, isRecording else { return }
         if !text.isEmpty {
             lastText = text
+            lastVoiceAt = Date()
             onPartial?(text)
         }
         if let error {
@@ -172,6 +203,40 @@ final class SpeechRecorder {
         }
     }
 
+    /// Тикер для круга: читает RMS из неизолированной обёртки и отдаёт его на
+    /// главном акторе. 30 Гц достаточно для плавной волны и не грузит CPU.
+    private func startLevelPump(run: Int, meter: LevelMeter) {
+        levelPump?.cancel()
+        levelPump = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.generation == run, self.isRecording else { return }
+                self.onLevel?(meter.displayLevel)
+                try? await Task.sleep(nanoseconds: 33_000_000)
+            }
+        }
+    }
+
+    /// Сторож тишины: если человек замолчал, сами заканчиваем запись и отдаём
+    /// текст. Без него «слушаю» висело вечно — пользователь ждал, что Ева
+    /// остановится сама, и не понимал, нужно ли жать ⌥Space ещё раз.
+    private func startSilenceWatch() {
+        silence?.cancel()
+        silence = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard let self, self.isRecording else { return }
+                let idle = Date().timeIntervalSince(self.lastVoiceAt)
+                let hasText = !self.lastText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                let limit = hasText ? self.silenceLimit : self.silenceWarmup
+                if idle >= limit {
+                    log("речь: тишина \(String(format: "%.1f", idle)) с — заканчиваю сам")
+                    self.finish(error: nil)
+                    return
+                }
+            }
+        }
+    }
+
     // MARK: - Завершение
 
     private func finish(error: String?) {
@@ -180,6 +245,8 @@ final class SpeechRecorder {
         generation += 1
         timeout?.cancel()
         timeout = nil
+        silence?.cancel()
+        silence = nil
         teardown()
         onState?(false)
 
@@ -201,6 +268,8 @@ final class SpeechRecorder {
         generation += 1
         timeout?.cancel()
         timeout = nil
+        silence?.cancel()
+        silence = nil
         teardown()
         onState?(false)
         delivered = true
@@ -215,6 +284,10 @@ final class SpeechRecorder {
                 engine.inputNode.removeTap(onBus: 0)
             }
         }
+        levelPump?.cancel()
+        levelPump = nil
+        levelMeter = nil
+        onLevel?(0)
         request?.endAudio()
         task?.cancel()
         engine = nil
@@ -226,12 +299,80 @@ final class SpeechRecorder {
 
     // MARK: - Права
 
-    @MainActor
+    /// Запрос прав на распознавание. Обязательно **nonisolated**: колбэк TCC
+    /// приходит на своей очереди, а замыкание внутри @MainActor-функции Swift 6
+    /// считает изолированным и падает с dispatch_assert_queue (SIGTRAP) — именно
+    /// это случилось при первом ⌥Space после выдачи разрешения.
+    nonisolated
     private static func requestSpeechAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
-        await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
+        await withCheckedContinuation { (continuation: CheckedContinuation<SFSpeechRecognizerAuthorizationStatus, Never>) in
+            let handler: @Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void = { status in
                 continuation.resume(returning: status)
             }
+            SFSpeechRecognizer.requestAuthorization(handler)
         }
+    }
+}
+
+/// Неизолированная обёртка над запросом распознавания: нужна, чтобы колбэк
+/// аудио-тапа (realtime-очередь, @Sendable) мог складывать буферы, не хватая
+/// @MainActor-состояние SpeechRecorder. `append` у SFSpeechAudioBufferRecognitionRequest
+/// безопасен при вызове из одного потока записи.
+final class RequestSink: @unchecked Sendable {
+    private let request: SFSpeechAudioBufferRecognitionRequest
+    private let meter: LevelMeter?
+
+    init(request: SFSpeechAudioBufferRecognitionRequest, meter: LevelMeter? = nil) {
+        self.request = request
+        self.meter = meter
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {
+        request.append(buffer)
+        meter?.update(buffer)
+    }
+}
+
+/// RMS последнего аудио-буфера. Живёт между realtime-тапом и главным актором:
+/// тап пишет под коротким замком, тикер круга читает. `@unchecked Sendable`
+/// честен: всё изменяемое состояние защищено замком, а буфер наружу не отдаётся.
+final class LevelMeter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rms: Float = 0
+
+    func update(_ buffer: AVAudioPCMBuffer) {
+        let value = LevelMeter.rms(of: buffer)
+        lock.lock()
+        rms = value
+        lock.unlock()
+    }
+
+    /// Нормированный 0…1 уровень: −50 дБ — тишина, 0 дБ — громко.
+    /// Обычная речь даёт примерно 0,4–0,8, поэтому волна заметна сразу.
+    var displayLevel: Float {
+        lock.lock()
+        let value = rms
+        lock.unlock()
+        let db = 20 * log10f(max(value, 0.000001))
+        return min(max((db + 50) / 50, 0), 1)
+    }
+
+    private static func rms(of buffer: AVAudioPCMBuffer) -> Float {
+        guard let channels = buffer.floatChannelData,
+              buffer.frameLength > 0
+        else {
+            return 0
+        }
+        let frames = Int(buffer.frameLength)
+        let channelCount = max(Int(buffer.format.channelCount), 1)
+        var sum: Float = 0
+        for channel in 0..<channelCount {
+            let samples = channels[channel]
+            for index in 0..<frames {
+                let sample = samples[index]
+                sum += sample * sample
+            }
+        }
+        return sqrtf(sum / Float(frames * channelCount))
     }
 }

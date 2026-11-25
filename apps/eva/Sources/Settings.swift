@@ -58,6 +58,8 @@ final class Settings {
     static let voiceKey = "eva.voice"
     static let speakKey = "eva.speakReplies"
     static let maxTokensKey = "eva.maxTokens"
+    /// Галочка «Анимация»: без неё большой круг статичен (слабые машины).
+    static let animateCircleKey = "eva.animateCircle"
 
     static let defaultServer = "http://127.0.0.1:8765"
     static let defaultMaxTokens = 256
@@ -75,6 +77,7 @@ final class Settings {
             Settings.voiceKey: VoicePresets.defaultID,
             Settings.speakKey: true,
             Settings.maxTokensKey: Settings.defaultMaxTokens,
+            Settings.animateCircleKey: true,
         ])
     }
 
@@ -104,6 +107,13 @@ final class Settings {
             return value > 0 ? value : Settings.defaultMaxTokens
         }
         set { store(Settings.maxTokensKey, newValue) }
+    }
+
+    /// Анимация большого круга. Выключение экономит CPU на слабых машинах:
+    /// круг остаётся, но не дышит, не вращается и не повторяет волну.
+    var animateCircle: Bool {
+        get { defaults.bool(forKey: Settings.animateCircleKey) }
+        set { store(Settings.animateCircleKey, newValue) }
     }
 
     /// Нормализованный базовый URL сервера без хвостового слэша.

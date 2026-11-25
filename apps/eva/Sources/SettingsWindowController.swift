@@ -9,6 +9,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var modelPopup: NSPopUpButton!
     private var voicePopup: NSPopUpButton!
     private var speakCheck: NSButton!
+    private var animateCheck: NSButton!
     private var statusLabel: NSTextField!
 
     /// Список моделей, полученный от сервера; текущая настройка добавляется
@@ -79,6 +80,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         )
         speakCheck.controlSize = .small
 
+        animateCheck = NSButton(
+            checkboxWithTitle: "Анимация круга (меньше CPU)",
+            target: self,
+            action: #selector(animateChanged)
+        )
+        animateCheck.controlSize = .small
+
         let hint = NSTextField(
             wrappingLabelWithString: "Модель и голос берутся у сервера. "
                 + "Если список моделей пуст — сервер выключен, но адрес и голос "
@@ -112,6 +120,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             row("Модель", modelRow),
             row("Голос", voicePopup),
             row("", speakCheck),
+            row("", animateCheck),
             hint,
             statusLabel,
             buttons,
@@ -154,6 +163,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         guard serverField != nil else { return }
         serverField.stringValue = Settings.shared.serverText
         speakCheck.state = Settings.shared.speakReplies ? .on : .off
+        animateCheck.state = Settings.shared.animateCircle ? .on : .off
         let voiceID = Settings.shared.voice
         if let index = VoicePresets.all.firstIndex(where: { $0.id == voiceID }) {
             voicePopup.selectItem(at: index)
@@ -264,10 +274,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             Settings.shared.voice = VoicePresets.all[voiceIndex].id
         }
         Settings.shared.speakReplies = speakCheck.state == .on
+        Settings.shared.animateCircle = animateCheck.state == .on
         statusLabel.stringValue = "сохранено"
         statusLabel.textColor = .secondaryLabelColor
         log("настройки: сервер=\(base.absoluteString) модель=\(Settings.shared.model.storageValue) "
-            + "голос=\(Settings.shared.voice) озвучка=\(Settings.shared.speakReplies)")
+            + "голос=\(Settings.shared.voice) озвучка=\(Settings.shared.speakReplies) "
+            + "анимация=\(Settings.shared.animateCircle)")
     }
 
     @objc private func check() {
@@ -313,5 +325,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     @objc private func speakChanged() {
         Settings.shared.speakReplies = speakCheck.state == .on
+    }
+
+    /// Галочка применяется сразу: круг в главном окне перестаёт анимироваться
+    /// без перезапуска (главное окно слушает `Settings.didChange`).
+    @objc private func animateChanged() {
+        Settings.shared.animateCircle = animateCheck.state == .on
+        log("настройки: анимация круга=\(Settings.shared.animateCircle ? "включена" : "выключена")")
     }
 }

@@ -24,6 +24,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isSpeaking = false
     private var isTerminating = false
 
+    // Большой круг: одно место, где решается, что он показывает. Флаги
+    // обновляют `wireRecorder`/`wireAnswer`/`ask`, а `refreshVisualState`
+    // выбирает состояние по приоритету и пишет переходы в журнал.
+    private var visualState: EvaCircleState = .idle
+    private var awaitingFirstToken = false
+    /// Текст уже пошёл, но первый звук ещё синтезируется: круг остаётся
+    /// «думаю», чтобы не мигать idle между первым токеном и озвучкой.
+    private var awaitingAudio = false
+    private var errorActive = false
+    private var errorToken = 0
+
     // MARK: - Запуск
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -45,14 +56,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let model = Settings.shared.model.storageValue
         let voice = Settings.shared.voice
         let speak = Settings.shared.speakReplies
-        log("настройки: сервер=\(server) модель=\(model) голос=\(voice) озвучка=\(speak)")
+        let animate = Settings.shared.animateCircle
+        log("настройки: сервер=\(server) модель=\(model) голос=\(voice) озвучка=\(speak) "
+            + "анимация=\(animate)")
 
         startRequestedQuestionIfAny()
+        // Показываем окно при обычном запуске: без иконки в доке (accessory)
+        // пользователь иначе не понимает, что приложение вообще открылось.
+        // Флаг --background оставляет только статус-бар (автозапуск/агент).
+        if !CommandLine.arguments.contains("--background") {
+            window.showAndFocusInput()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         log("выход")
         isTerminating = true
+        window.stopCircleAnimation()
         recorder.stop()
         answer.stop()
         if let hotKeyRef {
@@ -245,11 +265,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.onState = { [weak self] recording in
             guard let self else { return }
             self.isRecording = recording
+            if recording {
+                // Новое прослушивание отменяет затухающую ошибку: человек уже
+                // действует, красная вспышка не должна перекрывать микрофон.
+                self.clearVisualError()
+                self.awaitingFirstToken = false
+                self.awaitingAudio = false
+            } else {
+                self.window.setCircleLevel(0)
+            }
             self.listenItem?.title = recording
                 ? "Остановить (⌥Space)"
                 : "Слушать (⌥Space)"
             self.window.setStatus(recording ? "слушаю…" : "готово", isError: false)
             self.updateStatusIcon()
+            self.refreshVisualState(recording ? "микрофон включён" : "микрофон выключен")
+        }
+        recorder.onLevel = { [weak self] level in
+            self?.window.setCircleLevel(CGFloat(level))
         }
         recorder.onPartial = { [weak self] text in
             self?.window.showPartial(text)
@@ -263,6 +296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.window.setStatus("речь: \(message)", isError: true)
             self.window.showPartial("")
+            self.showVisualError(message)
         }
     }
 
@@ -284,15 +318,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func wireAnswer() {
         answer.onStatus = { [weak self] text, isError in
-            self?.window.setStatus(text, isError: isError)
+            guard let self else { return }
+            self.window.setStatus(text, isError: isError)
+            if isError { self.showVisualError(text) }
         }
         answer.onAnswer = { [weak self] visible, thinking in
-            self?.window.updateAnswer(visible: visible, thinking: thinking)
+            guard let self else { return }
+            self.window.updateAnswer(visible: visible, thinking: thinking)
+            // «Думаю» живёт до первого видимого токена, а если включена
+            // озвучка — до первого звука (TTS может думать ещё пару сотен мс).
+            if self.awaitingFirstToken, !visible.isEmpty {
+                self.awaitingFirstToken = false
+                self.awaitingAudio = self.expectsVoice && !self.isSpeaking
+                self.refreshVisualState("первый видимый текст")
+            }
+        }
+        answer.onFinished = { [weak self] in
+            guard let self else { return }
+            self.awaitingFirstToken = false
+            if self.isSpeaking || !self.expectsVoice {
+                self.awaitingAudio = false
+            }
+            self.refreshVisualState("ответ завершён")
         }
         answer.onSpeakingChanged = { [weak self] speaking in
             guard let self else { return }
             self.isSpeaking = speaking
+            if speaking {
+                self.awaitingFirstToken = false
+                self.awaitingAudio = false
+            }
             self.updateStatusIcon()
+            self.refreshVisualState(speaking ? "озвучка пошла" : "озвучка кончилась")
+        }
+        answer.onLevel = { [weak self] level in
+            self?.window.setCircleLevel(CGFloat(level))
         }
     }
 
@@ -305,6 +365,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.recorder.stop()
             self.answer.stop()
             self.isSpeaking = false
+            self.awaitingFirstToken = false
+            self.awaitingAudio = false
+            self.clearVisualError()
+            self.window.setCircleLevel(0)
+            self.refreshVisualState("стоп по кнопке")
             self.updateStatusIcon()
             log("стоп по кнопке")
         }
@@ -338,10 +403,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !trimmed.isEmpty else { return }
         guard let server = effectiveServerURL else {
             window.show()
-            window.setStatus(
-                "адрес сервера непонятен: \(Settings.shared.serverText) — откройте настройки",
-                isError: true
-            )
+            let message = "адрес сервера непонятен: \(Settings.shared.serverText) — откройте настройки"
+            window.setStatus(message, isError: true)
+            showVisualError(message)
             return
         }
         let config = ChatConfig(
@@ -354,6 +418,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.beginAnswer()
         log("вопрос (\"\(trimmed.prefix(120))\"): модель=\(config.model.storageValue) "
             + "сервер=\(server.absoluteString)")
+        // «Думаю» — с этого момента до первого видимого текста. Ставим флаг
+        // до `answer.ask`: старый поток может синхронно прислать «озвучка
+        // кончилась», и это не должно вернуть круг в idle.
+        awaitingFirstToken = true
+        awaitingAudio = false
+        clearVisualError()
+        refreshVisualState("вопрос ушёл")
         answer.ask(
             trimmed,
             config: config,
@@ -389,6 +460,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func quit() {
         log("выход из меню")
         NSApp.terminate(nil)
+    }
+
+    // MARK: - Большой круг
+
+    /// Приоритет: ошибка → микрофон → ожидание первого токена → озвучка →
+    /// покой. Причина попадает в журнал, чтобы по `eva.log` был виден весь
+    /// сценарий: `круг: idle → listening — микрофон включён`.
+    private func refreshVisualState(_ reason: String) {
+        let next: EvaCircleState
+        if errorActive {
+            next = .error
+        } else if isRecording {
+            next = .listening
+        } else if awaitingFirstToken || awaitingAudio {
+            next = .thinking
+        } else if isSpeaking {
+            next = .speaking
+        } else {
+            next = .idle
+        }
+        applyVisualState(next, reason: reason)
+    }
+
+    private func applyVisualState(_ next: EvaCircleState, reason: String) {
+        guard next != visualState else { return }
+        log("круг: \(visualState.rawValue) → \(next.rawValue) — \(reason)")
+        visualState = next
+        window.setVisualState(next)
+    }
+
+    /// Красная вспышка ~1,2 с, потом круг возвращается к настоящему состоянию.
+    /// Токен защищает от запоздавшего сброса прошлой ошибки.
+    private func showVisualError(_ message: String) {
+        errorActive = true
+        errorToken += 1
+        let token = errorToken
+        awaitingFirstToken = false
+        awaitingAudio = false
+        window.setVisualError(message)
+        // В статусе ошибка уже с префиксом «ошибка:», в журнале префикс не
+        // дублируем — состояние и так названо.
+        let prefix = "ошибка: "
+        let reason = message.hasPrefix(prefix)
+            ? String(message.dropFirst(prefix.count))
+            : message
+        applyVisualState(.error, reason: "\(reason.prefix(120))")
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard let self, self.errorToken == token else { return }
+            self.errorActive = false
+            self.refreshVisualState("вспышка ошибки прошла")
+        }
+    }
+
+    private func clearVisualError() {
+        errorActive = false
+        errorToken += 1
+    }
+
+    /// Озвучка включена в настройках и не выключена флагом `--no-voice`.
+    private var expectsVoice: Bool {
+        Settings.shared.speakReplies && !Launch.noVoice
     }
 
     // MARK: - Автозапуск запроса из аргументов (`--ask`)

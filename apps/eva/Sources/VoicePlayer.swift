@@ -18,12 +18,15 @@ final class VoicePlayer {
     private var pendingWav: [Data] = []
     private var synthesis: Task<Void, Never>?
     private var player: AVAudioPlayer?
+    private var meterTimer: Timer?
     private var generation = 0
     private var warnedUnavailable = false
 
     /// Куда сообщать, почему голос молчит (сервер не отвечает, `/api/tts` 503).
     var onIssue: ((String) -> Void)?
     var onSpeakingChanged: ((Bool) -> Void)?
+    /// Громкость текущей фразы 0…1 для большого круга (30 Гц, metering плеера).
+    var onLevel: ((Float) -> Void)?
 
     func configure(server: URL?, voice id: String) {
         self.server = server
@@ -47,6 +50,7 @@ final class VoicePlayer {
         synthesis = nil
         texts.removeAll()
         pendingWav.removeAll()
+        stopMetering()
         player?.stop()
         player = nil
         onSpeakingChanged?(false)
@@ -129,17 +133,53 @@ final class VoicePlayer {
         let wav = pendingWav.removeFirst()
         do {
             let audio = try AVAudioPlayer(data: wav)
+            audio.isMeteringEnabled = true
             audio.prepareToPlay()
             player = audio
             let started = audio.play()
             log("озвучка: играю \(wav.count) байт, старт=\(started)")
             onSpeakingChanged?(true)
+            startMetering()
             watchPlayback(generation: generation)
         } catch {
             player = nil
             report("не удалось проиграть WAV: \(error.localizedDescription)")
             playNextIfIdle()
         }
+    }
+
+    // MARK: - Уровень для круга
+
+    /// `AVAudioPlayer` умеет metering сам: раз в тик обновляем замеры и отдаём
+    /// нормированную громкость. 30 Гц — столько же, сколько рисует круг.
+    private func startMetering() {
+        meterTimer?.invalidate()
+        let timer = Timer(
+            timeInterval: 1.0 / 30.0,
+            target: self,
+            selector: #selector(meterTick),
+            userInfo: nil,
+            repeats: true
+        )
+        timer.tolerance = 1.0 / 150.0
+        RunLoop.main.add(timer, forMode: .common)
+        meterTimer = timer
+    }
+
+    private func stopMetering() {
+        meterTimer?.invalidate()
+        meterTimer = nil
+        onLevel?(0)
+    }
+
+    @objc private func meterTick() {
+        guard let player, player.isPlaying else {
+            stopMetering()
+            return
+        }
+        player.updateMeters()
+        let db = player.averagePower(forChannel: 0)
+        onLevel?(min(max((db + 50) / 50, 0), 1))
     }
 
     /// Опрос `isPlaying` вместо делегата: так `AVAudioPlayer` не пересекает
@@ -153,6 +193,7 @@ final class VoicePlayer {
                 return
             }
             if self.player != nil {
+                self.stopMetering()
                 self.player = nil
                 self.onSpeakingChanged?(false)
                 self.playNextIfIdle()

@@ -5,6 +5,7 @@ import AppKit
 @MainActor
 final class MainWindowController: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
+    private var circleView: CircleView?
     private var answerView: NSTextView!
     private var answerScroll: NSScrollView!
     private var thinkView: NSTextView!
@@ -80,11 +81,33 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         statusLabel?.textColor = isError ? .systemRed : .secondaryLabelColor
     }
 
+    // MARK: - Большой круг
+
+    /// Смена визуального состояния (AppDelegate уже залогировал переход).
+    func setVisualState(_ state: EvaCircleState) {
+        circleView?.visualState = state
+    }
+
+    /// Уровень микрофона или озвучки, 0…1.
+    func setCircleLevel(_ level: CGFloat) {
+        circleView?.setLevel(level)
+    }
+
+    /// Красная вспышка с текстом ошибки (полный текст — в статусе шапки).
+    func setVisualError(_ message: String) {
+        circleView?.showError(message)
+    }
+
+    /// При закрытии приложения/окна не оставляем тикающий таймер.
+    func stopCircleAnimation() {
+        circleView?.stopAnimation()
+    }
+
     // MARK: - Сборка окна
 
     private func build() {
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 580, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: 580, height: 560),
             styleMask: [.titled, .closable, .resizable, .utilityWindow],
             backing: .buffered,
             defer: false
@@ -94,7 +117,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.delegate = self
-        panel.contentMinSize = NSSize(width: 460, height: 400)
+        panel.contentMinSize = NSSize(width: 460, height: 460)
         panel.setFrameAutosaveName("EVA.mainWindow")
         panel.center()
         self.panel = panel
@@ -114,6 +137,12 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         header.orientation = .horizontal
         header.spacing = 8
         header.distribution = .fill
+
+        // Новый верхний блок: большой круг состояния. Высота — доля ширины
+        // окна (круг масштабируется), но не больше 240 pt и не меньше 110 pt.
+        let circle = CircleView(frame: .zero)
+        circle.animationEnabled = Settings.shared.animateCircle
+        circleView = circle
 
         transcriptLabel = NSTextField(wrappingLabelWithString: "")
         transcriptLabel.font = .systemFont(ofSize: 14)
@@ -244,19 +273,27 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         inputRow.distribution = .fill
 
         let stack = NSStackView(views: [
-            header, transcriptLabel, answerScroll, thinkBox, controls, inputRow,
+            header, circle, transcriptLabel, answerScroll, thinkBox, controls, inputRow,
         ])
         stack.orientation = .vertical
         stack.alignment = .width
         stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(stack)
+        let circleHeight = circle.heightAnchor.constraint(
+            equalTo: content.widthAnchor,
+            multiplier: 0.28
+        )
+        circleHeight.priority = .defaultHigh
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -14),
-            answerScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 180),
+            circle.heightAnchor.constraint(lessThanOrEqualToConstant: 240),
+            circle.heightAnchor.constraint(greaterThanOrEqualToConstant: 110),
+            circleHeight,
+            answerScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
             transcriptLabel.heightAnchor.constraint(equalToConstant: 44),
         ])
     }
@@ -313,6 +350,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     func reloadFromSettings() {
         speakCheck?.state = Settings.shared.speakReplies ? .on : .off
+        circleView?.animationEnabled = Settings.shared.animateCircle
         selectVoice(Settings.shared.voice)
     }
 
