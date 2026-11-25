@@ -2162,6 +2162,12 @@ PAGE_HTML = """<!doctype html>
     <textarea id="question" rows="3" placeholder="Например: напиши заголовок для поста о весенней скидке на стрижку"></textarea>
     <div class="controls">
       <label class="check"><input type="checkbox" id="use-system" checked> системный промпт EVA32</label>
+      <label class="field inline" for="mode">режим
+        <select id="mode">
+          <option value="fast">быстро — 3B (слово за 0,25 с)</option>
+          <option value="smart">умно — 30B MoE (слово за 1 с)</option>
+        </select>
+      </label>
       <button id="ask" type="button">Спросить</button>
       <span id="status" role="status"></span>
     </div>
@@ -3095,6 +3101,34 @@ PAGE_HTML = """<!doctype html>
   window.addEventListener("scroll", function () {
     stickToBottom = isNearStreamEnd();
   }, { passive: true });
+
+  // Режим «быстро/умно»: переключает ВТМ-колонки между 3B и 30B.
+  // Не трогает Ollama-колонку — сравнение с ней остаётся на месте.
+  var MODE_MODELS = {
+    fast: "runs/q4/3b-q4k.vtm",
+    smart: "runs/q4/qwen3-30b-a3b.vtm"
+  };
+
+  function applyMode(mode) {
+    var target = MODE_MODELS[mode];
+    if (!target) { return; }
+    [0, 1].forEach(function (side) {
+      if (byId("backend-" + side).value !== "vtm") { return; }
+      var select = byId("model-" + side);
+      for (var i = 0; i < select.options.length; i += 1) {
+        if (select.options[i].value === target) {
+          select.value = target;
+          break;
+        }
+      }
+    });
+    refreshModels();
+    setStatus("режим: " + (mode === "fast" ? "быстро (3B)" : "умно (30B MoE)"), false);
+  }
+
+  byId("mode").addEventListener("change", function () {
+    applyMode(this.value);
+  });
 
   loadCatalog();
   refreshSystem();
