@@ -1160,5 +1160,12 @@
     "status": "done",
     "file": "0174-stream-import.md",
     "assignee": "agent:stream-import"
+  },
+  {
+    "id": "0175",
+    "title": "Эксперты через pread в кэш",
+    "status": "in_progress",
+    "file": "0175-moe-pread-cache.md",
+    "assignee": "agent:moe-pread"
   }
 ]
