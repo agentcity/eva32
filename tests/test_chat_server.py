@@ -2621,12 +2621,13 @@ class TestTtsPage(ServerTestCase):
         # Web Audio, а не <audio>: автоплей блокировал play() после fetch, а
         # AudioContext разблокируется один раз в жесте пользователя. Один
         # источник звука на страницу — фразы играют последовательно.
-        # Основной путь — Web Audio; <audio> допустим только как запасной,
-        # поэтому он не должен быть создан заранее/на странице.
-        self.assertEqual(page.count("new Audio("), 1, "ожидался только запасной <audio>")
-        self.assertIn("fallback", page)
+        # Только Web Audio и только Blob: <audio> и blob-URL'ы убраны совсем.
+        # fetch(blob:) запрещён CSP connect-src 'self' — из-за этого звук и не шёл.
+        self.assertEqual(page.count("new Audio("), 0, "элемент <audio> больше не нужен")
+        self.assertEqual(page.count("createObjectURL"), 0, "blob-URL в чате не используются")
         self.assertIn("AudioContext", page)
-        self.assertEqual(page.count("decodeAudioData"), 1, "ожидался один декодер")
+        # Декодер вызывается из playSpeech и из лога шагов — оба в одном месте.
+        self.assertGreaterEqual(page.count("decodeAudioData"), 1, "нет декодера")
         self.assertIn('byId("stop").addEventListener("click", stopAll)', page)
 
     def test_new_question_and_stop_clear_speech(self):

@@ -2192,6 +2192,39 @@ async function main() {
   }
 }
 main();
+
+// Вариант B — ровно путь чата: blob → createObjectURL → fetch(url) → arrayBuffer
+// → decodeAudioData. Нужен, чтобы отличать проблему страницы чата от сервера.
+async function variantB() {
+  log("--- вариант B (как в чате)");
+  try {
+    var ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await ctx.resume();
+    var resp = await fetch("/api/tts", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({text: "Звук включён. Я Ева, слушайте ответы."})
+    });
+    log("B http: " + resp.status);
+    var blob = await resp.blob();
+    log("B blob: " + blob.size + " б, тип " + blob.type);
+    var url = URL.createObjectURL(blob);
+    var again = await fetch(url);
+    log("B повторный fetch: " + again.status);
+    var buf = await again.arrayBuffer();
+    log("B arraybuffer: " + buf.byteLength);
+    var decoded = await new Promise(function (res, rej) { ctx.decodeAudioData(buf, res, rej); });
+    log("B decoded: " + decoded.duration.toFixed(2) + " с");
+    var src = ctx.createBufferSource();
+    src.buffer = decoded;
+    src.connect(ctx.destination);
+    src.start(0);
+    log("B РЕЗУЛЬТАТ: играет");
+  } catch (e) {
+    log("B ОШИБКА: " + (e && (e.name || e.message) ? (e.name + ": " + e.message) : e));
+  }
+}
+variantB();
 </script>
 """
 
@@ -2568,6 +2601,7 @@ PAGE_HTML = """<!doctype html>
       (~3 символа на токен): бюджет и число реплик задаёт сервер
       (--history-tokens/--history-turns), «Новый диалог» её очищает.</p>
   </section>
+<pre id="selfout" style="display:none"></pre>
 </main>
 <script>
 (function () {
@@ -2809,9 +2843,6 @@ PAGE_HTML = """<!doctype html>
       try { tts.source.stop(); } catch (ignored) { /* уже */ }
       tts.source = null;
     }
-    if (tts.current && tts.current.url) {
-      try { URL.revokeObjectURL(tts.current.url); } catch (ignored) { /* уже */ }
-    }
     tts.current = null;
     tts.playing = false;
   }
@@ -2837,19 +2868,26 @@ PAGE_HTML = """<!doctype html>
     }
   }
 
-  // Играем WAV через декодер Web Audio: onDone — конец, onError(имя ошибки).
-  function playSpeech(url, side, onDone, onError) {
+  // Играем WAV через декодер Web Audio прямо из Blob: onDone — конец,
+  // onError(имя ошибки). Blob-URL'ы не используем — CSP connect-src 'self'
+  // запрещает fetch(blob:), именно из-за этого звук не шёл.
+  function ttsLog(text) {
+    if (typeof window !== "undefined" && window.__ttslog) { window.__ttslog(text); }
+  }
+
+  function playSpeech(blob, side, onDone, onError) {
     var ctx = unlockSpeech();
+    ttsLog("play: ctx " + (ctx ? ctx.state : "нет") + ", blob " + (blob ? blob.size : "нет"));
     if (!ctx) { onError("нет AudioContext"); return; }
-    fetch(url).then(function (resp) {
-      if (!resp.ok) { throw new Error("blob " + resp.status); }
-      return resp.arrayBuffer();
-    }).then(function (data) {
+    if (!blob || !blob.size) { onError("пустой ответ синтеза"); return; }
+    blob.arrayBuffer().then(function (data) {
+      ttsLog("play: arraybuffer " + data.byteLength);
       return new Promise(function (resolve, reject) {
         var decoded = ctx.decodeAudioData(data, resolve, reject);
         if (decoded && typeof decoded.then === "function") { decoded.then(resolve, reject); }
       });
     }).then(function (buffer) {
+      ttsLog("play: decoded " + (buffer ? buffer.duration.toFixed(2) : "нет"));
       if (!buffer) { throw new Error("декодер вернул пусто"); }
       var src = ctx.createBufferSource();
       src.buffer = buffer;
@@ -2857,22 +2895,10 @@ PAGE_HTML = """<!doctype html>
       src.onended = function () { tts.source = null; onDone(); };
       tts.source = src;
       src.start(0);
+      ttsLog("play: start ok");
     }).catch(function (err) {
-      var name = (err && (err.name || err.message)) || String(err);
-      // Запасной путь: иногда декодер молчит на конкретном WAV, а <audio>
-      // тот же файл играет. Проблема автоплея здесь уже снята тем, что мы
-      // внутри жеста (или после разблокированного контекста).
-      try {
-        var fallback = new Audio(url);
-        fallback.onended = function () { onDone(); };
-        fallback.onerror = function () { onError(name); };
-        var played = fallback.play();
-        if (played && typeof played.catch === "function") {
-          played.catch(function (e) { onError(name + " / audio: " + (e && e.name ? e.name : e)); });
-        }
-      } catch (ignored) {
-        onError(name);
-      }
+      var name = err ? (err.name ? err.name + ": " + err.message : String(err.message || err)) : "?";
+      onError(name);
     });
   }
 
@@ -2890,7 +2916,13 @@ PAGE_HTML = """<!doctype html>
     var ctx = unlockSpeech();
     if (!ctx) { setVoiceNote(side, "браузер не поддерживает Web Audio"); return; }
     setVoiceNote(side, "гружу голос… (AudioContext: " + ctx.state + ")");
-    fetch("/api/tts", {
+    // decodeAudioData на ещё не запущенном контексте может не вызвать callback
+    // вовсе (видели именно это в Chrome), поэтому сначала дожидаемся resume.
+    var ready = (ctx.state === "running" || typeof ctx.resume !== "function")
+      ? Promise.resolve()
+      : ctx.resume().catch(function () {});
+    ready.then(function () {
+      return fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: "Звук включён. Я Ева, слушайте ответы." })
@@ -2899,10 +2931,9 @@ PAGE_HTML = """<!doctype html>
       return resp.blob();
     }).then(function (blob) {
       tts.lastBlob = { size: blob.size, type: blob.type, ctx: ctx.state };
-      var url = URL.createObjectURL(blob);
-      tts.current = { url: url, side: side };
+      tts.current = { side: side };
       tts.playing = true;
-      playSpeech(url, side, function () {
+      playSpeech(blob, side, function () {
         releaseSpeech();
         setVoiceNote(side, "");
         tts.available = true;
@@ -2923,6 +2954,7 @@ PAGE_HTML = """<!doctype html>
           " · blob " + (info.size || 0) + " б, тип " + (info.type || "?") +
           ", ctx " + (info.ctx || "?"));
       });
+    });
     }).catch(function (err) {
       var note = byId("tts-note-" + side);
       if (note) { note.textContent = "синтез недоступен: " + (err && err.message ? err.message : err); }
@@ -2934,16 +2966,15 @@ PAGE_HTML = """<!doctype html>
     var job = tts.queue.shift();
     if (!job) { return; }
     tts.playing = true;
-    job.ready.then(function (url) {
+    job.ready.then(function (blob) {
       if (job.generation !== tts.generation) {
-        if (url) { try { URL.revokeObjectURL(url); } catch (ignored) { /* уже */ } }
         tts.playing = false;
         pumpSpeech();
         return;
       }
-      if (!url) { tts.playing = false; pumpSpeech(); return; }
-      tts.current = { url: url, side: job.side };
-      playSpeech(url, job.side, function () {
+      if (!blob) { tts.playing = false; pumpSpeech(); return; }
+      tts.current = { side: job.side };
+      playSpeech(blob, job.side, function () {
         releaseSpeech();
         pumpSpeech();
       }, function (name) {
@@ -2992,15 +3023,15 @@ PAGE_HTML = """<!doctype html>
       }
       return response.blob();
     }).then(function (blob) {
-      if (generation !== tts.generation || !blob || !blob.size) { return ""; }
-      return URL.createObjectURL(blob);
+      if (generation !== tts.generation || !blob || !blob.size) { return null; }
+      return blob;
     }).catch(function (err) {
       if (generation !== tts.generation) { return ""; }
       // 400 — фраза не годится (после чистки пусто, например одна ссылка):
       // молчим только про неё, голос не выключаем.
-      if (err && err.status === 400) { return ""; }
+      if (err && err.status === 400) { return null; }
       voiceFailed(side, err && err.message ? err.message : String(err));
-      return "";
+      return null;
     });
     tts.queue.push({ side: side, generation: generation, ready: ready });
     pumpSpeech();
@@ -3800,6 +3831,27 @@ PAGE_HTML = """<!doctype html>
   byId("mode").addEventListener("change", function () {
     applyMode(this.value);
   });
+
+  // Автотест страницы чата: /?selftest=1 прогоняет настоящий speakCheck и
+  // складывает ошибки в скрытый <pre> — так звук проверяется без слуха.
+  if (location.search.indexOf("selftest") >= 0) {
+    var selfout = byId("selfout");
+    var NL = String.fromCharCode(10);
+    var selflog = function (t) { if (selfout) { selfout.textContent += NL + t; } };
+    window.addEventListener("error", function (e) {
+      selflog("window error: " + (e && e.message ? e.message : e));
+    });
+    window.__ttslog = selflog;
+    setTimeout(function () {
+      selflog("ctx before: " + (tts.ctx ? tts.ctx.state : "нет"));
+      speakCheck(0);
+      setTimeout(function () {
+        selflog("note: " + (byId("tts-note-0") ? byId("tts-note-0").textContent : "?"));
+        selflog("ctx after: " + (tts.ctx ? tts.ctx.state : "нет"));
+        selflog("playing: " + tts.playing + ", source: " + (tts.source ? "есть" : "нет"));
+      }, 10000);
+    }, 300);
+  }
 
   loadCatalog();
   refreshSystem();
