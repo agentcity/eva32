@@ -41,7 +41,7 @@ cat > vendor/piper/bin/piper <<'WRAP'
 # --output_file OUT` с текстом на stdin, а у нас piper установлен как модуль
 # в vendor/piper-py (onnxruntime + голоса). Пути вычисляются от самого скрипта.
 here=$(cd "$(dirname "$0")/.." && pwd)
-PYTHONPATH="$here/../piper-py" exec "${PIPER_PYTHON:-/opt/homebrew/bin/python3.13}" -m piper "$@"
+OMP_NUM_THREADS="${PIPER_THREADS:-2}" PYTHONPATH="$here/../piper-py" exec "${PIPER_PYTHON:-/opt/homebrew/bin/python3.13}" -m piper "$@"
 WRAP
 chmod +x vendor/piper/bin/piper
 

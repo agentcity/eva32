@@ -170,7 +170,7 @@ OLLAMA_BASE = "http://127.0.0.1:11434/v1"
 DEFAULT_MAX_TOKENS = 256
 #: Бюджет истории диалога на колонку, токенов (задача 0182).
 #: ``0`` — истории нет: каждая колонка спрашивается с чистого листа.
-DEFAULT_HISTORY_TOKENS = 1024
+DEFAULT_HISTORY_TOKENS = 512
 #: Сколько последних реплик (пар вопрос/ответ) держать в истории колонки.
 DEFAULT_HISTORY_TURNS = 8
 #: Оценка токенов без токенизатора: средний BPE-токен — 3–4 символа
@@ -1702,6 +1702,19 @@ def _prompt_text(messages: Sequence[Mapping[str, str]]) -> str:
         "{}: {}".format(message.get("role", ""), message.get("content", ""))
         for message in messages
     )
+
+
+def _strip_think(text: str) -> str:
+    """Убрать рассуждение ``<think>…</think>`` из ответа (включая незакрытый).
+
+    Клиент показывает его отдельным блоком, а в историю он попадать не должен:
+    иначе каждый следующий запрос тащит прошлые «размышления» и модель
+    тратит на них контекст и время.
+    """
+    import re as _re
+
+    text = _re.sub(r"(?is)<think(?:ing)?\b[^>]*>.*?(?:</think(?:ing)?>|$)", "", text)
+    return text.strip()
 
 
 def _last_question(messages: Sequence[Mapping[str, str]]) -> str:
@@ -4776,7 +4789,12 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         question = questions[side] if 0 <= side < len(questions) else ""
         if not question or not answer.strip():
             return
-        self.server.history.append(side, question, answer)
+        # Рассуждение в историю не кладём: <think> съедает половину контекста,
+        # из-за чего следующий промпт длиннее, а ответ приходит позже.
+        cleaned = _strip_think(answer)
+        if not cleaned.strip():
+            return
+        self.server.history.append(side, question, cleaned)
 
     # -- журнал ---------------------------------------------------------------
 
