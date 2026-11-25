@@ -1227,7 +1227,7 @@
   {
     "id": "0184",
     "title": "EVA.app — нативное приложение с голосом",
-    "status": "in_progress",
+    "status": "done",
     "file": "0184-native-voice-app.md",
     "assignee": "agent:eva-app"
   }

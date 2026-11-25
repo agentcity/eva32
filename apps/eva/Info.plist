@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>ru</string>
+	<key>CFBundleExecutable</key>
+	<string>EVA</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.eva32.eva</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>EVA</string>
+	<key>CFBundleDisplayName</key>
+	<string>Ева</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>EVA32, локальный голосовой ассистент</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Ева слушает ваш вопрос с микрофона. Запись не покидает этот Mac: распознавание идёт на устройстве.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Ева распознаёт русскую речь прямо на этом Mac (Apple Speech, on-device) и отправляет текст только на локальный сервер Евы.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+</dict>
+</plist>
