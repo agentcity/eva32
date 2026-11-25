@@ -5809,8 +5809,9 @@ static void bench_cache_prefix(void) {
 // Банк kind 6: 18-байтовый заголовок сегмента + блоки GGML (144 Б). Значения
 // детерминированные, d конечное и маленькое: тесту важна не точность весов, а
 // то, что pread отдаёт ровно те же байты, которые дал бы mmap.
-static void model_add_q4k_bank(model_t *m, const char *name, int ndim,
-                               const uint32_t *dims, uint32_t seed) {
+static void model_add_q4k_bank_d(model_t *m, const char *name, int ndim,
+                                 const uint32_t *dims, uint32_t seed,
+                                 float d) {
     tensor_def *td = model_slot(m, name, VTM_TENSOR_Q4K, ndim, dims);
     uint32_t n = dims_product(ndim, dims);
     uint32_t n_blk = (n + VTM_Q4K_BLOCK_VALUES - 1u) / VTM_Q4K_BLOCK_VALUES;
@@ -5826,7 +5827,7 @@ static void model_add_q4k_bank(model_t *m, const char *name, int ndim,
         uint8_t block[VTM_Q4K_BLOCK_BYTES];
         for (i = 0; i < sizeof block; i++)
             block[i] = (uint8_t)((i * 37u + k * 11u + seed * 29u) & 0xFFu);
-        put_u16(block, vtm_float_to_half(0.01f));    // d
+        put_u16(block, vtm_float_to_half(d));        // d
         put_u16(block + 2, vtm_float_to_half(0.0f)); // dmin
         buf_append(&b, block, sizeof block);
     }
@@ -5835,8 +5836,9 @@ static void model_add_q4k_bank(model_t *m, const char *name, int ndim,
 }
 
 // Банк kind 7: блок 210 Б, d — последние два байта.
-static void model_add_q6k_bank(model_t *m, const char *name, int ndim,
-                               const uint32_t *dims, uint32_t seed) {
+static void model_add_q6k_bank_d(model_t *m, const char *name, int ndim,
+                                 const uint32_t *dims, uint32_t seed,
+                                 float d) {
     tensor_def *td = model_slot(m, name, VTM_TENSOR_Q6K, ndim, dims);
     uint32_t n = dims_product(ndim, dims);
     uint32_t n_blk = (n + VTM_Q6K_BLOCK_VALUES - 1u) / VTM_Q6K_BLOCK_VALUES;
@@ -5853,11 +5855,23 @@ static void model_add_q6k_bank(model_t *m, const char *name, int ndim,
         for (i = 0; i < sizeof block; i++)
             block[i] = (uint8_t)((i * 53u + k * 17u + seed * 31u) & 0xFFu);
         put_u16(block + VTM_Q6K_BLOCK_BYTES - 2u,
-                vtm_float_to_half(0.02f)); // d
+                vtm_float_to_half(d)); // d
         buf_append(&b, block, sizeof block);
     }
     td->blob = b.p;
     td->blob_len = b.len;
+}
+
+// Прежние величины d: тестам 0175/0177 важны байты и совпадение путей, а не
+// масштаб выхода.
+static void model_add_q4k_bank(model_t *m, const char *name, int ndim,
+                               const uint32_t *dims, uint32_t seed) {
+    model_add_q4k_bank_d(m, name, ndim, dims, seed, 0.01f);
+}
+
+static void model_add_q6k_bank(model_t *m, const char *name, int ndim,
+                               const uint32_t *dims, uint32_t seed) {
+    model_add_q6k_bank_d(m, name, ndim, dims, seed, 0.02f);
 }
 
 // Один и тот же файл гоняется дважды: с VTM_MOE_CACHE_MB=0 (mmap + madvise,
@@ -6091,6 +6105,272 @@ static void test_moe_prefetch(void) {
     model_free(&md);
 }
 
+// --- MoE: батчевый prefill (задача 0179) -----------------------------------
+
+// Крошечная MoE-модель той же формы, что у 30B: EMB (x из id токена) ->
+// MOE (top-3 из 16 экспертов, Q4_K gate/up + Q6_K down) -> SAMP (argmax).
+// Разные id дают разные x, поэтому наборы экспертов у токенов пачки разные и
+// пересекаются — ровно то, что группирует батчевый путь.
+enum { MB_NEXP = 16, MB_HID = 256, MB_INTER = 256, MB_TOPK = 3, MB_VOCAB = 16 };
+
+static void moe_batch_image(uint8_t **img, size_t *size) {
+    model_t md;
+    uint32_t rd[2] = {MB_NEXP, MB_HID}, xd[1] = {MB_HID}, yd[1] = {MB_HID};
+    uint32_t bd[3] = {MB_NEXP, MB_INTER, MB_HID};
+    uint32_t dd[3] = {MB_NEXP, MB_HID, MB_INTER};
+    uint32_t ed[2] = {MB_VOCAB, MB_HID}, td[1] = {1};
+    float router[MB_NEXP * MB_HID], emb[MB_VOCAB * MB_HID], zero[MB_HID];
+    int i;
+
+    for (i = 0; i < MB_NEXP * MB_HID; i++)
+        router[i] = (float)(((i * 13) % 19) - 9) * 0.05f;
+    for (i = 0; i < MB_VOCAB * MB_HID; i++)
+        emb[i] = (float)(((i * 29 + 7) % 23) - 11) * 0.09f;
+    for (i = 0; i < MB_HID; i++) zero[i] = 0.0f;
+
+    model_init(&md);
+    (void)yd;
+    model_init(&md);
+    model_add_f32(&md, "router", 2, rd, router);
+    model_add_f32(&md, "x", 1, xd, zero);
+    // d на два порядка меньше, чем у тестов 0175/0177: у 30B веса обычного
+    // масштаба, и выход MOE ~0,05. С «громкими» весами (d=0,01) слагаемые
+    // ~1e6 гасят друг друга, и f32-ядро пачки расходится с double-путём на
+    // 1e-2 — это свойство синтетики, а не батчевого кода.
+    model_add_q4k_bank_d(&md, "gate", 3, bd, 1, 1e-5f);
+    model_add_q4k_bank_d(&md, "up", 3, bd, 2, 1e-5f);
+    model_add_q6k_bank_d(&md, "down", 3, dd, 3, 2e-5f);
+    model_add_f32(&md, "emb", 2, ed, emb);
+    model_add_f32(&md, "token", 1, td, zero);
+    // dst у MOE — тот же x (резидуальный поток), как у 30B: EMB переписывает
+    // его каждый проход, поэтому состояние не копится от токена к токену.
+    model_inst(&md, VTM_OP_EMB, VTM_FLAG_EMB_INPUT, 1, 5, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_MOE, 0, 1, 0, 1, 2, MB_TOPK);
+    model_inst(&md, VTM_OP_SAMP, 0, 6, 1, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_SAMP_ARGMAX);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_set_meta(&md, "{\"temperature\": 0, \"rms_norm_eps\": 1e-06}");
+    model_build(&md, img, size);
+    model_free(&md);
+}
+
+static vtm_t *moe_batch_model(void) {
+    uint8_t *img = NULL;
+    size_t size = 0;
+    vtm_t *m;
+
+    moe_batch_image(&img, &size);
+    m = load_ok(img, size);
+    free(img);
+    return m;
+}
+
+// Объединение top-k по пачке — независимым расчётом в тесте, чтобы проверить
+// не «сколько получилось», а «каждого эксперта прочитали один раз».
+// Роутер: logits[e] = router[e]·x в double; top-k выбирает строго старшего,
+// перебором по возрастанию (как moe_route), softmax для порядка не нужен.
+static int moe_batch_union(const int32_t *ids, int n) {
+    int seen[MB_NEXP];
+    int i, e, k, j, ne = 0;
+    double *lg = (double *)calloc(MB_NEXP, sizeof *lg);
+
+    memset(seen, 0, sizeof seen);
+    for (i = 0; i < n; i++) {
+        int token = (int)(ids[i] % MB_VOCAB);
+        int chosen[MB_TOPK];
+        for (e = 0; e < MB_NEXP; e++) {
+            double dot = 0.0;
+            for (j = 0; j < MB_HID; j++) {
+                double r = (double)(((e * MB_HID + j) * 13 % 19) - 9) * 0.05;
+                double x = (double)(((token * MB_HID + j) * 29 + 7) % 23 - 11)
+                         * 0.09;
+                dot += r * x;
+            }
+            lg[e] = dot;
+        }
+        for (k = 0; k < MB_TOPK; k++) {
+            int best = -1, used;
+            double bp = -1e300;
+            for (e = 0; e < MB_NEXP; e++) {
+                used = 0;
+                for (j = 0; j < k; j++)
+                    if (chosen[j] == e) { used = 1; break; }
+                if (used) continue;
+                if (lg[e] > bp) { bp = lg[e]; best = e; }
+            }
+            chosen[k] = best < 0 ? 0 : best;
+        }
+        for (k = 0; k < MB_TOPK; k++) seen[chosen[k]] = 1;
+    }
+    for (e = 0; e < MB_NEXP; e++) ne += seen[e];
+    free(lg);
+    return ne;
+}
+
+static void test_moe_batch(void) {
+    int32_t ids[64];
+    vtm_t *want, *got;
+    int i;
+
+    printf("  -- MoE: батчевый prefill (0179)\n");
+    for (i = 0; i < 64; i++) ids[i] = (int32_t)((i * 5 + 1) % MB_VOCAB);
+
+    // 1. Пачка 12 == 12 прогонов по токену. Здесь явно включено батчевое
+    //    ядро kind 6/7 (VTM_MOE_BATCH_KERNEL=1): оно считает ту же сумму в
+    //    f32-порядке, поэтому сравнение с допуском 1e-5, а выбранный токен —
+    //    точно (расхождение токена это 1, а не 1e-5). Умолчание (поштучные
+    //    ядра в группе) проверяется побитово в п. 3b.
+    {
+        want = moe_batch_model();
+        got = moe_batch_model();
+        CHECK(want != NULL && got != NULL);
+        if (want && got) {
+            setenv("VTM_MOE_BATCH_KERNEL", "1", 1);
+            cache_run_plain(want, ids, 12);
+            vtm_set_position(got, 0);
+            CHECK(vtm_run_batch(got, ids, 12) == VTM_OK);
+            CHECK(vtm_position(got) == 11);
+            batch_check_same(want, got, "MoE пачка 12 (батчевое ядро)", 1e-5);
+            unsetenv("VTM_MOE_BATCH_KERNEL");
+            vtm_free(want);
+            vtm_free(got);
+        }
+    }
+
+    // 2. Пачка длиннее прежнего потолка 32: у MoE-графа потолок свой
+    //    (VTM_MOE_BATCH_TOKENS), иначе 77-токенный промпт на 30B резался бы на
+    //    куски и читал одних и тех же экспертов заново.
+    {
+        want = moe_batch_model();
+        got = moe_batch_model();
+        CHECK(want != NULL && got != NULL);
+        if (want && got) {
+            cache_run_plain(want, ids, 40);
+            vtm_set_position(got, 0);
+            CHECK(vtm_run_batch(got, ids, 40) == VTM_OK);
+            batch_check_same(want, got, "MoE пачка 40", 1e-5);
+            vtm_free(want);
+            vtm_free(got);
+        }
+    }
+
+    // 3. Один токен; и VTM_MOE_BATCH=0 — прежний поштучный путь целиком.
+    {
+        vtm_t *a = moe_batch_model();
+        vtm_t *b = moe_batch_model();
+        CHECK(a != NULL && b != NULL);
+        if (a && b) {
+            cache_run_plain(a, ids, 1);
+            vtm_set_position(b, 0);
+            CHECK(vtm_run_batch(b, ids, 1) == VTM_OK);
+            batch_check_same(a, b, "MoE пачка 1", 0.0);
+            vtm_free(a);
+            vtm_free(b);
+        }
+        setenv("VTM_MOE_BATCH", "0", 1);
+        a = moe_batch_model();
+        b = moe_batch_model();
+        CHECK(a != NULL && b != NULL);
+        if (a && b) {
+            cache_run_plain(a, ids, 8);
+            vtm_set_position(b, 0);
+            CHECK(vtm_run_batch(b, ids, 8) == VTM_OK);
+            batch_check_same(a, b, "MoE VTM_MOE_BATCH=0", 0.0);
+            vtm_free(a);
+            vtm_free(b);
+        }
+        unsetenv("VTM_MOE_BATCH");
+    }
+
+    // 3b. VTM_MOE_BATCH_KERNEL=0 — в группе считают поштучные ядра, поэтому
+    //     выход MOE обязан совпасть с поштучным путём побитово (порядок
+    //     сложений вкладов экспертов тот же: k по возрастанию). Это эталон
+    //     группировки: если он расходится, виновата не арифметика ядер.
+    {
+        vtm_t *a = moe_batch_model();
+        vtm_t *b = moe_batch_model();
+        CHECK(a != NULL && b != NULL);
+        if (a && b) {
+            setenv("VTM_MOE_BATCH_KERNEL", "0", 1);
+            cache_run_plain(a, ids, 12);
+            vtm_set_position(b, 0);
+            CHECK(vtm_run_batch(b, ids, 12) == VTM_OK);
+            batch_check_same(a, b, "MoE пачка 12 (поштучные ядра)", 0.0);
+            unsetenv("VTM_MOE_BATCH_KERNEL");
+            vtm_free(a);
+            vtm_free(b);
+        }
+    }
+
+    // 4. Байты: батчевый путь читает каждого эксперта пачки один раз, а не по
+    //    разу на каждый выбравший его токен. Счётчики pread детерминированы
+    //    при VTM_MOE_IO_THREADS=0; кэш 1 МиБ меньше рабочего набора (16
+    //    экспертов × 3 банка = 2 МиБ), поэтому поштучный путь перечитывает.
+    {
+        uint8_t *img = NULL;
+        size_t size = 0;
+        char path[80];
+        long stamp = (long)time(NULL);
+        FILE *f;
+        uint64_t hb = 0, mb = 0, ht = 0, mt = 0;
+        size_t by = 0, by2 = 0;
+        int uni;
+
+        moe_batch_image(&img, &size);
+        snprintf(path, sizeof path, "/tmp/vtm_moe_batch_%ld.vtm", stamp);
+        f = fopen(path, "wb");
+        CHECK(f != NULL);
+        if (f) {
+            CHECK(fwrite(img, 1, size, f) == size);
+            fclose(f);
+
+            setenv("VTM_MOE_IO_THREADS", "0", 1);
+            setenv("VTM_MOE_CACHE_MB", "1", 1);
+
+            // Пачка: 12 токенов одной инструкцией.
+            vtm_internal_moe_cache_reset();
+            want = vtm_load(path);
+            CHECK(want != NULL);
+            if (want) {
+                vtm_set_position(want, 0);
+                CHECK(vtm_run_batch(want, ids, 12) == VTM_OK);
+                vtm_internal_moe_cache_stats(&hb, &mb, &by, NULL);
+                vtm_free(want);
+            }
+            // Поштучно: те же 12 токенов по одному.
+            vtm_internal_moe_cache_reset();
+            got = vtm_load(path);
+            CHECK(got != NULL);
+            if (got) {
+                cache_run_plain(got, ids, 12);
+                vtm_internal_moe_cache_stats(&ht, &mt, &by2, NULL);
+                vtm_free(got);
+            }
+            uni = moe_batch_union(ids, 12);
+            CHECK(uni > 0 && uni < 12 * MB_TOPK); // пересечение есть
+            // Батчевый путь: ровно 3 промаха на уникального эксперта и ни
+            // одного повторного чтения.
+            CHECK(mb == (uint64_t)3 * (uint64_t)uni);
+            CHECK(hb == 0);
+            // Поштучный: тех же экспертов читают столько раз, сколько токенов
+            // их выбрали, поэтому промахов заведомо больше.
+            CHECK(mt > mb);
+            printf("    экспертов %d: пачка — %llu чтений, поштучно — %llu\n",
+                   uni, (unsigned long long)mb, (unsigned long long)mt);
+
+            remove(path);
+            unsetenv("VTM_MOE_CACHE_MB");
+            unsetenv("VTM_MOE_IO_THREADS");
+            vtm_internal_moe_cache_reset();
+        }
+        free(img);
+    }
+
+    printf("  -- MoE: батчевый prefill — токены и выход совпали\n");
+}
+
 // --- main ------------------------------------------------------------------
 
 int main(void) {
@@ -6146,6 +6426,7 @@ int main(void) {
     test_run_batch();
     test_moe_pread_cache();
     test_moe_prefetch();
+    test_moe_batch();
     bench_cache_prefix();
     test_samp_bench_150k();
 

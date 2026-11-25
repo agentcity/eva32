@@ -1192,7 +1192,7 @@
   {
     "id": "0179",
     "title": "Батчевый prefill MoE",
-    "status": "in_progress",
+    "status": "done",
     "file": "0179-moe-batched-prefill.md",
     "assignee": "agent:moe-prefill"
   }

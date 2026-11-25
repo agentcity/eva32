@@ -771,9 +771,10 @@ static pthread_mutex_t g_moe_cache_mu = PTHREAD_MUTEX_INITIALIZER;
 // класса должны освободиться, иначе кэш занимает заметно больше бюджета.
 #define VTM_MOE_FREE_KEEP 64
 // Потолок очереди prefetch. За одну инструкцию MOE туда кладётся 3·top_k
-// заданий (24 при top-8); 256 — запас на случай, если слой начнётся раньше,
-// чем воркеры дочитают предыдущий.
-#define VTM_MOE_PF_MAX 256
+// заданий (24 при top-8); батчевый MOE (0179) ставит 3 задания на каждого
+// уникального эксперта пачки, то есть до 3·n_experts (384 при 128) — отсюда
+// 512, иначе moe_pf_push ждал бы опустошения очереди посреди слоя.
+#define VTM_MOE_PF_MAX 512
 #define VTM_MOE_PF_THREADS_MAX 8
 
 typedef struct moe_cache_entry {
@@ -1352,13 +1353,14 @@ static int moe_pf_wait(uint64_t bank_off, uint32_t expert, size_t nbytes) {
     return 0;
 }
 
-// Поставить чтение выбранных экспертов слоя. Порядок — как их спросит
-// главный поток: gate/up/down эксперта 0, потом 1 и т.д. Так первый эксперт
-// готов раньше остальных, и главный ждёт меньше.
-static void moe_pf_prefetch_experts(const moe_source *src, const int *chosen,
-                                    int top_k, uint64_t gate_off,
-                                    uint64_t up_off, uint64_t down_off,
-                                    size_t gate_bytes, size_t down_bytes) {
+// Поставить чтение списка экспертов (поштучно — top_k выбранных, батчево —
+// объединение по пачке). Порядок — как их спросит главный поток: gate/up/down
+// эксперта 0, потом 1 и т.д. Так первый эксперт готов раньше остальных, и
+// главный ждёт меньше.
+static void moe_pf_prefetch_list(const moe_source *src, const int *experts,
+                                 int n, uint64_t gate_off, uint64_t up_off,
+                                 uint64_t down_off, size_t gate_bytes,
+                                 size_t down_bytes) {
     int k;
     if (!g_moe_pf.ready || g_moe_pf.n_io <= 0) return;
 #if VTM_MOE_HAVE_PTHREAD
@@ -1368,11 +1370,19 @@ static void moe_pf_prefetch_experts(const moe_source *src, const int *chosen,
     g_moe_pf.src = *src;
     pthread_mutex_unlock(&g_moe_pf_mu);
 #endif
-    for (k = 0; k < top_k; k++) {
-        moe_pf_push(gate_off, (uint32_t)chosen[k], gate_bytes);
-        moe_pf_push(up_off, (uint32_t)chosen[k], gate_bytes);
-        moe_pf_push(down_off, (uint32_t)chosen[k], down_bytes);
+    for (k = 0; k < n; k++) {
+        moe_pf_push(gate_off, (uint32_t)experts[k], gate_bytes);
+        moe_pf_push(up_off, (uint32_t)experts[k], gate_bytes);
+        moe_pf_push(down_off, (uint32_t)experts[k], down_bytes);
     }
+}
+
+static void moe_pf_prefetch_experts(const moe_source *src, const int *chosen,
+                                    int top_k, uint64_t gate_off,
+                                    uint64_t up_off, uint64_t down_off,
+                                    size_t gate_bytes, size_t down_bytes) {
+    moe_pf_prefetch_list(src, chosen, top_k, gate_off, up_off, down_off,
+                         gate_bytes, down_bytes);
 }
 
 // Взять байты эксперта: попадание — сразу, промах — дождаться prefetch или
@@ -1615,51 +1625,58 @@ static vtm_status moe_check_bank(vtm_t *m, uint32_t ins, const vtm_tensor *t,
     return VTM_OK;
 }
 
-static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
-    vtm_status st;
-    const vtm_tensor *router = need(m, in->a, ins, "a (router)", &st);
-    const vtm_tensor *x;
+// Геометрия инструкции MOE и роутер — общие для поштучного (op_moe) и
+// батчевого (batch_moe_apply, 0179) путей.
+//
+// Почему вынесено. Выбор экспертов — дискретное решение: если бы батчевый путь
+// считал роутер своей копией кода (или в другом порядке сложений), top-k у
+// части токенов разошёлся бы на границе, и argmax поехал бы не «на 1e-5», а на
+// целого эксперта. Поэтому арифметика роутера, softmax, top-k и нормировки
+// ровно одна — здесь, а оба пути только читают результат.
+typedef struct {
+    const vtm_tensor *router;
     const vtm_tensor *y;
     const vtm_tensor *gate_bank;
     const vtm_tensor *up_bank;
     const vtm_tensor *down_bank;
-    int n_experts, hidden, inter, top_k, e, i, j, k;
-    int64_t bank_blocks, expert_blocks;
+    int n_experts, hidden, inter, top_k, renorm;
+    int64_t expert_blocks;
     size_t gate_block_bytes, down_block_bytes;
-    double *logits = NULL, *acc = NULL;
-    int *chosen = NULL;
-    double *weights = NULL;
-    float *scratch = NULL;
-    int renorm;
-    moe_source src;
-    int use_pread;
-    uint64_t gate_off = 0, up_off = 0, down_off = 0;
+    uint64_t gate_off, up_off, down_off; // файловые смещения банков (pread)
+} moe_geom;
 
-    if (!router) return st;
+static vtm_status moe_geom_init(vtm_t *m, uint32_t ins, const vtm_instr *in,
+                                moe_geom *g) {
+    vtm_status st;
+    const vtm_tensor *x;
+
+    memset(g, 0, sizeof *g);
+    g->router = need(m, in->a, ins, "a (router)", &st);
+    if (!g->router) return st;
     x = need(m, in->b, ins, "b (x)", &st);
     if (!x) return st;
-    y = need(m, in->dst, ins, "dst (y)", &st);
-    if (!y) return st;
-    if ((st = req_f32(m, router, ins, "a (router)")) != VTM_OK) return st;
+    g->y = need(m, in->dst, ins, "dst (y)", &st);
+    if (!g->y) return st;
+    if ((st = req_f32(m, g->router, ins, "a (router)")) != VTM_OK) return st;
     if ((st = req_f32(m, x, ins, "b (x)")) != VTM_OK) return st;
-    if ((st = req_f32(m, y, ins, "dst (y)")) != VTM_OK) return st;
-    if (router->ndim != 2)
+    if ((st = req_f32(m, g->y, ins, "dst (y)")) != VTM_OK) return st;
+    if (g->router->ndim != 2)
         return fail(m, ins, VTM_E_SHAPE,
                     "MOE: роутер должен быть [n_experts, hidden]");
-    n_experts = (int)router->dims[0];
-    hidden = (int)router->dims[1];
-    if (n_experts <= 0 || n_experts > VTM_MOE_MAX_EXPERTS)
-        return fail(m, ins, VTM_E_SHAPE, "MOE: экспертов %d", n_experts);
-    if ((int)x->n_elements != hidden || (int)y->n_elements != hidden)
+    g->n_experts = (int)g->router->dims[0];
+    g->hidden = (int)g->router->dims[1];
+    if (g->n_experts <= 0 || g->n_experts > VTM_MOE_MAX_EXPERTS)
+        return fail(m, ins, VTM_E_SHAPE, "MOE: экспертов %d", g->n_experts);
+    if ((int)x->n_elements != g->hidden || (int)g->y->n_elements != g->hidden)
         return fail(m, ins, VTM_E_SHAPE,
                     "MOE: x/y длиной %u/%u, у роутера hidden=%d",
-                    x->n_elements, y->n_elements, hidden);
-    top_k = (int)in->imm;
-    if (top_k <= 0 || top_k > n_experts)
+                    x->n_elements, g->y->n_elements, g->hidden);
+    g->top_k = (int)in->imm;
+    if (g->top_k <= 0 || g->top_k > g->n_experts)
         return fail(m, ins, VTM_E_ARG,
-                    "MOE: top_k (imm) = %d, допустимо 1..%d", top_k,
-                    n_experts);
-    renorm = (in->flags & VTM_MOE_FLAG_NO_RENORM) == 0;
+                    "MOE: top_k (imm) = %d, допустимо 1..%d", g->top_k,
+                    g->n_experts);
+    g->renorm = (in->flags & VTM_MOE_FLAG_NO_RENORM) == 0;
 
     // Банки: c, c+1, c+2 — смежность в таблице тензоров (ABI, vtm.h).
     if (in->c == VTM_NO_TENSOR || (uint32_t)in->c + 2u >= m->n_tensors)
@@ -1667,90 +1684,89 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
                     "MOE: банки экспертов — три подряд идущих тензора "
                     "(c, c+1, c+2), c=%u вне таблицы (%u)",
                     (unsigned)in->c, m->n_tensors);
-    gate_bank = &m->tensors[in->c];
-    up_bank = &m->tensors[(uint32_t)in->c + 1u];
-    down_bank = &m->tensors[(uint32_t)in->c + 2u];
-    if (gate_bank->kind != up_bank->kind)
+    g->gate_bank = &m->tensors[in->c];
+    g->up_bank = &m->tensors[(uint32_t)in->c + 1u];
+    g->down_bank = &m->tensors[(uint32_t)in->c + 2u];
+    if (g->gate_bank->kind != g->up_bank->kind)
         return fail(m, ins, VTM_E_FORMAT,
                     "MOE: gate (%s) и up (%s) разного вида; ожидались "
                     "одинаковые банки",
-                    gate_bank->kind == VTM_TENSOR_Q4K ? "Q4_K" : "Q6_K",
-                    up_bank->kind == VTM_TENSOR_Q4K ? "Q4_K" : "Q6_K");
-    if (gate_bank->ndim == 3 && gate_bank->dims[1] && gate_bank->dims[2])
-        inter = (int)gate_bank->dims[1];
+                    g->gate_bank->kind == VTM_TENSOR_Q4K ? "Q4_K" : "Q6_K",
+                    g->up_bank->kind == VTM_TENSOR_Q4K ? "Q4_K" : "Q6_K");
+    if (g->gate_bank->ndim == 3 && g->gate_bank->dims[1]
+        && g->gate_bank->dims[2])
+        g->inter = (int)g->gate_bank->dims[1];
     else
         return fail(m, ins, VTM_E_SHAPE, "MOE: у банка gate нет dims");
-    if ((st = moe_check_bank(m, ins, gate_bank, "gate", n_experts, inter,
-                             hidden)) != VTM_OK)
+    if ((st = moe_check_bank(m, ins, g->gate_bank, "gate", g->n_experts,
+                             g->inter, g->hidden)) != VTM_OK)
         return st;
-    if ((st = moe_check_bank(m, ins, up_bank, "up", n_experts, inter,
-                             hidden)) != VTM_OK)
+    if ((st = moe_check_bank(m, ins, g->up_bank, "up", g->n_experts, g->inter,
+                             g->hidden)) != VTM_OK)
         return st;
-    if ((st = moe_check_bank(m, ins, down_bank, "down", n_experts, hidden,
-                             inter)) != VTM_OK)
+    if ((st = moe_check_bank(m, ins, g->down_bank, "down", g->n_experts,
+                             g->hidden, g->inter)) != VTM_OK)
         return st;
-    if (inter <= 0 || hidden <= 0)
-        return fail(m, ins, VTM_E_SHAPE, "MOE: inter=%d hidden=%d", inter,
-                    hidden);
+    if (g->inter <= 0 || g->hidden <= 0)
+        return fail(m, ins, VTM_E_SHAPE, "MOE: inter=%d hidden=%d", g->inter,
+                    g->hidden);
 
     // Размер блока у gate/up и у down может быть разным: в Q4_K_M gate/up —
     // Q4_K (144 байта на 256 значений), down — Q6_K (210). Один общий
     // block_bytes здесь означал бы чтение down со сдвигом на чужой размер
     // блока — правдоподобный мусор вместо весов.
-    gate_block_bytes = gate_bank->kind == VTM_TENSOR_Q4K ? VTM_Q4K_BLOCK_BYTES
-                                                         : VTM_Q6K_BLOCK_BYTES;
-    down_block_bytes = down_bank->kind == VTM_TENSOR_Q4K ? VTM_Q4K_BLOCK_BYTES
-                                                         : VTM_Q6K_BLOCK_BYTES;
-    expert_blocks = ((int64_t)inter * hidden) / VTM_Q4K_BLOCK_VALUES;
-    bank_blocks = (int64_t)n_experts * expert_blocks;
+    g->gate_block_bytes = g->gate_bank->kind == VTM_TENSOR_Q4K
+                        ? VTM_Q4K_BLOCK_BYTES : VTM_Q6K_BLOCK_BYTES;
+    g->down_block_bytes = g->down_bank->kind == VTM_TENSOR_Q4K
+                        ? VTM_Q4K_BLOCK_BYTES : VTM_Q6K_BLOCK_BYTES;
+    g->expert_blocks = ((int64_t)g->inter * g->hidden) / VTM_Q4K_BLOCK_VALUES;
 
-    logits = (double *)calloc((size_t)n_experts, sizeof *logits);
-    chosen = (int *)calloc((size_t)top_k, sizeof *chosen);
-    weights = (double *)calloc((size_t)top_k, sizeof *weights);
-    acc = (double *)calloc((size_t)hidden, sizeof *acc);
-    scratch = (float *)calloc((size_t)inter * 3u + (size_t)hidden,
-                              sizeof *scratch);
-    if (!logits || !chosen || !weights || !acc || !scratch) {
-        free(logits); free(chosen); free(weights); free(acc); free(scratch);
-        return fail(m, ins, VTM_E_NOMEM, "MOE: нет памяти под рабочие буферы");
+    // Смещение банка в файле: отображение начинается с нуля файла, поэтому
+    // «указатель блока минус база отображения» и есть file offset. Если
+    // арифметика даст мусор, границы проверит moe_cache_load().
+    g->gate_off = (uint64_t)(uintptr_t)g->gate_bank->qblocks
+                - (uint64_t)(uintptr_t)m->map;
+    g->up_off = (uint64_t)(uintptr_t)g->up_bank->qblocks
+              - (uint64_t)(uintptr_t)m->map;
+    g->down_off = (uint64_t)(uintptr_t)g->down_bank->qblocks
+                - (uint64_t)(uintptr_t)m->map;
+    return VTM_OK;
+}
+
+// logits[e] = router[e]·x, накопление в double. Порядок сложений (по i) —
+// часть контракта: батчевый путь зовёт ровно эту функцию, поэтому выбор
+// экспертов у него совпадает с поштучным побитово.
+static void moe_route_logits(const moe_geom *g, const float *x, double *logits) {
+    int n_experts = g->n_experts, hidden = g->hidden;
+    int e, i;
+
+    for (e = 0; e < n_experts; e++) {
+        const float *row = g->router->f32 + (size_t)e * hidden;
+        double dot = 0.0;
+        for (i = 0; i < hidden; i++)
+            dot += (double)row[i] * (double)x[i];
+        logits[e] = dot;
     }
+}
 
-    moe_cache_init();
-    moe_source_init(m, &src);
-    use_pread = src.use && g_moe_cache.ready && !g_moe_cache.disabled;
-    if (use_pread) moe_pf_start();
-    if (use_pread) {
-        // Смещение банка в файле: отображение начинается с нуля файла, поэтому
-        // «указатель блока минус база отображения» и есть file offset. Если
-        // арифметика даст мусор, границы проверит moe_cache_fetch().
-        gate_off = (uint64_t)(uintptr_t)gate_bank->qblocks
-                 - (uint64_t)(uintptr_t)m->map;
-        up_off = (uint64_t)(uintptr_t)up_bank->qblocks
-               - (uint64_t)(uintptr_t)m->map;
-        down_off = (uint64_t)(uintptr_t)down_bank->qblocks
-                 - (uint64_t)(uintptr_t)m->map;
+// softmax/top-k/нормировка по готовым логитам; logits переписываются на месте.
+// chosen/weights — top_k элементов.
+static void moe_route_pick(const moe_geom *g, uint32_t ins, double *logits,
+                           int *chosen, double *weights) {
+    int n_experts = g->n_experts, top_k = g->top_k;
+    double peak = -INFINITY, sum = 0.0;
+    int e, j, k;
+
+    for (e = 0; e < n_experts; e++)
+        if (logits[e] > peak) peak = logits[e];
+    for (e = 0; e < n_experts; e++) {
+        logits[e] = exp(logits[e] - peak);
+        sum += logits[e];
     }
+    if (sum > 0.0)
+        for (e = 0; e < n_experts; e++) logits[e] /= sum;
 
-    // 1. Роутер: logits[e] = router[e]·x, затем softmax по всем экспертам.
-    {
-        double peak = -INFINITY, sum = 0.0;
-        for (e = 0; e < n_experts; e++) {
-            const float *row = router->f32 + (size_t)e * hidden;
-            double dot = 0.0;
-            for (i = 0; i < hidden; i++)
-                dot += (double)row[i] * (double)x->f32[i];
-            logits[e] = dot;
-            if (dot > peak) peak = dot;
-        }
-        for (e = 0; e < n_experts; e++) {
-            logits[e] = exp(logits[e] - peak);
-            sum += logits[e];
-        }
-        if (sum > 0.0)
-            for (e = 0; e < n_experts; e++) logits[e] /= sum;
-    }
-
-    // 2. top-k: выбор k старших (порядок — по убыванию вероятности).
+    // top-k: выбор k старших (порядок — по убыванию вероятности).
     for (k = 0; k < top_k; k++) {
         int best = -1;
         double best_p = -INFINITY;
@@ -1765,10 +1781,10 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         weights[k] = best < 0 ? 0.0 : best_p;
     }
 
-    // 3. Нормировка весов выбранных (Qwen3 norm_topk_prob=true) — но только
-    //    когда флаг NO_RENORM не выставлен.
-    if (renorm) {
-        double sum = 0.0;
+    // Нормировка весов выбранных (Qwen3 norm_topk_prob=true) — но только
+    // когда флаг NO_RENORM не выставлен.
+    if (g->renorm) {
+        sum = 0.0;
         for (k = 0; k < top_k; k++) sum += weights[k];
         if (sum > 0.0)
             for (k = 0; k < top_k; k++) weights[k] /= sum;
@@ -1783,64 +1799,111 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
             fprintf(stderr, " %d:%.6f", chosen[k], weights[k]);
         fprintf(stderr, "\n");
     }
+}
+
+// Роутер одного токена: логиты, затем выбор. op_moe зовёт это целиком.
+static void moe_route(const moe_geom *g, uint32_t ins, const float *x,
+                      double *logits, int *chosen, double *weights) {
+    moe_route_logits(g, x, logits);
+    moe_route_pick(g, ins, logits, chosen, weights);
+}
+
+static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
+    vtm_status st;
+    moe_geom g;
+    const vtm_tensor *x;
+    int i, k;
+    double *logits = NULL, *acc = NULL;
+    int *chosen = NULL;
+    double *weights = NULL;
+    float *scratch = NULL;
+    moe_source src;
+    int use_pread;
+
+    if ((st = moe_geom_init(m, ins, in, &g)) != VTM_OK) return st;
+    x = need(m, in->b, ins, "b (x)", &st);
+    if (!x) return st;
+
+    logits = (double *)calloc((size_t)g.n_experts, sizeof *logits);
+    chosen = (int *)calloc((size_t)g.top_k, sizeof *chosen);
+    weights = (double *)calloc((size_t)g.top_k, sizeof *weights);
+    acc = (double *)calloc((size_t)g.hidden, sizeof *acc);
+    scratch = (float *)calloc((size_t)g.inter * 3u + (size_t)g.hidden,
+                              sizeof *scratch);
+    if (!logits || !chosen || !weights || !acc || !scratch) {
+        free(logits); free(chosen); free(weights); free(acc); free(scratch);
+        return fail(m, ins, VTM_E_NOMEM, "MOE: нет памяти под рабочие буферы");
+    }
+
+    moe_cache_init();
+    moe_source_init(m, &src);
+    use_pread = src.use && g_moe_cache.ready && !g_moe_cache.disabled;
+    if (use_pread) moe_pf_start();
+
+    moe_route(&g, ins, x->f32, logits, chosen, weights);
+
     // 3b. Prefetch: пока главный поток считает эксперта 0, воркеры читают
     //     остальных. Порядок очереди — порядок спроса (gate/up/down на
     //     эксперта), поэтому ожидание на первом эксперте минимально.
-    if (use_pread && top_k > 0)
-        moe_pf_prefetch_experts(&src, chosen, top_k, gate_off, up_off, down_off,
-                                (size_t)(expert_blocks
-                                         * (int64_t)gate_block_bytes),
-                                (size_t)(expert_blocks
-                                         * (int64_t)down_block_bytes));
+    if (use_pread && g.top_k > 0)
+        moe_pf_prefetch_experts(&src, chosen, g.top_k, g.gate_off, g.up_off,
+                                g.down_off,
+                                (size_t)(g.expert_blocks
+                                         * (int64_t)g.gate_block_bytes),
+                                (size_t)(g.expert_blocks
+                                         * (int64_t)g.down_block_bytes));
 
     // 4. madvise — только когда pread-кэш не работает (выключен или нет
     //    дескриптора). С кэшем упреждение вредно: оно втягивает в page cache
     //    ровно те страницы, которые pread и так читает мимо отображения.
     if (!use_pread && moe_madvise_enabled()) {
-        for (k = 0; k < top_k; k++) {
-            int64_t off_gate = (int64_t)chosen[k] * expert_blocks
-                             * (int64_t)gate_block_bytes;
-            int64_t off_down = (int64_t)chosen[k] * expert_blocks
-                             * (int64_t)down_block_bytes;
-            moe_advise((const uint8_t *)gate_bank->qblocks + off_gate,
-                       (size_t)(expert_blocks * (int64_t)gate_block_bytes));
-            moe_advise((const uint8_t *)up_bank->qblocks + off_gate,
-                       (size_t)(expert_blocks * (int64_t)gate_block_bytes));
-            moe_advise((const uint8_t *)down_bank->qblocks + off_down,
-                       (size_t)(expert_blocks * (int64_t)down_block_bytes));
+        for (k = 0; k < g.top_k; k++) {
+            int64_t off_gate = (int64_t)chosen[k] * g.expert_blocks
+                             * (int64_t)g.gate_block_bytes;
+            int64_t off_down = (int64_t)chosen[k] * g.expert_blocks
+                             * (int64_t)g.down_block_bytes;
+            moe_advise((const uint8_t *)g.gate_bank->qblocks + off_gate,
+                       (size_t)(g.expert_blocks
+                                * (int64_t)g.gate_block_bytes));
+            moe_advise((const uint8_t *)g.up_bank->qblocks + off_gate,
+                       (size_t)(g.expert_blocks
+                                * (int64_t)g.gate_block_bytes));
+            moe_advise((const uint8_t *)g.down_bank->qblocks + off_down,
+                       (size_t)(g.expert_blocks
+                                * (int64_t)g.down_block_bytes));
         }
     }
 
     // 5. Эксперты: gate/up → silu(gate)*up → down → acc += w·out.
     {
         float *gate = scratch;
-        float *up = gate + inter;
-        float *mul = up + inter;
-        float *out = mul + inter;
+        float *up = gate + g.inter;
+        float *mul = up + g.inter;
+        float *out = mul + g.inter;
         int (*silu)(float *, const float *, int) =
             (m->backend && m->backend->silu) ? m->backend->silu
                                              : vtm_backend_scalar_lut.silu;
         moe_cache_entry *gpin = NULL, *upin = NULL, *dpin = NULL;
-        for (k = 0; k < top_k; k++) {
+        for (k = 0; k < g.top_k; k++) {
             int ex = chosen[k];
-            const uint8_t *gb = (const uint8_t *)gate_bank->qblocks +
-                                (int64_t)ex * expert_blocks
-                                * (int64_t)gate_block_bytes;
-            const uint8_t *ub = (const uint8_t *)up_bank->qblocks +
-                                (int64_t)ex * expert_blocks
-                                * (int64_t)gate_block_bytes;
-            const uint8_t *db = (const uint8_t *)down_bank->qblocks +
-                                (int64_t)ex * expert_blocks
-                                * (int64_t)down_block_bytes;
-            size_t expert_bytes = (size_t)(expert_blocks
-                                           * (int64_t)gate_block_bytes);
-            size_t down_bytes = (size_t)(expert_blocks
-                                         * (int64_t)down_block_bytes);
+            const uint8_t *gb = (const uint8_t *)g.gate_bank->qblocks +
+                                (int64_t)ex * g.expert_blocks
+                                * (int64_t)g.gate_block_bytes;
+            const uint8_t *ub = (const uint8_t *)g.up_bank->qblocks +
+                                (int64_t)ex * g.expert_blocks
+                                * (int64_t)g.gate_block_bytes;
+            const uint8_t *db = (const uint8_t *)g.down_bank->qblocks +
+                                (int64_t)ex * g.expert_blocks
+                                * (int64_t)g.down_block_bytes;
+            size_t expert_bytes = (size_t)(g.expert_blocks
+                                           * (int64_t)g.gate_block_bytes);
+            size_t down_bytes = (size_t)(g.expert_blocks
+                                         * (int64_t)g.down_block_bytes);
             int (*kernel)(float *, const uint8_t *, const float *, int, int) =
-                gate_bank->kind == VTM_TENSOR_Q4K ? vtm_q4k_tmv : vtm_q6k_tmv;
+                g.gate_bank->kind == VTM_TENSOR_Q4K ? vtm_q4k_tmv : vtm_q6k_tmv;
             int (*kernel_down)(float *, const uint8_t *, const float *, int,
                                int) =
-                down_bank->kind == VTM_TENSOR_Q4K ? vtm_q4k_tmv : vtm_q6k_tmv;
+                g.down_bank->kind == VTM_TENSOR_Q4K ? vtm_q4k_tmv : vtm_q6k_tmv;
 
             // pread в свой кэш: попадание — готовые байты, промах — ожидание
             // prefetch (или один крупный pread на всю матрицу эксперта).
@@ -1850,13 +1913,13 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
             if (use_pread) {
                 const uint8_t *cached;
                 uint64_t t_fetch = moe_now_ns();
-                cached = moe_cache_acquire(&src, gate_off, (uint32_t)ex,
+                cached = moe_cache_acquire(&src, g.gate_off, (uint32_t)ex,
                                            expert_bytes, &gpin);
                 if (cached) gb = cached;
-                cached = moe_cache_acquire(&src, up_off, (uint32_t)ex,
+                cached = moe_cache_acquire(&src, g.up_off, (uint32_t)ex,
                                            expert_bytes, &upin);
                 if (cached) ub = cached;
-                cached = moe_cache_acquire(&src, down_off, (uint32_t)ex,
+                cached = moe_cache_acquire(&src, g.down_off, (uint32_t)ex,
                                            down_bytes, &dpin);
                 if (cached) db = cached;
                 g_moe_fetch_ns += moe_now_ns() - t_fetch;
@@ -1864,8 +1927,8 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 
             {
             uint64_t t_c = moe_now_ns();
-            if (kernel(gate, gb, x->f32, inter, hidden) != 0 ||
-                kernel(up, ub, x->f32, inter, hidden) != 0) {
+            if (kernel(gate, gb, x->f32, g.inter, g.hidden) != 0 ||
+                kernel(up, ub, x->f32, g.inter, g.hidden) != 0) {
                 free(logits); free(chosen); free(weights); free(acc);
                 free(scratch);
                 // Ошибка ядра прерывает прогон, но закреплённые слоты
@@ -1877,7 +1940,7 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
                             "MOE: ядро gate/up вернуло ошибку (эксперт %d)",
                             ex);
             }
-            if (silu(gate, gate, inter) != 0) {
+            if (silu(gate, gate, g.inter) != 0) {
                 free(logits); free(chosen); free(weights); free(acc);
                 free(scratch);
                 // Ошибка ядра прерывает прогон, но закреплённые слоты
@@ -1888,8 +1951,8 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
                 return fail(m, ins, VTM_E_TENSOR,
                             "MOE: ядро SILU вернуло ошибку (эксперт %d)", ex);
             }
-            for (i = 0; i < inter; i++) mul[i] = gate[i] * up[i];
-            if (kernel_down(out, db, mul, hidden, inter) != 0) {
+            for (i = 0; i < g.inter; i++) mul[i] = gate[i] * up[i];
+            if (kernel_down(out, db, mul, g.hidden, g.inter) != 0) {
                 free(logits); free(chosen); free(weights); free(acc);
                 free(scratch);
                 // Ошибка ядра прерывает прогон, но закреплённые слоты
@@ -1900,7 +1963,7 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
                 return fail(m, ins, VTM_E_TENSOR,
                             "MOE: ядро down вернуло ошибку (эксперт %d)", ex);
             }
-            for (i = 0; i < hidden; i++)
+            for (i = 0; i < g.hidden; i++)
                 acc[i] += weights[k] * (double)out[i];
             g_moe_compute_ns += moe_now_ns() - t_c;
             }
@@ -1912,10 +1975,9 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         }
     }
 
-    for (i = 0; i < hidden; i++)
-        y->f32[i] = (float)((double)y->f32[i] + acc[i]);
+    for (i = 0; i < g.hidden; i++)
+        g.y->f32[i] = (float)((double)g.y->f32[i] + acc[i]);
 
-    (void)bank_blocks;
     free(logits);
     free(chosen);
     free(weights);
@@ -3522,6 +3584,81 @@ vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
 // и тот же размер 12 — поэтому поднимать scratch ради 16 не нужно, а для
 // моделей поменьше (активации на токен меньше) потолок 32 работает как есть.
 #define VTM_BATCH_TOKENS        32
+// Верхняя граница пачки вообще (её, а не VTM_BATCH_TOKENS, хватает стековым
+// буферам батчевых ядер). У MoE-графов потолок свой (см. VTM_MOE_BATCH_TOKENS):
+// там смысл пачки не в L1, а в том, чтобы эксперт читался один раз на много
+// токенов, поэтому 32 — слишком мало (см. «батчевый MOE»).
+#define VTM_BATCH_TOKENS_MAX    256
+
+// Батчевый MOE (задача 0179): потолок пачки и бюджет активаций на неё.
+//
+// Потолок 128 — не про L1, как у плотных графов (VTM_BATCH_TOKENS = 32), а про
+// смысл группировки: эксперт читается один раз на всех, кому он нужен в этой
+// пачке, и выигрыш растёт как 1-(1-top_k/n_experts)^C. На 30B (128 экспертов,
+// top-8) при C=8 общих экспертов почти нет (36 % перекрытия, замер 0177), при
+// C=32 уникальных ~112 из 256 обращений, а при C=77 — 127 из 616, то есть
+// 4,8× меньше байт. Поэтому пачка 77 токенов в одну не должна упираться в
+// потолок 32.
+//
+// Бюджет 384 МиБ: 30B держит ~3,57 МБ активаций на токен (48 слоёв своих
+// h1/q/k/v/attn/o/h2 + logits 152 КБ), то есть 107 токенов; 77-токенный
+// промпт — 275 МБ, один проход. VTM_MOE_BATCH_MB уменьшает/увеличивает бюджет
+// (на 16 ГиБ больше ~512 МБ брать не стоит: кэш экспертов 1792 МБ и dense уже
+// занимают память).
+#define VTM_MOE_BATCH_TOKENS 128
+#define VTM_MOE_BATCH_MB 384
+
+// Ядра kind 6/7 внутри группы.
+//
+// По умолчанию (VTM_MOE_BATCH_KERNEL не задан) группа считает **поштучными**
+// ядрами по своим членам: эксперт всё равно прочитан один раз (это и есть
+// выигрыш), а арифметика при этом побитово та же, что у поштучного пути, —
+// значит argmax и последовательность совпадают не «в пределах 1e-5», а точно.
+// Замер на этой машине (arm64, int8-dot) вдобавок показал, что поштучное ядро
+// kind 6/7 быстрее батчевого: int8-dot даёт ~60 G MAC/s против ~25 G MAC/s у
+// f32-батчевого (bench_backend --q4k), и на 77 токенах MOE считался 7,7 с
+// против 12,9 с. ~139 G MAC на 77 токенов никуда не деваются: батчевый путь
+// экономит байты с диска, а не FLOP.
+//
+// VTM_MOE_BATCH_KERNEL=1 — батчевое ядро (вес разворачивается один раз на
+// группу, f32-дорожки по токенам). Оставлено для машин, где f32-батчевое ядро
+// быстрее (x86 без VNNI / без int8-dot), и как A/B: на этой машине оно
+// медленнее, поэтому умолчание — поштучные ядра.
+static int moe_batch_kernel_enabled(void) {
+    const char *e = getenv("VTM_MOE_BATCH_KERNEL");
+    return e && *e && *e != '0';
+}
+
+// Батчевый MOE включается по умолчанию; VTM_MOE_BATCH=0 — поштучный путь
+// (A/B-замер «до/после» на одном бинарнике).
+static int moe_batch_enabled(void) {
+    const char *e = getenv("VTM_MOE_BATCH");
+    return !(e && *e && *e == '0');
+}
+
+static long moe_env_long(const char *name, long def, long lo, long hi) {
+    const char *env = getenv(name);
+    long v = def;
+
+    if (env && *env) {
+        char *end = NULL;
+        long t = strtol(env, &end, 10);
+        if (end != env && end && *end == '\0') v = t;
+    }
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return v;
+}
+
+// Потолок пачки и бюджет активаций для MoE-графа.
+static void moe_batch_limits(int *cap, size_t *bytes) {
+    long mb = moe_env_long("VTM_MOE_BATCH_MB", VTM_MOE_BATCH_MB, 1, 16384);
+
+    *cap = (int)moe_env_long("VTM_MOE_BATCH_TOKENS", VTM_MOE_BATCH_TOKENS, 4,
+                             VTM_BATCH_TOKENS_MAX);
+    *bytes = (size_t)mb << 20;
+}
+
 // Минимальная пачка для батчевого плотного (fp32) TMV/MM: ядро 0159
 // векторизует по токенам, и меньше 4 токенов четвёрка лент не набирается.
 // Такие пачки считаются по токену через vtm_simd_gemv_f32 — это быстрее
@@ -3550,6 +3687,7 @@ static float batch_load_f32(const float *scales, size_t i) {
 
 typedef struct {
     int       C;          // токенов в текущей пачке
+    int       has_moe;    // в программе есть MOE (свой потолок пачки, 0179)
     uint32_t  n_tensors;
     uint32_t  n_local;    // сколько тензоров-активаций
     uint8_t  *local;      // [n_tensors] 1 — у токена своя копия
@@ -3587,14 +3725,28 @@ static int batch_classify(vtm_t *m, batch_scratch *b) {
     b->real = (float **)calloc(n ? n : 1u, sizeof *b->real);
     if (!b->local || !b->off || !b->idx || !b->real) return 0;
 
+    // Есть ли в программе MOE. У MoE-графов свой потолок пачки и свой бюджет
+    // активаций (moe_batch_limits): смысл пачки там не в L1, а в том, чтобы
+    // эксперт читался один раз на всех, кому он нужен.
+    for (i = 0; i < m->n_instr; i++)
+        if (m->instr[i].opcode == VTM_OP_MOE) {
+            b->has_moe = 1;
+            break;
+        }
+    // VTM_MOE_BATCH=0 — прежний путь целиком: пачки нет вовсе (так же, как до
+    // 0179, когда MOE выключал батчевый prefill). Смешанный вариант «TMV
+    // пачкой, MOE по токену» не нужен ни для замера, ни для смысла.
+    if (b->has_moe && !moe_batch_enabled()) return 0;
+
     for (i = 0; i < m->n_instr; i++) {
         const vtm_instr *in = &m->instr[i];
-        // MOE выбирает экспертов по данным и читает банки с диска; RMSH
-        // нормирует по последней оси. Батчевых ядер у них нет, а батчевый
-        // путь гоняет инструкцию на каждый токен пачки — для MOE это была бы
-        // не пачка, а k-кратное чтение тех же банков. Честно уходим на путь
-        // по токену (как при отсутствии батчевых ядер).
-        if (in->opcode == VTM_OP_MOE || in->opcode == VTM_OP_RMSH) return 0;
+        // RMSH (QK-norm) батчевых ядер не имеет, но он дешёвый и считается по
+        // токену в batch_token_op. Раньше он выключал пачку целиком — вместе с
+        // MOE, из-за чего у Qwen3-MoE батчевого prefill не было вообще (0179).
+        // Для графов без MOE поведение прежнее: пачка по-прежнему только там,
+        // где её проверяли (плотные модели), — RMSH значит Qwen3, а его
+        // ARGMAX-паритет с поштучным путём на 30B не проверялся до 0179.
+        if (in->opcode == VTM_OP_RMSH && !b->has_moe) return 0;
         // KV-кэш — общий: его строки адресуются глобальной позицией, а не
         // токеном пачки. KVW пишет в него напрямую (см. op_kvw).
         if (in->opcode == VTM_OP_KVW) {
@@ -3773,7 +3925,7 @@ static void batch_tmv_trit_rows(const vtm_tensor *w, const float *xt, int C,
     (void)rows;
 
     for (r = r0; r < r1; r++) {
-        double acc[VTM_BATCH_TOKENS], ba[VTM_BATCH_TOKENS];
+        double acc[VTM_BATCH_TOKENS_MAX], ba[VTM_BATCH_TOKENS_MAX];
         int64_t base = (int64_t)r * cols;
         int64_t end = base + cols;
         int64_t wi = base / VTM_TRITS_PER_WORD;
@@ -3841,7 +3993,7 @@ static void batch_mm_trit_rows(const vtm_tensor *a, const float *bt, int C,
     lut243_init();
     (void)mm;
     for (r = r0; r < r1; r++) {
-        double acc[VTM_BATCH_TOKENS];
+        double acc[VTM_BATCH_TOKENS_MAX];
         for (j = 0; j < C; j++) acc[j] = 0.0;
         for (t = 0; t < kk; t++) {
             float wv;
@@ -4029,6 +4181,15 @@ static int batch_tmv_ready(vtm_t *m, const vtm_instr *in,
         // деквантизует строку один раз на пачку. Условия — как у поштучного
         // req_q4k, плюс кратность cols блоку 256: иначе строка начинается не
         // с границы блока, и ядро отказывает (поштучный путь умеет).
+        //
+        // Пачка меньше 4 токенов — по токену: батчевое ядро kind 6/7 считает
+        // токены четвёрками, а остаток 1-3 идёт скалярным double-циклом по
+        // всей строке, и на 3 токенах это дороже трёх поштучных GEMV (замер
+        // 0179: промпт 3 токена — пачка 3,9 с против 3,0 с по токену).
+        // У MOE-графа потолок пачки свой, но короткий промпт остаётся
+        // коротким: без этого правила батчевый prefill 3-токенного промпта
+        // был бы медленнее прежнего пути.
+        if (b->C < VTM_DENSE_BATCH_MIN) return 0;
         if ((in->flags & VTM_FLAG_TMV_TRANSPOSED) != 0) return 0;
         if (!w->qblocks || w->scale_block != VTM_Q4K_BLOCK_VALUES) return 0;
         nb = ((uint64_t)w->n_elements + VTM_Q4K_BLOCK_VALUES - 1u)
@@ -4135,6 +4296,9 @@ static int batch_mm_ready(vtm_t *m, const vtm_instr *in,
         uint64_t n = (uint64_t)*mm * (uint64_t)*kk;
         uint64_t nb = ((uint64_t)a->n_elements + VTM_Q4K_BLOCK_VALUES - 1u)
                     / VTM_Q4K_BLOCK_VALUES;
+        // Как у TMV kind 6/7: пачка меньше 4 токенов — по токену (я бatчевого
+        // ядра считает четвёрками, хвост 1-3 — скалярным double-циклом).
+        if (b->C < VTM_DENSE_BATCH_MIN) return 0;
         if (!a->qblocks || a->scale_block != VTM_Q4K_BLOCK_VALUES) return 0;
         if ((uint64_t)a->n_qblocks != nb) return 0;
         if ((uint64_t)a->n_elements < n) return 0;
@@ -4191,11 +4355,379 @@ static vtm_status batch_mm_apply(vtm_t *m, uint32_t pc,
     return VTM_OK;
 }
 
+// Диагностика батчевого пути (VTM_BATCH_TRACE=1). --trace-summary для него не
+// работает: она включает поштучный путь (трасса — «инструкция на токен»),
+// поэтому без этого счётчика «пачка идёт 19 с» было бы чёрным ящиком: не видно,
+// сколько из них MOE, сколько TMV и сколько ожидания I/O.
+#define VTM_BATCH_OP_MAX 32
+static uint64_t g_bt_ns[VTM_BATCH_OP_MAX], g_bt_calls[VTM_BATCH_OP_MAX];
+
+static int batch_trace_enabled(void) {
+    const char *e = getenv("VTM_BATCH_TRACE");
+    return e && *e && *e != '0';
+}
+
+static void batch_trace_report(int ntok) {
+    uint64_t total = 0;
+    int i;
+
+    for (i = 0; i < VTM_BATCH_OP_MAX; i++) total += g_bt_ns[i];
+    fprintf(stderr, "VTM BATCH: токенов=%d, всего=%.3f с (по инструкциям)\n",
+            ntok, (double)total / 1e9);
+    for (i = 0; i < VTM_BATCH_OP_MAX; i++) {
+        if (!g_bt_calls[i]) continue;
+        fprintf(stderr, "  op=0x%02x вызовов=%llu время=%.3f с (%.1f%%)\n", i,
+                (unsigned long long)g_bt_calls[i],
+                (double)g_bt_ns[i] / 1e9,
+                total ? 100.0 * (double)g_bt_ns[i] / (double)total : 0.0);
+    }
+}
+
+// Роутер пачки по токенам параллельно (по одному токену на строку). Счёт
+// идёт той же функцией и в том же порядке (double, по i), что и поштучно,
+// поэтому это только скорость: на 30B роутер — 128 экспертов × 2048 на токен,
+// то есть ~1 с на 77 токенов одним потоком; в MOE это видно как «лишние»
+// секунды сверх fetch/compute.
+typedef struct {
+    const vtm_t *m;
+    const moe_geom *g;
+    const batch_scratch *b;
+    uint32_t x_idx;
+    double *logits;   // [C][n_experts]
+} moe_route_job;
+
+static void moe_route_rows(void *p, int tid, int r0, int r1) {
+    moe_route_job *job = (moe_route_job *)p;
+    int ne = job->g->n_experts;
+    int j;
+
+    (void)tid;
+    for (j = r0; j < r1; j++) {
+        const float *xj = batch_src(job->m, job->b, job->x_idx, j);
+        if (!xj) continue;
+        moe_route_logits(job->g, xj, job->logits + (size_t)j * (size_t)ne);
+    }
+}
+
+// --- батчевый MOE (задача 0179) --------------------------------------------
+//
+// Зачем. Поштучный prefill считает каждый токен отдельным проходом, поэтому
+// банк эксперта читается заново для каждого выбравшего его токена: на 77
+// токенах это 77·8 = 616 обращений к экспертам на слой (по 3 банка каждое) при
+// 128 существующих экспертах. При C=32 уникальных ~112, при C=77 — 127, то
+// есть 4,8× меньше байт: ~18,5 ГБ (вся секция экспертов ровно один раз) вместо
+// ~90 ГБ. Это и есть TTFT.
+//
+// Как. Токены пачки делятся на группы по эксперту (top-8 у каждого свой, но
+// пересекаются сильно). Для группы: банк эксперта берётся из pread-кэша один
+// раз (одна закреплённая тройка на группу), а gate/up/down считаются батчевыми
+// ядрами kind 6/7 (vtm_q4k_tmv_batch/vtm_q6k_tmv_batch — строка веса
+// разворачивается один раз на группу). silu и произведение — по всей группе.
+// Выход эксперта для каждого токена группы кладётся в part[токен][k], а в конце
+// вклады складываются в порядке k — так же, как в поштучном op_moe.
+//
+// Почему это не меняет выбора токена. Роутер, softmax, top-k и нормировка —
+// общий код с поштучным путём (moe_route): выбор экспертов совпадает
+// побитово. Группировка меняет только порядок, в котором в acc одного токена
+// приходят его эксперты, а не набор слагаемых; ядра kind 6/7 в пачке считают
+// ту же сумму в f32-порядке (поштучный путь — int8-dot по под-блокам), поэтому
+// расхождение выхода MOE — 1e-7, а не «другой эксперт».
+//
+// Запасной путь. Если геометрия инструкции не та (или нет памяти), *handled
+// остаётся 0 и инструкция считается поштучно — как до 0179. dst при этом не
+// тронут: всё копится в acc, поэтому «начали пачкой, бросили» безопасно.
+static vtm_status batch_moe_apply(vtm_t *m, uint32_t pc, const vtm_instr *in,
+                                  batch_scratch *b, int *handled) {
+    vtm_status st = VTM_OK;
+    moe_geom g;
+    moe_source src;
+    int use_pread;
+    int C = b->C;
+    int top_k, hidden, inter, n_experts;
+    int j, k, t, e, ne, nt;
+    size_t nsel, i, nwork;
+    int *chosen = NULL, *count = NULL, *start = NULL, *pos = NULL;
+    int *list = NULL, *uniq = NULL;
+    double *weights = NULL, *logits = NULL, *part = NULL, *acc1 = NULL;
+    double *all_logits = NULL;
+    float *work = NULL;
+    int (*silu)(float *, const float *, int);
+    int exact = 0;
+
+    *handled = 0;
+    if (C < 1 || !moe_batch_enabled()) return VTM_OK;
+    // dst — активация токена: писать в общий тензор «всей пачкой» нельзя
+    // (поштучный путь делает y += acc на каждый токен, то есть копит сумму).
+    if (in->dst == VTM_NO_TENSOR || in->dst >= b->n_tensors
+        || !b->local[in->dst])
+        return VTM_OK;
+    if ((st = moe_geom_init(m, pc, in, &g)) != VTM_OK) return VTM_OK;
+
+    top_k = g.top_k;
+    hidden = g.hidden;
+    inter = g.inter;
+    n_experts = g.n_experts;
+    nsel = (size_t)C * (size_t)top_k;
+
+    chosen = (int *)calloc(nsel ? nsel : 1u, sizeof *chosen);
+    count = (int *)calloc((size_t)n_experts, sizeof *count);
+    start = (int *)calloc((size_t)n_experts, sizeof *start);
+    pos = (int *)calloc((size_t)n_experts, sizeof *pos);
+    uniq = (int *)calloc((size_t)n_experts, sizeof *uniq);
+    list = (int *)calloc(nsel ? nsel : 1u, sizeof *list);
+    weights = (double *)calloc(nsel ? nsel : 1u, sizeof *weights);
+    logits = (double *)calloc((size_t)n_experts, sizeof *logits);
+    all_logits = (double *)calloc((size_t)C * (size_t)n_experts,
+                                  sizeof *all_logits);
+    // part[токен][k][i] — выход эксперта, которого токен выбрал k-м. Копим
+    // сюда, а не в acc[токен], чтобы сложить вклады в том же порядке, что и
+    // поштучный путь (k по возрастанию): тогда при VTM_MOE_BATCH_KERNEL=0
+    // (поштучные ядра) результат побитово равен поштучному пути, а при
+    // батчевых ядрах отличается только их арифметикой.
+    part = (double *)calloc(nsel * (size_t)hidden, sizeof *part);
+    acc1 = (double *)calloc((size_t)hidden, sizeof *acc1);
+    nwork = (size_t)C * ((size_t)hidden * 2u + (size_t)inter * 3u);
+    work = (float *)calloc(nwork ? nwork : 1u, sizeof *work);
+    if (!chosen || !count || !start || !pos || !uniq || !list || !weights
+        || !logits || !part || !acc1 || !work || !all_logits) {
+        st = fail(m, pc, VTM_E_NOMEM, "MOE (пачка): нет памяти под буферы");
+        goto done;
+    }
+
+    // 1. Роутер по каждому токену — тем же кодом, что и поштучно. Логиты всех
+    //    токенов считаются параллельно (строки независимы), выбор top-k —
+    //    последовательно: он дешёвый и трогает общий счётчик трассы.
+    {
+        moe_route_job rj;
+
+        rj.m = m;
+        rj.g = &g;
+        rj.b = b;
+        rj.x_idx = in->b;
+        rj.logits = all_logits;
+        vtm_parallel_rows(C, (double)C * (double)n_experts * (double)hidden,
+                          moe_route_rows, &rj);
+        for (j = 0; j < C; j++) {
+            const float *xj = batch_src(m, b, in->b, j);
+            if (!xj) goto done;
+            for (t = 0; t < n_experts; t++)
+                logits[t] = all_logits[(size_t)j * (size_t)n_experts
+                                       + (size_t)t];
+            moe_route_pick(&g, pc, logits, chosen + (size_t)j * top_k,
+                           weights + (size_t)j * top_k);
+        }
+    }
+
+    // 2. Группы: count[e] — сколько обращений к эксперту, list[] — индексы
+    //    обращений (j*top_k + k) в порядке появления, uniq[] — эксперты в
+    //    порядке первого спроса (он же порядок чтения и счёта).
+    for (i = 0; i < nsel; i++) count[chosen[i]]++;
+    ne = 0;
+    for (e = 0; e < n_experts; e++) {
+        start[e] = pos[e] = (e ? start[e - 1] + count[e - 1] : 0);
+        if (count[e]) uniq[ne++] = e;
+    }
+    for (i = 0; i < nsel; i++) list[pos[chosen[i]]++] = (int)i;
+
+    moe_cache_init();
+    moe_source_init(m, &src);
+    use_pread = src.use && g_moe_cache.ready && !g_moe_cache.disabled;
+    if (use_pread) moe_pf_start();
+    if (use_pread && ne > 0) {
+        // Очередь — весь набор экспертов пачки сразу: воркеры читают слой,
+        // пока главный считает первые группы. Порядок = порядок спроса.
+        moe_pf_prefetch_list(&src, uniq, ne, g.gate_off, g.up_off, g.down_off,
+                             (size_t)(g.expert_blocks
+                                      * (int64_t)g.gate_block_bytes),
+                             (size_t)(g.expert_blocks
+                                      * (int64_t)g.down_block_bytes));
+    }
+    if (!use_pread && moe_madvise_enabled()) {
+        for (k = 0; k < ne; k++) {
+            int64_t off_gate = (int64_t)uniq[k] * g.expert_blocks
+                             * (int64_t)g.gate_block_bytes;
+            int64_t off_down = (int64_t)uniq[k] * g.expert_blocks
+                             * (int64_t)g.down_block_bytes;
+            moe_advise((const uint8_t *)g.gate_bank->qblocks + off_gate,
+                       (size_t)(g.expert_blocks
+                                * (int64_t)g.gate_block_bytes));
+            moe_advise((const uint8_t *)g.up_bank->qblocks + off_gate,
+                       (size_t)(g.expert_blocks
+                                * (int64_t)g.gate_block_bytes));
+            moe_advise((const uint8_t *)g.down_bank->qblocks + off_down,
+                       (size_t)(g.expert_blocks
+                                * (int64_t)g.down_block_bytes));
+        }
+    }
+
+    silu = (m->backend && m->backend->silu) ? m->backend->silu
+                                            : vtm_backend_scalar_lut.silu;
+    exact = !moe_batch_kernel_enabled();
+
+    // 3. Группы: эксперт читается один раз, ядра — на все токены группы.
+    {
+        float *xt = work;                          // [hidden][nt]
+        float *gate = xt + (size_t)hidden * (size_t)C;   // [inter][nt]
+        float *up = gate + (size_t)inter * (size_t)C;
+        float *mul = up + (size_t)inter * (size_t)C;
+        float *out = mul + (size_t)inter * (size_t)C;    // [hidden][nt]
+
+        for (k = 0; k < ne; k++) {
+            moe_cache_entry *gpin = NULL, *upin = NULL, *dpin = NULL;
+            const uint8_t *gb, *ub, *db;
+            size_t expert_bytes = (size_t)(g.expert_blocks
+                                           * (int64_t)g.gate_block_bytes);
+            size_t down_bytes = (size_t)(g.expert_blocks
+                                         * (int64_t)g.down_block_bytes);
+            int (*kbatch)(float *, const uint8_t *, const float *, int, int,
+                          int) = g.gate_bank->kind == VTM_TENSOR_Q4K
+                               ? vtm_q4k_tmv_batch : vtm_q6k_tmv_batch;
+            int (*kbatch_down)(float *, const uint8_t *, const float *, int,
+                               int, int) = g.down_bank->kind == VTM_TENSOR_Q4K
+                                          ? vtm_q4k_tmv_batch
+                                          : vtm_q6k_tmv_batch;
+            int ex = uniq[k];
+            uint64_t t_c;
+
+            e = start[ex];
+            nt = count[ex];
+            for (j = 0; j < nt; j++) {
+                int s = list[e + j];
+                const float *xj = batch_src(m, b, in->b, s / top_k);
+                for (t = 0; t < hidden; t++)
+                    xt[(size_t)t * (size_t)nt + (size_t)j] = xj[t];
+            }
+
+            gb = (const uint8_t *)g.gate_bank->qblocks
+               + (int64_t)ex * g.expert_blocks
+               * (int64_t)g.gate_block_bytes;
+            ub = (const uint8_t *)g.up_bank->qblocks
+               + (int64_t)ex * g.expert_blocks
+               * (int64_t)g.gate_block_bytes;
+            db = (const uint8_t *)g.down_bank->qblocks
+               + (int64_t)ex * g.expert_blocks
+               * (int64_t)g.down_block_bytes;
+            if (use_pread) {
+                const uint8_t *cached;
+                uint64_t t_fetch = moe_now_ns();
+                cached = moe_cache_acquire(&src, g.gate_off, (uint32_t)ex,
+                                           expert_bytes, &gpin);
+                if (cached) gb = cached;
+                cached = moe_cache_acquire(&src, g.up_off, (uint32_t)ex,
+                                           expert_bytes, &upin);
+                if (cached) ub = cached;
+                cached = moe_cache_acquire(&src, g.down_off, (uint32_t)ex,
+                                           down_bytes, &dpin);
+                if (cached) db = cached;
+                g_moe_fetch_ns += moe_now_ns() - t_fetch;
+            }
+
+            t_c = moe_now_ns();
+            if (exact) {
+                // Поштучные ядра по членам группы: тот же код и порядок, что в
+                // op_moe, поэтому acc совпадает с поштучным путём побитово.
+                int (*k1)(float *, const uint8_t *, const float *, int, int) =
+                    g.gate_bank->kind == VTM_TENSOR_Q4K ? vtm_q4k_tmv
+                                                        : vtm_q6k_tmv;
+                int (*k1d)(float *, const uint8_t *, const float *, int, int) =
+                    g.down_bank->kind == VTM_TENSOR_Q4K ? vtm_q4k_tmv
+                                                        : vtm_q6k_tmv;
+                for (j = 0; j < nt; j++) {
+                    int s = list[e + j];
+                    const float *xj = batch_src(m, b, in->b, s / top_k);
+                    double *aj = part + (size_t)s * (size_t)hidden;
+                    if (k1(gate, gb, xj, inter, hidden) != 0
+                        || k1(up, ub, xj, inter, hidden) != 0
+                        || silu(gate, gate, inter) != 0) {
+                        moe_cache_unpin(gpin); moe_cache_unpin(upin);
+                        moe_cache_unpin(dpin);
+                        goto done;
+                    }
+                    for (i = 0; i < (size_t)inter; i++)
+                        mul[i] = gate[i] * up[i];
+                    if (k1d(out, db, mul, hidden, inter) != 0) {
+                        moe_cache_unpin(gpin); moe_cache_unpin(upin);
+                        moe_cache_unpin(dpin);
+                        goto done;
+                    }
+                    for (i = 0; i < (size_t)hidden; i++)
+                        aj[i] = (double)out[i];
+                }
+            } else {
+                if (kbatch(gate, gb, xt, inter, hidden, nt) != 0
+                    || kbatch(up, ub, xt, inter, hidden, nt) != 0
+                    || silu(gate, gate, inter * nt) != 0) {
+                    moe_cache_unpin(gpin); moe_cache_unpin(upin);
+                    moe_cache_unpin(dpin);
+                    goto done;   // handled == 0: уйдёт в поштучный путь
+                }
+                for (i = 0; i < (size_t)inter * (size_t)nt; i++)
+                    mul[i] = gate[i] * up[i];
+                if (kbatch_down(out, db, mul, hidden, inter, nt) != 0) {
+                    moe_cache_unpin(gpin); moe_cache_unpin(upin);
+                    moe_cache_unpin(dpin);
+                    goto done;
+                }
+                for (j = 0; j < nt; j++) {
+                    int s = list[e + j];
+                    double *aj = part + (size_t)s * (size_t)hidden;
+                    for (i = 0; i < (size_t)hidden; i++)
+                        aj[i] = (double)out[i * (size_t)nt + (size_t)j];
+                }
+            }
+            g_moe_compute_ns += moe_now_ns() - t_c;
+            if (use_pread) {
+                moe_cache_unpin(gpin);
+                moe_cache_unpin(upin);
+                moe_cache_unpin(dpin);
+            }
+        }
+    }
+
+    // 4. y += Σ_k w_k·out_k по каждому токену — порядок k тот же, что в op_moe
+    //    (поэтому при VTM_MOE_BATCH_KERNEL=0 результат побитово равен
+    //    поштучному пути, а при батчевых ядрах отличается только ими).
+    for (j = 0; j < C; j++) {
+        float *yj = b->mem + (size_t)j * b->slot + b->off[in->dst];
+        for (i = 0; i < (size_t)hidden; i++) acc1[i] = 0.0;
+        for (k = 0; k < top_k; k++) {
+            double w = weights[(size_t)j * top_k + k];
+            const double *pk = part
+                             + ((size_t)j * top_k + (size_t)k) * (size_t)hidden;
+            for (i = 0; i < (size_t)hidden; i++)
+                acc1[i] += w * pk[i];
+        }
+        for (i = 0; i < (size_t)hidden; i++)
+            yj[i] = (float)((double)yj[i] + acc1[i]);
+    }
+    *handled = 1;
+
+done:
+    free(chosen);
+    free(count);
+    free(start);
+    free(pos);
+    free(uniq);
+    free(list);
+    free(weights);
+    free(logits);
+    free(all_logits);
+    free(part);
+    free(acc1);
+    free(work);
+    return st;
+}
+
 // Одна инструкция прежним путём (кроме TMV/MM — их зовёт batch_token_op).
 static vtm_status batch_op_one(vtm_t *m, uint32_t i, const vtm_instr *in) {
     switch (in->opcode) {
     case VTM_OP_RMSN:
         return op_rmsn(m, i, in);
+    case VTM_OP_RMSH:
+        return op_rmsh(m, i, in);
+    case VTM_OP_MOE:
+        // Запасной путь батчевого MOE: геометрия не та или нет памяти.
+        return op_moe(m, i, in);
     case VTM_OP_ROPE:
         return op_rope(m, i, in);
     case VTM_OP_SM:
@@ -4276,6 +4808,7 @@ static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
     uint32_t pc;
     vtm_status st = VTM_OK;
     int halted = 0;
+    int bt_trace = batch_trace_enabled();
 
     b->C = C;
     m->halted = 0;
@@ -4285,6 +4818,7 @@ static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
     for (pc = 0; pc < m->n_instr && !halted; pc++) {
         const vtm_instr *in = &m->instr[pc];
         int handled = 0;
+        uint64_t t0 = bt_trace ? moe_now_ns() : 0u;
 
         switch (in->opcode) {
         case VTM_OP_TMV:
@@ -4297,6 +4831,11 @@ static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
             if (st == VTM_OK && !handled)
                 st = batch_token_op(m, pc, in, b, ids, pos0);
             break;
+        case VTM_OP_MOE:
+            st = batch_moe_apply(m, pc, in, b, &handled);
+            if (st == VTM_OK && !handled)
+                st = batch_token_op(m, pc, in, b, ids, pos0);
+            break;
         case VTM_OP_HALT:
             m->halted = 1;
             halted = 1;
@@ -4304,6 +4843,10 @@ static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
         default:
             st = batch_token_op(m, pc, in, b, ids, pos0);
             break;
+        }
+        if (bt_trace && in->opcode < VTM_BATCH_OP_MAX) {
+            g_bt_ns[in->opcode] += moe_now_ns() - t0;
+            g_bt_calls[in->opcode]++;
         }
         if (st != VTM_OK) break;
     }
@@ -4349,9 +4892,20 @@ vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
         return batch_sequential(m, ids, n, (int)start);
     }
     // Предел пачки — и по памяти (в пачке C копий активаций), и по длине.
+    // У MoE-графов потолок и бюджет свои (moe_batch_limits, 0179): эксперты
+    // читаются один раз на пачку, и выигрыш растёт с ней почти линейно, пока
+    // растёт доля «общих» экспертов.
     cmax = VTM_BATCH_TOKENS;
     {
-        size_t lim = VTM_BATCH_SCRATCH_BYTES / (b.slot * sizeof(float));
+        size_t budget = VTM_BATCH_SCRATCH_BYTES;
+        size_t lim;
+        int cap = 0;
+
+        if (b.has_moe) {
+            moe_batch_limits(&cap, &budget);
+            cmax = cap;
+        }
+        lim = budget / (b.slot * sizeof(float));
         if (lim < 1u) lim = 1u;
         if ((size_t)cmax > lim) cmax = (int)lim;
     }
@@ -4397,6 +4951,7 @@ vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
     batch_free(&b);
     m->position = (int)(start + (int64_t)n - 1);
     m->input_token = ids[n - 1];
+    if (batch_trace_enabled()) batch_trace_report(n);
     return VTM_OK;
 }
 
