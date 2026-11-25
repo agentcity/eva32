@@ -1185,7 +1185,7 @@
   {
     "id": "0178",
     "title": "Большое поле ответа и сворачиваемый think",
-    "status": "in_progress",
+    "status": "done",
     "file": "0178-chat-answer-ui.md",
     "assignee": "agent:chat-ui"
   }

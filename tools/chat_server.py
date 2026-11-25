@@ -2042,6 +2042,10 @@ PAGE_HTML = """<!doctype html>
     background: var(--accent-2);
   }
   button.mini.alt { background: var(--muted); }
+  button.mini.ghost {
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--border);
+  }
   .loadctl { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
   #status { color: var(--muted); font-size: 13px; }
   #status.error { color: var(--danger); }
@@ -2073,13 +2077,36 @@ PAGE_HTML = """<!doctype html>
     font-size: 12px; font-variant-numeric: tabular-nums;
   }
   .stats b { color: var(--text); font-weight: 650; }
+  /* Ответ растёт по содержимому: без max-height и без внутренней прокрутки.
+     Свернуть длинный ответ можно кнопкой в шапке панели — состояние
+     .panel.answer-collapsed ограничивает только сам текст ответа. */
   .answer {
-    margin: 0; padding: 15px; flex: 1; overflow: auto; max-height: 58vh;
+    margin: 0; padding: 15px; flex: 1 0 auto;
     white-space: pre-wrap; overflow-wrap: anywhere; background: transparent;
     color: var(--text); font: inherit;
+    max-height: none; overflow: visible;
+  }
+  .panel.answer-collapsed .answer {
+    flex: 0 1 auto; max-height: 18rem; overflow: auto;
   }
   .answer:empty::before {
     content: "Ответ появится здесь…"; color: var(--muted); font-style: italic;
+  }
+  /* Рассуждение <think>: свёрнуто по умолчанию, раскрывается кликом. */
+  .think {
+    margin: 12px 14px 0; padding: 8px 12px;
+    background: var(--code-bg); border: 1px dashed var(--border);
+    border-radius: 10px; color: var(--muted); font-size: 13px;
+  }
+  .think[hidden] { display: none; }
+  .think summary { cursor: pointer; font-weight: 650; color: var(--muted); }
+  .think summary:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  .think-body {
+    margin: 8px 0 0; padding: 0; max-height: 45vh; overflow: auto;
+    white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text);
+    font: inherit;
   }
   .answer .error-text {
     color: var(--danger); font-style: normal; white-space: pre-wrap;
@@ -2156,7 +2183,12 @@ PAGE_HTML = """<!doctype html>
           <span>ток/с: <b id="speed-0">—</b></span>
           <span>токенов: <b id="tokens-0">—</b></span>
         </div>
+        <button type="button" class="mini ghost" id="collapse-0" hidden>свернуть</button>
       </div>
+      <details class="think" id="think-0" hidden>
+        <summary id="think-sum-0">рассуждение</summary>
+        <pre class="think-body" id="think-body-0"></pre>
+      </details>
       <pre class="answer" id="answer-0" aria-live="polite"></pre>
       <div class="foot" id="foot-0"></div>
     </article>
@@ -2176,7 +2208,12 @@ PAGE_HTML = """<!doctype html>
           <span>ток/с: <b id="speed-1">—</b></span>
           <span>токенов: <b id="tokens-1">—</b></span>
         </div>
+        <button type="button" class="mini ghost" id="collapse-1" hidden>свернуть</button>
       </div>
+      <details class="think" id="think-1" hidden>
+        <summary id="think-sum-1">рассуждение</summary>
+        <pre class="think-body" id="think-body-1"></pre>
+      </details>
       <pre class="answer" id="answer-1" aria-live="polite"></pre>
       <div class="foot" id="foot-1"></div>
     </article>
@@ -2287,6 +2324,10 @@ PAGE_HTML = """<!doctype html>
   var running = false;
   var finishedSides = 0;
   var controlBusy = [false, false];
+  // Поток каждого ответа: парсер <think> и счётчик символов рассуждения.
+  var streams = [null, null];
+  // Автоскролл к концу держится, пока читатель сам не отлистал вверх.
+  var stickToBottom = true;
 
   function byId(id) { return document.getElementById(id); }
   function backendOf(id) {
@@ -2342,11 +2383,63 @@ PAGE_HTML = """<!doctype html>
     fillModels(side, spec ? spec.model : null);
   }
 
+  // --- think-парсер: начало (логику проверяет node из tests.test_chat_server) ---
+  // Qwen3 кладёт рассуждение в <think>…</think> прямо в поток текста, поэтому
+  // тег может прийти разорванным между delta («<thi» + «nk>»). Держим хвост,
+  // который ещё может оказаться началом тега, и отдаём его в следующий раз.
+  // Всё внутри think уходит отдельным обработчиком: в ответ теги не попадают.
+  var THINK_TAG_RE = /<\\/?think(?:ing)?\\s*>/i;
+  // Начало тега, оборванное на конце куска: «<», «</», «<thi», «</think »…
+  // Такой хвост нельзя показывать — он может дорасти до тега в следующем delta.
+  var THINK_TAIL_RE = /^<\\/?(?:t(?:h(?:i(?:n(?:k(?:ing)?)?)?)?)?)?\\s*>?$/;
+
+  function holdThinkTail(text) {
+    var start = text.lastIndexOf("<");
+    if (start < 0) { return 0; }
+    var tail = text.slice(start).toLowerCase();
+    return THINK_TAIL_RE.test(tail) ? tail.length : 0;
+  }
+
+  function createThinkParser(handlers) {
+    var buffer = "";
+    var inThink = false;
+
+    function emit(text) {
+      if (!text) { return; }
+      if (inThink) { handlers.think(text); } else { handlers.answer(text); }
+    }
+
+    function feed(chunk) {
+      buffer += chunk || "";
+      for (;;) {
+        var match = THINK_TAG_RE.exec(buffer);
+        if (!match) { break; }
+        emit(buffer.slice(0, match.index));
+        inThink = match[0].charAt(1) !== "/";
+        buffer = buffer.slice(match.index + match[0].length);
+      }
+      var held = holdThinkTail(buffer);
+      emit(buffer.slice(0, buffer.length - held));
+      buffer = buffer.slice(buffer.length - held);
+    }
+
+    // Поток оборвался. В буфере остаётся только начало тега, разорванного
+    // вместе с потоком, — как текст его показывать нельзя. Всё содержательное
+    // уже ушло в ответ или в рассуждение (незакрытый think — целиком туда).
+    function flush() {
+      buffer = "";
+    }
+
+    return { feed: feed, flush: flush, inThink: function () { return inThink; } };
+  }
+  // --- think-парсер: конец ---
+
   function resetPanels() {
     finishedSides = 0;
+    stickToBottom = true;
     [0, 1].forEach(function (side) {
       byId("panel-" + side).className = "panel";
-      byId("answer-" + side).textContent = "";
+      resetAnswer(side);
       byId("time-" + side).textContent = "—";
       byId("speed-" + side).textContent = "—";
       byId("tokens-" + side).textContent = "—";
@@ -2680,9 +2773,104 @@ PAGE_HTML = """<!doctype html>
   function appendText(side, text) {
     var answer = byId("answer-" + side);
     answer.appendChild(document.createTextNode(text));
-    if (answer.scrollHeight - answer.scrollTop - answer.clientHeight < 140) {
-      answer.scrollTop = answer.scrollHeight;
+    followStream(side);
+  }
+
+  function appendThink(side, text) {
+    var state = streams[side];
+    var box = byId("think-" + side);
+    if (!state || !text) { return; }
+    if (box.hidden) { box.hidden = false; }
+    state.thinkChars += text.length;
+    byId("think-body-" + side).appendChild(document.createTextNode(text));
+    byId("think-sum-" + side).textContent =
+      "рассуждение (" + state.thinkChars + " симв.)";
+    followStream(side);
+  }
+
+  // Новый ответ: поле ответа и блок рассуждения пустые, парсер — с нуля.
+  // Свёрнутость прошлого ответа снимаем: новый ответ показываем целиком.
+  function resetAnswer(side) {
+    var box = byId("think-" + side);
+    box.hidden = true;
+    box.open = false;
+    byId("think-sum-" + side).textContent = "рассуждение";
+    byId("think-body-" + side).textContent = "";
+    byId("answer-" + side).textContent = "";
+    panelOf(side).classList.remove("answer-collapsed");
+    var button = byId("collapse-" + side);
+    button.hidden = true;
+    button.textContent = "свернуть";
+    streams[side] = {
+      thinkChars: 0,
+      flushed: false,
+      parser: createThinkParser({
+        answer: function (text) { appendText(side, text); },
+        think: function (text) { appendThink(side, text); }
+      })
+    };
+  }
+
+  function deltaAnswer(side, text) {
+    if (!streams[side]) { resetAnswer(side); }
+    streams[side].parser.feed(text || "");
+  }
+
+  // Конец потока: содержательное уже разложено по ответу и рассуждению, в
+  // буфере парсера остался только оборванный тег — его не показываем.
+  function flushAnswer(side) {
+    var state = streams[side];
+    if (!state || state.flushed) { return; }
+    state.flushed = true;
+    state.parser.flush();
+    updateCollapseButton(side);
+  }
+
+  function updateCollapseButton(side) {
+    var button = byId("collapse-" + side);
+    var collapsed = panelOf(side).classList.contains("answer-collapsed");
+    var answer = byId("answer-" + side);
+    // Кнопка нужна только длинному ответу: короткий виден целиком и так.
+    if (!collapsed && answer.scrollHeight < 520) {
+      button.hidden = true;
+      return;
     }
+    button.hidden = false;
+    button.textContent = collapsed ? "развернуть" : "свернуть";
+  }
+
+  function toggleCollapse(side) {
+    var collapsed = panelOf(side).classList.toggle("answer-collapsed");
+    updateCollapseButton(side);
+    if (!collapsed) { followStream(side); }
+  }
+
+  // Низ блока ответов: страницу тянем к нему, а не к концу документа —
+  // иначе автоскролл увозил бы из чата в панель метрик.
+  function streamBottom() {
+    var grid = document.querySelector(".grid");
+    var bottom = grid ? grid.offsetTop + grid.offsetHeight
+                      : document.documentElement.scrollHeight;
+    return Math.max(0, bottom - window.innerHeight);
+  }
+
+  function isNearStreamEnd() {
+    var root = document.scrollingElement || document.documentElement;
+    return Math.abs(root.scrollTop - streamBottom()) <= 160;
+  }
+
+  // Автоскролл к концу: страницу тянем только пока читатель у конца ответов;
+  // свёрнутый ответ крутим внутри него самого. Отлистал — не дёргаем.
+  function followStream(side) {
+    var answer = byId("answer-" + side);
+    if (panelOf(side).classList.contains("answer-collapsed")) {
+      answer.scrollTop = answer.scrollHeight;
+      return;
+    }
+    if (!stickToBottom) { return; }
+    var root = document.scrollingElement || document.documentElement;
+    var target = streamBottom();
+    if (root.scrollTop < target) { root.scrollTop = target; }
   }
 
   function appendError(side, message) {
@@ -2705,17 +2893,20 @@ PAGE_HTML = """<!doctype html>
     }
     var side = event.side;
     if (side !== 0 && side !== 1) { return; }
+    var panel = panelOf(side);
     if (event.type === "start") {
-      panelOf(side).className = "panel streaming";
+      panel.classList.remove("failed");
+      panel.classList.add("streaming");
       byId("foot-" + side).textContent =
         (event.backend_label || event.backend) + " · " +
         (event.model_label || event.model);
     } else if (event.type === "delta") {
       if (statusPhase === "думает") { switchStatusPhase("отвечает"); }
-      appendText(side, event.text || "");
+      deltaAnswer(side, event.text || "");
     } else if (event.type === "done") {
       stopStatusTimer();
-      panelOf(side).className = "panel";
+      flushAnswer(side);
+      panel.classList.remove("streaming");
       byId("time-" + side).textContent = formatSeconds(event.elapsed_ms);
       var speed = typeof event.tokens_per_second === "number"
         ? event.tokens_per_second.toFixed(1) : "—";
@@ -2739,7 +2930,9 @@ PAGE_HTML = """<!doctype html>
         refreshSystem();
       }
     } else if (event.type === "error") {
-      panelOf(side).className = "panel failed";
+      flushAnswer(side);
+      panel.classList.remove("streaming");
+      panel.classList.add("failed");
       appendError(side, event.message || "неизвестная ошибка");
       byId("time-" + side).textContent = formatSeconds(event.elapsed_ms);
       byId("speed-" + side).textContent = "—";
@@ -2832,9 +3025,15 @@ PAGE_HTML = """<!doctype html>
         }
       }
       if (!sawDone) {
+        flushAnswer(0);
+        flushAnswer(1);
         setStatus("поток прервался", true);
       }
     } catch (err) {
+      // Поток оборвался на середине: недосказанное — в ответ/рассуждение,
+      // незакрытый think так и останется рассуждением.
+      flushAnswer(0);
+      flushAnswer(1);
       if (err && err.name === "AbortError") {
         setStatus("запрос отменён", false);
       } else {
@@ -2887,7 +3086,15 @@ PAGE_HTML = """<!doctype html>
     byId("unload-" + side).addEventListener("click", function () {
       loadModel(side, "unload");
     });
+    byId("collapse-" + side).addEventListener("click", function () {
+      toggleCollapse(side);
+    });
   });
+  // Отлистал вверх — автоскролл за потоком выключается, вернулся к концу —
+  // включается снова.
+  window.addEventListener("scroll", function () {
+    stickToBottom = isNearStreamEnd();
+  }, { passive: true });
 
   loadCatalog();
   refreshSystem();

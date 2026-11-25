@@ -22,6 +22,7 @@ import pathlib
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -35,6 +36,9 @@ from tools import chat_server  # noqa: E402
 
 HOST = "127.0.0.1"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+#: node нужен только для проверок клиентского JS (задача 0178); без него
+#: эти тесты пропускаются, а не падают.
+NODE = shutil.which("node")
 
 REGISTRY = (
     chat_server.BackendSpec(
@@ -128,6 +132,82 @@ def parse_sse(raw):
                 continue
             events.append(json.loads(payload))
     return events, done
+
+
+# --------------------------------------------------------------------------- #
+# Клиентский JS страницы: <script>, парсер <think> (задача 0178)
+# --------------------------------------------------------------------------- #
+
+THINK_PARSER_START = "// --- think-парсер: начало"
+THINK_PARSER_END = "// --- think-парсер: конец"
+
+THINK_HARNESS = r"""
+var chunks = JSON.parse(process.argv[2]);
+var answer = "";
+var think = "";
+var parser = createThinkParser({
+  answer: function (text) { answer += text; },
+  think: function (text) { think += text; }
+});
+chunks.forEach(function (chunk) { parser.feed(chunk); });
+parser.flush();
+process.stdout.write(JSON.stringify({
+  answer: answer, think: think, inThink: parser.inThink()
+}));
+"""
+
+
+def page_html(case):
+    """Отдать HTML главной страницы теста."""
+    status, _, body = case.request("GET", "/")
+    case.assertEqual(status, 200)
+    return body.decode("utf-8")
+
+
+def page_script(page):
+    """Единственный <script> страницы (без внешних src — это проверяют тесты)."""
+    match = re.search(r"<script>(.*?)</script>", page, re.S)
+    if match is None:
+        raise AssertionError("на странице нет встроенного <script>")
+    return match.group(1)
+
+
+def think_parser_source(page):
+    """Вырезать из страницы самодостаточный блок парсера <think>."""
+    script = page_script(page)
+    start = script.index("\n", script.index(THINK_PARSER_START)) + 1
+    marker = script.index(THINK_PARSER_END)
+    end = script.rfind("\n", 0, marker) + 1
+    return script[start:end]
+
+
+def run_think_parser(page, chunks):
+    """Прогнать куски потока через клиентский парсер страницы в node."""
+    if NODE is None:
+        raise unittest.SkipTest("node не установлен")
+    source = think_parser_source(page) + THINK_HARNESS
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "think_parser.js")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(source)
+        proc = subprocess.run(
+            [NODE, path, json.dumps(list(chunks))],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    if proc.returncode != 0:
+        raise AssertionError("node: " + (proc.stderr or proc.stdout))
+    return json.loads(proc.stdout)
+
+
+def stream_text(events, side=0):
+    """Склеить delta одной колонки — ровно то, что видит клиент."""
+    return "".join(
+        event["text"]
+        for event in events
+        if event["type"] == "delta" and event["side"] == side
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -354,6 +434,152 @@ class TestPage(ServerTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), {"status": "ok"})
         self.assertIn("application/json", headers.get("Content-Type", ""))
+
+
+class TestAnswerUi(ServerTestCase):
+    """Длинный ответ не обрезается, `<think>` свёрнут (задача 0178)."""
+
+    def test_page_has_reasoning_block_and_collapse_control(self):
+        page = page_html(self)
+        for fragment in (
+            '<details class="think" id="think-0" hidden>',
+            '<details class="think" id="think-1" hidden>',
+            '<summary id="think-sum-0">рассуждение</summary>',
+            '<pre class="think-body" id="think-body-1"></pre>',
+            'id="collapse-0"',
+            'id="collapse-1"',
+        ):
+            self.assertIn(fragment, page)
+        # Блок рассуждения стоит до ответа и свёрнут по умолчанию: JS только
+        # снимает hidden, атрибут open не выставляется.
+        self.assertNotIn("setAttribute(\"open\"", page)
+        self.assertLess(page.index('id="think-0"'), page.index('id="answer-0"'))
+
+    def test_answer_rule_has_no_fixed_max_height(self):
+        page = page_html(self)
+        match = re.search(r"\.answer\s*\{(.*?)\}", page, re.S)
+        self.assertIsNotNone(match, "нет правила .answer")
+        rule = match.group(1)
+        self.assertIn("max-height: none", rule, "ответ снова обрезается по высоте")
+        self.assertNotRegex(rule, r"max-height\s*:\s*[\d.]", "у ответа снова потолок высоты")
+        self.assertIn("overflow: visible", rule)
+        # Ограничение высоты осталось только у явно свёрнутого ответа.
+        collapsed = re.search(r"\.panel\.answer-collapsed \.answer\s*\{(.*?)\}", page, re.S)
+        self.assertIsNotNone(collapsed)
+        self.assertIn("max-height", collapsed.group(1))
+
+    def test_streaming_helpers_are_on_the_page(self):
+        page = page_html(self)
+        for name in (
+            "createThinkParser",
+            "function appendThink",
+            "function flushAnswer",
+            "function updateCollapseButton",
+            "function followStream",
+            "stickToBottom",
+        ):
+            self.assertIn(name, page)
+
+    def test_autoscroll_targets_answer_block_not_page_bottom(self):
+        # Метрики стоят под чатом: прокрутка к концу документа увозила бы
+        # из ответа в панель метрик, поэтому цель — низ .grid.
+        page = page_html(self)
+        self.assertIn("function streamBottom", page)
+        self.assertIn('querySelector(".grid")', page)
+        self.assertNotIn("root.scrollTop = root.scrollHeight", page)
+
+    @unittest.skipUnless(NODE, "node не установлен")
+    def test_page_script_passes_node_check(self):
+        script = page_script(page_html(self))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "page.js")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(script)
+            proc = subprocess.run(
+                [NODE, "--check", path],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+
+
+class TestThinkParser(ServerTestCase):
+    """Клиентский разбор <think> на разорванном потоке delta."""
+
+    @unittest.skipUnless(NODE, "node не установлен")
+    def test_think_goes_to_reasoning_and_never_to_answer(self):
+        result = run_think_parser(
+            page_html(self),
+            ["<think>", "сначала подумаю", "</think>", "Ответ"],
+        )
+        self.assertEqual(result["answer"], "Ответ")
+        self.assertEqual(result["think"], "сначала подумаю")
+        self.assertFalse(result["inThink"])
+
+    @unittest.skipUnless(NODE, "node не установлен")
+    def test_split_tag_between_deltas_is_glued(self):
+        result = run_think_parser(
+            page_html(self),
+            ["Начало. <thi", "nk>рассуждение</thi", "nk> Конец."],
+        )
+        self.assertEqual(result["answer"], "Начало.  Конец.")
+        self.assertEqual(result["think"], "рассуждение")
+
+    @unittest.skipUnless(NODE, "node не установлен")
+    def test_closing_tag_split_after_slash(self):
+        result = run_think_parser(
+            page_html(self),
+            ["<think>думаю</", "think>Ответ"],
+        )
+        self.assertEqual(result["answer"], "Ответ")
+        self.assertEqual(result["think"], "думаю")
+
+    @unittest.skipUnless(NODE, "node не установлен")
+    def test_unclosed_think_is_reasoning_to_the_end(self):
+        result = run_think_parser(
+            page_html(self),
+            ["Ответ<think>поток оборвался", " на середине"],
+        )
+        self.assertEqual(result["answer"], "Ответ")
+        self.assertEqual(result["think"], "поток оборвался на середине")
+        self.assertTrue(result["inThink"])
+
+    @unittest.skipUnless(NODE, "node не установлен")
+    def test_torn_tag_at_stream_end_is_not_shown(self):
+        result = run_think_parser(page_html(self), ["Ответ", "<thi"])
+        self.assertEqual(result["answer"], "Ответ")
+        self.assertEqual(result["think"], "")
+
+    @unittest.skipUnless(NODE, "node не установлен")
+    def test_plain_text_and_angle_brackets_survive(self):
+        result = run_think_parser(page_html(self), ["a < b, c > d — не тег"])
+        self.assertEqual(result["answer"], "a < b, c > d — не тег")
+        self.assertEqual(result["think"], "")
+
+
+class TestThinkStream(ServerTestCase):
+    """SSE отдаёт <think> как есть, а клиентский парсер раскладывает его."""
+
+    @unittest.skipUnless(NODE, "node не установлен")
+    def test_split_think_from_mock_backend_is_parsed(self):
+        # Задержка между кусками больше окна склейки delta (60 мс): сервер
+        # обязан отдать тег разрезанным, как в настоящем потоке Qwen3.
+        self.vtm.pieces = ["<thi", "nk>рассуждаю вслух", "</thi", "nk>Ответ"]
+        self.vtm.delay = 0.09
+        events, _, _ = self.post_chat_ok()
+        raw = stream_text(events)
+        self.assertEqual(raw, "<think>рассуждаю вслух</think>Ответ")
+        chunks = [
+            event["text"]
+            for event in events
+            if event["type"] == "delta" and event["side"] == 0
+        ]
+        self.assertEqual(chunks[0], "<thi", "тег пришёл целым куском — проверка не о разрыве")
+        result = run_think_parser(page_html(self), chunks)
+        self.assertEqual(result["answer"], "Ответ")
+        self.assertEqual(result["think"], "рассуждаю вслух")
+        self.assertNotIn("<think>", result["answer"])
 
 
 class TestCatalog(ServerTestCase):
