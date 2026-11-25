@@ -2430,6 +2430,14 @@ PAGE_HTML = """<!doctype html>
     <textarea id="question" rows="3" placeholder="Например: напиши заголовок для поста о весенней скидке на стрижку"></textarea>
     <div class="controls">
       <label class="check"><input type="checkbox" id="use-system" checked> системный промпт EVA32</label>
+      <label class="field inline" for="voice">голос
+        <select id="voice">
+          <option value="irina">обычный</option>
+          <option value="soft">мягче</option>
+          <option value="young">моложе</option>
+          <option value="young_soft" selected>моложе и мягче</option>
+        </select>
+      </label>
       <label class="field inline" for="mode">режим
         <select id="mode">
           <option value="fast">быстро — 3B (слово за 0,25 с)</option>
@@ -2806,6 +2814,13 @@ PAGE_HTML = """<!doctype html>
 
   function ttsBox(side) { return byId("tts-" + side); }
 
+  // Пресет голоса выбирается один на страницу: «мягче» — медленнее и ровнее,
+  // «моложе» — сдвиг высоты на ~полутон, «моложе и мягче» — оба.
+  function voicePreset() {
+    var select = byId("voice");
+    return select ? select.value : "irina";
+  }
+
   function ttsEnabled(side) {
     var box = ttsBox(side);
     return !!(box && box.checked && tts.available);
@@ -2925,7 +2940,7 @@ PAGE_HTML = """<!doctype html>
       return fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: "Звук включён. Я Ева, слушайте ответы." })
+      body: JSON.stringify({ text: "Звук включён. Я Ева, слушайте ответы.", voice: voicePreset() })
     }).then(function (resp) {
       if (!resp.ok) { throw new Error("tts " + resp.status); }
       return resp.blob();
@@ -3007,7 +3022,7 @@ PAGE_HTML = """<!doctype html>
     var ready = fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Accept": "audio/wav" },
-      body: JSON.stringify({ text: text })
+      body: JSON.stringify({ text: text, voice: voicePreset() })
     }).then(function (response) {
       if (!response.ok) {
         var status = response.status;
@@ -3928,6 +3943,71 @@ def looks_like_wav(data: bytes | bytearray | None) -> bool:
     return bytes(data[:4]) == b"RIFF" and bytes(data[8:12]) == b"WAVE"
 
 
+# --------------------------------------------------------------------------- #
+# Пресеты голоса
+# --------------------------------------------------------------------------- #
+# Piper даёт один женский русский голос (irina), поэтому «мягче» и «моложе» —
+# это параметры синтеза и пост-обработка, а не другой голос:
+#   rate  — темп: у Piper length_scale = 180/rate, больше значение — медленнее
+#           и спокойнее (мягче);
+#   pitch — сдвиг высоты: ресемплинг вверх (1.06 ≈ +1 полутон) делает голос
+#           моложе; темп при этом растёт на те же 6%, поэтому он компенсирован
+#           в rate.
+VOICE_PRESETS: dict[str, dict[str, float]] = {
+    "irina": {"rate": 180.0, "pitch": 1.0},
+    "soft": {"rate": 163.0, "pitch": 1.0},
+    "young": {"rate": 190.0, "pitch": 1.06},
+    "young_soft": {"rate": 172.0, "pitch": 1.05},
+}
+
+
+def _pitch_shift_wav(wav: bytes, factor: float) -> bytes:
+    """Сдвинуть высоту WAV (моно, 16 бит) ресемплингом в ``factor`` раз.
+
+    Меняет и темп; вызывающий компенсирует его через ``rate``. Линейная
+    интерполяция достаточна: у нас речь, а не музыка, и слышимая разница —
+    именно высота голоса. Любая нестандартная форма волны возвращается как
+    есть — лучше обычный голос, чем испорченный.
+    """
+    if factor <= 0 or abs(factor - 1.0) < 1e-3:
+        return wav
+    try:
+        import io
+        import wave
+
+        with wave.open(io.BytesIO(wav), "rb") as src:
+            if src.getnchannels() != 1 or src.getsampwidth() != 2:
+                return wav
+            rate = src.getframerate()
+            frames = src.readframes(src.getnframes())
+    except Exception:  # noqa: BLE001 - не WAV/не тот формат
+        return wav
+    import array
+
+    samples = array.array("h")
+    samples.frombytes(frames)
+    total = len(samples)
+    if total < 2:
+        return wav
+    out_len = max(1, int(total / factor))
+    out = array.array("h", bytes(2 * out_len))
+    step = factor
+    pos = 0.0
+    for i in range(out_len):
+        left = int(pos)
+        right = min(left + 1, total - 1)
+        frac = pos - left
+        out[i] = int(samples[left] * (1.0 - frac) + samples[right] * frac)
+        pos += step
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as dst:
+        dst.setnchannels(1)
+        dst.setsampwidth(2)
+        dst.setframerate(rate)
+        dst.writeframes(out.tobytes())
+    return buf.getvalue()
+
+
 def default_tts_speech(text: str, voice: str | None = None) -> bytes:
     """Синтез через ``eva/tts.py``: Piper → say → espeak, иначе пустые байты.
 
@@ -3941,7 +4021,13 @@ def default_tts_speech(text: str, voice: str | None = None) -> bytes:
         from eva.tts import synthesize
     except ImportError as exc:  # pragma: no cover - eva лежит в репозитории
         raise RuntimeError("нет адаптера синтеза eva/tts.py") from exc
-    result = synthesize(text, voice=voice)
+    preset = VOICE_PRESETS.get((voice or "").strip().lower())
+    if preset is None:
+        result = synthesize(text, voice=voice)
+    else:
+        result = synthesize(text, rate=preset["rate"])
+        if isinstance(result, (bytes, bytearray)):
+            result = _pitch_shift_wav(bytes(result), preset["pitch"])
     return bytes(result) if isinstance(result, (bytes, bytearray)) else b""
 
 
