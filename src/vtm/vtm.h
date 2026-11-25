@@ -216,6 +216,16 @@ typedef enum {
 // нет. Тензор с этим флагом обязан быть fp (kind 1..3): тритового кэша не
 // бывает. Биты 1..15 резервированы и при чтении игнорируются.
 #define VTM_TENSOR_FLAG_KV_CACHE 0x0001u
+// VTM_TENSOR_FLAG_STATE — состояние рекуррентного слоя (задача 0176): короткая
+// свёртка CONV4 (последние 3 входа на канал) и матрица Gated Delta Net
+// [value_heads, key_dim, value_dim]. Семантика та же, что у KV-кэша: payload'а
+// в файле нет, буфер n_elements×4 создаётся в арене и стартует с нулей, а
+// vtm_reset() его обнуляет (в отличие от KV-кэша, который сбрасывает хост).
+// Общий маркер «вне файла» — VTM_TENSOR_FLAG_OUT_OF_FILE: по нему загрузчик
+// не ищет данные в секции и не считает offset адресом.
+#define VTM_TENSOR_FLAG_STATE    0x0002u
+#define VTM_TENSOR_FLAG_OUT_OF_FILE \
+    (VTM_TENSOR_FLAG_KV_CACHE | VTM_TENSOR_FLAG_STATE)
 
 typedef struct {
     char name[24];          // NUL-терминированное имя из таблицы
@@ -324,12 +334,43 @@ typedef enum {
     // RMSH: построчный RMSN по последней оси (QK-norm Qwen3): y[i] =
     //      x[i]/rms(x[row])·w[i % head_dim]; w задаётся на head_dim и
     //      повторяется по строкам. a — x, b — w, dst — y, imm — eps×1000.
-    VTM_OP_RMSH  = 0x11
+    VTM_OP_RMSH  = 0x11,
+    // CONV4 (задача 0176): причинная depthwise-свёртка с ядром 4, один токен
+    //      за вызов (Qwen3.5, linear_conv_kernel_dim=4).
+    //        y[c] = Σ_{j=0..3} w[c,j]·s[j,c],  где s = [x_{t-3}, x_{t-2}, x_{t-1}]
+    //      (нули на старте), затем s сдвигается и s[2] = x.
+    //      a — x [width], b — w [width, 4], c — состояние [3, width],
+    //      dst — y [width], imm — 0 (резерв).
+    VTM_OP_CONV4 = 0x12,
+    // GDELTA (задача 0176): шаг Gated Delta Net + выходной RMS-гейт.
+    //      Для каждой value-головы h (key-голова kh = h / (Hv/Hk)):
+    //        q̂ = q/√(q·q+eps), k̂ = k/√(k·k+eps),
+    //        α = exp(g[h]), β = sigmoid(beta[h]),
+    //        S_t = α·S_{t-1} + β·(v − α·S_{t-1}·k̂)·k̂ᵀ,
+    //        o   = S_t·q̂,
+    //        y   = rmsnorm(o)·norm_w·silu(z).
+    //      Банк из шести подряд идущих тензоров, c — первый:
+    //        c   — состояние [Hv, Dk, Dv] (флаг STATE),
+    //        c+1 — v [Hv, Dv], c+2 — beta[h] (логит) [Hv],
+    //        c+3 — g[h] (лог декея) [Hv], c+4 — z [Hv, Dv],
+    //        c+5 — norm_w [Dv].
+    //      a — q [Hk, Dk], b — k [Hk, Dk], dst — y [Hv, Dv];
+    //      imm — eps×1e6 (0 — без эпсилона).
+    VTM_OP_GDELTA = 0x13
 } vtm_opcode;
 
 // Флаг MOE: не нормировать веса top-k на единицу (Qwen3 norm_topk_prob=true —
 // умолчание, флаг НЕ выставлен). Флаг нужен моделям без нормировки (Mixtral).
 #define VTM_MOE_FLAG_NO_RENORM 0x01u
+
+// Разреженное чтение экспертов (задача 0175). По умолчанию op MOE читает
+// выбранных экспертов явным pread в собственный LRU-кэш: бюджет
+// VTM_MOE_CACHE_MB МиБ (3072, если переменная не задана), 0 — выключить и
+// вернуться к mmap-страницам с madvise. Кэш — на процесс; ключ включает
+// файл (st_dev/st_ino/mtime), смещение банка и номер эксперта, поэтому две
+// машины одного контейнера делят данные. VTM_MOE_TRACE=1 печатает hits/misses/
+// cache/pread/alloc на HALT; VTM_MOE_MADVISE=0 по-прежнему отключает
+// упреждение для mmap-пути (с включённым кэшем оно не делается).
 
 // --- SAMP: стратегии и параметры ------------------------------------------
 //

@@ -49,13 +49,19 @@
 #endif
 #endif
 
-// --- KV-кэши вне файла: кэп и признак нового контейнера (задача 0118) ------
+// --- буферы вне файла: кэп и признак нового контейнера ---------------------
 //
 // 0101 вынесла KV-кэши из файла: у помеченного тензора (VTM_TENSOR_FLAG_KV_CACHE)
 // payload'а нет, а загрузчик выделяет буфер n_elements×4 в арене. Файл в
 // 192 байта (заголовок + таблица + программа) мог запросить до
 // VTM_MAX_ELEMENTS×4 = 4 ГиБ — это вектор амплификации из 0110. Сумма всех
-// KV-кэшей ограничена VTM_MAX_KV_BYTES.
+// буферов вне файла ограничена VTM_MAX_KV_BYTES.
+//
+// 0176 добавила второй вид такого буфера — состояние рекуррентного слоя
+// (VTM_TENSOR_FLAG_STATE): короткая свёртка CONV4 и матрица GDELTA. Для
+// загрузчика он не отличается от KV-кэша: payload'а нет, буфер в арене,
+// offset — маркер. Отличие только в сбросе: vtm_reset() обнуляет STATE, а
+// KV-кэш по-прежнему сбрасывает хост.
 //
 // Почему 512 МиБ: каноническая 1.5B-раскладка (ctx 2048, kv_dim 256, 28 слоёв)
 // — 112 МиБ, то есть запас ×4,5 (тот же профиль при ctx 8192); при этом
@@ -66,14 +72,14 @@
 #define VTM_MAX_KV_BYTES ((uint64_t)512u << 20)
 #endif
 
-// Флаг заголовка «KV-кэши (если есть) лежат вне файла». Бит 2 свободен:
-// бит 0 — fp32-масштабы (C и Python), бит 15 — блок 160 (расширение C),
-// бит 1 пишет Python (VFLAG_CAUSAL), C его не смотрит. Старые контейнеры
-// присылают 0 и читаются прежним путём; контейнер с флагом обязан нести
-// хотя бы один KV-кэш.
+// Флаг заголовка «буферы (KV-кэши и состояния) лежат вне файла». Бит 2
+// свободен: бит 0 — fp32-масштабы (C и Python), бит 15 — блок 160
+// (расширение C), бит 1 пишет Python (VFLAG_CAUSAL), C его не смотрит.
+// Старые контейнеры присылают 0 и читаются прежним путём; контейнер с флагом
+// обязан нести хотя бы один такой буфер.
 #define VTM_HEADER_FLAG_KV_OUT_OF_FILE 0x0004u
 
-// offset KV-кэша в контейнере с флагом выше: payload'а нет, поэтому поле —
+// offset буфера в контейнере с флагом выше: payload'а нет, поэтому поле —
 // не адрес. 0xFFFFFFFF = «смещения нет» (как VTM_NO_OFFSET у scale_offset).
 // Это же — отказ старому бинарю: загрузчик до 0101 не знает ни флага, ни
 // роли тензора, зато первым делом проверяет `offset % 32 != 0` и возвращает
@@ -194,6 +200,8 @@ const char *vtm_op_name(uint8_t opcode) {
     // в interp.c; загрузчик о них по-прежнему ничего не знает.
     case VTM_OP_MOE:  return "MOE";
     case VTM_OP_RMSH: return "RMSH";
+    case VTM_OP_CONV4: return "CONV4";
+    case VTM_OP_GDELTA: return "GDELTA";
     default:          return "?";
     }
 }
@@ -478,9 +486,10 @@ static int tensor_arena_size(const vtm_tensor *t, size_t *out) {
 //   - всё, что интерпретатор может писать (writable: dst и V-кэш KVW);
 //   - fp16/bf16 — их всё равно нужно развернуть в fp32 (t->f32 — float*);
 //   - масштабы тритов в fp16: API отдаёт их как float*.
-// KV-кэш (flag VTM_TENSOR_FLAG_KV_CACHE) — отдельный случай: содержимого в
-// файле нет, поэтому копировать нечего; в арене под него выделяется буфер
-// n_elements float (арена выделена calloc'ом и стартует с нулей).
+// Буфер вне файла (flag VTM_TENSOR_FLAG_OUT_OF_FILE: KV-кэш или состояние
+// рекуррентного слоя) — отдельный случай: содержимого в файле нет, поэтому
+// копировать нечего; в арене под него выделяется буфер n_elements float
+// (арена выделена calloc'ом и стартует с нулей).
 typedef struct {
     size_t arena_size;  // байт в арене
     int    copy_data;   // fp32/fp16/bf16: копировать значения в арену
@@ -506,7 +515,7 @@ static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
     p->copy_qblocks = 0;
     p->copy_i8 = 0;
 
-    if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) {
+    if ((t->flags & VTM_TENSOR_FLAG_OUT_OF_FILE) != 0) {
         // writable и can_reference тут ни при чём: файла нет, копировать
         // нечего. Размер считается по dims, а не по payload'у; kind проверен
         // при разборе записи таблицы.
@@ -650,7 +659,7 @@ static const uint8_t *trit_scales_ptr(const vtm_tensor *t, const uint8_t *data) 
 // молча отдать интерпретатору мусор.
 static int fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
                                uint8_t *dst, const tensor_plan *p) {
-    if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) {
+    if ((t->flags & VTM_TENSOR_FLAG_OUT_OF_FILE) != 0) {
         // Копировать нечего: буфер уже в арене и обнулён calloc'ом (см.
         // выделение арены). Нули — это и есть «пустой кэш»: ровно то же
         // состояние, что давал старый контейнер, где в файле лежали нули.
@@ -1257,6 +1266,10 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
     }
     m->backend = vtm_backend_from_env();
     m->input_token = -1;
+    // Дескрипторов нет, пока vtm_load() их не отдал (0175). Именно -1, а не
+    // 0 из calloc: 0 — валидный fd, и «нет дескриптора» должно отличаться.
+    m->fd = -1;
+    m->moe_fd = 0;
     // Дефолты меты: без меты/с битой метой ROPE работает на 10000, как раньше.
     m->rope_theta = VTM_DEFAULT_ROPE_THETA;
     m->rope_layout = VTM_ROPE_LAYOUT_HALF;
@@ -1443,7 +1456,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         // offset KV-кэша — VTM_KV_NO_OFFSET: файл без полезной нагрузки не
         // должен выглядеть как валидный старый контейнер. Без флага (0101 и
         // старее) принимаем прежний offset=0.
-        if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) {
+        if ((t->flags & VTM_TENSOR_FLAG_OUT_OF_FILE) != 0) {
             uint64_t bytes;
             if (t->kind == VTM_TENSOR_TRIT || t->kind == VTM_TENSOR_INT8 ||
                 t->kind == VTM_TENSOR_Q4 || t->kind == VTM_TENSOR_Q4K ||
@@ -2230,7 +2243,7 @@ static void map_trim_copied(vtm_t *m) {
         // KV-кэша в файле нет (offset — не адрес: 0 или VTM_KV_NO_OFFSET),
         // его страницы в отображении не занимались — трогать их madvise'ом
         // нельзя.
-        if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) continue;
+        if ((t->flags & VTM_TENSOR_FLAG_OUT_OF_FILE) != 0) continue;
         begin = base + (uintptr_t)m->data_start + (uintptr_t)t->offset64;
         end = begin + (uintptr_t)t->n_elements * 2u;
         lo = begin & ~(uintptr_t)(page - 1u);
@@ -2329,7 +2342,9 @@ static vtm_t *load_mmap(const char *path) {
         set_global_error("%s: файл изменился во время загрузки", path);
         return NULL;
     }
-    close(fd);
+    // fd переходит машине: pread-кэш экспертов MoE (0175) читает блоки из
+    // того же файла, не трогая страницы отображения. Закроет vtm_free().
+    m->fd = fd;
     map_trim_copied(m);
     return m;
 }
@@ -2361,6 +2376,14 @@ vtm_t *vtm_load(const char *path) {
 void vtm_free(vtm_t *m) {
     if (!m) return;
 #if !defined(_WIN32)
+    if (m->fd >= 0) {
+        close(m->fd);
+        m->fd = -1;
+    }
+    if (m->moe_fd > 0) {
+        close(m->moe_fd);
+        m->moe_fd = 0;
+    }
     if (m->map) {
         munmap(m->map, m->map_size);
         m->map = NULL;

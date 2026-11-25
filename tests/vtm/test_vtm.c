@@ -32,6 +32,13 @@ static int g_fail;
     } \
 } while (0)
 
+// Хуки pread-кэша экспертов MoE (задача 0175). Объявлены здесь, а не через
+// vtm_internal.h, по той же причине, что и хуки загрузчика ниже: тест не
+// должен зависеть от внутренней раскладки struct vtm.
+void vtm_internal_moe_cache_reset(void);
+void vtm_internal_moe_cache_stats(uint64_t *hits, uint64_t *misses,
+                                  size_t *bytes, uint64_t *allocs);
+
 // --- big-endian: контейнер не читается, загрузчик обязан отказать ----------
 //
 // Обычная сборка гоняет весь набор ниже. Сборка с -DVTM_HOST_BIG_ENDIAN=1
@@ -5793,6 +5800,176 @@ static void bench_cache_prefix(void) {
     vtm_free(plain);
 }
 
+// --- MoE: pread-кэш экспертов (задача 0175) --------------------------------
+
+// Банк kind 6: 18-байтовый заголовок сегмента + блоки GGML (144 Б). Значения
+// детерминированные, d конечное и маленькое: тесту важна не точность весов, а
+// то, что pread отдаёт ровно те же байты, которые дал бы mmap.
+static void model_add_q4k_bank(model_t *m, const char *name, int ndim,
+                               const uint32_t *dims, uint32_t seed) {
+    tensor_def *td = model_slot(m, name, VTM_TENSOR_Q4K, ndim, dims);
+    uint32_t n = dims_product(ndim, dims);
+    uint32_t n_blk = (n + VTM_Q4K_BLOCK_VALUES - 1u) / VTM_Q4K_BLOCK_VALUES;
+    buf_t b = {0};
+    uint32_t k, i;
+
+    buf_append(&b, VTM_Q4K_MAGIC, 4);
+    buf_u8(&b, (uint8_t)VTM_Q4K_VERSION);
+    buf_u8(&b, 0); // reserved
+    buf_u64(&b, n);
+    buf_u32(&b, n_blk);
+    for (k = 0; k < n_blk; k++) {
+        uint8_t block[VTM_Q4K_BLOCK_BYTES];
+        for (i = 0; i < sizeof block; i++)
+            block[i] = (uint8_t)((i * 37u + k * 11u + seed * 29u) & 0xFFu);
+        put_u16(block, vtm_float_to_half(0.01f));    // d
+        put_u16(block + 2, vtm_float_to_half(0.0f)); // dmin
+        buf_append(&b, block, sizeof block);
+    }
+    td->blob = b.p;
+    td->blob_len = b.len;
+}
+
+// Банк kind 7: блок 210 Б, d — последние два байта.
+static void model_add_q6k_bank(model_t *m, const char *name, int ndim,
+                               const uint32_t *dims, uint32_t seed) {
+    tensor_def *td = model_slot(m, name, VTM_TENSOR_Q6K, ndim, dims);
+    uint32_t n = dims_product(ndim, dims);
+    uint32_t n_blk = (n + VTM_Q6K_BLOCK_VALUES - 1u) / VTM_Q6K_BLOCK_VALUES;
+    buf_t b = {0};
+    uint32_t k, i;
+
+    buf_append(&b, VTM_Q6K_MAGIC, 4);
+    buf_u8(&b, (uint8_t)VTM_Q4K_VERSION);
+    buf_u8(&b, 0);
+    buf_u64(&b, n);
+    buf_u32(&b, n_blk);
+    for (k = 0; k < n_blk; k++) {
+        uint8_t block[VTM_Q6K_BLOCK_BYTES];
+        for (i = 0; i < sizeof block; i++)
+            block[i] = (uint8_t)((i * 53u + k * 17u + seed * 31u) & 0xFFu);
+        put_u16(block + VTM_Q6K_BLOCK_BYTES - 2u,
+                vtm_float_to_half(0.02f)); // d
+        buf_append(&b, block, sizeof block);
+    }
+    td->blob = b.p;
+    td->blob_len = b.len;
+}
+
+// Один и тот же файл гоняется дважды: с VTM_MOE_CACHE_MB=0 (mmap + madvise,
+// прежний путь) и с кэшем (pread). Выход MOE обязан совпасть побитово, а
+// счётчики — доказать, что второй прогон целиком из кэша и что число
+// выделений слотов не растёт (нет malloc на токен).
+static void test_moe_pread_cache(void) {
+    enum { NEXP = 4, HID = 256, INTER = 256, TOPK = 2 };
+    model_t md;
+    uint32_t rd[2] = {NEXP, HID};
+    uint32_t xd[1] = {HID};
+    uint32_t yd[1] = {HID};
+    uint32_t bd[3] = {NEXP, INTER, HID};
+    uint32_t dd[3] = {NEXP, HID, INTER};
+    float router[NEXP * HID], xv[HID], yv[HID], base[HID];
+    uint8_t *img = NULL;
+    size_t size = 0;
+    char path[80];
+    long stamp = (long)time(NULL);
+    FILE *f;
+    vtm_t *m;
+    const vtm_tensor *t;
+    uint64_t hits = 0, misses = 0, allocs = 0;
+    size_t bytes = 0;
+    int i, bmax = 0, ymax = 0;
+
+    for (i = 0; i < NEXP * HID; i++)
+        router[i] = (float)(((i * 13) % 19) - 9) * 0.05f;
+    for (i = 0; i < HID; i++) {
+        xv[i] = (float)(((i * 7) % 13) - 6) * 0.1f;
+        yv[i] = 0.0f;
+    }
+
+    model_init(&md);
+    model_add_f32(&md, "router", 2, rd, router);
+    model_add_f32(&md, "x", 1, xd, xv);
+    model_add_f32(&md, "y", 1, yd, yv);
+    model_add_q4k_bank(&md, "gate", 3, bd, 1);
+    model_add_q4k_bank(&md, "up", 3, bd, 2);
+    model_add_q6k_bank(&md, "down", 3, dd, 3);
+    // Две одинаковые инструкции подряд: вторая должна попасть в кэш целиком.
+    model_inst(&md, VTM_OP_MOE, 0, 2, 0, 1, 3, TOPK);
+    model_inst(&md, VTM_OP_MOE, 0, 2, 0, 1, 3, TOPK);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+
+    snprintf(path, sizeof path, "/tmp/vtm_moe_cache_%ld.vtm", stamp);
+    f = fopen(path, "wb");
+    CHECK(f != NULL);
+    if (!f) {
+        free(img);
+        model_free(&md);
+        return;
+    }
+    CHECK(fwrite(img, 1, size, f) == size);
+    fclose(f);
+
+    // 1. Эталон: кэш выключен, эксперты читаются из mmap.
+    setenv("VTM_MOE_CACHE_MB", "0", 1);
+    vtm_internal_moe_cache_reset();
+    m = vtm_load(path);
+    CHECK(m != NULL);
+    if (m) {
+        CHECK(run_ok(m));
+        vtm_internal_moe_cache_stats(&hits, &misses, &bytes, &allocs);
+        CHECK(hits == 0 && misses == 0 && bytes == 0 && allocs == 0);
+        t = vtm_tensor_by_name(m, "y");
+        CHECK(t != NULL);
+        if (t) for (i = 0; i < HID; i++) base[i] = t->f32[i];
+        vtm_free(m);
+    }
+
+    // 2. Тот же файл через pread-кэш (8 МиБ хватает на 6 слотов с запасом).
+    setenv("VTM_MOE_CACHE_MB", "8", 1);
+    vtm_internal_moe_cache_reset();
+    m = vtm_load(path);
+    CHECK(m != NULL);
+    if (m) {
+        CHECK(run_ok(m));
+        vtm_internal_moe_cache_stats(&hits, &misses, &bytes, &allocs);
+        CHECK(misses == 6);  // 2 эксперта × 3 банка
+        CHECK(hits == 6);    // вторая инструкция целиком из кэша
+        CHECK(allocs == 6);  // по слоту на запись, без копий в mmap
+        CHECK(bytes == 4u * 36864u + 2u * 57344u); // слоты выровнены
+        t = vtm_tensor_by_name(m, "y");
+        CHECK(t != NULL);
+        if (t) CHECK(memcmp(base, t->f32, sizeof base) == 0);
+
+        // 3. Повторный прогон: все обращения — попадания, выделений больше нет.
+        if (t) for (i = 0; i < HID; i++) t->f32[i] = 0.0f;
+        CHECK(run_ok(m));
+        vtm_internal_moe_cache_stats(&hits, &misses, &bytes, &allocs);
+        CHECK(hits == 18);
+        CHECK(misses == 6);
+        CHECK(allocs == 6);
+        t = vtm_tensor_by_name(m, "y");
+        CHECK(t != NULL);
+        if (t) {
+            CHECK(memcmp(base, t->f32, sizeof base) == 0);
+            for (i = 1; i < HID; i++)
+                if (base[i] > base[bmax]) bmax = i;
+            for (i = 1; i < HID; i++)
+                if (t->f32[i] > t->f32[ymax]) ymax = i;
+            CHECK(ymax == bmax); // argmax выхода MOE совпал с mmap-путём
+        }
+        vtm_free(m);
+    }
+
+    remove(path);
+    unsetenv("VTM_MOE_CACHE_MB");
+    vtm_internal_moe_cache_reset();
+    free(img);
+    model_free(&md);
+}
+
 // --- main ------------------------------------------------------------------
 
 int main(void) {
@@ -5846,6 +6023,7 @@ int main(void) {
     test_cache_prefix();
     test_cache_prefix_ring();
     test_run_batch();
+    test_moe_pread_cache();
     bench_cache_prefix();
     test_samp_bench_150k();
 

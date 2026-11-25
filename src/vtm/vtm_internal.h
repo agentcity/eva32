@@ -33,6 +33,16 @@ struct vtm {
     size_t          data_start; // начало секции данных в файле
     int             mapped;     // 1 — файл отображён
 
+    // --- дескрипторы контейнера (задача 0175) -------------------------------
+    // vtm_load() больше не закрывает fd после mmap: pread-кэш экспертов MoE
+    // читает блоки из того же файла явным pread, не трогая страницы
+    // отображения. fd — оригинал (нужен для fstat/F_GETPATH), moe_fd — свой
+    // дескриптор для pread (F_NOCACHE, чтобы чтение экспертов не вытесняло
+    // page cache attention/lm_head). fd < 0 — файла нет (load_mem/фолбэк);
+    // moe_fd: 0 — ещё не открывали, -1 — открыть не удалось, >0 — открыт.
+    int             fd;
+    int             moe_fd;
+
     uint16_t        header_flags;
     int             position;   // база позиции для ROPE/KVW/ATTN/SM
     int             input_token;// токен для EMB с флагом EMB_INPUT (-1 = нет)
@@ -163,5 +173,18 @@ void vtm_samp_poison_stamps(vtm_t *m, uint32_t gen);
 // заглядывая в struct vtm (она непрозрачна для пользователя vtm.h).
 int vtm_internal_file_is_mapped(const vtm_t *m);
 int vtm_internal_tensor_is_mapped(const vtm_t *m, uint32_t index);
+
+// --- pread-кэш экспертов MoE (задача 0175) --------------------------------
+// Сброс нужен тестам: кэш — один на процесс (как и раньше), а сравнить
+// mmap-путь с pread-путём на одной модели в одном процессе иначе нельзя:
+// env читается один раз, при первом MOE. После сброса следующий MOE снова
+// читает VTM_MOE_CACHE_MB.
+void vtm_internal_moe_cache_reset(void);
+
+// Счётчики одного прогона: hits/misses (обращения к экспертам), bytes —
+// занято под данные в кэше, allocs — сколько раз выделяли буфер слота
+// (после прогрева не растёт — это и есть «без malloc на токен»).
+void vtm_internal_moe_cache_stats(uint64_t *hits, uint64_t *misses,
+                                  size_t *bytes, uint64_t *allocs);
 
 #endif // VTM_INTERNAL_H

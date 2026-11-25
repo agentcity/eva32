@@ -1164,7 +1164,7 @@
   {
     "id": "0175",
     "title": "Эксперты через pread в кэш",
-    "status": "in_progress",
+    "status": "done",
     "file": "0175-moe-pread-cache.md",
     "assignee": "agent:moe-pread"
   },

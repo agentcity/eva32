@@ -11,6 +11,14 @@
 //   dst — приёмник, a/b/c — источники; imm — параметр операции.
 //   MUL/ADD, несмотря на запись «c = a·b» в спеке, пишут в dst: буква c
 //   там означает результат, а не поле инструкции.
+// На macOS struct stat под _POSIX_C_SOURCE не отдаёт st_mtimespec, а ключу
+// pread-кэша нужны наносекунды mtime: иначе переиспользованный inode (файл
+// удалили и создали за ту же секунду) мог бы отдать чужие веса. Макрос —
+// только для этого TU и только до первого системного заголовка.
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
+
 #include "vtm_internal.h"
 #include "vtm_backend.h"
 #include "trit.h"
@@ -26,7 +34,10 @@
 #include <time.h>
 
 #if !defined(_WIN32)
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -704,118 +715,408 @@ static vtm_status op_rmsh(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 // 8×3 диапазона параллельно, пока считается первый (образец — упреждающая
 // подкачка 0161). VTM_MOE_MADVISE=0 отключает.
 //
-// Кэш экспертов (LRU). Горячие блоки можно держать в своей памяти, а не в
-// page cache: на 16 ГиБ и 19 ГиБ файла page cache вытесняется целиком, и
-// каждый токен снова читает свои 1,2 ГБ с диска. VTM_MOE_CACHE_MB=N (0 —
-// выключен, по умолчанию) включает LRU на N МиБ с копированием блоков.
-// Ключ — (указатель банка, номер эксперта): указатель однозначно задаёт
-// отображение, поэтому кэш можно держать общим для машин процесса.
+// Кэш экспертов (LRU, pread). Файл модели 18,55 ГБ не влезает в 16 ГиБ RAM, и
+// каждое касание выбранного эксперта через mmap — это page fault на каждые
+// 16 КБ: 355 984 отказа и 10 с sys на 4 токена (замер 0174). Здесь эксперты
+// читаются явным pread целым куском (эксперт 0,84-1,29 МБ) в свою память:
+// отображение не трогается, отказов на экспертах нет. Дескриптор для pread
+// помечен F_NOCACHE, чтобы прочитанное не оседало в page cache и не вытесняло
+// attention/lm_head (те 0,84 ГБ как раз помещаются в RAM и после первого
+// токена читаются из памяти).
+//
+// Бюджет — VTM_MOE_CACHE_MB, по умолчанию 3072 МиБ; 0 выключает кэш, и
+// работает прежний mmap-путь с madvise. LRU по (файл, банк, эксперт), слоты
+// выровнены на 4 КБ и переиспользуются: после прогрева на токен не приходится
+// ни одного malloc. Ключ включает st_dev/st_ino/mtime файла, а не адрес
+// отображения: две машины одного файла делят кэш, а переиспользованный адрес
+// mmap не может отдать чужие веса.
 #define VTM_MOE_MAX_EXPERTS 65535
 #define VTM_MOE_TRACE_DEFAULT 0
+#define VTM_MOE_CACHE_DEFAULT_MB 3072
+#define VTM_MOE_SLOT_ALIGN 4096u
+#define VTM_MOE_HASH_BUCKETS 4096u
+#define VTM_MOE_MAX_CLASSES 16
+// Сколько освобождённых слотов держать на размерный класс. Больше не нужно:
+// при смене рабочего набора (модель перестала просить down) буферы другого
+// класса должны освободиться, иначе кэш занимает заметно больше бюджета.
+#define VTM_MOE_FREE_KEEP 64
 
 typedef struct moe_cache_entry {
-    struct moe_cache_entry *prev, *next;
-    const void *base;   // t->qblocks банка (идентифицирует отображение)
+    struct moe_cache_entry *lru_prev, *lru_next; // LRU (только в кэше)
+    struct moe_cache_entry *hash_next;           // цепочка бакета
+    struct moe_cache_entry *free_next;           // список свободных слотов
+    uint64_t dev, ino, mtime;  // файл — часть ключа
+    uint64_t bank_off;         // смещение банка в файле
     uint32_t expert;
-    size_t nbytes;
+    uint32_t bucket;
+    uint32_t cls;              // размерный класс (индекс в cls[])
+    size_t   nbytes;           // полезных байт
+    size_t   cap;              // выровненная ёмкость слота
     uint8_t *data;
 } moe_cache_entry;
 
 typedef struct {
-    moe_cache_entry *head, *tail;   // head — самый свежий
+    size_t cap;
+    moe_cache_entry *free;
+    size_t nfree;
+} moe_size_class;
+
+typedef struct {
+    moe_cache_entry *head, *tail;              // head — самый свежий
+    moe_cache_entry *hash[VTM_MOE_HASH_BUCKETS];
+    moe_size_class cls[VTM_MOE_MAX_CLASSES];
+    int n_classes;
     size_t bytes, cap;
     int ready;
+    int disabled;
 } moe_cache;
+
+// Откуда берутся эксперты в текущем прогоне. Один fstat на инструкцию MOE,
+// а не на эксперта: 48 слоёв × 8 экспертов × 3 банка — это 1152 fstat'а на
+// токен, если проверять файл в каждом обращении.
+typedef struct {
+    int use;
+    int fd;
+    uint64_t dev, ino, mtime;
+    size_t file_size;
+} moe_source;
 
 static moe_cache g_moe_cache;
 static uint64_t g_moe_hits, g_moe_misses, g_moe_advised;
+static uint64_t g_moe_pread_bytes, g_moe_pread_calls, g_moe_alloc_count;
+static uint64_t g_moe_evicted, g_moe_fallbacks;
 static int g_moe_cache_registered;
+static int g_moe_atexit;
+
+static void moe_cache_entry_free(moe_cache_entry *e) {
+    free(e->data);
+    free(e);
+}
 
 static void moe_cache_drop(void) {
     moe_cache_entry *e = g_moe_cache.head;
+    int i;
+
     while (e) {
-        moe_cache_entry *next = e->next;
-        free(e->data);
-        free(e);
+        moe_cache_entry *next = e->lru_next;
+        moe_cache_entry_free(e);
         e = next;
+    }
+    for (i = 0; i < g_moe_cache.n_classes; i++) {
+        e = g_moe_cache.cls[i].free;
+        while (e) {
+            moe_cache_entry *next = e->free_next;
+            moe_cache_entry_free(e);
+            e = next;
+        }
     }
     memset(&g_moe_cache, 0, sizeof g_moe_cache);
 }
 
 static void moe_cache_init(void) {
     const char *env;
-    long mb;
+    long mb = VTM_MOE_CACHE_DEFAULT_MB;
+    uint64_t bytes;
 
     if (g_moe_cache_registered) return;
     g_moe_cache_registered = 1;
     memset(&g_moe_cache, 0, sizeof g_moe_cache);
     env = getenv("VTM_MOE_CACHE_MB");
-    if (!env || !*env) return;
-    mb = strtol(env, NULL, 10);
+    if (env && *env) {
+        char *end = NULL;
+        long value = strtol(env, &end, 10);
+        // Мусор в env — не повод выключать кэш молча: остаёмся на дефолте.
+        if (end != env && end && *end == '\0') mb = value;
+    }
     if (mb <= 0) return;
-    g_moe_cache.cap = (size_t)mb << 20;
+    bytes = (uint64_t)mb << 20;
+    if (bytes > (uint64_t)SIZE_MAX) bytes = (uint64_t)SIZE_MAX;
+    g_moe_cache.cap = (size_t)bytes;
     g_moe_cache.ready = 1;
-    atexit(moe_cache_drop);
+    if (!g_moe_atexit) {
+        atexit(moe_cache_drop);
+        g_moe_atexit = 1;
+    }
 }
 
-static void moe_cache_unlink(moe_cache_entry *e) {
-    if (e->prev) e->prev->next = e->next; else g_moe_cache.head = e->next;
-    if (e->next) e->next->prev = e->prev; else g_moe_cache.tail = e->prev;
-    e->prev = e->next = NULL;
+void vtm_internal_moe_cache_reset(void) {
+    moe_cache_drop();
+    g_moe_cache_registered = 0;
+    g_moe_hits = g_moe_misses = g_moe_advised = 0;
+    g_moe_pread_bytes = g_moe_pread_calls = g_moe_alloc_count = 0;
+    g_moe_evicted = g_moe_fallbacks = 0;
 }
 
-static void moe_cache_push(moe_cache_entry *e) {
-    e->next = g_moe_cache.head;
-    e->prev = NULL;
-    if (g_moe_cache.head) g_moe_cache.head->prev = e;
+void vtm_internal_moe_cache_stats(uint64_t *hits, uint64_t *misses,
+                                  size_t *bytes, uint64_t *allocs) {
+    if (hits) *hits = g_moe_hits;
+    if (misses) *misses = g_moe_misses;
+    if (bytes) *bytes = g_moe_cache.bytes;
+    if (allocs) *allocs = g_moe_alloc_count;
+}
+
+static size_t moe_align_up(size_t value, size_t align) {
+    return (value + align - 1u) & ~(align - 1u);
+}
+
+static uint32_t moe_hash_bucket(uint64_t dev, uint64_t ino, uint64_t mtime,
+                                uint64_t bank_off, uint32_t expert,
+                                size_t nbytes) {
+    uint64_t h = bank_off * 0x9E3779B97F4A7C15ull;
+    h ^= (uint64_t)expert * 0xC2B2AE3D27D4EB4Full;
+    h ^= dev * 0xBF58476D1CE4E5B9ull;
+    h ^= ino * 0x94D049BB133111EBull;
+    h ^= mtime * 0xD6E8FEB86659FD93ull;
+    h ^= (uint64_t)nbytes;
+    h ^= h >> 33;
+    h *= 0xFF51AFD7ED558CCDull;
+    h ^= h >> 29;
+    return (uint32_t)h & (VTM_MOE_HASH_BUCKETS - 1u);
+}
+
+static int moe_class_for(size_t cap) {
+    int i;
+    for (i = 0; i < g_moe_cache.n_classes; i++)
+        if (g_moe_cache.cls[i].cap == cap) return i;
+    if (g_moe_cache.n_classes >= VTM_MOE_MAX_CLASSES) return -1;
+    g_moe_cache.cls[g_moe_cache.n_classes].cap = cap;
+    return g_moe_cache.n_classes++;
+}
+
+static void moe_lru_unlink(moe_cache_entry *e) {
+    if (e->lru_prev) e->lru_prev->lru_next = e->lru_next;
+    else g_moe_cache.head = e->lru_next;
+    if (e->lru_next) e->lru_next->lru_prev = e->lru_prev;
+    else g_moe_cache.tail = e->lru_prev;
+    e->lru_prev = e->lru_next = NULL;
+}
+
+static void moe_lru_push(moe_cache_entry *e) {
+    e->lru_next = g_moe_cache.head;
+    e->lru_prev = NULL;
+    if (g_moe_cache.head) g_moe_cache.head->lru_prev = e;
     g_moe_cache.head = e;
     if (!g_moe_cache.tail) g_moe_cache.tail = e;
 }
 
-static const uint8_t *moe_cache_get(const void *base, uint32_t expert,
-                                    size_t nbytes) {
+static void moe_hash_add(moe_cache_entry *e) {
+    e->bucket = moe_hash_bucket(e->dev, e->ino, e->mtime, e->bank_off,
+                                e->expert, e->nbytes);
+    e->hash_next = g_moe_cache.hash[e->bucket];
+    g_moe_cache.hash[e->bucket] = e;
+}
+
+static void moe_hash_remove(moe_cache_entry *e) {
+    moe_cache_entry **slot = &g_moe_cache.hash[e->bucket];
+    while (*slot) {
+        if (*slot == e) {
+            *slot = e->hash_next;
+            e->hash_next = NULL;
+            return;
+        }
+        slot = &(*slot)->hash_next;
+    }
+}
+
+// Вернуть слот в свой размерный класс или освободить, если их уже достаточно.
+static void moe_cache_dispose(moe_cache_entry *e) {
+    moe_size_class *c = &g_moe_cache.cls[e->cls];
+    if (c->nfree < VTM_MOE_FREE_KEEP) {
+        e->free_next = c->free;
+        c->free = e;
+        c->nfree++;
+    } else {
+        moe_cache_entry_free(e);
+    }
+}
+
+static void moe_cache_evict_tail(void) {
+    moe_cache_entry *e = g_moe_cache.tail;
+    if (!e) return;
+    moe_lru_unlink(e);
+    moe_hash_remove(e);
+    g_moe_cache.bytes -= e->cap;
+    g_moe_evicted++;
+    moe_cache_dispose(e);
+}
+
+static moe_cache_entry *moe_cache_claim(size_t nbytes) {
+    size_t cap = moe_align_up(nbytes, VTM_MOE_SLOT_ALIGN);
+    moe_size_class *c;
     moe_cache_entry *e;
-    if (!g_moe_cache.ready) return NULL;
-    for (e = g_moe_cache.head; e; e = e->next) {
-        if (e->base != base || e->expert != expert || e->nbytes != nbytes)
+    int ci;
+
+    if (cap < nbytes) return NULL; // переполнение выравнивания
+    ci = moe_class_for(cap);
+    if (ci < 0) return NULL;
+    while (g_moe_cache.bytes + cap > g_moe_cache.cap && g_moe_cache.tail)
+        moe_cache_evict_tail();
+    if (g_moe_cache.bytes + cap > g_moe_cache.cap) return NULL;
+    c = &g_moe_cache.cls[ci];
+    e = c->free;
+    if (e) {
+        c->free = e->free_next;
+        c->nfree--;
+        e->free_next = NULL;
+    } else {
+        e = (moe_cache_entry *)calloc(1u, sizeof *e);
+        if (!e) return NULL;
+        if (posix_memalign((void **)&e->data, VTM_MOE_SLOT_ALIGN, cap) != 0) {
+            free(e);
+            return NULL;
+        }
+        g_moe_alloc_count++;
+    }
+    e->cls = (uint32_t)ci;
+    e->nbytes = nbytes;
+    e->cap = cap;
+    g_moe_cache.bytes += cap;
+    return e;
+}
+
+static void moe_cache_release(moe_cache_entry *e) {
+    g_moe_cache.bytes -= e->cap;
+    moe_cache_dispose(e);
+}
+
+static moe_cache_entry *moe_cache_find(uint64_t dev, uint64_t ino,
+                                       uint64_t mtime, uint64_t bank_off,
+                                       uint32_t expert, size_t nbytes) {
+    uint32_t bucket = moe_hash_bucket(dev, ino, mtime, bank_off, expert,
+                                      nbytes);
+    moe_cache_entry *e;
+
+    for (e = g_moe_cache.hash[bucket]; e; e = e->hash_next) {
+        if (e->dev != dev || e->ino != ino || e->mtime != mtime ||
+            e->bank_off != bank_off || e->expert != expert ||
+            e->nbytes != nbytes)
             continue;
-        moe_cache_unlink(e);
-        moe_cache_push(e);
+        moe_lru_unlink(e);
+        moe_lru_push(e);
         g_moe_hits++;
-        return e->data;
+        return e;
     }
     g_moe_misses++;
     return NULL;
 }
 
-static void moe_cache_put(const void *base, uint32_t expert, const void *src,
-                          size_t nbytes) {
-    moe_cache_entry *e;
-    uint8_t *copy;
+static int moe_pread_full(int fd, uint8_t *dst, size_t n, off_t off) {
+    while (n > 0) {
+        ssize_t got = pread(fd, dst, n, off);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (got == 0) return -1; // файл короче, чем обещал fstat
+        dst += (size_t)got;
+        off += (off_t)got;
+        n -= (size_t)got;
+    }
+    return 0;
+}
 
-    if (!g_moe_cache.ready || nbytes == 0 || nbytes > g_moe_cache.cap) return;
-    while (g_moe_cache.tail &&
-           g_moe_cache.bytes + nbytes > g_moe_cache.cap) {
-        moe_cache_entry *old = g_moe_cache.tail;
-        moe_cache_unlink(old);
-        g_moe_cache.bytes -= old->nbytes;
-        free(old->data);
-        free(old);
+// Прочитать выбранный эксперт в кэш (или найти его там). NULL — кэш
+// выключен/слот не дался/чтение не удалось; вызывающий берёт mmap-указатель.
+static const uint8_t *moe_cache_fetch(const moe_source *src, uint64_t bank_off,
+                                      uint32_t expert, size_t nbytes) {
+    moe_cache_entry *e;
+    uint64_t off;
+
+    if (!g_moe_cache.ready || g_moe_cache.disabled || !src->use ||
+        nbytes == 0)
+        return NULL;
+    e = moe_cache_find(src->dev, src->ino, src->mtime, bank_off, expert,
+                       nbytes);
+    if (e) return e->data;
+    off = bank_off + (uint64_t)expert * (uint64_t)nbytes;
+    if (off > (uint64_t)src->file_size ||
+        (uint64_t)nbytes > (uint64_t)src->file_size - off) {
+        g_moe_fallbacks++;
+        return NULL;
     }
-    e = (moe_cache_entry *)calloc(1u, sizeof *e);
-    copy = (uint8_t *)malloc(nbytes);
-    if (!e || !copy) {
-        free(e);
-        free(copy);
-        return;
+    e = moe_cache_claim(nbytes);
+    if (!e) return NULL;
+    if (moe_pread_full(src->fd, e->data, nbytes, (off_t)off) != 0) {
+        g_moe_fallbacks++;
+        moe_cache_release(e);
+        return NULL;
     }
-    memcpy(copy, src, nbytes);
-    e->base = base;
+    e->dev = src->dev;
+    e->ino = src->ino;
+    e->mtime = src->mtime;
+    e->bank_off = bank_off;
     e->expert = expert;
     e->nbytes = nbytes;
-    e->data = copy;
-    moe_cache_push(e);
-    g_moe_cache.bytes += nbytes;
+    moe_hash_add(e);
+    moe_lru_push(e);
+    g_moe_pread_bytes += (uint64_t)nbytes;
+    g_moe_pread_calls++;
+    return e->data;
+}
+
+// Один и тот же файл? Дескриптор для pread открывается по пути, а банки
+// адресуются смещениями из mmap-отображения. Если файл по пути успели
+// заменить, открылся бы другой inode, и pread вернул бы чужие веса — лучше
+// остаться на mmap-пути.
+static int moe_same_file(int a, int b) {
+    struct stat sa, sb;
+    if (fstat(a, &sa) != 0 || fstat(b, &sb) != 0) return 0;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+// Дескриптор для pread: свой, чтобы F_NOCACHE не влиял на mmap-отображение.
+// Путь берём у оригинала через F_GETPATH (macOS); если так нельзя — dup:
+// тогда данные кэшируются и в page cache, но корректность та же.
+static void moe_source_init(vtm_t *m, moe_source *src) {
+    struct stat st;
+
+    src->use = 0;
+    src->fd = 0;
+    src->dev = src->ino = src->mtime = 0;
+    src->file_size = 0;
+    if (!g_moe_cache.ready || g_moe_cache.disabled) return;
+    if (!m->mapped || !m->map || m->fd < 0) return;
+    if (m->moe_fd == 0) {
+        m->moe_fd = -1;
+#if defined(F_GETPATH)
+        {
+            char path[PATH_MAX];
+            if (fcntl(m->fd, F_GETPATH, path) == 0) {
+                int fd = open(path, O_RDONLY);
+                if (fd >= 0) {
+                    if (moe_same_file(m->fd, fd)) {
+#if defined(F_NOCACHE)
+                        (void)fcntl(fd, F_NOCACHE, 1);
+#endif
+                        m->moe_fd = fd;
+                    } else {
+                        close(fd);
+                    }
+                }
+            }
+        }
+#endif
+        if (m->moe_fd <= 0) {
+            int fd = dup(m->fd);
+            if (fd > 0) m->moe_fd = fd;
+        }
+    }
+    if (m->moe_fd <= 0) return;
+    if (fstat(m->moe_fd, &st) != 0) return;
+    if (st.st_size < 0 ||
+        (uint64_t)st.st_size > (uint64_t)SIZE_MAX) return;
+    src->use = 1;
+    src->fd = m->moe_fd;
+    src->dev = (uint64_t)st.st_dev;
+    src->ino = (uint64_t)st.st_ino;
+#if defined(__APPLE__)
+    src->mtime = (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull
+               + (uint64_t)st.st_mtimespec.tv_nsec;
+#else
+    src->mtime = (uint64_t)st.st_mtim.tv_sec * 1000000000ull
+               + (uint64_t)st.st_mtim.tv_nsec;
+#endif
+    src->file_size = (size_t)st.st_size;
 }
 
 // Упреждающая подкачка диапазона из отображения: madvise требует выровненный
@@ -873,11 +1174,19 @@ static int moe_trace_enabled(void) {
 // прогона (tools/moe_program.py) — там счётчики есть.
 static void moe_trace_report(void) {
     if (!moe_trace_enabled()) return;
-    fprintf(stderr, "VTM MOE: hits=%llu misses=%llu cache=%zu КиБ advised=%llu\n",
+    fprintf(stderr,
+            "VTM MOE: hits=%llu misses=%llu cache=%zu КиБ advised=%llu "
+            "pread=%llu КиБ calls=%llu allocs=%llu evicted=%llu "
+            "fallbacks=%llu\n",
             (unsigned long long)g_moe_hits,
             (unsigned long long)g_moe_misses,
             (size_t)(g_moe_cache.bytes >> 10),
-            (unsigned long long)g_moe_advised);
+            (unsigned long long)g_moe_advised,
+            (unsigned long long)(g_moe_pread_bytes >> 10),
+            (unsigned long long)g_moe_pread_calls,
+            (unsigned long long)g_moe_alloc_count,
+            (unsigned long long)g_moe_evicted,
+            (unsigned long long)g_moe_fallbacks);
 }
 
 // Банк экспертов: kind 6/7, dims [n_experts, rows, cols], блоки GGML.
@@ -925,6 +1234,9 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     double *weights = NULL;
     float *scratch = NULL;
     int renorm;
+    moe_source src;
+    int use_pread;
+    uint64_t gate_off = 0, up_off = 0, down_off = 0;
 
     if (!router) return st;
     x = need(m, in->b, ins, "b (x)", &st);
@@ -1007,6 +1319,19 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     }
 
     moe_cache_init();
+    moe_source_init(m, &src);
+    use_pread = src.use && g_moe_cache.ready && !g_moe_cache.disabled;
+    if (use_pread) {
+        // Смещение банка в файле: отображение начинается с нуля файла, поэтому
+        // «указатель блока минус база отображения» и есть file offset. Если
+        // арифметика даст мусор, границы проверит moe_cache_fetch().
+        gate_off = (uint64_t)(uintptr_t)gate_bank->qblocks
+                 - (uint64_t)(uintptr_t)m->map;
+        up_off = (uint64_t)(uintptr_t)up_bank->qblocks
+               - (uint64_t)(uintptr_t)m->map;
+        down_off = (uint64_t)(uintptr_t)down_bank->qblocks
+                 - (uint64_t)(uintptr_t)m->map;
+    }
 
     // 1. Роутер: logits[e] = router[e]·x, затем softmax по всем экспертам.
     {
@@ -1060,9 +1385,10 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
             fprintf(stderr, " %d:%.6f", chosen[k], weights[k]);
         fprintf(stderr, "\n");
     }
-    // 4. Упреждающая подкачка всех выбранных экспертов до счёта: 3×top_k
-    //    диапазонов уходят ядру одним заходом (0161).
-    if (moe_madvise_enabled()) {
+    // 4. madvise — только когда pread-кэш не работает (выключен или нет
+    //    дескриптора). С кэшем упреждение вредно: оно втягивает в page cache
+    //    ровно те страницы, которые pread и так читает мимо отображения.
+    if (!use_pread && moe_madvise_enabled()) {
         for (k = 0; k < top_k; k++) {
             int64_t off_gate = (int64_t)chosen[k] * expert_blocks
                              * (int64_t)gate_block_bytes;
@@ -1101,28 +1427,26 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
                                            * (int64_t)gate_block_bytes);
             size_t down_bytes = (size_t)(expert_blocks
                                          * (int64_t)down_block_bytes);
-            const uint8_t *cached;
-            int hit_gate = 0, hit_up = 0, hit_down = 0;
             int (*kernel)(float *, const uint8_t *, const float *, int, int) =
                 gate_bank->kind == VTM_TENSOR_Q4K ? vtm_q4k_tmv : vtm_q6k_tmv;
             int (*kernel_down)(float *, const uint8_t *, const float *, int,
                                int) =
                 down_bank->kind == VTM_TENSOR_Q4K ? vtm_q4k_tmv : vtm_q6k_tmv;
 
-            if ((cached = moe_cache_get(gate_bank->qblocks, (uint32_t)ex,
-                                        expert_bytes)) != NULL) {
-                gb = cached;
-                hit_gate = 1;
-            }
-            if ((cached = moe_cache_get(up_bank->qblocks, (uint32_t)ex,
-                                        expert_bytes)) != NULL) {
-                ub = cached;
-                hit_up = 1;
-            }
-            if ((cached = moe_cache_get(down_bank->qblocks, (uint32_t)ex,
-                                        down_bytes)) != NULL) {
-                db = cached;
-                hit_down = 1;
+            // pread в свой кэш: попадание — готовые байты, промах — один
+            // крупный pread на всю матрицу эксперта. NULL — кэш выключен или
+            // чтение не удалось, тогда остаётся mmap-указатель.
+            if (use_pread) {
+                const uint8_t *cached;
+                if ((cached = moe_cache_fetch(&src, gate_off, (uint32_t)ex,
+                                              expert_bytes)) != NULL)
+                    gb = cached;
+                if ((cached = moe_cache_fetch(&src, up_off, (uint32_t)ex,
+                                              expert_bytes)) != NULL)
+                    ub = cached;
+                if ((cached = moe_cache_fetch(&src, down_off, (uint32_t)ex,
+                                              down_bytes)) != NULL)
+                    db = cached;
             }
 
             if (kernel(gate, gb, x->f32, inter, hidden) != 0 ||
@@ -1148,20 +1472,6 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
             }
             for (i = 0; i < hidden; i++)
                 acc[i] += weights[k] * (double)out[i];
-
-            // Пополняем кэш только тем, чего в нём не было: чтение блока из
-            // отображения — это и есть страничный отказ, который кэш снимает.
-            if (g_moe_cache.ready) {
-                if (!hit_gate)
-                    moe_cache_put(gate_bank->qblocks, (uint32_t)ex, gb,
-                                  expert_bytes);
-                if (!hit_up)
-                    moe_cache_put(up_bank->qblocks, (uint32_t)ex, ub,
-                                  expert_bytes);
-                if (!hit_down)
-                    moe_cache_put(down_bank->qblocks, (uint32_t)ex, db,
-                                  down_bytes);
-            }
         }
     }
 
