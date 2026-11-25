@@ -25,8 +25,21 @@ final class VoicePlayer {
     /// Куда сообщать, почему голос молчит (сервер не отвечает, `/api/tts` 503).
     var onIssue: ((String) -> Void)?
     var onSpeakingChanged: ((Bool) -> Void)?
+    /// Очередь опустела: всё сказанное доиграно и синтезировать больше нечего.
+    /// Нужно follow-up (задача 0190): микрофон открывается только после того,
+    /// как голос Евы смолк, иначе она услышит саму себя. Вызывается только при
+    /// естественном конце — `stop()` («Стоп», новый вопрос) сюда не относится.
+    var onDrained: (() -> Void)?
     /// Громкость текущей фразы 0…1 для большого круга (30 Гц, metering плеера).
     var onLevel: ((Float) -> Void)?
+
+    /// Очередь пуста: ничего не играет, не ждёт и не синтезируется.
+    var isDrained: Bool {
+        player == nil && pendingWav.isEmpty && texts.isEmpty && synthesis == nil
+    }
+
+    /// Уже сообщили, что очередь опустела: не повторяем на каждый чих.
+    private var drainedNotified = true
 
     func configure(server: URL?, voice id: String) {
         self.server = server
@@ -41,6 +54,7 @@ final class VoicePlayer {
     func enqueue(_ phrases: [String]) {
         guard !phrases.isEmpty else { return }
         texts.append(contentsOf: phrases)
+        drainedNotified = false
         pump()
     }
 
@@ -53,6 +67,7 @@ final class VoicePlayer {
         stopMetering()
         player?.stop()
         player = nil
+        drainedNotified = true
         onSpeakingChanged?(false)
     }
 
@@ -64,6 +79,7 @@ final class VoicePlayer {
         guard let base = server else {
             texts.removeAll()
             report("не задан адрес сервера")
+            notifyDrainedIfIdle()
             return
         }
         let text = texts.removeFirst()
@@ -82,6 +98,7 @@ final class VoicePlayer {
                 self.report(error.message)
             }
             self.pump()
+            self.notifyDrainedIfIdle()
         }
     }
 
@@ -145,6 +162,7 @@ final class VoicePlayer {
             player = nil
             report("не удалось проиграть WAV: \(error.localizedDescription)")
             playNextIfIdle()
+            notifyDrainedIfIdle()
         }
     }
 
@@ -197,8 +215,17 @@ final class VoicePlayer {
                 self.player = nil
                 self.onSpeakingChanged?(false)
                 self.playNextIfIdle()
+                self.notifyDrainedIfIdle()
             }
         }
+    }
+
+    /// Сообщить ровно один раз: озвучка доиграла и очередь пуста. Отсюда
+    /// `AppDelegate` открывает follow-up микрофон.
+    private func notifyDrainedIfIdle() {
+        guard !drainedNotified, isDrained else { return }
+        drainedNotified = true
+        onDrained?()
     }
 
     private func report(_ message: String) {

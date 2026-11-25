@@ -64,6 +64,16 @@ final class CircleView: NSView {
         }
     }
 
+    /// Follow-up (задача 0190): микрофон открыт сразу после ответа, вопрос
+    /// ещё не начался. Состояние остаётся `listening`, но волны приглушены —
+    /// так видно, что это «слышу вас» после ответа, а не запись по ⌥Space.
+    var followUpListening = false {
+        didSet {
+            guard followUpListening != oldValue else { return }
+            needsDisplay = true
+        }
+    }
+
     /// Галочка «Анимация»: выключена — ни таймера, ни волн, только цвет и
     /// подпись состояния (слабые машины).
     var animationEnabled = true {
@@ -239,7 +249,9 @@ final class CircleView: NSView {
 
         switch visualState {
         case .listening:
-            drawListeningRings(ctx, center: center, radius: radius, color: color, level: level)
+            withFollowUpDim(ctx) {
+                drawListeningRings(ctx, center: center, radius: radius, color: color, level: level)
+            }
         case .speaking:
             drawSpeakingRings(ctx, center: center, radius: radius, color: color, level: level)
         case .thinking:
@@ -272,7 +284,9 @@ final class CircleView: NSView {
         case .thinking:
             drawThinkingArcs(ctx, center: center, radius: radius, color: color)
         case .listening:
-            drawListeningBars(ctx, center: center, radius: radius, color: color, level: level)
+            withFollowUpDim(ctx) {
+                drawListeningBars(ctx, center: center, radius: radius, color: color, level: level)
+            }
         case .speaking:
             drawSpeakingCore(ctx, center: center, radius: radius, color: color, level: level)
         case .error:
@@ -347,6 +361,19 @@ final class CircleView: NSView {
             width: radius * 0.92,
             height: radius * 0.44
         ))
+        ctx.restoreGState()
+    }
+
+    /// Приглушение волн в follow-up: состояние то же («слушаю»), но не спорит
+    /// с обычной записью по ⌥Space/«Привет, Ева».
+    private func withFollowUpDim(_ ctx: CGContext, _ body: () -> Void) {
+        guard visualState == .listening, followUpListening else {
+            body()
+            return
+        }
+        ctx.saveGState()
+        ctx.setAlpha(0.55)
+        body()
         ctx.restoreGState()
     }
 

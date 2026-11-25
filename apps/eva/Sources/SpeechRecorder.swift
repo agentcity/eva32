@@ -2,6 +2,15 @@ import AVFoundation
 import Foundation
 import Speech
 
+/// Чем закончился follow-up без вопроса (задача 0190). Тишина — это не
+/// ошибка: вызывающий тихо возвращает wake-ожидание и ничего не отправляет.
+enum FollowUpEnd: Sendable, Equatable {
+    /// Ни слова за `followUpSilence` секунд; число — выдержанная пауза.
+    case silence(Int)
+    /// Микрофон закрыли сами (⌥Space/«Стоп»), не сказав ни слова.
+    case manual
+}
+
 /// Запись с микрофона и распознавание ru-RU **на устройстве**.
 ///
 /// Права: Apple Speech требует `NSSpeechRecognitionUsageDescription`, микрофон —
@@ -19,9 +28,17 @@ final class SpeechRecorder {
     var onPartial: ((String) -> Void)?
     var onFinal: ((String) -> Void)?
     var onError: ((String) -> Void)?
+    /// Follow-up закончился без слов: ни ошибки, ни отправки (задача 0190).
+    var onFollowUpEnd: ((FollowUpEnd) -> Void)?
     /// Уровень микрофона 0…1 для большого круга. Обновляется с главного
     /// актора 30 раз в секунду, а RMS считается в аудио-тапе (см. `LevelMeter`).
     var onLevel: ((Float) -> Void)?
+
+    /// Текущая запись — follow-up: ждём вопрос без «Привет, Ева». Пока не
+    /// сказано ни слова, пауза ограничена `followUpSilence`, а закрытие тихое.
+    private(set) var isFollowUp = false
+    /// Сколько секунд ждать первую фразу в follow-up (из настроек).
+    var followUpSilence: Double = Double(Settings.defaultFollowUpSilence)
 
     private var generation = 0
     private var engine: AVAudioEngine?
@@ -48,16 +65,17 @@ final class SpeechRecorder {
     /// Дольше минуты не слушаем: забытый микрофон — это и батарея, и приватность.
     private let maxDuration: UInt64 = 60
 
-    func start() {
+    func start(followUp: Bool = false) {
         guard !isRecording else { return }
         generation += 1
         let run = generation
         isRecording = true
+        isFollowUp = followUp
         lastText = ""
         delivered = false
         onState?(true)
         onPartial?("")
-        log("речь: старт записи")
+        log("речь: старт записи" + (followUp ? " (follow-up)" : ""))
 
         timeout?.cancel()
         timeout = Task { [weak self] in
@@ -227,8 +245,22 @@ final class SpeechRecorder {
                 guard let self, self.isRecording else { return }
                 let idle = Date().timeIntervalSince(self.lastVoiceAt)
                 let hasText = !self.lastText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                let limit = hasText ? self.silenceLimit : self.silenceWarmup
+                let limit = SpeechRecorder.silenceTimeout(
+                    hasText: hasText,
+                    followUp: self.isFollowUp,
+                    followUpSilence: self.followUpSilence,
+                    warmup: self.silenceWarmup,
+                    afterSpeech: self.silenceLimit
+                )
                 if idle >= limit {
+                    if self.isFollowUp, !hasText {
+                        // Follow-up без единого слова: это не ошибка, вопрос
+                        // отправлять нечего — тихо уходим в ожидание.
+                        log("речь: follow-up — тишина "
+                            + String(format: "%.0f", limit) + " с, закрываю")
+                        self.finishFollowUp(.silence(Int(limit.rounded())))
+                        return
+                    }
                     log("речь: тишина \(String(format: "%.1f", idle)) с — заканчиваю сам")
                     self.finish(error: nil)
                     return
@@ -237,12 +269,29 @@ final class SpeechRecorder {
         }
     }
 
+    /// Порог тишины для текущей записи. Вынесен в `nonisolated static`, чтобы
+    /// проверить без микрофона (`--selftest-followup`): после речи — 2,2 с,
+    /// follow-up без слов — пауза из настроек, обычная запись без слов — 6 с.
+    nonisolated static func silenceTimeout(
+        hasText: Bool,
+        followUp: Bool,
+        followUpSilence: Double,
+        warmup: Double,
+        afterSpeech: Double
+    ) -> Double {
+        if hasText { return afterSpeech }
+        if followUp { return max(followUpSilence, 0.5) }
+        return warmup
+    }
+
     // MARK: - Завершение
 
     private func finish(error: String?) {
         guard isRecording else { return }
         isRecording = false
         generation += 1
+        let followUp = isFollowUp
+        isFollowUp = false
         timeout?.cancel()
         timeout = nil
         silence?.cancel()
@@ -255,6 +304,13 @@ final class SpeechRecorder {
         if !delivered {
             delivered = true
             if text.isEmpty {
+                if followUp {
+                    // В follow-up пустая запись — не «не расслышала», а
+                    // нормальный уход в ожидание.
+                    log("речь: follow-up остановлен без слов — не отправляю")
+                    onFollowUpEnd?(.manual)
+                    return
+                }
                 onError?(error.map { "распознавание: \($0)" } ?? "не расслышала — попробуйте ещё раз")
                 return
             }
@@ -262,10 +318,28 @@ final class SpeechRecorder {
         }
     }
 
+    /// Тихое закрытие follow-up: микрофон отпущен, ни ошибки, ни отправки.
+    /// `delivered = true` — `finish` больше ничего не пришлёт.
+    private func finishFollowUp(_ end: FollowUpEnd) {
+        guard isRecording else { return }
+        isRecording = false
+        generation += 1
+        isFollowUp = false
+        timeout?.cancel()
+        timeout = nil
+        silence?.cancel()
+        silence = nil
+        teardown()
+        delivered = true
+        onState?(false)
+        onFollowUpEnd?(end)
+    }
+
     private func fail(_ message: String) {
         guard isRecording else { return }
         isRecording = false
         generation += 1
+        isFollowUp = false
         timeout?.cancel()
         timeout = nil
         silence?.cancel()

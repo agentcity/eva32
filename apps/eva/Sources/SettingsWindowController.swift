@@ -11,6 +11,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var speakCheck: NSButton!
     private var animateCheck: NSButton!
     private var wakeCheck: NSButton!
+    private var followUpCheck: NSButton!
+    private var followUpPopup: NSPopUpButton!
     private var statusLabel: NSTextField!
 
     /// Список моделей, полученный от сервера; текущая настройка добавляется
@@ -36,7 +38,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private func build() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 430),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 520),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -95,6 +97,40 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         )
         wakeCheck.controlSize = .small
 
+        // Follow-up (задача 0190): микрофон после ответа, без «Привет, Ева».
+        followUpCheck = NSButton(
+            checkboxWithTitle: "Слушать после ответа",
+            target: self,
+            action: #selector(followUpChanged)
+        )
+        followUpCheck.controlSize = .small
+
+        followUpPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        followUpPopup.controlSize = .small
+        followUpPopup.font = .systemFont(ofSize: 11)
+        followUpPopup.addItems(
+            withTitles: Settings.followUpSilenceOptions.map { "\($0) с" }
+        )
+        followUpPopup.target = self
+        followUpPopup.action = #selector(followUpSilenceChanged)
+
+        let followUpPauseLabel = NSTextField(
+            labelWithString: "тишины — и возвращаюсь к „Привет, Ева“"
+        )
+        followUpPauseLabel.font = .systemFont(ofSize: 11)
+        followUpPauseLabel.textColor = .secondaryLabelColor
+        let followUpRow = NSStackView(views: [followUpPopup, followUpPauseLabel])
+        followUpRow.orientation = .horizontal
+        followUpRow.spacing = 8
+        followUpRow.distribution = .fill
+
+        let followUpHint = NSTextField(
+            wrappingLabelWithString: "после ответа микрофон открыт сразу; "
+                + "работает при включённом ожидании «Привет, Ева»"
+        )
+        followUpHint.font = .systemFont(ofSize: 11)
+        followUpHint.textColor = .secondaryLabelColor
+
         // Приватность важна: человек должен видеть, что микрофон не отправляет
         // звук в сеть, даже когда ожидание включено постоянно.
         let wakeHint = NSTextField(
@@ -139,6 +175,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             row("", animateCheck),
             row("", wakeCheck),
             row("", wakeHint),
+            row("", followUpCheck),
+            row("", followUpHint),
+            row("Пауза", followUpRow),
             hint,
             statusLabel,
             buttons,
@@ -183,6 +222,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         speakCheck.state = Settings.shared.speakReplies ? .on : .off
         animateCheck.state = Settings.shared.animateCircle ? .on : .off
         wakeCheck.state = Settings.shared.wakeWord ? .on : .off
+        followUpCheck.state = Settings.shared.followUpListen ? .on : .off
+        // Пауза может быть выставлена и вручную (`defaults write`) — тогда
+        // показываем ближайший вариант, а хранимое значение не переписываем.
+        let pause = Settings.shared.followUpSilence
+        if let index = Settings.followUpSilenceOptions.firstIndex(of: pause) {
+            followUpPopup.selectItem(at: index)
+        } else {
+            let fallback = Settings.followUpSilenceOptions
+                .firstIndex(of: Settings.defaultFollowUpSilence) ?? 1
+            followUpPopup.selectItem(at: fallback)
+        }
         let voiceID = Settings.shared.voice
         if let index = VoicePresets.all.firstIndex(where: { $0.id == voiceID }) {
             voicePopup.selectItem(at: index)
@@ -295,12 +345,18 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         Settings.shared.speakReplies = speakCheck.state == .on
         Settings.shared.animateCircle = animateCheck.state == .on
         Settings.shared.wakeWord = wakeCheck.state == .on
+        Settings.shared.followUpListen = followUpCheck.state == .on
+        let pauseIndex = followUpPopup.indexOfSelectedItem
+        if Settings.followUpSilenceOptions.indices.contains(pauseIndex) {
+            Settings.shared.followUpSilence = Settings.followUpSilenceOptions[pauseIndex]
+        }
         statusLabel.stringValue = "сохранено"
         statusLabel.textColor = .secondaryLabelColor
         log("настройки: сервер=\(base.absoluteString) модель=\(Settings.shared.model.storageValue) "
             + "голос=\(Settings.shared.voice) озвучка=\(Settings.shared.speakReplies) "
             + "анимация=\(Settings.shared.animateCircle) "
-            + "ожидание=\(Settings.shared.wakeWord)")
+            + "ожидание=\(Settings.shared.wakeWord) "
+            + "follow-up=\(Settings.shared.followUpListen)/\(Settings.shared.followUpSilence) с")
     }
 
     @objc private func check() {
@@ -360,5 +416,20 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     @objc private func wakeChanged() {
         Settings.shared.wakeWord = wakeCheck.state == .on
         log("настройки: ожидание „Привет, Ева“=\(Settings.shared.wakeWord ? "включено" : "выключено")")
+    }
+
+    /// «Слушать после ответа» (задача 0190) применяется сразу: следующий
+    /// ответ уже откроет микрофон сам (или не откроет, если сняли галочку).
+    @objc private func followUpChanged() {
+        Settings.shared.followUpListen = followUpCheck.state == .on
+        log("настройки: слушать после ответа="
+            + "\(Settings.shared.followUpListen ? "включено" : "выключено")")
+    }
+
+    @objc private func followUpSilenceChanged() {
+        let index = followUpPopup.indexOfSelectedItem
+        guard Settings.followUpSilenceOptions.indices.contains(index) else { return }
+        Settings.shared.followUpSilence = Settings.followUpSilenceOptions[index]
+        log("настройки: пауза follow-up=\(Settings.shared.followUpSilence) с")
     }
 }

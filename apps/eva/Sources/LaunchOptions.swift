@@ -11,6 +11,8 @@ import Foundation
 /// * `--selftest-speech` — права и офлайн-доступность Apple Speech;
 /// * `--selftest-text` — скрытие `<think>` и нарезка фраз для озвучки;
 /// * `--selftest-wake` — триггер «Привет, Ева» и кольцевой буфер (без микрофона);
+/// * `--selftest-followup` — пауза тишины follow-up и правило «только вместе с
+///   ожиданием „Привет, Ева“» (без микрофона);
 /// * `--selftest-wake-audio N` — N секунд держать микрофон и кольцевой буфер
 ///   без распознавания: замер CPU и проверка остановки `AVAudioEngine`.
 enum Launch {
@@ -37,6 +39,7 @@ enum Launch {
         if arguments.contains("--selftest-speech") { return .speech }
         if arguments.contains("--selftest-text") { return .text }
         if arguments.contains("--selftest-wake") { return .wake }
+        if arguments.contains("--selftest-followup") { return .followUp }
         if let raw = value("--selftest-wake-audio") {
             return .wakeAudio(Double(raw) ?? 10)
         }

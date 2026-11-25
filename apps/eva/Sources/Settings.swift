@@ -63,9 +63,20 @@ final class Settings {
     /// Фоновое ожидание «Привет, Ева»: постоянно включённый микрофон, поэтому
     /// по умолчанию выключено (батарея и приватность).
     static let wakeWordKey = "eva.wakeWord"
+    /// «Слушать после ответа» (задача 0190): микрофон открывается сам, чтобы
+    /// следующий вопрос можно было задать без «Привет, Ева».
+    static let followUpKey = "eva.followUpListen"
+    /// Сколько секунд тишины терпит follow-up, пока не сказано ни слова.
+    static let followUpSilenceKey = "eva.followUpSilence"
 
     static let defaultServer = "http://127.0.0.1:8765"
     static let defaultMaxTokens = 256
+    /// По умолчанию follow-up включён: разговор без кнопок — основной сценарий.
+    static let defaultFollowUpListen = true
+    /// Варианты паузы «до ухода в ожидание»; 12 с — компромисс между
+    /// «не успел собраться с мыслью» и «микрофон висит впустую».
+    static let followUpSilenceOptions = [8, 12, 20]
+    static let defaultFollowUpSilence = 12
 
     private let defaults: UserDefaults
 
@@ -82,6 +93,8 @@ final class Settings {
             Settings.maxTokensKey: Settings.defaultMaxTokens,
             Settings.animateCircleKey: true,
             Settings.wakeWordKey: false,
+            Settings.followUpKey: Settings.defaultFollowUpListen,
+            Settings.followUpSilenceKey: Settings.defaultFollowUpSilence,
         ])
     }
 
@@ -126,6 +139,27 @@ final class Settings {
         get { defaults.bool(forKey: Settings.wakeWordKey) }
         set { store(Settings.wakeWordKey, newValue) }
     }
+
+    /// Слушать после ответа (задача 0190). Включено по умолчанию; работает
+    /// только вместе с `wakeWord`: без ожидания фразы микрофон после ответа
+    /// сам не открывается (прежнее поведение).
+    var followUpListen: Bool {
+        get { defaults.bool(forKey: Settings.followUpKey) }
+        set { store(Settings.followUpKey, newValue) }
+    }
+
+    /// Пауза тишины в follow-up, секунды. Значение вне списка вариантов не
+    /// ломает поведение: оно честно используется как есть.
+    var followUpSilence: Int {
+        get {
+            let value = defaults.integer(forKey: Settings.followUpSilenceKey)
+            return value > 0 ? value : Settings.defaultFollowUpSilence
+        }
+        set { store(Settings.followUpSilenceKey, max(newValue, 1)) }
+    }
+
+    /// Та же пауза в секундах — для таймеров `SpeechRecorder`.
+    var followUpSilenceValue: Double { Double(followUpSilence) }
 
     /// Нормализованный базовый URL сервера без хвостового слэша.
     /// `127.0.0.1:8765` превращается в `http://127.0.0.1:8765`.

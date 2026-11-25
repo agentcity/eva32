@@ -16,6 +16,7 @@ enum SelfTest {
         case speech
         case text
         case wake
+        case followUp
         case wakeAudio(Double)
         case version
     }
@@ -35,6 +36,8 @@ enum SelfTest {
             return runTextTools()
         case .wake:
             return runWakeWord()
+        case .followUp:
+            return runFollowUp()
         case .wakeAudio(let seconds):
             return await runWakeAudio(seconds: seconds)
         case .version:
@@ -364,6 +367,69 @@ enum SelfTest {
               "кадров=\(wrapped.frameLength), первый=\(wrappedValues.first ?? -1), последний=\(wrappedValues.last ?? -1)")
 
         print(failures == 0 ? "все проверки wake-слова прошли" : "провалено: \(failures)")
+        return failures == 0 ? 0 : 1
+    }
+
+    // MARK: - Follow-up без микрофона
+
+    /// Проверяет правила задачи 0190, которые не требуют живого микрофона:
+    /// пауза тишины в follow-up, приоритет обычного авто-стопа после речи и
+    /// запрет автоматики при выключенном ожидании «Привет, Ева».
+    @MainActor
+    private static func runFollowUp() -> Int32 {
+        var failures = 0
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            print((ok ? "OK   " : "FAIL ") + name + (detail.isEmpty ? "" : " — " + detail))
+            if !ok { failures += 1 }
+        }
+
+        check("«слушать после ответа» по умолчанию включено",
+              Settings.defaultFollowUpListen)
+        check("варианты паузы: 8/12/20 с",
+              Settings.followUpSilenceOptions == [8, 12, 20],
+              "\(Settings.followUpSilenceOptions)")
+        check("пауза по умолчанию 12 с", Settings.defaultFollowUpSilence == 12)
+
+        let afterSpeech = 2.2
+        let warmup = 6.0
+        func timeout(hasText: Bool, followUp: Bool, silence: Double) -> Double {
+            SpeechRecorder.silenceTimeout(
+                hasText: hasText,
+                followUp: followUp,
+                followUpSilence: silence,
+                warmup: warmup,
+                afterSpeech: afterSpeech
+            )
+        }
+
+        check("follow-up без слов ждёт паузу из настроек",
+              timeout(hasText: false, followUp: true, silence: 12) == 12,
+              "\(timeout(hasText: false, followUp: true, silence: 12))")
+        check("follow-up с паузой 8 с", timeout(hasText: false, followUp: true, silence: 8) == 8)
+        check("follow-up с паузой 20 с", timeout(hasText: false, followUp: true, silence: 20) == 20)
+        check("follow-up после речи — обычный авто-стоп 2,2 с",
+              timeout(hasText: true, followUp: true, silence: 12) == afterSpeech)
+        check("обычная запись без слов — 6 с",
+              timeout(hasText: false, followUp: false, silence: 12) == warmup)
+        check("обычная запись после речи — 2,2 с",
+              timeout(hasText: true, followUp: false, silence: 12) == afterSpeech)
+        check("нулевая пауза не превращается в мгновенное закрытие",
+              timeout(hasText: false, followUp: true, silence: 0) >= 0.5)
+
+        check("follow-up + ожидание → автоматика разрешена",
+              AppDelegate.followUpAllowed(followUpListen: true, wakeWord: true))
+        check("follow-up без ожидания «Привет, Ева» запрещён",
+              !AppDelegate.followUpAllowed(followUpListen: true, wakeWord: false))
+        check("выключенный follow-up запрещён",
+              !AppDelegate.followUpAllowed(followUpListen: false, wakeWord: true))
+        check("после ошибки ответа follow-up не открывается",
+              !AppDelegate.followUpAllowed(
+                  followUpListen: true,
+                  wakeWord: true,
+                  answerFailed: true
+              ))
+
+        print(failures == 0 ? "все проверки follow-up прошли" : "провалено: \(failures)")
         return failures == 0 ? 0 : 1
     }
 

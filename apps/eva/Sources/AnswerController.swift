@@ -25,6 +25,17 @@ final class AnswerController {
     var onLevel: ((Float) -> Void)?
     /// Поток ответа закончился (успешно или с ошибкой): круг перестаёт «думать».
     var onFinished: (() -> Void)?
+    /// Озвучка доиграла всё, что было в очереди: в follow-up можно открывать
+    /// микрофон (задача 0190). Раньше этого делать нельзя — перебьём голос.
+    var onVoiceDrained: (() -> Void)?
+
+    /// Нечего играть и нечего синтезировать прямо сейчас.
+    var voiceIsIdle: Bool { voice.isDrained }
+
+    /// Ответ этого запуска закончился ошибкой (сеть, HTTP, модель). Follow-up
+    /// после ошибки не открываем: иначе красная вспышка и текст ошибки будут
+    /// мгновенно перекрыты «слушаю…».
+    var didFail: Bool { hadError }
 
     init() {
         voice.onIssue = { [weak self] message in
@@ -35,6 +46,9 @@ final class AnswerController {
         }
         voice.onLevel = { [weak self] level in
             self?.onLevel?(level)
+        }
+        voice.onDrained = { [weak self] in
+            self?.onVoiceDrained?()
         }
     }
 

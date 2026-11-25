@@ -1269,7 +1269,7 @@
   {
     "id": "0190",
     "title": "Слушание после ответа (follow-up)",
-    "status": "in_progress",
+    "status": "done",
     "file": "0190-followup-listening.md",
     "assignee": "agent:followup-listen"
   }

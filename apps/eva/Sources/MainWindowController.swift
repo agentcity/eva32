@@ -107,6 +107,12 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         circleView?.wakeWaiting = waiting
     }
 
+    /// Идёт follow-up (задача 0190): микрофон открыт после ответа, круг
+    /// остаётся «слушаю», но чуть приглушён.
+    func setFollowUp(_ active: Bool) {
+        circleView?.followUpListening = active
+    }
+
     /// При закрытии приложения/окна не оставляем тикающий таймер.
     func stopCircleAnimation() {
         circleView?.stopAnimation()

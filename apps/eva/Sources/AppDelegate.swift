@@ -26,6 +26,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isSpeaking = false
     private var isTerminating = false
 
+    // Follow-up (задача 0190): после ответа микрофон открывается сам, без
+    // «Привет, Ева». Автоматика включается только когда ожидание фразы
+    // включено: иначе микрофон после ответа не появляется вовсе.
+    /// SSE-поток закрыт (ответ дочитан); озвучка может ещё играть.
+    private var answerEnded = false
+    /// Намерение открыть follow-up: ждём, пока смолкнет голос Евы.
+    private var followUpArmed = false
+    /// Текущая запись — follow-up (для журнала и приглушённого круга).
+    private var isFollowUp = false
+
     /// Отложенное включение/выключение wake-слушателя: после стопа записи
     /// нужно дать `onFinal` уйти в чат, иначе ожидание поднимется на миг и
     /// тут же погаснет. Одна задача — одно актуальное намерение.
@@ -70,7 +80,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let animate = Settings.shared.animateCircle
         let wakeWord = Settings.shared.wakeWord
         log("настройки: сервер=\(server) модель=\(model) голос=\(voice) озвучка=\(speak) "
-            + "анимация=\(animate) ожидание=\(wakeWord)")
+            + "анимация=\(animate) ожидание=\(wakeWord) "
+            + "follow-up=\(Settings.shared.followUpListen)/\(Settings.shared.followUpSilence) с")
 
         if Launch.ask == nil {
             // При `--ask` вопрос уйдёт через 0,4 с: поднимать ожидание на этот
@@ -89,6 +100,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         log("выход")
         isTerminating = true
+        followUpArmed = false
+        answerEnded = false
         wakeSync?.cancel()
         wakeSync = nil
         wake.stop()
@@ -294,6 +307,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.awaitingAudio = false
             } else {
                 self.window.setCircleLevel(0)
+                // Круг возвращается к обычному виду: приглушение — только
+                // пока идёт follow-up-запись.
+                self.window.setFollowUp(false)
             }
             self.listenItem?.title = recording
                 ? "Остановить (⌥Space)"
@@ -317,11 +333,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         recorder.onFinal = { [weak self] text in
             guard let self, !self.isTerminating else { return }
+            if self.isFollowUp {
+                log("follow-up: услышала вопрос, отправляю")
+                self.isFollowUp = false
+                self.window.setFollowUp(false)
+            }
             self.window.showQuestion(text)
             self.ask(text)
         }
+        // Follow-up без слов — не ошибка: тихо закрываемся и возвращаемся
+        // в ожидание «Привет, Ева» (задача 0190).
+        recorder.onFollowUpEnd = { [weak self] end in
+            guard let self, !self.isTerminating else { return }
+            self.isFollowUp = false
+            switch end {
+            case .silence(let seconds):
+                log("follow-up: тишина \(seconds) с — ушла в ожидание")
+            case .manual:
+                log("follow-up: остановлено без слов — ушла в ожидание")
+            }
+            self.window.setStatus(
+                Settings.shared.wakeWord ? "жду „Привет, Ева“" : "готово",
+                isError: false
+            )
+            self.refreshVisualState("follow-up: тишина")
+            self.syncWake("follow-up: тишина", after: 0.2)
+        }
         recorder.onError = { [weak self] message in
             guard let self else { return }
+            self.isFollowUp = false
             self.window.setStatus("речь: \(message)", isError: true)
             self.window.showPartial("")
             self.showVisualError(message)
@@ -337,7 +377,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func startListening() {
+    /// `followUp: true` — автоматическое включение после ответа (задача 0190).
+    /// Отличие от ⌥Space: окно не поднимаем и не перехватываем фокус, а
+    /// тишина до первого слова считается по настройке, а не 6 с.
+    private func startListening(followUp: Bool = false) {
         // Двух захватов одновременно быть не должно: ожидание отпускает
         // микрофон до того, как запись его займёт.
         wakeSync?.cancel()
@@ -345,9 +388,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             wake.stop()
         }
         window.setWakeWaiting(false)
-        window.show()
-        window.showPartial("")
-        recorder.start()
+        if followUp {
+            // Ответ только что показан; активировать приложение после каждого
+            // ответа — навязчиво.
+            window.showPartial("")
+            recorder.followUpSilence = Settings.shared.followUpSilenceValue
+            log("follow-up: слушаю")
+        } else {
+            // Ручное прослушивание отменяет отложенный follow-up.
+            followUpArmed = false
+            window.show()
+            window.showPartial("")
+        }
+        isFollowUp = followUp
+        window.setFollowUp(followUp)
+        recorder.start(followUp: followUp)
     }
 
     // MARK: - Чат и ответ
@@ -375,9 +430,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if self.isSpeaking || !self.expectsVoice {
                 self.awaitingAudio = false
             }
+            self.answerEnded = true
             self.refreshVisualState("ответ завершён")
+            self.armFollowUp("ответ завершён")
             self.syncWake("ответ завершён")
             self.scheduleVoiceFallback()
+        }
+        // Озвучка доиграла: только теперь можно открыть микрофон, иначе Ева
+        // услышит собственный голос (и «Ева» в нём).
+        answer.onVoiceDrained = { [weak self] in
+            self?.startFollowUpIfReady("озвучка доиграла")
         }
         answer.onSpeakingChanged = { [weak self] speaking in
             guard let self else { return }
@@ -385,6 +447,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if speaking {
                 self.awaitingFirstToken = false
                 self.awaitingAudio = false
+            } else {
+                // Голос смолк: если follow-up ждал именно этого — открываем
+                // микрофон до смены состояния круга, чтобы не мигать «idle»
+                // между «говорю» и «слушаю».
+                self.startFollowUpIfReady("озвучка кончилась")
             }
             self.updateStatusIcon()
             self.refreshVisualState(speaking ? "озвучка пошла" : "озвучка кончилась")
@@ -407,6 +474,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard self.awaitingAudio, !self.isSpeaking, !self.isRecording else { return }
             self.awaitingAudio = false
             self.refreshVisualState("озвучка не началась")
+            // Голос не зазвучал: follow-up может открываться — ждать больше
+            // нечего (если очередь синтеза не пуста, `onVoiceDrained` догонит).
+            self.armFollowUp("озвучка не началась")
             self.syncWake("озвучка не началась")
         }
     }
@@ -417,6 +487,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         window.onStop = { [weak self] in
             guard let self else { return }
+            // «Стоп» — ручное действие: follow-up после него не открываем.
+            self.answerEnded = false
+            self.followUpArmed = false
+            self.isFollowUp = false
+            self.window.setFollowUp(false)
             // Серверу — явный POST /api/cancel (задача 0185): обрыв SSE тоже
             // отменяет, но флаг в C-рантайме надёжнее и виден в метриках.
             self.cancelServerGeneration()
@@ -457,6 +532,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !Settings.shared.speakReplies {
             answer.stopVoice()
         }
+        // Выключили «Слушать после ответа» или само ожидание — отложенный
+        // follow-up больше не нужен.
+        if !AppDelegate.followUpAllowed(
+            followUpListen: Settings.shared.followUpListen,
+            wakeWord: Settings.shared.wakeWord
+        ) {
+            followUpArmed = false
+        }
         syncWake("настройки")
     }
 
@@ -486,6 +569,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // кончилась», и это не должно вернуть круг в idle.
         awaitingFirstToken = true
         awaitingAudio = false
+        // Новый вопрос начинает цикл заново: старые намерения follow-up
+        // относятся к прошлому ответу.
+        answerEnded = false
+        followUpArmed = false
+        isFollowUp = false
+        window.setFollowUp(false)
         clearVisualError()
         refreshVisualState("вопрос ушёл")
         syncWake("вопрос ушёл")
@@ -578,6 +667,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             && !wakeSuppressed
             && !isRecording
             && !isSpeaking
+            && !followUpArmed
             && !awaitingFirstToken
             && !awaitingAudio
             && !errorActive
@@ -591,6 +681,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             wake.stop()
         }
         window.setWakeWaiting(wake.isRunning)
+    }
+
+    // MARK: - Follow-up: слушаю после ответа (задача 0190)
+
+    /// Решение «открыть микрофон после ответа». Настройки проверяем в момент
+    /// решения, а не только на старте ответа: галочку могли снять, пока Ева
+    /// говорила. Если голос ещё звучит или синтезируется — ждём
+    /// `onVoiceDrained`, а не открываем микрофон поверх собственной озвучки.
+    private func armFollowUp(_ reason: String) {
+        guard AppDelegate.followUpAllowed(
+            followUpListen: Settings.shared.followUpListen,
+            wakeWord: Settings.shared.wakeWord,
+            answerFailed: answer.didFail
+        ) else {
+            followUpArmed = false
+            return
+        }
+        guard answerEnded, !isTerminating, !isRecording else { return }
+        followUpArmed = true
+        guard !isSpeaking, answer.voiceIsIdle else { return }
+        startFollowUpIfReady(reason)
+    }
+
+    /// Открыть follow-up, если намерение ещё в силе и голос умолк. Вызывается
+    /// из `armFollowUp`, по `onVoiceDrained` и из страховки озвучки — поэтому
+    /// проверки повторяются: между ними мог прийти «Стоп» или новый вопрос.
+    private func startFollowUpIfReady(_ reason: String) {
+        guard followUpArmed, answerEnded, !isTerminating, !isRecording else { return }
+        guard AppDelegate.followUpAllowed(
+            followUpListen: Settings.shared.followUpListen,
+            wakeWord: Settings.shared.wakeWord,
+            answerFailed: answer.didFail
+        ) else {
+            followUpArmed = false
+            return
+        }
+        guard !isSpeaking, answer.voiceIsIdle else { return }
+        followUpArmed = false
+        log("follow-up: открываю микрофон — \(reason)")
+        startListening(followUp: true)
+    }
+
+    /// Автоматическое открытие микрофона после ответа возможно только при
+    /// включённом ожидании «Привет, Ева»: без галочки поведение прежнее
+    /// (микрофон — только по ⌥Space). Ошибка ответа тоже отменяет автоматику,
+    /// иначе «слушаю…» мгновенно перекрыло бы текст ошибки. Вынесено сюда,
+    /// чтобы правило проверялось без микрофона и UI.
+    nonisolated static func followUpAllowed(
+        followUpListen: Bool,
+        wakeWord: Bool,
+        answerFailed: Bool = false
+    ) -> Bool {
+        followUpListen && wakeWord && !answerFailed
     }
 
     /// «Стоп» сообщает серверу, что генерацию пора бросить.
