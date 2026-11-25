@@ -2156,6 +2156,45 @@ def _run_side(
 # HTML-страница (CSS/JS встроены, внешних ссылок нет)
 # --------------------------------------------------------------------------- #
 
+# Самопроверка звука без слуха: страница проходит тот же путь, что и чат
+# (POST /api/tts → decodeAudioData → BufferSource), печатая шаги в DOM.
+AUDIO_CHECK_PAGE = """<!doctype html><meta charset="utf-8"><title>audio</title>
+<pre id="out">старт</pre>
+<script>
+var out = document.getElementById("out");
+var NL = String.fromCharCode(10);
+function log(t) { out.textContent += NL + t; }
+async function main() {
+  try {
+    var ctx = new (window.AudioContext || window.webkitAudioContext)();
+    log("ctx: " + ctx.state);
+    await ctx.resume();
+    log("ctx после resume: " + ctx.state);
+    var resp = await fetch("/api/tts", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({text: "Проверка звука"})
+    });
+    log("http: " + resp.status + " " + resp.headers.get("content-type"));
+    var blob = await resp.blob();
+    log("blob: " + blob.size + " б, тип " + blob.type);
+    var buf = await blob.arrayBuffer();
+    log("arraybuffer: " + buf.byteLength);
+    var decoded = await new Promise(function (res, rej) { ctx.decodeAudioData(buf, res, rej); });
+    log("decoded: " + decoded.duration.toFixed(2) + " с, " + decoded.sampleRate + " Гц");
+    var src = ctx.createBufferSource();
+    src.buffer = decoded;
+    src.connect(ctx.destination);
+    src.start(0);
+    log("РЕЗУЛЬТАТ: играет");
+  } catch (e) {
+    log("ОШИБКА: " + (e && (e.name || e.message) ? (e.name + ": " + e.message) : e));
+  }
+}
+main();
+</script>
+"""
+
 PAGE_HTML = """<!doctype html>
 <html lang="ru">
 <head>
@@ -2859,6 +2898,7 @@ PAGE_HTML = """<!doctype html>
       if (!resp.ok) { throw new Error("tts " + resp.status); }
       return resp.blob();
     }).then(function (blob) {
+      tts.lastBlob = { size: blob.size, type: blob.type, ctx: ctx.state };
       var url = URL.createObjectURL(blob);
       tts.current = { url: url, side: side };
       tts.playing = true;
@@ -2878,7 +2918,10 @@ PAGE_HTML = """<!doctype html>
       }, function (name) {
         releaseSpeech();
         tts.available = false;
-        setVoiceNote(side, "звук не пошёл: " + name);
+        var info = tts.lastBlob || {};
+        setVoiceNote(side, "звук не пошёл: " + name +
+          " · blob " + (info.size || 0) + " б, тип " + (info.type || "?") +
+          ", ctx " + (info.ctx || "?"));
       });
     }).catch(function (err) {
       var note = byId("tts-note-" + side);
@@ -3990,7 +4033,11 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - имя задано BaseHTTPRequestHandler
         path = urlsplit(self.path).path
         try:
-            if path in ("/", "/index.html"):
+            if path == "/audio-check":
+                self._send_bytes(
+                    200, AUDIO_CHECK_PAGE.encode("utf-8"), "text/html; charset=utf-8"
+                )
+            elif path in ("/", "/index.html"):
                 self._send_page()
             elif path == "/api/backends":
                 self._send_json(
