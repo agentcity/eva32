@@ -1115,7 +1115,7 @@
   {
     "id": "0168",
     "title": "Убрать накладные расходы батчевого prefill",
-    "status": "in_progress",
+    "status": "pending",
     "file": "0168-prefill-overhead.md",
     "assignee": "agent:prefill-overhead"
   },
@@ -1125,5 +1125,12 @@
     "status": "done",
     "file": "0169-decode-int8.md",
     "assignee": "agent:decode-int8"
+  },
+  {
+    "id": "0170",
+    "title": "Упакованная таблица словаря — потолок 27 ток/с",
+    "status": "in_progress",
+    "file": "0170-quant-lmhead.md",
+    "assignee": "agent:quant-lmhead"
   }
 ]
