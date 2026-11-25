@@ -1181,5 +1181,12 @@
     "status": "in_progress",
     "file": "0177-moe-speed.md",
     "assignee": "agent:moe-speed2"
+  },
+  {
+    "id": "0178",
+    "title": "Большое поле ответа и сворачиваемый think",
+    "status": "in_progress",
+    "file": "0178-chat-answer-ui.md",
+    "assignee": "agent:chat-ui"
   }
 ]
