@@ -237,6 +237,12 @@ def _resolve_tokenizer(model_path: Path, explicit: str | None = None) -> str:
     env_value = (os.environ.get("EVA_VTM_TOKENIZER") or "").strip()
     if env_value:
         candidates.append(Path(env_value).expanduser())
+    # Токенизатор под конкретную модель: у Qwen3 и Qwen2.5 в каталоге лежат
+    # разные словари, и общий tokenizer.json даёт «неизвестный token id» на
+    # служебных токенах Qwen3. Поэтому сначала ищем файл с именем модели.
+    stem = model_path.name.split("-")[0].split(".")[0]
+    for name in (stem + "-tokenizer.json", pathlib.Path(stem).stem + "-tokenizer.json"):
+        candidates.append(model_path.with_name(name))
     candidates.append(model_path.with_name("tokenizer.json"))
     candidates.append(ROOT / "tokenizer.json")
     candidates.append(FALLBACK_TOKENIZER)
