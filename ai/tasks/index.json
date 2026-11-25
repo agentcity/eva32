@@ -1265,5 +1265,12 @@
     "status": "in_progress",
     "file": "0189-dense-prefill-gemm.md",
     "assignee": "agent:prefill-gemm"
+  },
+  {
+    "id": "0190",
+    "title": "Слушание после ответа (follow-up)",
+    "status": "in_progress",
+    "file": "0190-followup-listening.md",
+    "assignee": "agent:followup-listen"
   }
 ]
