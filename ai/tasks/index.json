@@ -1251,5 +1251,12 @@
     "status": "in_progress",
     "file": "0187-wake-word.md",
     "assignee": "agent:wake-word"
+  },
+  {
+    "id": "0188",
+    "title": "Свернуть в круг — мини-окно поверх окон",
+    "status": "pending",
+    "file": "0188-compact-floating-circle.md",
+    "assignee": "agent:compact-circle"
   }
 ]
