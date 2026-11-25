@@ -1216,5 +1216,12 @@
     "status": "in_progress",
     "file": "0182-chat-memory.md",
     "assignee": "agent:chat-memory"
+  },
+  {
+    "id": "0183",
+    "title": "Озвучка ответов в чате",
+    "status": "in_progress",
+    "file": "0183-chat-tts.md",
+    "assignee": "agent:chat-tts"
   }
 ]
