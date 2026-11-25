@@ -37,8 +37,11 @@
                                     (читатель принимает и offset+18 как синоним)
  50  flags/резерв u16              0 — обычный тензор; бит 0 — KV-кэш
                                     (VTM_TENSOR_FLAG_KV_CACHE, payload'а нет);
-                                    биты 1..2 — хранение тритов (0 packed20,
-                                    1 native; задача 0057)
+                                    бит 1 — состояние рекуррентного слоя
+                                    (VTM_TENSOR_FLAG_STATE, только fp; задача
+                                    0176); у тритов биты 1..2 — хранение
+                                    (0 packed20, 1 native; задача 0057) —
+                                    тот же бит 1, различаются по kind
      (20 из 32 байт заголовка — это поля спеки; 12 байт «резерва» заняты
       program_offset/meta_offset/meta_len, что обратно совместимо: C может
       игнорировать эти три слова и читать программу с конца файла.)
@@ -49,16 +52,24 @@ program_offset = meta_start + align32(meta_len)  — программа идёт
 программа:          n_instr * 16 байт, файл заканчивается ровно на ней
 ```
 
-KV-кэши вне контейнера (задачи 0101, 0118). Поле по смещению 50 было резервом и
-всегда 0; младший бит занят ролью `KV_CACHE`. Такой тензор существует только
-в таблице (`name`/`kind`/`dims`), а его payload в секцию данных **не пишется**:
-`offset` — не адрес, `scale_offset = 0`. Кэш пуст на старте и заполняется KVW,
-поэтому хранить под него `ctx × kv_dim × 4` байт в файле незачем — для
-1.5B-раскладки (28 слоёв, ctx 2048, kv_dim 256) это 112 МиБ. Читатель создаёт
-буфер сам (Python — список нулей, C — буфер в арене); старые контейнеры
-присылают 0 в этом поле и читаются прежним путём, с содержимым из файла.
-Тензор с флагом обязан быть fp (kind 1..3); неизвестные биты читатель
+Буферы вне контейнера: KV-кэш (0101, 0118) и состояние рекуррентного слоя
+(0176). Поле по смещению 50 было резервом и всегда 0; младший бит занят ролью
+`KV_CACHE` (бит 0), второй — ролью `STATE` (бит 1). Такой тензор существует
+только в таблице (`name`/`kind`/`dims`), а его payload в секцию данных **не
+пишется**: `offset` — не адрес (`KV_NO_OFFSET` в контейнере с флагом
+`VFLAG_KV_OUT_OF_FILE`, иначе 0), `scale_offset = 0`. Кэш пуст на старте и
+заполняется KVW, состояние — CONV4/GDELTA; хранить их в файле незачем: у
+1.5B-раскладки KV — 112 МиБ, у состояния GDELTA 9b — `32·128·128·4·30` ≈ 60 МиБ.
+Читатель создаёт буфер сам (Python — список нулей, C — буфер в арене); старые
+контейнеры присылают 0 в этом поле и читаются прежним путём, с содержимым из
+файла. Тензор с флагом обязан быть fp (kind 1..3); неизвестные биты читатель
 игнорирует.
+
+Бит 1 у тритов — не STATE, а часть кода хранения (биты 1..2, задача 0057):
+поэтому «вне файла» определяется по kind — STATE только у fp-тензоров. Это
+бит 3 свободен: биты 1..2 заняты хранением тритов (`VTM_TENSOR_FLAG_STATE == 0x0008`; при
+`VTM_TENSOR_FLAG_STORAGE_MASK == 0x0006`), и загрузчик обязан проверять kind
+раньше флага (см. `docs/qwen35.md`, «Риски», п. 1).
 
 Новый вид контейнера (задача 0118) отмечается флагом заголовка
 `VFLAG_KV_OUT_OF_FILE` (0x0004) и `offset == KV_NO_OFFSET` (0xFFFFFFFF) у
@@ -452,6 +463,16 @@ Q4K_SUB_BLOCKS = Q4K_BLOCK_VALUES // Q4K_SCALE_BLOCK
 #: Как и в C (src/vtm/vtm.h), осмыслен только бит 0; остальные биты
 #: сохраняются, но поведение не меняют — контейнер будущей версии читается.
 TFLAG_KV_CACHE = 0x0001
+#: TFLAG_STATE — состояние рекуррентного слоя (задача 0176): короткая свёртка
+#: CONV4 (3 прошлых входа на канал) и матрица GDELTA [Hv, Dk, Dv]. Семантика
+#: та же, что у KV-кэша: payload'а в файле нет, буфер создаётся читателем
+#: нулями. Бит совпадает с битом 1 кода хранения тритов (TFLAG_STORAGE_MASK),
+#: поэтому STATE осмыслен только у fp-тензоров: у kind 0 биты 1..2 — хранение.
+TFLAG_STATE = 0x0008
+#: Маска «вне файла» — только для fp-тензоров. У тритов эту маску применять
+#: нельзя: 0x0006 там значит хранение тритов (задача 0057). Проверка — kind-aware,
+#: см. `_is_out_of_file`.
+TFLAG_OUT_OF_FILE_FP = TFLAG_KV_CACHE | TFLAG_STATE
 
 #: offset KV-кэша в контейнере с флагом VFLAG_KV_OUT_OF_FILE: payload'а нет,
 #: поэтому поле — не адрес («смещения нет», как NO_OFFSET у scale_offset).
@@ -464,6 +485,14 @@ KV_NO_OFFSET = 0xFFFFFFFF
 #: (ctx 8192); 192-байтный файл не должен просить 4 ГиБ. Значения в двух
 #: загрузчиках обязаны совпадать: tools/vtm_ref.py — эталон для C.
 MAX_KV_BYTES = 512 << 20
+
+#: CONV4 (задача 0176): ядро причинной depthwise-свёртки Qwen3.5
+#: (`linear_conv_kernel_dim: 4`). Состояние хранит 3 прошлых входа на канал,
+#: четвёртый — текущий x; на старте состояние нулевое.
+CONV4_KERNEL = 4
+#: GDELTA (задача 0176): число подряд идущих тензоров банка — состояние, v,
+#: beta, g, z, norm_w (`c`..`c+5`), см. `src/vtm/vtm.h`.
+GDELTA_BANK_SIZE = 6
 
 #: Флаги контейнера (заголовок).
 VFLAG_F32_SCALES = 0x0001  # масштабы тритов по умолчанию float32
@@ -532,6 +561,13 @@ class Op(IntEnum):
     # RMSH (задача 0172): RMSN по последней оси — QK-norm Qwen3, где w задан
     # на head_dim и повторяется по головам.
     RMSH = 0x11
+    # CONV4 (задача 0176): причинная depthwise-свёртка с ядром 4 — короткая
+    # свёртка по q/k/v Qwen3.5 (`linear_conv_kernel_dim: 4`). Один токен за
+    # инструкцию, состояние `[3, width]` живёт между проходами.
+    CONV4 = 0x12
+    # GDELTA (задача 0176): шаг Gated Delta Net (arXiv 2412.06464) плюс
+    # выходной RMS-гейт. Состояние `[Hv, Dk, Dv]` f32 живёт между проходами.
+    GDELTA = 0x13
 
 
 OP_NAMES = {int(op): op.name for op in Op}
@@ -683,6 +719,19 @@ def _check_finite(values: Sequence[float], what: str) -> None:
             raise ValueError(f"{what}: неконечное значение {value!r}")
 
 
+def _is_out_of_file(flags: int, kind: int) -> bool:
+    """Тензор существует только в таблице: KV-кэш (бит 0) или состояние.
+
+    У тритов (kind 0) бит 1 — это `native`-хранение, а не STATE (задача 0057),
+    поэтому STATE проверяется только у fp-видов. C-загрузчик обязан сделать
+    то же самое (см. `docs/qwen35.md`, «Риски», п. 1).
+    """
+    mask = int(flags) & TFLAG_OUT_OF_FILE_FP
+    if not mask:
+        return False
+    return bool(mask & TFLAG_KV_CACHE) or kind not in PACKED_KINDS
+
+
 # ---------------------------------------------------------------------------
 # Тензоры
 # ---------------------------------------------------------------------------
@@ -698,8 +747,9 @@ class Tensor:
     (каркас графа без весов): такой тензор нельзя записать в файл, но можно
     оценить по размеру.
 
-    Исключение — `flags & TFLAG_KV_CACHE` (K/V-кэш внимания, задача 0101):
-    данных у него нет и в файл они не пишутся, но это не каркас, а полноценный
+    Исключение — `flags & TFLAG_KV_CACHE` (K/V-кэш внимания, задача 0101) и
+    `flags & TFLAG_STATE` у fp-тензора (состояние CONV4/GDELTA, задача 0176):
+    данных у них нет и в файл они не пишутся, но это не каркас, а полноценный
     тензор — читатель сам создаёт буфер нужного размера по `dims`.
     """
 
@@ -765,19 +815,27 @@ class Tensor:
             raise ValueError(
                 f"тензор {self.name!r}: flags={self.flags}, а поле таблицы — u16"
             )
-        if self.flags & TFLAG_KV_CACHE:
-            # Кэш существует только в таблице: содержимое не пишется и не
-            # читается (его создаёт исполнитель), поэтому данные запрещены —
-            # иначе легко решить, что они попадут в файл.
+        if _is_out_of_file(self.flags, self.kind):
+            if self.flags & TFLAG_KV_CACHE and self.flags & TFLAG_STATE:
+                raise ValueError(
+                    f"тензор {self.name!r}: биты KV_CACHE и STATE вместе не "
+                    "выставляются — это разные роли буфера"
+                )
+            role = "KV-кэш" if self.flags & TFLAG_KV_CACHE else "состояние"
+            # Кэш/состояние существуют только в таблице: содержимое не пишется
+            # и не читается (буфер создаёт исполнитель), поэтому данные
+            # запрещены — иначе легко решить, что они попадут в файл.
             if self.kind in PACKED_KINDS:
                 raise ValueError(
-                    f"тензор {self.name!r}: KV-кэш обязан быть fp-тензором (kind {self.kind})"
+                    f"тензор {self.name!r}: {role} обязан быть fp-тензором "
+                    f"(kind {self.kind})"
                 )
             if (self.data is not None or self.trits is not None
                     or self.scales is not None or self.q4_mins is not None):
                 raise ValueError(
-                    f"тензор {self.name!r}: у KV-кэша нет данных — буфер создаёт "
-                    "читатель (Tensor.kv_cache())"
+                    f"тензор {self.name!r}: у буфера вне файла ({role.lower()}) "
+                    "нет данных — его создаёт читатель "
+                    "(Tensor.kv_cache()/Tensor.state())"
                 )
             return
         if self.kind == KIND_TRITS:
@@ -987,6 +1045,22 @@ class Tensor:
         """1 — K/V-кэш: payload'а в файле нет, буфер создаёт читатель."""
         return bool(getattr(self, "flags", 0) & TFLAG_KV_CACHE)
 
+    @property
+    def is_state(self) -> bool:
+        """1 — состояние рекуррентного слоя (CONV4/GDELTA): payload'а нет.
+
+        Бит STATE у тритов означает `native`-хранение, поэтому здесь проверка
+        kind-aware — как в `_is_out_of_file`.
+        """
+        return _is_out_of_file(getattr(self, "flags", 0), self.kind) and not (
+            getattr(self, "flags", 0) & TFLAG_KV_CACHE
+        )
+
+    @property
+    def is_out_of_file(self) -> bool:
+        """1 — payload'а в файле нет (KV-кэш или состояние)."""
+        return _is_out_of_file(getattr(self, "flags", 0), self.kind)
+
     @classmethod
     def kv_cache(cls, name: str, dims: Sequence[int]) -> "Tensor":
         """K/V-кэш внимания `(ctx, kv_dim)`: в контейнере только запись таблицы.
@@ -996,6 +1070,17 @@ class Tensor:
         тензор занимает `ctx × kv_dim × 4` байт только в памяти.
         """
         return cls(name=name, kind=KIND_F32, dims=tuple(dims), flags=TFLAG_KV_CACHE)
+
+    @classmethod
+    def state(cls, name: str, dims: Sequence[int]) -> "Tensor":
+        """Состояние рекуррентного слоя (задача 0176), fp32, нули на старте.
+
+        `dims` — `(3, width)` у CONV4 или `(Hv, Dk, Dv)` у GDELTA. Payload'а в
+        файле нет: `CONV4`/`GDELTA` живут между проходами и обнуляются только
+        новым запуском (`execute` создаёт новый буфер).
+        """
+        return cls(name=name, kind=KIND_F32, dims=tuple(dims), flags=TFLAG_STATE)
+
 
     @classmethod
     def f32(cls, name: str, dims: Sequence[int], values: Iterable[float]) -> "Tensor":
@@ -2043,10 +2128,11 @@ class Instr:
 def tensor_payload_size(tensor: Tensor) -> int:
     """Размер payload'а тензора в байтах (без выравнивания).
 
-    У KV-кэша payload'а нет (TFLAG_KV_CACHE) — 0 байт: место под кэш
-    выделяется при загрузке, а не хранится в файле (задача 0101).
+    У KV-кэша (TFLAG_KV_CACHE) и состояния (TFLAG_STATE) payload'а нет — 0
+    байт: место под буфер выделяется при загрузке, а не хранится в файле
+    (задачи 0101, 0176).
     """
-    if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+    if _is_out_of_file(getattr(tensor, "flags", 0), tensor.kind):
         return 0
     if tensor.kind == KIND_TRITS:
         n_values = tensor.n_elements
@@ -2571,8 +2657,8 @@ def decode_trit_segment(data: bytes) -> tuple[list[int], list[float], str]:
 
 def encode_tensor_payload(tensor: Tensor) -> bytes:
     """Payload тензора в том виде, в каком он лежит в секции данных."""
-    if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
-        # KV-кэш в файл не пишется: тензор живёт только в таблице.
+    if _is_out_of_file(getattr(tensor, "flags", 0), tensor.kind):
+        # KV-кэш/состояние в файл не пишутся: тензор живёт только в таблице.
         return b""
     if tensor.kind == KIND_TRITS:
         return encode_trit_segment(tensor)
@@ -2966,7 +3052,7 @@ def _streamed_payload_kind(tensor: Tensor) -> str | None:
     `PackedInt8`, и тогда `bytes` на весь сегмент (1,6 ГиБ q4 + 0,3 ГиБ
     int8 у 3B) не материализуется.
     """
-    if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+    if _is_out_of_file(getattr(tensor, "flags", 0), tensor.kind):
         return None
     if tensor.kind == KIND_Q4 and isinstance(tensor.qdata, PackedQ4):
         return "q4"
@@ -3004,12 +3090,13 @@ def write_vtm(
     контейнеры не ломаются). Загрузчик проверяет блок всегда, когда он есть;
     `VTM_SKIP_HASH=1` отключает сверку.
 
-    Контейнер с KV-кэшами (TFLAG_KV_CACHE) получает флаг заголовка
-    `VFLAG_KV_OUT_OF_FILE` и offset `KV_NO_OFFSET` у кэшей (задача 0118):
+    Контейнер с буферами вне файла — KV-кэшами (TFLAG_KV_CACHE) и состояниями
+    CONV4/GDELTA (TFLAG_STATE, задача 0176) — получает флаг заголовка
+    `VFLAG_KV_OUT_OF_FILE` и offset `KV_NO_OFFSET` у их записей (задача 0118):
     старый загрузчик до 0101 видит невыровненный offset и отказывает, а не
-    читает мусор. Суммарный размер кэшей проверяется по `MAX_KV_BYTES` —
-    ровно так же, как это сделает загрузчик, чтобы не записать нечитаемый
-    файл.
+    читает мусор. Суммарный размер таких буферов проверяется по
+    `MAX_KV_BYTES` — ровно так же, как это сделает загрузчик, чтобы не
+    записать нечитаемый файл.
 
     Q4/INT8 с ленивыми окнами (`decode_q4_segment_ex` даёт `PackedQ4`,
     `decode_int8_segment` — `PackedInt8`) пишутся **потоком**, кусками по
@@ -3026,11 +3113,15 @@ def write_vtm(
     if len(tensor_list) > MAX_TENSORS:
         raise ValueError(f"тензоров {len(tensor_list)}, максимум {MAX_TENSORS}")
 
-    kv_caches = [t for t in tensor_list if getattr(t, "flags", 0) & TFLAG_KV_CACHE]
-    kv_bytes = sum(t.n_elements * 4 for t in kv_caches)
+    buffers = [
+        t for t in tensor_list
+        if _is_out_of_file(getattr(t, "flags", 0), t.kind)
+    ]
+    kv_bytes = sum(t.n_elements * 4 for t in buffers)
     if kv_bytes > MAX_KV_BYTES:
         raise ValueError(
-            f"KV-кэши: суммарный размер {kv_bytes} байт больше предела "
+            f"буферы вне файла (KV-кэши/состояния): суммарный размер "
+            f"{kv_bytes} байт больше предела "
             f"{MAX_KV_BYTES} (MAX_KV_BYTES); уменьшите ctx или kv_dim. "
             "Если контекст нужен целиком, кэп поднимается на сборке рантайма: "
             + kv_rebuild_hint(kv_bytes)
@@ -3061,17 +3152,17 @@ def write_vtm(
     n_tensors = len(tensor_list)
 
     digest = hashlib.sha256() if write_integrity else None
-    has_kv = bool(kv_caches)
+    has_out = bool(buffers)
     data_size = 0
     for tensor, payload in zip(tensor_list, payloads):
         size = tensor_payload_size(tensor) if payload is None else len(payload)
-        if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
-            # KV-кэш места в секции данных не занимает: payload'а нет, размер
-            # известен из dims. У контейнера нового вида offset — маркер
-            # KV_NO_OFFSET (не адрес): старый загрузчик до 0101 проверяет
-            # выравнивание offset и отказывает, не читая данные. Без флага
-            # (0101 и старше) сохраняем прежний offset=0 — совместимость.
-            tensor.offset = KV_NO_OFFSET if has_kv else 0
+        if _is_out_of_file(getattr(tensor, "flags", 0), tensor.kind):
+            # KV-кэш/состояние места в секции данных не занимает: payload'а
+            # нет, размер известен из dims. У контейнера нового вида offset —
+            # маркер KV_NO_OFFSET (не адрес): старый загрузчик до 0101
+            # проверяет выравнивание offset и отказывает, не читая данные.
+            # Без флага (0101 и старше) сохраняем прежний offset=0.
+            tensor.offset = KV_NO_OFFSET if has_out else 0
             tensor.scale_offset = 0
             continue
         tensor.offset = data_size
@@ -3129,10 +3220,10 @@ def write_vtm(
     flags = VFLAG_CAUSAL
     if all(t.kind != KIND_TRITS or t.scale_dtype == "float32" for t in tensor_list):
         flags |= VFLAG_F32_SCALES
-    if has_kv:
-        # Новый вид контейнера (0118): KV-кэши вне файла, их offset —
-        # KV_NO_OFFSET. Бита 0x0004 старый загрузчик не знает и игнорирует,
-        # отказ даёт offset (см. write_vtm).
+    if has_out:
+        # Новый вид контейнера (0118, 0176): буферы (KV-кэши и состояния)
+        # вне файла, их offset — KV_NO_OFFSET. Бита 0x0004 старый загрузчик
+        # не знает и игнорирует, отказ даёт offset (см. write_vtm).
         flags |= VFLAG_KV_OUT_OF_FILE
 
     header = _HEADER_STRUCT.pack(
@@ -3252,7 +3343,7 @@ def _empty_payload_prefix(tensor: Tensor) -> tuple[bytes, int]:
     потоковый писатель (`write_vtm_stream`) отдаёт контейнер нужной формы,
     не материализуя веса: 7B-раскладка — это ~1,5 ГиБ тритов, а 32B — ~7 ГиБ.
     """
-    if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+    if _is_out_of_file(getattr(tensor, "flags", 0), tensor.kind):
         return b"", 0
     size = tensor_payload_size(tensor)
     if tensor.kind == KIND_TRITS:
@@ -3319,9 +3410,10 @@ def write_vtm_stream(
     требует данных в каждом тензоре и на 32B съел бы ~7 ГиБ списков Python;
     здесь память — один буфер `chunk` байт, а файл пишется последовательно.
 
-    KV-кэши, как и в `write_vtm`, в файл не пишутся (флаг
-    `VFLAG_KV_OUT_OF_FILE`, offset `KV_NO_OFFSET`), а их суммарный размер
-    проверяется по `MAX_KV_BYTES` — ровно так же, как это сделает загрузчик.
+    KV-кэши и состояния рекуррентных слоёв, как и в `write_vtm`, в файл не
+    пишутся (флаг `VFLAG_KV_OUT_OF_FILE`, offset `KV_NO_OFFSET`), а их
+    суммарный размер проверяется по `MAX_KV_BYTES` — ровно так же, как это
+    сделает загрузчик.
 
     `container_version` — как у `write_vtm`: "auto" пишет v0.2, пока файл
     < 4 ГиБ, и v0.3 (u64-смещения, 60-байтная запись) — когда иначе нельзя.
@@ -3336,7 +3428,7 @@ def write_vtm_stream(
     if chunk <= 0:
         raise ValueError(f"chunk={chunk} должен быть > 0")
     for tensor in tensor_list:
-        if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
+        if _is_out_of_file(getattr(tensor, "flags", 0), tensor.kind):
             continue
         if (
             tensor.data is not None
@@ -3352,11 +3444,15 @@ def write_vtm_stream(
                 "пишите контейнер через write_vtm"
             )
 
-    kv_caches = [t for t in tensor_list if getattr(t, "flags", 0) & TFLAG_KV_CACHE]
-    kv_bytes = sum(t.n_elements * 4 for t in kv_caches)
+    buffers = [
+        t for t in tensor_list
+        if _is_out_of_file(getattr(t, "flags", 0), t.kind)
+    ]
+    kv_bytes = sum(t.n_elements * 4 for t in buffers)
     if kv_bytes > MAX_KV_BYTES:
         raise ValueError(
-            f"KV-кэши: суммарный размер {kv_bytes} байт больше предела "
+            f"буферы вне файла (KV-кэши/состояния): суммарный размер "
+            f"{kv_bytes} байт больше предела "
             f"{MAX_KV_BYTES} (MAX_KV_BYTES); уменьшите ctx или kv_dim. "
             "Если контекст нужен целиком, кэп поднимается на сборке рантайма: "
             + kv_rebuild_hint(kv_bytes)
@@ -3365,14 +3461,14 @@ def write_vtm_stream(
     write_integrity = _integrity_requested(integrity)
     requested_version = parse_container_version(container_version)
     n_tensors = len(tensor_list)
-    has_kv = bool(kv_caches)
+    has_out = bool(buffers)
 
     digest = hashlib.sha256() if write_integrity else None
     layout: list[tuple[Tensor, bytes, int]] = []
     data_size = 0
     for tensor in tensor_list:
-        if getattr(tensor, "flags", 0) & TFLAG_KV_CACHE:
-            tensor.offset = KV_NO_OFFSET if has_kv else 0
+        if _is_out_of_file(getattr(tensor, "flags", 0), tensor.kind):
+            tensor.offset = KV_NO_OFFSET if has_out else 0
             tensor.scale_offset = 0
             layout.append((tensor, b"", 0))
             continue
@@ -3427,7 +3523,7 @@ def write_vtm_stream(
     flags = VFLAG_CAUSAL
     if all(t.kind != KIND_TRITS or t.scale_dtype == "float32" for t in tensor_list):
         flags |= VFLAG_F32_SCALES
-    if has_kv:
+    if has_out:
         flags |= VFLAG_KV_OUT_OF_FILE
 
     header = _HEADER_STRUCT.pack(
@@ -3526,12 +3622,14 @@ def _payload_extent(
 ) -> tuple[int, str | None]:
     """Размер payload'а по заголовку TRT1 (для тритов) или по kind/dims.
 
-    У KV-кэша (flags & TFLAG_KV_CACHE) payload'а нет: 0 байт, читать нечего.
+    У буфера вне файла (KV-кэш или состояние; flags, kind-aware) payload'а
+    нет: 0 байт, читать нечего.
     """
-    if flags & TFLAG_KV_CACHE:
+    if _is_out_of_file(flags, kind):
         if kind in PACKED_KINDS:
             raise ValueError(
-                f"KV-кэш обязан быть fp-тензором, а запись говорит kind={kind}"
+                f"буфер вне файла обязан быть fp-тензором, а запись говорит "
+                f"kind={kind}"
             )
         return 0, None
     if kind == KIND_TRITS:
@@ -3682,9 +3780,10 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     tensor_struct = (
         _TENSOR_STRUCT_V03 if version == VTM_VERSION_V03 else _TENSOR_STRUCT
     )
-    # Задача 0118: флаг «KV-кэши вне файла». Старые контейнеры его не ставят
-    # и читаются прежним путём; контейнер с флагом обязан нести KV-кэши, а их
-    # offset — маркер KV_NO_OFFSET, а не адрес.
+    # Задача 0118/0176: флаг «буферы (KV-кэши и состояния) вне файла».
+    # Старые контейнеры его не ставят и читаются прежним путём; контейнер с
+    # флагом обязан нести хотя бы один такой буфер, а его offset — маркер
+    # KV_NO_OFFSET, а не адрес.
     kv_flag = bool(flags & VFLAG_KV_OUT_OF_FILE)
     if n_tensors > MAX_TENSORS:
         raise ValueError(f"n_tensors={n_tensors} больше предела {MAX_TENSORS}")
@@ -3745,8 +3844,8 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     # --- таблица тензоров ---------------------------------------------------
     tensors: list[Tensor] = []
     ranges: list[tuple[int, int, str]] = []
-    kv_bytes = 0
-    has_kv = False
+    out_bytes = 0
+    has_out = False
     for index in range(n_tensors):
         entry_offset = HEADER_SIZE + entry_size * index
         raw_name, kind, ndim, d0, d1, d2, d3, offset, scale_offset, tflags = (
@@ -3766,38 +3865,43 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
         dims = tuple((d0, d1, d2, d3)[:ndim])
         if any(d == 0 for d in dims):
             raise ValueError(f"тензор {name!r}: нулевое измерение в {dims}")
-        if tflags & TFLAG_KV_CACHE:
-            # KV-кэш: payload'а в файле нет, offset — не адрес. В контейнере
-            # нового вида (флаг VFLAG_KV_OUT_OF_FILE) это маркер
-            # KV_NO_OFFSET; старый загрузчик до 0101 на нём отказывает, а не
-            # читает данные по offset=0 как мусор. Контейнеры без флага
-            # (0101 и старше) по-прежнему несут offset=0.
+        if _is_out_of_file(tflags, kind):
+            # Буфер вне файла (KV-кэш или состояние рекуррентного слоя):
+            # payload'а в файле нет, offset — не адрес. В контейнере нового
+            # вида (флаг VFLAG_KV_OUT_OF_FILE) это маркер KV_NO_OFFSET;
+            # старый загрузчик до 0101 на нём отказывает, а не читает данные
+            # по offset=0 как мусор. Контейнеры без флага (0101 и старше)
+            # по-прежнему несут offset=0.
+            role = "KV-кэш" if tflags & TFLAG_KV_CACHE else "состояние"
             if kind in PACKED_KINDS:
-                raise ValueError(f"тензор {name!r}: KV-кэш обязан быть fp-тензором")
+                raise ValueError(
+                    f"тензор {name!r}: {role} обязан быть fp-тензором"
+                )
             if scale_offset != 0:
                 raise ValueError(
-                    f"тензор {name!r}: у KV-кэша scale_offset={scale_offset}, ожидался 0"
+                    f"тензор {name!r}: у буфера вне файла ({role.lower()}) "
+                    f"scale_offset={scale_offset}, ожидался 0"
                 )
             if kv_flag:
                 if offset != KV_NO_OFFSET:
                     raise ValueError(
-                        f"тензор {name!r}: KV-кэш с флагом KV_OUT_OF_FILE, "
+                        f"тензор {name!r}: {role} с флагом KV_OUT_OF_FILE, "
                         f"offset={offset}, ожидался 0x{KV_NO_OFFSET:08X} "
                         "(payload'а в файле нет)"
                     )
             elif offset != 0:
                 raise ValueError(
-                    f"тензор {name!r}: KV-кэш без флага KV_OUT_OF_FILE, "
+                    f"тензор {name!r}: {role} без флага KV_OUT_OF_FILE, "
                     f"offset={offset}, ожидался 0"
                 )
-            kv_bytes += prod(dims) * 4
-            if kv_bytes > MAX_KV_BYTES:
+            out_bytes += prod(dims) * 4
+            if out_bytes > MAX_KV_BYTES:
                 raise ValueError(
-                    f"KV-кэши: суммарный размер {kv_bytes} байт больше предела "
-                    f"{MAX_KV_BYTES} (MAX_KV_BYTES); тензор {name!r} — "
-                    f"{prod(dims)} элементов"
+                    f"буферы вне файла: суммарный размер {out_bytes} байт "
+                    f"больше предела {MAX_KV_BYTES} (MAX_KV_BYTES); "
+                    f"тензор {name!r} — {prod(dims)} элементов"
                 )
-            has_kv = True
+            has_out = True
             tensor = Tensor(
                 name=name, kind=kind, dims=dims, offset=offset,
                 scale_offset=0, flags=tflags,
@@ -3879,11 +3983,13 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
         tensors.append(tensor)
 
     # Флаг обещает новый вид контейнера: в нём обязан быть хотя бы один
-    # KV-кэш. Обратное не требуется — старые контейнеры с кэшами внутри и
-    # 0101-контейнеры без флага читаются по-прежнему (задача 0118).
-    if kv_flag and not has_kv:
+    # буфер вне файла (KV-кэш или состояние). Обратное не требуется — старые
+    # контейнеры с кэшами внутри и 0101-контейнеры без флага читаются
+    # по-прежнему (задачи 0118, 0176).
+    if kv_flag and not has_out:
         raise ValueError(
-            "флаг KV_OUT_OF_FILE поднят, но в таблице нет KV-кэшей"
+            "флаг KV_OUT_OF_FILE поднят, но в таблице нет буферов вне файла "
+            "(KV-кэшей/состояний)"
         )
 
     ranges.sort()
@@ -4145,6 +4251,51 @@ def _silu(value: float) -> float:
     if value < -700.0:
         return 0.0
     return value / (1.0 + math.exp(-value))
+
+
+def _sigmoid(value: float) -> float:
+    """`1 / (1 + exp(-v))` без переполнения на больших |v|."""
+    if value >= 0.0:
+        return 1.0 / (1.0 + math.exp(-value))
+    scaled = math.exp(value)
+    return scaled / (1.0 + scaled)
+
+
+def _exp_decay(value: float) -> float:
+    """`exp(v)` для логарифма гейта; на переполнении — `inf`, а не исключение.
+
+    В GDELTA `g` — лог затухания (в Qwen3-Next `g ≤ 0`), поэтому переполнение
+    означает испорченный вход, а не норму. C-эталон на `exp` вернул бы `inf`;
+    повторяем это поведение, чтобы Python и C расходились только в NaN-payload.
+    """
+    try:
+        return math.exp(value)
+    except OverflowError:
+        return math.inf
+
+
+def _l2_normalize_rows(
+    values: Sequence[float], n_heads: int, dim: int, eps: float
+) -> list[float]:
+    """Построчная L2-нормировка `x / sqrt(x·x + eps)` (q/k в GDELTA).
+
+    Нулевая строка остаётся нулевой (`0` вместо деления на `sqrt(eps)`):
+    при `eps = 0` это иначе был бы ZeroDivisionError, а при `eps > 0` —
+    произвольное направление, которого нет во входе.
+    """
+    out = [0.0] * (n_heads * dim)
+    for head in range(n_heads):
+        base = head * dim
+        square = math.fsum(
+            values[base + index] * values[base + index] for index in range(dim)
+        )
+        denominator = square + eps
+        if denominator <= 0.0:
+            continue
+        norm = math.sqrt(denominator)
+        for index in range(dim):
+            out[base + index] = values[base + index] / norm
+    return out
 
 
 def _argmax(values: Sequence[float]) -> int:
@@ -4422,16 +4573,24 @@ class _Interpreter:
             if int(instr.op) == Op.KVW
             for index in (int(instr.dst), int(instr.b))
         }
+        #: индексы состояний рекуррентных слоёв (CONV4/GDELTA, задача 0176):
+        #: обновляются на каждом проходе и переживают сброс рабочей области.
+        self.state_indices = {
+            int(instr.c)
+            for instr in self.program
+            if int(instr.op) in (Op.CONV4, Op.GDELTA)
+        }
         self.workspace: dict[int, list[float]] = {}
-        # KV-кэш из контейнера нового формата (TFLAG_KV_CACHE) данных не
-        # имеет: буфер создаётся здесь, нулями — ровно как кэш из старого
-        # контейнера, где в файле лежали нули. Так оба формата дают одно
-        # поведение (ATTN до первого KVW видит нули, а не «нет данных»).
+        # Буферы вне файла (KV-кэш TFLAG_KV_CACHE и состояние TFLAG_STATE)
+        # данных не имеют: буфер создаётся здесь, нулями — ровно как кэш из
+        # старого контейнера, где в файле лежали нули. Так оба формата дают
+        # одно поведение (ATTN до первого KVW видит нули, CONV4/GDELTA до
+        # первого шага — нулевое состояние, а не «нет данных»).
         # Берём все помеченные тензоры, а не только dst/b KVW: в C такой
         # тензор тоже существует и читается как нули, даже если программа до
         # него не пишет.
         for index, tensor in enumerate(self.tensors):
-            if tensor.is_kv_cache:
+            if tensor.is_out_of_file:
                 self.workspace[index] = [0.0] * tensor.n_elements
 
     # -- доступ к значениям --------------------------------------------------
@@ -4476,11 +4635,15 @@ class _Interpreter:
     # -- проход --------------------------------------------------------------
 
     def begin_step(self) -> None:
-        """Сбросить рабочую область, сохранив KV-кэш."""
+        """Сбросить рабочую область, сохранив KV-кэш и состояния слоёв."""
         self.workspace = {
             index: values
             for index, values in self.workspace.items()
-            if index in self.cache_indices or self.tensors[index].is_kv_cache
+            if (
+                index in self.cache_indices
+                or index in self.state_indices
+                or self.tensors[index].is_out_of_file
+            )
         }
 
     def run_step(self, state: _State) -> None:
@@ -4876,6 +5039,199 @@ class _Interpreter:
                 int(instr.dst),
                 [_f32(old + delta) for old, delta in zip(y, acc)],
             )
+        elif op == Op.CONV4:
+            # Причинная depthwise-свёртка с ядром 4 (задача 0176):
+            #   s = [x_{t-3}, x_{t-2}, x_{t-1}, x_t],  s[3] = x (нули на старте)
+            #   y[c] = Σ_{j=0..3} w[c, j] · s[j, c]
+            # затем state = [x_{t-2}, x_{t-1}, x_t]. Один токен за вызов.
+            state_index = int(instr.c)
+            if state_index >= len(self.tensors):
+                raise ValueError(
+                    f"CONV4: состояние c={state_index} за границей таблицы "
+                    f"тензоров ({len(self.tensors)})"
+                )
+            x = self._read(int(instr.a))
+            w = self._read(int(instr.b))
+            w_tensor = self.tensors[int(instr.b)]
+            state_tensor = self.tensors[state_index]
+            if len(w_tensor.dims) != 2 or w_tensor.dims[1] != CONV4_KERNEL:
+                raise ValueError(
+                    f"CONV4: w {w_tensor.name!r} должен быть [width, "
+                    f"{CONV4_KERNEL}], dims={w_tensor.dims}"
+                )
+            width = w_tensor.dims[0]
+            if len(x) != width:
+                raise ValueError(
+                    f"CONV4: x длиной {len(x)}, а w ждёт width={width}"
+                )
+            if tuple(state_tensor.dims) != (CONV4_KERNEL - 1, width):
+                raise ValueError(
+                    f"CONV4: состояние {state_tensor.name!r} должно быть "
+                    f"{(CONV4_KERNEL - 1, width)}, dims={state_tensor.dims}"
+                )
+            if state_tensor.kind in PACKED_KINDS:
+                raise ValueError(
+                    f"CONV4: состояние {state_tensor.name!r} должно быть fp"
+                )
+            state_values = self.workspace.get(state_index)
+            if state_values is None:
+                # Состояние без флага STATE: читаем его из контейнера, но
+                # работаем с копией, иначе execute() испортил бы тензор VTM.
+                state_values = list(self._read(state_index))
+                self.workspace[state_index] = state_values
+            out = [0.0] * width
+            for channel in range(width):
+                base = channel * CONV4_KERNEL
+                out[channel] = _f32(
+                    w[base] * state_values[channel]
+                    + w[base + 1] * state_values[width + channel]
+                    + w[base + 2] * state_values[2 * width + channel]
+                    + w[base + 3] * x[channel]
+                )
+            for channel in range(width):
+                state_values[channel] = _f32(state_values[width + channel])
+                state_values[width + channel] = _f32(
+                    state_values[2 * width + channel]
+                )
+                state_values[2 * width + channel] = _f32(x[channel])
+            self._write(int(instr.dst), out)
+        elif op == Op.GDELTA:
+            # Шаг Gated Delta Net (arXiv 2412.06464, «gated delta rule») и
+            # выходной RMS-гейт (Qwen3-Next/RMSNormGated). Для каждой
+            # value-головы h, kh = h / (Hv/Hk):
+            #   q̂ = q/√(q·q+eps), k̂ = k/√(k·k+eps), α = exp(g), β = sigmoid(b)
+            #   u[dv]      = Σ_dk k̂[dk]·S[dk,dv]             (u = k̂ᵀS)
+            #   γ[dv]      = v[dv] − α·u[dv]
+            #   S_t[dk,dv] = α·S[dk,dv] + β·k̂[dk]·γ[dv]      (delta + decay)
+            #   o[dv]      = Σ_dk q̂[dk]·S_t[dk,dv]           (o = S_tᵀq̂)
+            #   y = rmsnorm(o)·norm_w·silu(z)
+            # Банк — шесть подряд идущих тензоров c..c+5 (часть ABI, vtm.h).
+            bank = int(instr.c)
+            if bank + GDELTA_BANK_SIZE - 1 >= len(self.tensors):
+                raise ValueError(
+                    f"GDELTA: банк — {GDELTA_BANK_SIZE} подряд идущих тензоров "
+                    f"(c..c+{GDELTA_BANK_SIZE - 1}), c={bank} вне таблицы "
+                    f"({len(self.tensors)} записей)"
+                )
+            state_tensor, v_tensor = self.tensors[bank], self.tensors[bank + 1]
+            beta_tensor, g_tensor = self.tensors[bank + 2], self.tensors[bank + 3]
+            z_tensor, norm_tensor = self.tensors[bank + 4], self.tensors[bank + 5]
+            q_tensor = self.tensors[int(instr.a)]
+            k_tensor = self.tensors[int(instr.b)]
+            if len(q_tensor.dims) != 2:
+                raise ValueError(
+                    f"GDELTA: q {q_tensor.name!r} должен быть [Hk, Dk], "
+                    f"dims={q_tensor.dims}"
+                )
+            n_k_heads, key_dim = q_tensor.dims
+            if tuple(k_tensor.dims) != (n_k_heads, key_dim):
+                raise ValueError(
+                    f"GDELTA: k dims={k_tensor.dims}, ожидались "
+                    f"{(n_k_heads, key_dim)}"
+                )
+            if len(v_tensor.dims) != 2:
+                raise ValueError(
+                    f"GDELTA: v {v_tensor.name!r} должен быть [Hv, Dv], "
+                    f"dims={v_tensor.dims}"
+                )
+            n_v_heads, value_dim = v_tensor.dims
+            if n_k_heads <= 0 or n_v_heads % n_k_heads:
+                raise ValueError(
+                    f"GDELTA: {n_v_heads} value-голов не делятся на "
+                    f"{n_k_heads} key-голов"
+                )
+            expected_state = (n_v_heads, key_dim, value_dim)
+            if tuple(state_tensor.dims) != expected_state:
+                raise ValueError(
+                    f"GDELTA: состояние {state_tensor.name!r} dims="
+                    f"{state_tensor.dims}, ожидалось {expected_state}"
+                )
+            for tensor, expected, what in (
+                (beta_tensor, (n_v_heads,), "beta"),
+                (g_tensor, (n_v_heads,), "g"),
+                (z_tensor, (n_v_heads, value_dim), "z"),
+                (norm_tensor, (value_dim,), "norm_w"),
+            ):
+                if tuple(tensor.dims) != expected:
+                    raise ValueError(
+                        f"GDELTA: {what} {tensor.name!r} dims={tensor.dims}, "
+                        f"ожидалось {expected}"
+                    )
+            for tensor, what in (
+                (state_tensor, "состояние"), (v_tensor, "v"), (z_tensor, "z"),
+                (norm_tensor, "norm_w"), (q_tensor, "q"), (k_tensor, "k"),
+            ):
+                if tensor.kind in PACKED_KINDS:
+                    raise ValueError(f"GDELTA: {what} {tensor.name!r} — нужен fp-тензор")
+            if instr.imm < 0:
+                raise ValueError(
+                    f"GDELTA: eps (imm) не может быть отрицательным: {instr.imm}"
+                )
+            eps = int(instr.imm) / 1e6
+            q = self._read(int(instr.a))
+            k = self._read(int(instr.b))
+            v = self._read(bank + 1)
+            beta = self._read(bank + 2)
+            g = self._read(bank + 3)
+            z = self._read(bank + 4)
+            norm_w = self._read(bank + 5)
+            state_values = self.workspace.get(bank)
+            if state_values is None:
+                state_values = list(self._read(bank))
+                self.workspace[bank] = state_values
+            q_hat = _l2_normalize_rows(q, n_k_heads, key_dim, eps)
+            k_hat = _l2_normalize_rows(k, n_k_heads, key_dim, eps)
+            group = n_v_heads // n_k_heads
+            out = [0.0] * (n_v_heads * value_dim)
+            for head in range(n_v_heads):
+                key_head = head // group
+                alpha = _exp_decay(g[head])
+                beta_head = _sigmoid(beta[head])
+                state_base = head * key_dim * value_dim
+                key_base = key_head * key_dim
+                # u[dv] = Σ_dk S[dk,dv]·k̂[dk] — состояние [Dk, Dv], а не
+                # [Dv, Dk] как в статье: сумма идёт по ключевой оси.
+                u = [0.0] * value_dim
+                for dk in range(key_dim):
+                    k_value = k_hat[key_base + dk]
+                    if k_value == 0.0:
+                        continue
+                    row = state_base + dk * value_dim
+                    for dv in range(value_dim):
+                        u[dv] += state_values[row + dv] * k_value
+                # γ = v − α·u и S_t = α·S_{t-1} + β·γ·k̂ᵀ; состояние — f32,
+                # поэтому каждый элемент округляется сразу (как в C).
+                gamma = [
+                    v[head * value_dim + dv] - alpha * u[dv]
+                    for dv in range(value_dim)
+                ]
+                for dk in range(key_dim):
+                    k_value = k_hat[key_base + dk]
+                    row = state_base + dk * value_dim
+                    for dv in range(value_dim):
+                        state_values[row + dv] = _f32(
+                            alpha * state_values[row + dv]
+                            + beta_head * gamma[dv] * k_value
+                        )
+                # o = S_t·q̂.
+                o = [0.0] * value_dim
+                for dk in range(key_dim):
+                    q_value = q_hat[key_base + dk]
+                    if q_value == 0.0:
+                        continue
+                    row = state_base + dk * value_dim
+                    for dv in range(value_dim):
+                        o[dv] += state_values[row + dv] * q_value
+                # Выходной RMS-гейт: y = o/rms(o)·norm_w·silu(z), rms по Dv.
+                mean_square = math.fsum(value * value for value in o) / value_dim
+                denominator = mean_square + eps
+                inverse = 0.0 if denominator <= 0.0 else 1.0 / math.sqrt(denominator)
+                base = head * value_dim
+                for dv in range(value_dim):
+                    out[base + dv] = _f32(
+                        o[dv] * inverse * norm_w[dv] * _silu(z[base + dv])
+                    )
+            self._write(int(instr.dst), out)
         elif op == Op.HALT:
             state.halted = True
         else:  # pragma: no cover - Instr уже проверил opcode
