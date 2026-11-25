@@ -1258,5 +1258,12 @@
     "status": "pending",
     "file": "0188-compact-floating-circle.md",
     "assignee": "agent:compact-circle"
+  },
+  {
+    "id": "0189",
+    "title": "Плотный prefill через GEMM",
+    "status": "in_progress",
+    "file": "0189-dense-prefill-gemm.md",
+    "assignee": "agent:prefill-gemm"
   }
 ]
