@@ -499,11 +499,19 @@ static void test_prefill_batch(const char *path) {
         vtm_api_close(s32);
     }
 
-    // NULL opts — дефолт prefill_batch == 0 (сравниваем с эталоном batch=0).
+    // NULL opts и struct_size == 0 — «все дефолты» (0180): prefill_batch == 128.
+    // Наружу значение не отдаётся, поэтому проверяем открытие; ответы при 128
+    // и 0 на demo-модели совпадают — это уже проверено выше для N = 1..1e6.
     {
+        vtm_api_options zero;
         vtm_api_t *dflt = vtm_api_open(path, NULL);
-        check(dflt != NULL, "open с NULL opts (batch по умолчанию)");
+        vtm_api_t *zeroed;
+        check(dflt != NULL, "open с NULL opts (prefill_batch по умолчанию)");
         vtm_api_close(dflt);
+        memset(&zero, 0, sizeof zero);   // struct_size == 0 — все дефолты
+        zeroed = vtm_api_open(path, &zero);
+        check(zeroed != NULL, "open с struct_size=0 (все дефолты, 0180)");
+        vtm_api_close(zeroed);
     }
 }
 

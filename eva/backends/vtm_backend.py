@@ -32,6 +32,9 @@
     EVA_VTM_MAX_TOKENS  потолок новых токенов за генерацию (по умолчанию 64, 0 — без лимита)
     EVA_VTM_BACKEND     auto|simd|scalar|lut|direct (auto — как VTM_BACKEND/vtm_load)
     EVA_VTM_THREADS     потоков в SIMD-ядрах; транслируется в VTM_THREADS (C-рантайм)
+    EVA_VTM_CACHE       кэш префикса: 1 включает, 0/no/false выключает
+    EVA_VTM_PREFILL_BATCH
+                        токенов на пачку prefill (по умолчанию 128, 0 — по токену)
     EVA_VTM_CC          компилятор для автосборки (по умолчанию cc)
 
 Пример::
@@ -119,6 +122,10 @@ _ENV_THREADS = "EVA_VTM_THREADS"
 _ENV_CC = "EVA_VTM_CC"
 
 DEFAULT_MAX_TOKENS = 64
+# Батчевый prefill (0114, 0180): по умолчанию 128 токенов на пачку, как и
+# умолчание C-ABI (VTM_API_PREFILL_BATCH_DEFAULT). Короткий промпт считается
+# по длине; 0 — выключатель (прежний путь по токену).
+DEFAULT_PREFILL_BATCH = 128
 
 
 class VtmError(RuntimeError):
@@ -207,15 +214,20 @@ class VTMConfig:
     # Кэш префикса (0087): следующий запрос с тем же началом не пересчитывается.
     # По умолчанию выключен — поведение не меняется без явного согласия.
     cache_prefix: bool = False
-    # Батчевый prefill (0114): промпт считается пачками по N токенов (0 — по токену).
-    # Ускоряет только скалярный бэкенд: батчевых SIMD-ядер пока нет (0113).
-    prefill_batch: int = 0
+    # Батчевый prefill (0114, 0180): промпт (а с кэшем — некэшированный хвост)
+    # считается пачками по N токенов; 0 — выключатель, по токену.
+    # По умолчанию 128, как в C-ABI: короткий промпт — по длине.
+    prefill_batch: int = DEFAULT_PREFILL_BATCH
 
     def __post_init__(self) -> None:
         if self.max_tokens < 0:
             raise ValueError(f"max_tokens: ожидалось >= 0, получено {self.max_tokens}")
         if self.threads is not None and self.threads < 1:
             raise ValueError(f"threads: ожидалось >= 1, получено {self.threads}")
+        if self.prefill_batch < 0:
+            raise ValueError(
+                f"prefill_batch: ожидалось >= 0, получено {self.prefill_batch}"
+            )
         if self.backend not in _BACKENDS:
             raise ValueError(
                 f"backend={self.backend!r}: ожидалось одно из {', '.join(_BACKENDS)}"
@@ -273,6 +285,11 @@ class VTMConfig:
             None if raw_threads is None
             else _parse_int(_ENV_THREADS, raw_threads, minimum=1)
         )
+        raw_batch = pick(prefill_batch, _ENV_PREFILL_BATCH)
+        resolved_batch = (
+            DEFAULT_PREFILL_BATCH if raw_batch is None
+            else _parse_int(_ENV_PREFILL_BATCH, raw_batch, minimum=0)
+        )
 
         return cls(
             model=resolved_model,
@@ -286,11 +303,7 @@ class VTMConfig:
                 if cache_prefix is not None
                 else env.get(_ENV_CACHE, "") not in ("", "0", "no", "false")
             ),
-            prefill_batch=int(
-                prefill_batch
-                if prefill_batch is not None
-                else (env.get(_ENV_PREFILL_BATCH) or 0)
-            ),
+            prefill_batch=resolved_batch,
         )
 
 
@@ -547,7 +560,7 @@ class _VtmContext:
         max_new_tokens: int = 0,
         eos_token_id: int = -1,
         cache_prefix: bool | None = None,
-        prefill_batch: int = 0,
+        prefill_batch: int = DEFAULT_PREFILL_BATCH,
     ) -> None:
         self._lib = library
         self._handle: int | None = None

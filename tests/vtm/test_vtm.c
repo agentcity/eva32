@@ -43,6 +43,12 @@ void vtm_internal_moe_cache_stats(uint64_t *hits, uint64_t *misses,
 void vtm_internal_moe_prefetch_stats(uint64_t *jobs, uint64_t *waits,
                                      uint64_t *useful, int *threads);
 
+// Внутренние точки входа кэша с явной пачкой (задача 0180). В vtm.h не
+// выносятся (публичный заголовок ядра не меняется) — тест объявляет их сам,
+// как и хуки выше.
+vtm_status vtm_cache_prefix_ex(vtm_t *m, const int32_t *ids, int n, int batch);
+vtm_status vtm_run_cached_ex(vtm_t *m, const int32_t *ids, int n, int batch);
+
 // --- big-endian: контейнер не читается, загрузчик обязан отказать ----------
 //
 // Обычная сборка гоняет весь набор ниже. Сборка с -DVTM_HOST_BIG_ENDIAN=1
@@ -5269,6 +5275,100 @@ static void test_cache_prefix_ring(void) {
     if (!g_fail) printf("кэш префикса 0081 (кольцо KV): ok\n");
 }
 
+// Кэш префикса вместе с пачками (задача 0180). Проверяется проводка, которой
+// раньше не было: префикс кэшируется, а некэшированный хвост считается
+// пачками через vtm_run_batch(). На SIMD это уже не побитовый путь (батчевые
+// ядра дают ≤1e-5), поэтому точность сверяется по argmax/позиции/счётчику, а
+// самосогласованность кэша — побитово с полным прогоном теми же пачками.
+static int cache_snap_argmax(const cache_snap *s) {
+    int best = 0, i;
+    for (i = 1; i < CACHE_SNAP_VOCAB; i++)
+        if (s->logits[i] > s->logits[best]) best = i;
+    return best;
+}
+
+static void test_cache_batch(void) {
+    cache_cfg cfg;
+    int32_t prefix[8] = {3, 1, 4, 1, 5, 9, 2, 6};
+    int32_t ids[12];
+    cache_snap plain, full_batch, from_cache, again;
+    vtm_t *base, *ref, *mc;
+    uint64_t h0, m0, h1, m1;
+    int i;
+
+    cfg.ctx = 32;
+    cfg.hidden = 16;
+    cfg.vocab = 16;
+    cfg.inter = 32;
+    cfg.heads = 2;
+    cfg.head_dim = 8;
+    cfg.kv_heads = 1;
+
+    base = cache_model(&cfg);   // эталон: по токену
+    ref = cache_model(&cfg);    // весь промпт одной и той же пачкой
+    mc = cache_model(&cfg);     // кэш префикса + пачка хвоста
+    CHECK(base != NULL && ref != NULL && mc != NULL);
+    if (!base || !ref || !mc) {
+        vtm_free(base);
+        vtm_free(ref);
+        vtm_free(mc);
+        return;
+    }
+    for (i = 0; i < 8; i++) ids[i] = prefix[i];
+    ids[8] = 7;
+    ids[9] = 0;
+    ids[10] = 13;
+    ids[11] = 11;
+
+    // (1) Точность: пачка с кэшем против поштучного пути — argmax, позиция и
+    // счётчик сгенерированных совпадают (на скаляре совпало бы и побитово).
+    cache_run_plain(base, ids, 12);
+    cache_snap_take(base, &plain, 12);
+    CHECK(vtm_cache_prefix_ex(ref, ids, 12, 4) == VTM_OK);
+    cache_snap_take(ref, &full_batch, 12);
+    CHECK(cache_snap_argmax(&plain) == cache_snap_argmax(&full_batch));
+    CHECK(plain.position == full_batch.position);
+    CHECK(plain.generated == full_batch.generated);
+
+    // (2) Кэш + пачка: префикс 8 считается пачками 4+4, затем попадание и
+    // хвост 4 — ещё одна пачка. Это ровно те же пачки в том же порядке, что у
+    // полного прогона ref, поэтому состояние обязано совпасть побитово (даже
+    // на SIMD: раскладка пачек не меняется).
+    CHECK(vtm_cache_prefix_ex(mc, prefix, 8, 4) == VTM_OK);
+    CHECK(vtm_cache_prefix_len(mc) == 8);
+    vtm_cache_stats(mc, &h0, &m0);
+    CHECK(vtm_run_cached_ex(mc, ids, 12, 4) == VTM_OK);
+    cache_snap_take(mc, &from_cache, 12);
+    CHECK(cache_snap_equal(&full_batch, &from_cache));
+    vtm_cache_stats(mc, &h1, &m1);
+    CHECK(h1 == h0 + 1 && m1 == m0);          // префикс не пересчитывался
+    CHECK(vtm_cache_prefix_len(mc) == 8);     // кэш остался префиксом
+
+    // (3) Повтор того же запроса — полное попадание: состояние не меняется
+    // (пачки не запускаются вовсе), счётчик попаданий растёт.
+    vtm_cache_stats(mc, &h0, &m0);
+    CHECK(vtm_run_cached_ex(mc, ids, 12, 4) == VTM_OK);
+    cache_snap_take(mc, &again, 12);
+    CHECK(cache_snap_equal(&from_cache, &again));
+    vtm_cache_stats(mc, &h1, &m1);
+    CHECK(h1 == h0 + 1 && m1 == m0);
+
+    // (4) prefill_batch == 0 — выключатель: прежний путь (на SIMD по токену)
+    // даёт тот же argmax и позицию.
+    vtm_reset(mc);
+    CHECK(vtm_run_cached_ex(mc, ids, 12, 0) == VTM_OK);
+    cache_snap_take(mc, &again, 12);
+    CHECK(cache_snap_argmax(&plain) == cache_snap_argmax(&again));
+    CHECK(plain.position == again.position);
+    CHECK(plain.generated == again.generated);
+
+    vtm_free(mc);
+    vtm_free(ref);
+    vtm_free(base);
+    if (!g_fail)
+        printf("кэш префикса + пачки 0180: точность и попадание: ok\n");
+}
+
 
 // --- батчевый prefill (задача 0112) ----------------------------------------
 //
@@ -6423,6 +6523,7 @@ int main(void) {
     test_samp_stale_stamps();
     test_cache_prefix();
     test_cache_prefix_ring();
+    test_cache_batch();
     test_run_batch();
     test_moe_pread_cache();
     test_moe_prefetch();

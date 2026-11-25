@@ -76,6 +76,8 @@ class TestConfig(unittest.TestCase):
         cfg = VTMConfig.from_env({})
         self.assertEqual(cfg.backend, "auto")
         self.assertEqual(cfg.max_tokens, 64)
+        self.assertEqual(cfg.prefill_batch, 128)
+        self.assertFalse(cfg.cache_prefix)
         self.assertIsNone(cfg.threads)
         self.assertIsNone(cfg.library)
 
@@ -88,6 +90,7 @@ class TestConfig(unittest.TestCase):
                 "EVA_VTM_BACKEND": "scalar",
                 "EVA_VTM_MAX_TOKENS": "7",
                 "EVA_VTM_THREADS": "2",
+                "EVA_VTM_PREFILL_BATCH": "32",
             }
         )
         self.assertEqual(cfg.model, "/models/m.vtm")
@@ -96,6 +99,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.backend, "scalar")
         self.assertEqual(cfg.max_tokens, 7)
         self.assertEqual(cfg.threads, 2)
+        self.assertEqual(cfg.prefill_batch, 32)
+        # 0 из окружения — явный выключатель, а не «не задано».
+        self.assertEqual(
+            VTMConfig.from_env({"EVA_VTM_PREFILL_BATCH": "0"}).prefill_batch, 0
+        )
 
     def test_arguments_override_environment(self) -> None:
         cfg = VTMConfig.from_env(
@@ -115,6 +123,10 @@ class TestConfig(unittest.TestCase):
             VTMConfig.from_env({"EVA_VTM_BACKEND": "gpu"})
         with self.assertRaises(ValueError):
             VTMConfig.from_env({"EVA_VTM_THREADS": "0"})
+        with self.assertRaises(ValueError):
+            VTMConfig.from_env({"EVA_VTM_PREFILL_BATCH": "-1"})
+        with self.assertRaises(ValueError):
+            VTMConfig.from_env({"EVA_VTM_PREFILL_BATCH": "много"})
 
     def test_tokenizer_next_to_model(self) -> None:
         import shutil
@@ -271,6 +283,27 @@ class TestVtmGeneration(unittest.TestCase):
         first = self.backend.generate(PROMPT, max_new_tokens=4)
         second = self.backend.generate(PROMPT, max_new_tokens=4)
         self.assertEqual(first, second)
+
+    def test_prefill_batch_with_cache_same_tokens(self) -> None:
+        """Кэш + пачка (0180): префикс из кэша, хвост пачками — те же токены.
+
+        Пары ``cache_prefix`` × ``prefill_batch`` (0 — выключатель, 2 и 128 —
+        пачка) на demo-модели: ответ совпадает с поштучным путём. На SIMD
+        батчевые ядра дают ≤1e-5, поэтому сравниваются токены, а не байты.
+        """
+        runs: list[tuple[bool, int, tuple[int, ...]]] = []
+        for cache in (False, True):
+            for batch in (0, 2, 128):
+                backend = _demo_backend(cache_prefix=cache, prefill_batch=batch)
+                try:
+                    ids = backend.generate(PROMPT, max_new_tokens=3)
+                finally:
+                    backend.close()
+                runs.append((cache, batch, ids))
+        reference = runs[0][2]
+        for cache, batch, ids in runs:
+            with self.subTest(cache_prefix=cache, prefill_batch=batch):
+                self.assertEqual(ids, reference)
 
     def test_per_call_limit(self) -> None:
         result = self.backend.generate_result(PROMPT, max_new_tokens=2)

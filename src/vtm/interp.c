@@ -3456,43 +3456,114 @@ void vtm_cache_stats(const vtm_t *m, uint64_t *hits, uint64_t *misses) {
 // Кэш префикса (0081) требует, чтобы снимок состояния совпадал с прогоном
 // по токену побитово. Скалярные батчевые ядра этому соответствуют, а
 // SIMD-ядра 0122 — нет (у них другой порядок f32-сложения, расхождение
-// ≤1e-5), поэтому на SIMD кэш идёт прежним путём по токену. Это и обещает
-// контракт vtm_run_batch в vtm.h («на SIMD — прежний путь по токену»).
+// ≤1e-5), поэтому на SIMD кэш по умолчанию идёт прежним путём по токену. Это
+// и обещает контракт vtm_run_batch в vtm.h («на SIMD — прежний путь по
+// токену»).
+//
+// batch (задача 0180) — явный выбор хоста:
+//   * 0 — прежний выбор: скаляр — пачка, SIMD — по токену (побитовый кэш);
+//   * N > 0 — считать некэшированный хвост пачками не длиннее N на любом
+//     бэкенде, включая SIMD и MoE-пачку 0179. На SIMD это осознанно
+//     отступает от побитовости (≤1e-5): снимок кэша создаётся и
+//     восстанавливается тем же батчевым путём, поэтому кэш остаётся
+//     самосогласованным, а argmax и последовательность совпадают с
+//     поштучным путём. Ровно это использует C-ABI: chat ходит с
+//     cache_prefix == 1, и без пачки SIMD считал бы промпт по токену.
 static vtm_status batch_sequential(vtm_t *m, const int32_t *ids, int n,
                                    int pos0);
 static int batch_use_simd(const vtm_t *m);
 
-static vtm_status cache_run_tokens(vtm_t *m, const int32_t *ids, int n,
-                                   int pos0) {
-    if (batch_use_simd(m)) return batch_sequential(m, ids, n, pos0);
-    return vtm_run_batch(m, ids, n);
+// Окупается ли пачка в кэш-пути на этом графе и бэкенде (0180).
+//
+// У MoE — всегда: эксперт читается один раз на всех, кому он нужен (0179), и
+// это главный выигрыш. У плотного графа на SIMD с весами Q4_K/Q6_K — нет:
+// батчевое ядро kind 6/7 разворачивает вес в f32 на пачку, а поштучный
+// int8-dot на этой машине быстрее (замер на 3B Q4_K: TTFT 9,3 с по токену
+// против 11,4 с пачкой 128 при кэше). Поэтому такой граф остаётся на прежнем
+// побитовом пути по токену; на скалярном бэкенде батчевые ядра kind 6/7 идут
+// через double и выигрывают (0168), там пачка остаётся.
+static int cache_batch_worthwhile(const vtm_t *m) {
+    uint32_t i;
+    int has_moe = 0, has_q4k_dense = 0;
+
+    if (!batch_use_simd(m)) return 1;
+    for (i = 0; i < m->n_instr; i++) {
+        const vtm_instr *in = &m->instr[i];
+        const vtm_tensor *t;
+        if (in->opcode == VTM_OP_MOE) has_moe = 1;
+        if (in->opcode != VTM_OP_TMV && in->opcode != VTM_OP_MM) continue;
+        if (in->a == VTM_NO_TENSOR || in->a >= m->n_tensors) continue;
+        t = &m->tensors[in->a];
+        if (t->kind == VTM_TENSOR_Q4K || t->kind == VTM_TENSOR_Q6K) {
+            has_q4k_dense = 1;
+        }
+    }
+    return has_moe || !has_q4k_dense;
 }
 
-vtm_status vtm_cache_prefix(vtm_t *m, const int32_t *ids, int n) {
+static vtm_status cache_run_tokens(vtm_t *m, const int32_t *ids, int n,
+                                   int pos0, int batch) {
+    if (batch <= 0 || !cache_batch_worthwhile(m)) {
+        if (batch_use_simd(m)) return batch_sequential(m, ids, n, pos0);
+        return vtm_run_batch(m, ids, n);
+    }
+    // Пачка из одного токена всё равно уходит в поштучный путь: у
+    // vtm_run_batch на n == 1 накладные расходы на разметку пачки.
+    if (batch == 1) return batch_sequential(m, ids, n, pos0);
+    while (n > 0) {
+        const int len = n < batch ? n : batch;
+        const int pos = vtm_position(m);
+        vtm_status st;
+
+        // vtm_run_batch() оставляет позицию на последнем токене пачки;
+        // следующая пачка начинается со следующей позиции (как если бы хост
+        // выставлял её перед каждым вызовом).
+        if (len == 1) return batch_sequential(m, ids, 1, pos);
+        st = vtm_run_batch(m, ids, len);
+        if (st != VTM_OK) return st;
+        ids += len;
+        n -= len;
+        if (n > 0) vtm_set_position(m, vtm_position(m) + 1);
+    }
+    return VTM_OK;
+}
+
+// То же, что vtm_cache_prefix(), но с явным размером пачки (0180).
+// В vtm.h не объявляется: это внутренняя точка входа C-ABI (api.c), а
+// публичный заголовок ядра этой задачей не меняется. batch == 0 — прежнее
+// поведение; batch > 0 — пачки и на SIMD (см. cache_run_tokens).
+vtm_status vtm_cache_prefix_ex(vtm_t *m, const int32_t *ids, int n, int batch) {
     vtm_status st;
 
     if (!m) return VTM_E_ARG;
     if (n < 0 || (n > 0 && !ids)) return VTM_E_ARG;
+    if (batch < 0) return VTM_E_ARG;
     if (!m->backend) m->backend = &vtm_backend_scalar_lut;
     // Префикс считается с чистого состояния: vtm_reset() обнуляет позицию,
     // счётчик и сбрасывает сэмплер (лениво, на первом SAMP), поэтому прогон
     // префикса здесь побитово равен прогону тех же ids у хоста.
     vtm_reset(m);
     m->cache_valid = 0;
-    // Прогон префикса пачкой (0112): на скалярном бэкенде это в разы
-    // быстрее, на SIMD — прежний путь по токену (см. cache_run_tokens).
-    st = cache_run_tokens(m, ids, n, 0);
+    // Прогон префикса пачкой (0112, 0180).
+    st = cache_run_tokens(m, ids, n, 0, batch);
     if (st != VTM_OK) return st;
     cache_store(m, ids, n);
     return VTM_OK;
 }
 
-vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
+vtm_status vtm_cache_prefix(vtm_t *m, const int32_t *ids, int n) {
+    return vtm_cache_prefix_ex(m, ids, n, 0);
+}
+
+// То же, что vtm_run_cached(), но с явным размером пачки (0180): на промахе
+// весь промпт, на попадании — только хвост после кэшированного префикса.
+vtm_status vtm_run_cached_ex(vtm_t *m, const int32_t *ids, int n, int batch) {
     vtm_status st = VTM_OK;
     int start, hit;
 
     if (!m) return VTM_E_ARG;
     if (n < 0 || (n > 0 && !ids)) return VTM_E_ARG;
+    if (batch < 0) return VTM_E_ARG;
     if (!m->backend) m->backend = &vtm_backend_scalar_lut;
 
     hit = cache_hit(m, ids, n);
@@ -3509,17 +3580,21 @@ vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
         start = 0;
         m->cache_misses++;
     }
-    // Хвост после префикса (или весь прогон при промахе) — одной пачкой
-    // (0112); на SIMD — по токену, чтобы снимок кэша остался побитовым.
+    // Хвост после префикса (или весь прогон при промахе) — пачками (0112);
+    // на SIMD при batch == 0 — по токену, чтобы снимок кэша остался побитовым.
     if (start < n) {
         vtm_set_position(m, start);
-        st = cache_run_tokens(m, ids + start, n - start, start);
+        st = cache_run_tokens(m, ids + start, n - start, start, batch);
         if (st != VTM_OK) return st;
     }
     // При попадании кэш остаётся префиксом: запросы с тем же префиксом и
     // разными хвостами переиспользуют его повторно.
     if (!hit) cache_store(m, ids, n);
     return VTM_OK;
+}
+
+vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
+    return vtm_run_cached_ex(m, ids, n, 0);
 }
 
 // --- батчевый prefill (задача 0112) ----------------------------------------

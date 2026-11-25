@@ -29,6 +29,13 @@ int vtm_session_load(vtm_t *m, int32_t *pending_token, const char *path,
 int vtm_session_prune(const char *dir, uint64_t limit_bytes,
                       const char *keep_path);
 
+// Внутренние точки входа interp.c: кэш префикса с явным размером пачки
+// (задача 0180). В vtm.h не объявлены намеренно — это проводка C-ABI, а
+// публичный заголовок ядра задачей не меняется. batch == 0 — прежнее
+// поведение (на SIMD побитовый путь по токену), batch > 0 — пачки и на SIMD.
+vtm_status vtm_cache_prefix_ex(vtm_t *m, const int32_t *ids, int n, int batch);
+vtm_status vtm_run_cached_ex(vtm_t *m, const int32_t *ids, int n, int batch);
+
 // --- батчевый prefill (задачи 0112, 0114) ----------------------------------
 //
 // vtm_run_batch() — публичный API ядра из задачи 0112 (объявляется в vtm.h).
@@ -87,8 +94,10 @@ struct vtm_api {
     // Кэш префикса промпта между запросами (задача 0087): 0 — каждый
     // generate() начинает с vtm_reset(), 1 — префикс переиспользуется.
     int cache_prefix;
-    // Промпт пачками по prefill_batch токенов (задачи 0112, 0114). 0 — по
-    // токену, как раньше; действует только при cache_prefix == 0.
+    // Промпт пачками по prefill_batch токенов (задачи 0112, 0114, 0180).
+    // Действует и при cache_prefix == 1: кэшированный префикс
+    // восстанавливается, некэшированный хвост считается пачками
+    // (vtm_run_cached_ex). 0 — выключатель: прежний путь по токену.
     int prefill_batch;
     // 1 — следующий generate() обязан посчитать префикс заново, не доверяя
     // снимку ядра (ставится vtm_api_session_load(): состояние машины —
@@ -142,7 +151,7 @@ vtm_api_t *vtm_api_open(const char *path, const vtm_api_options *opts) {
     const vtm_backend *backend = NULL;
     uint32_t max_new = 0;
     uint32_t cache_prefix = 0;
-    uint32_t prefill_batch = 0;
+    uint32_t prefill_batch = VTM_API_PREFILL_BATCH_DEFAULT;
     int32_t eos = -1;
     size_t i;
 
@@ -191,15 +200,20 @@ vtm_api_t *vtm_api_open(const char *path, const vtm_api_options *opts) {
             return NULL;
         }
         cache_prefix = opts->cache_prefix;
-        // prefill_batch (0114) — только размер пачки: 0 = прежний путь по
-        // токену, N больше длины промпта = одна пачка. Ограничение сверху —
-        // int: длина пачки уходит в vtm_run_batch() как int.
-        if (opts->prefill_batch > (uint32_t)INT_MAX) {
-            open_fail("vtm_api_open: opts->prefill_batch=%u больше %d",
-                      (unsigned)opts->prefill_batch, INT_MAX);
-            return NULL;
+        // prefill_batch (0114, 0180). Умолчание — 128 (промпт короче
+        // считается по длине); 0 в заданной структуре — явный выключатель,
+        // прежний путь по токену. struct_size == 0 по контракту api.h значит
+        // «все дефолты», поэтому поле из такой структуры не читается:
+        // оставляем 128. Ограничение сверху — int: длина пачки уходит в
+        // vtm_run_batch() как int.
+        if (size != 0) {
+            if (opts->prefill_batch > (uint32_t)INT_MAX) {
+                open_fail("vtm_api_open: opts->prefill_batch=%u больше %d",
+                          (unsigned)opts->prefill_batch, INT_MAX);
+                return NULL;
+            }
+            prefill_batch = opts->prefill_batch;
         }
-        prefill_batch = opts->prefill_batch;
     }
 
     ctx = (vtm_api_t *)calloc(1, sizeof *ctx);
@@ -424,6 +438,17 @@ static int api_run(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
 // трогая снимок, поэтому после vtm_api_session_load() ставится
 // cache_invalidate: следующий прогон префикса считается заново
 // (vtm_cache_prefix — это vtm_reset() + полный прогон + новый снимок).
+//
+// Пачки (0112/0114/0180) и кэш работают вместе: префикс берётся из кэша,
+// некэшированный хвост считается пачками по prefill_batch через
+// vtm_run_cached_ex() (включая MoE-пачку 0179); vtm_cache_prefix_ex() — тот
+// же батчевый путь при промахе после session_load. При prefill_batch == 0
+// вызываются прежние vtm_run_cached()/vtm_cache_prefix(): на SIMD это
+// побитовый путь по токену, на скаляре — пачка, как было до 0180. Один
+// случай interp.c откатывает на поштучный путь и при N > 0 — плотный граф с
+// Q4_K/Q6_K на SIMD (батчевое ядро kind 6/7 там медленнее int8-dot, см.
+// cache_batch_worthwhile в interp.c): на 3B пачка 128 давала 11,4 с против
+// 9,3 с по токену, а критерий задачи — «на 3B не хуже».
 static int api_run_cached(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
                           vtm_api_token_cb cb, void *user) {
     vtm_t *m = ctx->m;
@@ -448,10 +473,12 @@ static int api_run_cached(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
     }
 
     if (ctx->cache_invalidate) {
-        st = vtm_cache_prefix(m, prompt_ids, (int)prefill);
+        st = vtm_cache_prefix_ex(m, prompt_ids, (int)prefill,
+                                 ctx->prefill_batch);
         ctx->cache_invalidate = 0;
     } else {
-        st = vtm_run_cached(m, prompt_ids, (int)prefill);
+        st = vtm_run_cached_ex(m, prompt_ids, (int)prefill,
+                               ctx->prefill_batch);
     }
     if (st != VTM_OK) {
         return api_fail(ctx, (int)st,

@@ -1199,7 +1199,7 @@
   {
     "id": "0180",
     "title": "Кэш префикса + батчевый prefill",
-    "status": "in_progress",
+    "status": "done",
     "file": "0180-cache-plus-batch.md",
     "assignee": "agent:cache-batch"
   }
