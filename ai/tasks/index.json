@@ -1195,5 +1195,12 @@
     "status": "done",
     "file": "0179-moe-batched-prefill.md",
     "assignee": "agent:moe-prefill"
+  },
+  {
+    "id": "0180",
+    "title": "Кэш префикса + батчевый prefill",
+    "status": "in_progress",
+    "file": "0180-cache-plus-batch.md",
+    "assignee": "agent:cache-batch"
   }
 ]
