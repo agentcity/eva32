@@ -29,6 +29,7 @@
 // Только тесту: минимальная машина без загрузчика, чтобы проверить проводку
 // kind 5 в interp.c (op_tmv/op_mm/op_emb) без сборки контейнера.
 #include "vtm_internal.h"
+#include "trit.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -573,7 +574,148 @@ static void report(const char *what, double diff, double ref, double tol) {
     if (!ok) failures++;
 }
 
-// Возвращает 0, если simd == scalar в пределах tol.
+// int8-таблица (kind 4, задача 0170) против независимого эталона в double:
+// w = q·scale, масштаб на блок 128 по сплющенной матрице. Проверяются
+//   * vtm_i8_tmv  — TMV/GEMV n == 1 (double, эталон формата);
+//   * vtm_i8_gemv — рабочий GEMV декода: режим 0 (точные активации, f32) и
+//     режимы 2/3 (int8-dot; порог CHECK_TOL_I8 — ошибка от квантования
+//     активаций);
+//   * vtm_i8_mm   — общий n > 1;
+//   * vtm_i8_dequant_row — строка EMB (точно: там нет сумм).
+// cols не кратен 128 — отдельный случай: SIMD-ядро отказывает, работает
+// переносимый путь, поэтому проверка не зависит от ISA.
+static double i8_ref_dot(const int8_t *q, const float *scales, int64_t base,
+                         int cols, const float *v, int stride) {
+    double acc = 0.0;
+    int j0 = 0;
+
+    while (j0 < cols) {
+        int64_t idx = base + (int64_t)j0;
+        int blk = (int)(idx / (int64_t)VTM_SCALE_BLOCK_128);
+        int m = (int)((int64_t)VTM_SCALE_BLOCK_128
+                      - idx % (int64_t)VTM_SCALE_BLOCK_128);
+        double sum = 0.0;
+        int t;
+        if (m > cols - j0) m = cols - j0;
+        for (t = 0; t < m; t++)
+            sum += (double)q[j0 + t] * (double)v[(size_t)(j0 + t) * (size_t)stride];
+        acc += sum * (double)scales[blk];
+        j0 += m;
+    }
+    return acc;
+}
+
+static void check_i8_case(int rows, int cols, int ncol_mm) {
+    int n = rows * cols;
+    int nblk = (n + (int)VTM_SCALE_BLOCK_128 - 1) / (int)VTM_SCALE_BLOCK_128;
+    uint32_t seed = 0x1700u + (uint32_t)rows * 17u + (uint32_t)cols;
+    int8_t *q = (int8_t *)malloc((size_t)(n ? n : 1));
+    float *scales = (float *)malloc((size_t)(nblk ? nblk : 1) * sizeof(float));
+    float *x = make_vec((size_t)cols, seed ^ 0x11u);
+    float *y_ref = (float *)calloc((size_t)rows, sizeof(float));
+    float *y = (float *)calloc((size_t)rows, sizeof(float));
+    float *b = make_vec((size_t)cols * (size_t)ncol_mm, seed ^ 0x22u);
+    float *ym_ref = (float *)calloc((size_t)rows * (size_t)ncol_mm,
+                                    sizeof(float));
+    float *ym = (float *)calloc((size_t)rows * (size_t)ncol_mm,
+                                sizeof(float));
+    float *emb = (float *)calloc((size_t)cols, sizeof(float));
+    char label[96];
+    int i, r, c;
+
+    if (!q || !scales || !x || !y_ref || !y || !b || !ym_ref || !ym || !emb) {
+        fprintf(stderr, "check_i8_case: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    for (i = 0; i < n; i++)
+        q[i] = (int8_t)((int)(rng_next(&seed) % 255u) - 127);
+    for (i = 0; i < nblk; i++)
+        scales[i] = 0.0005f + 0.02f * (float)(rng_next(&seed) % 100u) / 99.0f;
+
+    for (r = 0; r < rows; r++) {
+        const int8_t *row = q + (size_t)r * (size_t)cols;
+        y_ref[r] = (float)i8_ref_dot(row, scales, (int64_t)r * cols, cols,
+                                     x, 1);
+        for (c = 0; c < ncol_mm; c++)
+            ym_ref[(size_t)r * (size_t)ncol_mm + (size_t)c] = (float)
+                i8_ref_dot(row, scales, (int64_t)r * cols, cols, b + (size_t)c,
+                           ncol_mm);
+    }
+
+    {
+        double ref = 0.0;
+        if (vtm_i8_tmv(y, q, scales, x, rows, cols) != 0) {
+            printf("  i8 TMV: ядро вернуло ошибку\n");
+            failures++;
+        } else {
+            double d = max_diff(y, y_ref, (size_t)rows, &ref);
+            snprintf(label, sizeof label, "i8 TMV %dx%d (double)", rows, cols);
+            report(label, d, ref, 1e-5 * (ref > 1.0 ? ref : 1.0));
+        }
+    }
+    {
+        static const int modes[3] = {0, 2, 3};
+        int mi;
+        for (mi = 0; mi < 3; mi++) {
+            const int saved = vtm_q4k_i8_mode();
+            const int eff = vtm_q4k_i8_set_mode(modes[mi]);
+            double ref = 0.0;
+
+            if (modes[mi] != 0 && eff == 0) {
+                vtm_q4k_i8_set_mode(saved);
+                continue;   // int8-dot на этой сборке/CPU недоступен
+            }
+            if (vtm_i8_gemv(y, q, scales, x, rows, cols) != 0) {
+                printf("  i8 GEMV: ядро вернуло ошибку\n");
+                failures++;
+            } else {
+                snprintf(label, sizeof label, "i8 GEMV %dx%d (mode %d)",
+                         rows, cols, eff);
+                report(label, max_diff(y, y_ref, (size_t)rows, &ref), ref,
+                       (eff == 0 ? 1e-5 : CHECK_TOL_I8)
+                       * (ref > 1.0 ? ref : 1.0));
+            }
+            vtm_q4k_i8_set_mode(saved);
+        }
+    }
+    if (vtm_i8_mm(ym, q, scales, b, rows, cols, ncol_mm) != 0) {
+        printf("  i8 MM: ядро вернуло ошибку\n");
+        failures++;
+    } else {
+        double ref = 0.0;
+        snprintf(label, sizeof label, "i8 MM %dx%dx%d", rows, cols, ncol_mm);
+        report(label, max_diff(ym, ym_ref, (size_t)rows * (size_t)ncol_mm,
+                               &ref), ref, 1e-5 * (ref > 1.0 ? ref : 1.0));
+    }
+    if (vtm_i8_dequant_row(emb, q, scales, (int64_t)cols, cols) != 0) {
+        printf("  i8 dequant_row: ядро вернуло ошибку\n");
+        failures++;
+    } else {
+        double md = 0.0, mr = 0.0;
+        for (c = 0; c < cols; c++) {
+            double want = (double)q[(size_t)cols + (size_t)c]
+                        * (double)scales[((size_t)cols + (size_t)c)
+                                         / VTM_SCALE_BLOCK_128];
+            double d = fabs((double)emb[c] - want);
+            if (d > md) md = d;
+            if (fabs(want) > mr) mr = fabs(want);
+        }
+        snprintf(label, sizeof label, "i8 EMB-строка %d", cols);
+        report(label, md, mr, 1e-6 * (mr > 1.0 ? mr : 1.0));
+    }
+done:
+    free(q);
+    free(scales);
+    free(x);
+    free(y_ref);
+    free(y);
+    free(b);
+    free(ym_ref);
+    free(ym);
+    free(emb);
+}
+
 // Q4 TMV: ядро против независимой деквантизации в double. asym=0 — Q4_0,
 // asym=1 — Q4_1 (q*scale+min). Формы включают cols не кратные 32, чтобы
 // проверить группу, пересекающую границу строк.
@@ -1687,6 +1829,19 @@ static int run_checks(const vtm_backend *cand) {
         }
     }
 
+    // int8-таблица словаря (kind 4, задача 0170): EMB-строка, TMV/GEMV
+    // (режимы 0/2/3) и MM n > 1 против double-эталона формата. cols 128 и
+    // кратные ему — SIMD-путь; 300 — отказ SIMD и переносимый путь.
+    {
+        static const int i8shapes[][3] = {
+            {1, 128, 1}, {7, 256, 3}, {5, 1024, 2}, {3, 300, 1},
+            {17, 128, 5}
+        };
+        size_t ei;
+        for (ei = 0; ei < sizeof(i8shapes) / sizeof(i8shapes[0]); ei++)
+            check_i8_case(i8shapes[ei][0], i8shapes[ei][1], i8shapes[ei][2]);
+    }
+
     // Q4 (kind 5, задача 0152): независимый эталон — деквантизация в double.
     // Проверяем Q4_0 и Q4_1, хвосты групп (cols не кратны 32) и MM n>1.
     {
@@ -2060,6 +2215,111 @@ done:
     free(b);
     free(y_ref);
     free(y_cand);
+}
+
+// --- int8-таблица словаря: GEMV декода (задача 0170) ------------------------
+//
+// Таблица tied lm_head 3B — [151936, 2048]. В контейнере она int8 (kind 4,
+// 0,31 ГБ, масштаб на блок 128); до 0170 загрузчик разворачивал её в fp32 в
+// арене, и декод читал 1,24 ГБ на каждый токен (36,6 мс при 34 ГБ/с — потолок
+// ~27 ток/с). Здесь меряется ядро по упакованной таблице:
+//   * vtm_i8_gemv — рабочий GEMV (int8-dot на NEON, режим VTM_Q4_I8);
+//   * режим 0 — активации точно в f32 (переносимый путь, точность-эталон
+//     по активациям);
+//   * --f32-table — тот же GEMV по fp32-копии таблицы (vtm_simd_gemv_f32,
+//     прежний путь 0159): это и есть «до» по скорости, но требует ещё 1,24 ГиБ.
+//
+// Эталон точности — vtm_i8_tmv (double) на первых 64 строках: полный эталон
+// 311М MAC в double на загруженной машине меряется минутами.
+static void bench_i8_gemv_table(int rows, int cols, int iters, int with_f32) {
+    size_t n = (size_t)rows * (size_t)cols;
+    size_t nblk = n / (size_t)VTM_SCALE_BLOCK_128;
+    int8_t *q = (int8_t *)malloc(n ? n : 1u);
+    float *scales = (float *)malloc((nblk ? nblk : 1u) * sizeof(float));
+    float *x = make_vec((size_t)cols, 0x1700u);
+    float *y = (float *)calloc((size_t)rows, sizeof(float));
+    float *y_ref = (float *)calloc((size_t)rows, sizeof(float));
+    double flops = 2.0 * (double)rows * (double)cols;
+    double gb = (double)n / 1e9;
+    int ref_rows = rows > 64 ? 64 : rows;
+    int i, m, rc;
+    double t0, ms, ref = 0.0;
+
+    if (!q || !scales || !x || !y || !y_ref) {
+        fprintf(stderr, "bench_i8_gemv_table: нет памяти\n");
+        goto done;
+    }
+    for (i = 0; i < (int)n; i++) {
+        uint32_t s = (uint32_t)i * 2654435761u + 0x9e37u;
+        q[i] = (int8_t)((int)((s >> 16) % 255u) - 127);
+    }
+    for (i = 0; i < (int)nblk; i++)
+        scales[i] = 0.0005f + 0.0004f * (float)((i * 37u) % 100u) / 99.0f;
+
+    printf("таблица int8 %dx%d: %.2f ГБ (fp32 была бы %.2f ГБ), масштаб /%d\n",
+           rows, cols, gb, gb * 4.0, (int)VTM_SCALE_BLOCK_128);
+    if (vtm_i8_tmv(y_ref, q, scales, x, ref_rows, cols) != 0) {
+        printf("  эталон vtm_i8_tmv вернул ошибку\n");
+        goto done;
+    }
+    for (m = 0; m < 3; m++) {
+        static const int modes[3] = {0, 2, 3};
+        int eff = vtm_q4k_i8_set_mode(modes[m]);
+        double best = 1e300;
+
+        rc = vtm_i8_gemv(y, q, scales, x, rows, cols);
+        if (rc != 0) {
+            printf("  режим %d: ядро вернуло ошибку\n", modes[m]);
+            continue;
+        }
+        for (i = 0; i < iters; i++) {
+            t0 = now_ms();
+            if (vtm_i8_gemv(y, q, scales, x, rows, cols) != 0) break;
+            ms = now_ms() - t0;
+            if (ms < best) best = ms;
+        }
+        printf("  режим %d (%s): %7.2f мс  %6.2f ГБ/с  %6.2f GMAC/с  "
+               "max|Δ|=%.2e (max|ref|=%.2f, эталон — double, %d строк)\n",
+               eff, vtm_q4k_i8_name(), best, gb / (best * 1e-3),
+               flops / (best * 1e6) / 2.0,
+               max_diff(y, y_ref, (size_t)ref_rows, &ref), ref, ref_rows);
+    }
+    vtm_q4k_i8_set_mode(-1);
+    if (with_f32) {
+        // «До» (0159): fp32-копия таблицы и GEMV по ней. Память +4·n байт.
+        float *wf = (float *)malloc(n * sizeof(float));
+        double best = 1e300;
+
+        if (!wf) {
+            printf("  fp32-таблица: нет памяти (%.2f ГБ)\n", gb * 4.0);
+            goto done;
+        }
+        for (i = 0; i < (int)n; i++)
+            wf[i] = (float)q[i]
+                  * scales[(size_t)i / (size_t)VTM_SCALE_BLOCK_128];
+        for (i = 0; i < iters; i++) {
+            t0 = now_ms();
+            if (vtm_simd_gemv_f32(y_ref, wf, x, rows, cols, 0) != 0) break;
+            ms = now_ms() - t0;
+            if (ms < best) best = ms;
+        }
+        printf("  fp32-таблица (0159): %7.2f мс  %6.2f ГБ/с  %6.2f GMAC/с  "
+               "max|Δ int8−fp32|=%.2e\n", best, (gb * 4.0) / (best * 1e-3),
+               flops / (best * 1e6) / 2.0,
+               max_diff(y, y_ref, (size_t)rows, &ref));
+        free(wf);
+    }
+done:
+    free(q);
+    free(scales);
+    free(x);
+    free(y);
+    free(y_ref);
+}
+
+static int run_i8_gemv_bench(int rows, int cols, int iters, int with_f32) {
+    bench_i8_gemv_table(rows, cols, iters, with_f32);
+    return 0;
 }
 
 // --- многопоточность (задача 0077) -----------------------------------------
@@ -3736,6 +3996,190 @@ static int run_decode_check(const char *explicit_path, const char *prompts_path,
     return (bad_prompts || steps_all == 0) ? 1 : 0;
 }
 
+// --- упакованная таблица словаря: A/B по сырым логитам (задача 0170) -------
+//
+// Критерий 0170 — argmax 20/20 и Δlogits ≤1e-2 против прежнего пути, где
+// int8-таблица разворачивалась в fp32 в арене. Два режима нельзя держать в
+// одном процессе одновременно (1,24 ГиБ fp32-таблицы + упакованная), поэтому
+// модель загружается ДВА РАЗА последовательно: сначала с VTM_I8_EMB=0
+// (эталон, тензор приходит как kind 1), потом упакованная (kind 4). Пик
+// памяти — максимум двух прогонов, а не сумма.
+//
+// Логиты сравниваются шаг за шагом на тех же промптах (decode_compare):
+// argmax, top-5, max|Δlogits|, первый шаг расхождения последовательностей.
+// Время на токен печатается тоже, но на загруженной машине абсолютные мс
+// непригодны (page cache/подкачка) — решения по скорости принимаются по
+// bench_i8_gemv_table и отчёту.
+static int run_emb_check(const char *explicit_path, const char *prompts_path,
+                         int max_new, int limit) {
+    const char *path = find_model(explicit_path);
+    int32_t **ids = NULL;
+    int *lens = NULL;
+    int n_prompts = 0, np, phase;
+    float *lg[2] = {NULL, NULL};
+    int *toks[2] = {NULL, NULL};
+    tok_trace tr;
+    double *ms[2] = {NULL, NULL};
+    int n_logits = 0, n_logits2 = 0;
+    int bad_prompts = 0, seq_ok = 0, steps_all = 0, argmax_all = 0;
+    double sum_top5 = 0.0, max_dl = 0.0, max_ref_all = 0.0;
+
+    if (!path) {
+        fprintf(stderr, "модель не найдена (--emb-check PATH)\n");
+        return 2;
+    }
+    if (!prompts_path) {
+        fprintf(stderr, "--emb-check требует --prompts FILE\n");
+        return 2;
+    }
+    if (read_prompt_file(prompts_path, &ids, &n_prompts, &lens) != 0) return 2;
+    if (n_prompts == 0) {
+        fprintf(stderr, "в %s нет промптов\n", prompts_path);
+        return 2;
+    }
+    if (limit > 0 && limit < n_prompts) n_prompts = limit;
+    if (max_new < 1) max_new = 1;
+    if (max_new > 32) max_new = 32;
+
+    printf("модель: %s\n", path);
+    printf("emb-check: %d промптов × %d токенов; эталон — fp32-таблица "
+           "(VTM_I8_EMB=0), после — упакованная int8 (kind 4)\n",
+           n_prompts, max_new);
+    for (phase = 0; phase < 2; phase++) {
+        vtm_t *m;
+        const vtm_tensor *emb;
+        double t_all = 0.0;
+
+        /* phase 0 — эталон: fp32-развёртка в арене; 1 — упакованная таблица. */
+        vtm_i8_emb_set_mode(phase == 0 ? 0 : 1);
+        m = vtm_load(path);
+        if (!m) {
+            fprintf(stderr, "vtm_load(%s): %s\n", path, vtm_last_error());
+            goto fail;
+        }
+        vtm_set_backend(m, &vtm_backend_simd);
+        emb = vtm_tensor_by_name(m, "emb.w");
+        {
+            const vtm_tensor *lgt = vtm_tensor_by_name(m, "logits");
+
+            if (!lgt || !lgt->f32 || lgt->n_elements == 0) {
+                fprintf(stderr, "в модели нет тензора logits\n");
+                vtm_free(m);
+                goto fail;
+            }
+            if (n_logits == 0) n_logits = (int)lgt->n_elements;
+            else if (n_logits != (int)lgt->n_elements) {
+                fprintf(stderr, "emb-check: разные размеры логитов\n");
+                vtm_free(m);
+                goto fail;
+            }
+        }
+        printf("  фаза %d: emb.w kind=%s, %s\n", phase,
+               emb ? (emb->kind == VTM_TENSOR_INT8 ? "int8"
+                      : (emb->kind == VTM_TENSOR_F32 ? "f32" : "?")) : "нет",
+               emb && emb->i8 ? "байты q в отображении"
+                              : "fp32-развёртка в арене");
+        lg[phase] = (float *)malloc((size_t)n_prompts * (size_t)max_new
+                                    * (size_t)n_logits * sizeof(float));
+        ms[phase] = (double *)calloc((size_t)n_prompts, sizeof(double));
+        toks[phase] = (int *)malloc((size_t)n_prompts * (size_t)max_new
+                                    * sizeof(int));
+        if (!lg[phase] || !ms[phase] || !toks[phase]) {
+            fprintf(stderr, "emb-check: нет памяти (логитов %d × %d × %d)\n",
+                    n_prompts, max_new, n_logits);
+            vtm_free(m);
+            goto fail;
+        }
+        for (np = 0; np < n_prompts; np++) {
+            double t = 0.0;
+            float *dst = lg[phase] + (size_t)np * (size_t)max_new
+                       * (size_t)n_logits;
+
+            tr.toks = toks[phase] + (size_t)np * (size_t)max_new;
+            tr.cap = max_new;
+            tr.n = 0;
+            if (decode_run(m, ids[np], lens[np], max_new, dst, &n_logits2,
+                           &tr, &t) != 0 || n_logits2 != n_logits) {
+                fprintf(stderr, "emb-check: прогон промпта %d (фаза %d) "
+                        "не удался\n", np + 1, phase);
+                vtm_free(m);
+                goto fail;
+            }
+            ms[phase][np] = t / (double)max_new;
+            t_all += ms[phase][np];
+        }
+        printf("         средней мс/токен: %.2f\n",
+               n_prompts ? t_all / (double)n_prompts : 0.0);
+        vtm_free(m);
+    }
+    vtm_i8_emb_set_mode(-1);
+
+    printf("  %4s %7s %7s %8s %9s %13s %6s  %s\n", "N", "prompt", "argmax",
+           "top-5", "Δlogits", "мс/ток", "ускор.", "расхождение");
+    for (np = 0; np < n_prompts; np++) {
+        dec_cmp c;
+        size_t off = (size_t)np * (size_t)max_new * (size_t)n_logits;
+
+        tr.toks = toks[0] + (size_t)np * (size_t)max_new;
+        tr.cap = max_new;
+        tr.n = max_new;
+        {
+            tok_trace tr_a = tr, tr_b = tr;
+
+            tr_b.toks = toks[1] + (size_t)np * (size_t)max_new;
+            decode_compare(lg[0] + off, lg[1] + off, n_logits, &tr_a, &tr_b,
+                           max_new, &c);
+        }
+        c.t_ref = ms[0][np];
+        c.t_new = ms[1][np];
+        printf("  %4d %7d %5d/%-2d %7.1f%% %9.2e %6.1f/%5.1f %5.2fx  %s\n",
+               np + 1, lens[np], c.argmax_ok, c.steps_cmp,
+               100.0 * c.top5_hits / (double)c.steps_cmp, c.max_dlogit,
+               c.t_ref, c.t_new,
+               c.t_ref / (c.t_new > 0.0 ? c.t_new : 1.0),
+               c.diverge_step < 0 ? "нет" : "есть");
+        steps_all += c.steps_cmp;
+        argmax_all += c.argmax_ok;
+        sum_top5 += c.top5_hits;
+        if (c.max_dlogit > max_dl) max_dl = c.max_dlogit;
+        if (c.max_ref > max_ref_all) max_ref_all = c.max_ref;
+        if (c.diverge_step < 0) seq_ok++;
+    }
+    if (steps_all > 0) {
+        printf("итого: последовательность совпала у %d/%d промптов, "
+               "argmax %d/%d шагов, top-5 %.2f%%, "
+               "max|Δlogits| = %.2e (max|ref|=%.2f, порог 1e-2)\n",
+               seq_ok, n_prompts, argmax_all, steps_all,
+               100.0 * sum_top5 / (double)steps_all, max_dl, max_ref_all);
+        printf("emb-check: %s\n",
+               (max_dl <= 1e-2 && argmax_all == steps_all)
+                   ? "ok (argmax совпал на всех шагах, Δlogits ≤ 1e-2)"
+                   : "FAIL (argmax/Δlogits вне допуска)");
+    }
+    free(lg[0]);
+    free(lg[1]);
+    free(ms[0]);
+    free(ms[1]);
+    free(toks[0]);
+    free(toks[1]);
+    for (np = 0; np < n_prompts; np++) free(ids[np]);
+    free(ids);
+    free(lens);
+    return (bad_prompts || steps_all == 0) ? 1 : 0;
+fail:
+    vtm_i8_emb_set_mode(-1);
+    free(lg[0]);
+    free(lg[1]);
+    free(ms[0]);
+    free(ms[1]);
+    free(toks[0]);
+    free(toks[1]);
+    for (np = 0; np < n_prompts; np++) free(ids[np]);
+    free(ids);
+    free(lens);
+    return 1;
+}
+
 // --- TTFT prefill на настоящей модели: по токену против пачки (0162) --------
 //
 // Один процесс, чередование: для каждой длины промпта сначала один путь,
@@ -3866,6 +4310,10 @@ static void usage(const char *prog) {
            "           [--decode-reps N]]\n"
            "          [--decode-check PATH --prompts FILE [--decode-new N]\n"
            "           [--decode-limit N] [--planes 1|2|3]]\n"
+           "          [--emb-check PATH --prompts FILE [--decode-new N]\n"
+           "           [--decode-limit N]]\n"
+           "          [--i8-gemv [--rows N] [--cols N] [--iters N]\n"
+           "           [--f32-table]]\n"
            "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
            "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8);\n"
            "  env VTM_Q4_I8 — int8-dot (SDOT/VNNI): 0 — выключить; 1/2/3 —\n"
@@ -3891,6 +4339,8 @@ int main(int argc, char **argv) {
     int decode_reps = 2;
     const char *decode_prompts_path = NULL;
     int decode_new = 8, decode_limit = 0, planes = 2;
+    int emb_check_path_set = 0, i8_gemv = 0, i8_f32_table = 0;
+    const char *emb_check_path = NULL;
     const char *backend_name = NULL;
     const vtm_backend *cand;
     int i;
@@ -3952,6 +4402,13 @@ int main(int argc, char **argv) {
             decode_check_path = argv[++i];
         } else if (strcmp(argv[i], "--prompts") == 0 && i + 1 < argc) {
             decode_prompts_path = argv[++i];
+        } else if (strcmp(argv[i], "--emb-check") == 0 && i + 1 < argc) {
+            emb_check_path = argv[++i];
+            emb_check_path_set = 1;
+        } else if (strcmp(argv[i], "--i8-gemv") == 0) {
+            i8_gemv = 1;
+        } else if (strcmp(argv[i], "--f32-table") == 0) {
+            i8_f32_table = 1;
         } else if (strcmp(argv[i], "--decode-bench") == 0 && i + 1 < argc) {
             decode_bench_path = argv[++i];
         } else if (strcmp(argv[i], "--decode-reps") == 0 && i + 1 < argc) {
@@ -3971,7 +4428,10 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (rows <= 0 || cols <= 0 || iters <= 0 || cols > 32768 || rows > 32768) {
+    /* --i8-gemv меряет настоящую форму таблицы словаря (151936×2048), поэтому
+       для него предел строк — как у --gemv-rows, а не 32768. */
+    if (rows <= 0 || cols <= 0 || iters <= 0 || cols > 32768
+        || rows > (i8_gemv ? (1 << 22) : 32768)) {
         fprintf(stderr, "плохие размеры/итерации\n");
         return 2;
     }
@@ -4001,6 +4461,11 @@ int main(int argc, char **argv) {
     if (!backend_name && (!getenv("VTM_BACKEND") || !*getenv("VTM_BACKEND")))
         cand = &vtm_backend_simd;  // бенчмарк по умолчанию меряет SIMD
 
+    if (emb_check_path_set)
+        return run_emb_check(emb_check_path, decode_prompts_path, decode_new,
+                             decode_limit);
+    if (i8_gemv)
+        return run_i8_gemv_bench(rows, cols, iters, i8_f32_table);
     if (decode_bench_path)
         return run_decode_bench(*decode_bench_path ? decode_bench_path : NULL,
                                 decode_prompts_path, decode_new, decode_reps);

@@ -1115,7 +1115,7 @@
   {
     "id": "0168",
     "title": "Убрать накладные расходы батчевого prefill",
-    "status": "pending",
+    "status": "done",
     "file": "0168-prefill-overhead.md",
     "assignee": "agent:prefill-overhead"
   },

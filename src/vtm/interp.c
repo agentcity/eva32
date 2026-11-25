@@ -13,6 +13,7 @@
 //   там означает результат, а не поле инструкции.
 #include "vtm_internal.h"
 #include "vtm_backend.h"
+#include "trit.h"
 #include "sha256.h"
 
 #include <limits.h>
@@ -139,6 +140,34 @@ static int qk_tmv_kernel(const vtm_tensor *w, const float *x, int rows,
     if (w->kind == VTM_TENSOR_Q4K)
         return vtm_q4k_tmv(y, qk_blocks(w), x, rows, cols);
     return vtm_q6k_tmv(y, qk_blocks(w), x, rows, cols);
+}
+
+// --- kind 4 (int8), упакованная таблица словаря, задача 0170 ---------------
+//
+// Таблица словаря (tied lm_head) остаётся int8: байты q — в отображении
+// файла, fp32-масштабы по блоку 128 — в арене. EMB разворачивает одну строку,
+// MM/TMV идут GEMV по упакованной таблице (vtm_i8_*). VTM_I8_EMB=0 отдаёт
+// сюда fp32-тензор (kind 1) — тогда работают прежние пути.
+static vtm_status req_i8(vtm_t *m, const vtm_tensor *t, uint32_t ins,
+                         const char *role) {
+    uint64_t blocks;
+
+    if (!t || t->kind != VTM_TENSOR_INT8 || !t->scales || !t->i8)
+        return fail(m, ins, VTM_E_TENSOR,
+                    "%s: нужен int8-тензор (kind 4): байты и масштабы", role);
+    if (t->scale_block != VTM_SCALE_BLOCK_128)
+        return fail(m, ins, VTM_E_FORMAT,
+                    "%s: int8: блок масштаба %u, ожидали %u", role,
+                    (unsigned)t->scale_block,
+                    (unsigned)VTM_SCALE_BLOCK_128);
+    blocks = ((uint64_t)t->n_elements + VTM_SCALE_BLOCK_128 - 1u)
+           / VTM_SCALE_BLOCK_128;
+    if ((uint64_t)t->n_scales != blocks)
+        return fail(m, ins, VTM_E_FORMAT,
+                    "%s: int8: масштабов %u, нужно %llu (по %u значений)",
+                    role, (unsigned)t->n_scales, (unsigned long long)blocks,
+                    (unsigned)VTM_SCALE_BLOCK_128);
+    return VTM_OK;
 }
 
 static vtm_status same_count(vtm_t *m, const vtm_tensor *x, const vtm_tensor *y,
@@ -283,6 +312,30 @@ static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         return VTM_OK;
     }
 
+    // int8 (kind 4, задача 0170): таблица упакована, GEMV по ней — как у
+    // Q4_K/Q6_K, только деквантизация на лету (веса q·sc, блок 128).
+    // Транспонирование не поддержано так же, как у kind 5/6/7: tied lm_head
+    // читает таблицу в её «выходной» ориентации [vocab, hidden].
+    if (w->kind == VTM_TENSOR_INT8) {
+        if ((in->flags & VTM_FLAG_TMV_TRANSPOSED) != 0)
+            return fail(m, ins, VTM_E_UNSUPPORTED,
+                        "TMV: int8 (kind 4) с VTM_FLAG_TMV_TRANSPOSED "
+                        "не поддержан");
+        if ((st = req_i8(m, w, ins, "a (W)")) != VTM_OK) return st;
+        rows = (int)w->dims[0];
+        cols = (int)w->dims[1];
+        if (x->n_elements != (uint32_t)cols)
+            return fail(m, ins, VTM_E_SHAPE,
+                        "x: элементов %u, у W cols=%d", x->n_elements, cols);
+        if (y->n_elements != (uint32_t)rows)
+            return fail(m, ins, VTM_E_SHAPE,
+                        "y: элементов %u, у W rows=%d", y->n_elements, rows);
+        if (vtm_i8_gemv(y->f32, w->i8, w->scales, x->f32, rows, cols) != 0)
+            return fail(m, ins, VTM_E_TENSOR,
+                        "ядро int8 TMV вернуло ошибку");
+        return VTM_OK;
+    }
+
     // Плотный TMV: y = W·x. Нужен для нетернарных весов (эмбеддинги,
     // lm_head при tied_embeddings), которым в тритной матрице места нет.
     // VTM_FLAG_TMV_TRANSPOSED читает a как [cols, rows] и считает Wᵀ·x —
@@ -372,7 +425,7 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     const vtm_tensor *b;
     const vtm_tensor *y;
     int mm, kk, nn, r, c, t;
-    int a_trit, a_q4, a_qk;
+    int a_trit, a_q4, a_qk, a_i8;
 
     if (!a) return st;
     b = need(m, in->b, ins, "b (B)", &st);
@@ -382,10 +435,13 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     a_trit = a->kind == VTM_TENSOR_TRIT;
     a_q4 = a->kind == VTM_TENSOR_Q4;
     a_qk = a->kind == VTM_TENSOR_Q4K || a->kind == VTM_TENSOR_Q6K;
+    a_i8 = a->kind == VTM_TENSOR_INT8;
     if (a_q4) {
         if ((st = req_q4(m, a, ins, "a (A)")) != VTM_OK) return st;
     } else if (a_qk) {
         if ((st = req_q4k(m, a, ins, "a (A)")) != VTM_OK) return st;
+    } else if (a_i8) {
+        if ((st = req_i8(m, a, ins, "a (A)")) != VTM_OK) return st;
     } else if (a_trit) {
         if (!a->words || !a->scales)
             return fail(m, ins, VTM_E_TENSOR,
@@ -414,6 +470,19 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
                     (unsigned)y->dims[0], (unsigned)y->dims[1], mm, nn);
     if (y == a || y == b)
         return fail(m, ins, VTM_E_SHAPE, "MM: dst совпадает с входом");
+
+    if (a_i8) {
+        // kind 4 (0170): tied lm_head по упакованной int8-таблице. n == 1 —
+        // типовой случай: GEMV-ядро (int8-dot на NEON, иначе f32 по блокам).
+        // Общий n — эталон в double, строки таблицы по-прежнему не
+        // разворачиваются в fp32-копию матрицы.
+        int rc = (nn == 1)
+               ? vtm_i8_gemv(y->f32, a->i8, a->scales, b->f32, mm, kk)
+               : vtm_i8_mm(y->f32, a->i8, a->scales, b->f32, mm, kk, nn);
+        if (rc != 0)
+            return fail(m, ins, VTM_E_TENSOR, "ядро int8 MM вернуло ошибку");
+        return VTM_OK;
+    }
 
     if (a_q4) {
         // Q4 A (kind 5): не разворачиваем матрицу в fp32 — ядро деквантизует
@@ -766,6 +835,19 @@ static vtm_status op_emb(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     if (y->n_elements != (uint32_t)dim)
         return fail(m, ins, VTM_E_SHAPE,
                     "EMB: y=%u элементов, dim=%d", y->n_elements, dim);
+
+    if (e->kind == VTM_TENSOR_INT8) {
+        // kind 4 (0170): таблица упакована, разворачивается только строка
+        // токена — как у kind 5/6/7. fp32-копии таблицы в арене больше нет.
+        size_t base;
+        if ((st = req_i8(m, e, ins, "a (E)")) != VTM_OK) return st;
+        base = (size_t)token * (size_t)dim;
+        if (vtm_i8_dequant_row(y->f32, e->i8, e->scales, (int64_t)base, dim)
+            != 0)
+            return fail(m, ins, VTM_E_TENSOR,
+                        "EMB: ядро int8 вернуло ошибку");
+        return VTM_OK;
+    }
 
     if (e->kind == VTM_TENSOR_Q4) {
         // Q4-таблица словаря остаётся упакованной: разворачиваем одну строку
@@ -2119,12 +2201,30 @@ vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
 // прежним путём по токену: побитово то же состояние, без выигрыша. Так же
 // поступает трассировка: записи vtm_set_trace остаются «инструкция на токен».
 
-#define VTM_BATCH_TOKENS        16
+// Потолок пачки. В #define стояло 16, но настоящим потолком было 13 — столько
+// помещалось в scratch, и заодно это худший размер для ядра kind 6/7 (см.
+// batch_chunk_len). Теперь #define — 32 (задача 0168), а настоящий размер
+// режут два ограничителя ниже: память (scratch / активации на токен) и кэш.
+//
+// Кэш. Активации пачки лежат как x[t*C + j], и ядро TMV/MM читает всё x на
+// каждую строку весов. При cols=2048 и C=12 это 96 КБ — ещё в L1 (128 КБ на
+// ядро), а C=16 — уже 128 КБ, и пачка начинает вытеснять сама себя: на 3B
+// Q4_K пачка 16 стоит на токен на 24% дороже, чем 12 (замер 0168,
+// --prefill-ttft, CPU время, парные прогоны: C=12 — 39,1 с, C=16 — 48,6 с на
+// 128 токенов). То есть лимит памяти (96 МиБ ниже) и L1 дают для 3B Q4_K один
+// и тот же размер 12 — поэтому поднимать scratch ради 16 не нужно, а для
+// моделей поменьше (активации на токен меньше) потолок 32 работает как есть.
+#define VTM_BATCH_TOKENS        32
 // Минимальная пачка для батчевого плотного (fp32) TMV/MM: ядро 0159
 // векторизует по токенам, и меньше 4 токенов четвёрка лент не набирается.
 // Такие пачки считаются по токену через vtm_simd_gemv_f32 — это быстрее
 // скалярного double-цикла и не требует отдельной ветки в ядре.
 #define VTM_DENSE_BATCH_MIN     4
+// Лимит памяти пачки: C копий активаций. Оставлен прежним (96 МиБ): у 3B Q4_K
+// это 6,9 МБ активаций на токен, то есть C = 13 -> 12 (пачка кратна 4).
+// Поднимать его смысла нет: при C > 12 пачка упирается в L1 (см. выше), а не
+// в память. 96 МиБ при этом остаются верхней границей для моделей с большими
+// активациями на токен.
 #define VTM_BATCH_SCRATCH_BYTES ((size_t)96u << 20)
 
 // Слова/масштабы в TRT1 лежат со смещением 2 mod 4 (см. backend_scalar.c):
@@ -2837,6 +2937,26 @@ static vtm_status batch_token_op(vtm_t *m, uint32_t pc, const vtm_instr *in,
     return st;
 }
 
+// Размер следующей пачки. Ядро Q4 (0162) и kind 6/7 (0167) считают токены
+// четвёрками, а остаток 1-3 токена — скалярным double-циклом по строке. На 3B
+// Q4_K такой хвост стоит дороже всей пачки: пачка из 13 токенов — 1395 мс
+// против 499 мс у пачки из 12 (замер 0168, ядро TMV kind 6, wall). Поэтому
+// пачка не оставляет хвост 1-3: остаток сливается с ней и делится пополам
+// (13 -> 6+7, 14 -> 7+7, 25 -> 12+6+7). Меньше 2 токенов пачка не бывает —
+// такой хвост всё равно считается поштучно (batch_sequential).
+static int batch_chunk_len(int rem, int cmax) {
+    int C = rem < cmax ? rem : cmax;
+    int left = rem - C;
+
+    if (left > 0 && left < 4) {
+        int tot = C + left;
+
+        C = tot / 2;
+        if (C < 2) C = 2;
+    }
+    return C;
+}
+
 // Пачка: по инструкциям, внутри инструкции — по токенам.
 static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
                               int C, int pos0) {
@@ -2922,6 +3042,10 @@ vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
         if (lim < 1u) lim = 1u;
         if ((size_t)cmax > lim) cmax = (int)lim;
     }
+    // Пачка кратна 4: ядро TMV/MM для Q4/Q4_K/Q6_K считает токены четвёрками,
+    // а остаток 1-3 — скалярным double-циклом по всей строке (он дороже
+    // целой пачки, см. batch_chunk_len). Лимит памяти даёт 13 — берём 12.
+    if (cmax > 4) cmax &= ~3;
     if (cmax > n) cmax = n;
     if (cmax < 2) {                         // пачка не помещается/не нужна
         batch_free(&b);
@@ -2938,7 +3062,7 @@ vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
         int C = n - off;
         vtm_status st;
 
-        if (C > cmax) C = cmax;
+        C = batch_chunk_len(C, cmax);
         if (win != INT_MAX) {
             int64_t room = (int64_t)win - pos0;
             if (room < (int64_t)C) C = (int)room;
