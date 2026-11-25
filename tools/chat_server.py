@@ -2435,7 +2435,9 @@ PAGE_HTML = """<!doctype html>
           <option value="irina">обычный</option>
           <option value="soft">мягче</option>
           <option value="young">моложе</option>
-          <option value="young_soft" selected>моложе и мягче</option>
+          <option value="young_soft">моложе и мягче</option>
+          <option value="softest">очень мягко</option>
+          <option value="younger" selected>очень мягко и молодо</option>
         </select>
       </label>
       <label class="field inline" for="mode">режим
@@ -3954,11 +3956,59 @@ def looks_like_wav(data: bytes | bytearray | None) -> bool:
 #           моложе; темп при этом растёт на те же 6%, поэтому он компенсирован
 #           в rate.
 VOICE_PRESETS: dict[str, dict[str, float]] = {
-    "irina": {"rate": 180.0, "pitch": 1.0},
-    "soft": {"rate": 163.0, "pitch": 1.0},
-    "young": {"rate": 190.0, "pitch": 1.06},
-    "young_soft": {"rate": 172.0, "pitch": 1.05},
+    "irina": {"rate": 180.0, "pitch": 1.0, "smooth": 0.0},
+    "soft": {"rate": 163.0, "pitch": 1.0, "smooth": 0.0},
+    "young": {"rate": 190.0, "pitch": 1.06, "smooth": 0.0},
+    "young_soft": {"rate": 172.0, "pitch": 1.05, "smooth": 0.0},
+    # Ещё мягче и моложе: темп ниже (длиннее паузы, ровнее интонация), высота
+    # на два полутона вверх (1.122), плюс лёгкое сглаживание — убирает
+    # «стеклянную» резкость высоких, из-за которой голос кажется взрослее.
+    "softest": {"rate": 150.0, "pitch": 1.0, "smooth": 0.35},
+    "younger": {"rate": 150.0, "pitch": 1.122, "smooth": 0.35},
 }
+
+
+def _smooth_wav(wav: bytes, amount: float) -> bytes:
+    """Мягкое сглаживание PCM16-моно: y[i] = (1-a)·x[i] + a·(x[i-1]+x[i+1])/2.
+
+    Доля ``amount`` — насколько примешивать соседей. Убирает резкость высоких,
+    из-за которой синтез звучит «взрослее»; больше 0.5 делает кашу, поэтому
+    ограничиваем. Нестандартный WAV возвращается как есть.
+    """
+    if amount <= 0:
+        return wav
+    amount = min(0.5, float(amount))
+    try:
+        import io
+        import wave
+
+        with wave.open(io.BytesIO(wav), "rb") as src:
+            if src.getnchannels() != 1 or src.getsampwidth() != 2:
+                return wav
+            rate = src.getframerate()
+            frames = src.readframes(src.getnframes())
+    except Exception:  # noqa: BLE001
+        return wav
+    import array
+
+    samples = array.array("h")
+    samples.frombytes(frames)
+    total = len(samples)
+    if total < 3:
+        return wav
+    out = array.array("h", bytes(2 * total))
+    out[0] = samples[0]
+    out[total - 1] = samples[total - 1]
+    for i in range(1, total - 1):
+        out[i] = int((1.0 - amount) * samples[i]
+                     + amount * 0.5 * (samples[i - 1] + samples[i + 1]))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as dst:
+        dst.setnchannels(1)
+        dst.setsampwidth(2)
+        dst.setframerate(rate)
+        dst.writeframes(out.tobytes())
+    return buf.getvalue()
 
 
 def _pitch_shift_wav(wav: bytes, factor: float) -> bytes:
@@ -4027,7 +4077,8 @@ def default_tts_speech(text: str, voice: str | None = None) -> bytes:
     else:
         result = synthesize(text, rate=preset["rate"])
         if isinstance(result, (bytes, bytearray)):
-            result = _pitch_shift_wav(bytes(result), preset["pitch"])
+            shifted = _pitch_shift_wav(bytes(result), preset["pitch"])
+            result = _smooth_wav(shifted, preset.get("smooth", 0.0))
     return bytes(result) if isinstance(result, (bytes, bytearray)) else b""
 
 
