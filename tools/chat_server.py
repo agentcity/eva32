@@ -1809,6 +1809,20 @@ def _validate_payload(
     for index, raw_side in enumerate(raw_sides):
         if not isinstance(raw_side, Mapping):
             raise ClientError("sides[{}]: ожидался объект.".format(index))
+        # Колонка «нет»: пользователь гасит Ollama, чтобы не занимать память, —
+        # тогда вторая колонка выключается, а не висит на таймаутах.
+        if str(raw_side.get("backend") or "").strip().lower() == "none":
+            sides.append(
+                {
+                    "backend": "none",
+                    "backend_label": "выключена",
+                    "model": "",
+                    "model_label": "",
+                    "adapter": None,
+                    "disabled": True,
+                }
+            )
+            continue
         backend_id = raw_side.get("backend")
         model_id = raw_side.get("model")
         if not isinstance(backend_id, str) or backend_id not in catalog:
@@ -2461,7 +2475,9 @@ PAGE_HTML = """<!doctype html>
     <article class="panel" id="panel-0">
       <div class="panel-head">
         <div class="pickers">
-          <select id="backend-0" aria-label="Бэкенд слева"></select>
+          <select id="backend-0" aria-label="Бэкенд слева">
+            <option value="none">— нет —</option>
+          </select>
           <select id="model-0" aria-label="Модель слева"></select>
         </div>
         <div class="loadctl">
@@ -2491,7 +2507,9 @@ PAGE_HTML = """<!doctype html>
     <article class="panel" id="panel-1">
       <div class="panel-head">
         <div class="pickers">
-          <select id="backend-1" aria-label="Бэкенд справа"></select>
+          <select id="backend-1" aria-label="Бэкенд справа">
+            <option value="none">— нет —</option>
+          </select>
           <select id="model-1" aria-label="Модель справа"></select>
         </div>
         <div class="loadctl">
@@ -2658,6 +2676,11 @@ PAGE_HTML = """<!doctype html>
       if (!backend.models.length) { option.disabled = true; }
       select.appendChild(option);
     });
+  }
+
+  function backendIsNone(side) {
+    var select = byId("backend-" + side);
+    return !!(select && select.value === "none");
   }
 
   function fillModels(side, preferred) {
@@ -3336,6 +3359,17 @@ PAGE_HTML = """<!doctype html>
     setThreads(metrics.vtm_threads);
   }
 
+  // Ollama может быть выключен специально (освободить память под ВТМ).
+  // Тогда правая колонка переключается в «— нет —», а не висит на таймаутах.
+  function fallbackEmptySide() {
+    var hasOllama = catalog.some(function (item) { return item.id === "ollama"; });
+    if (!hasOllama && byId("backend-1") && byId("backend-1").value !== "none") {
+      byId("backend-1").value = "none";
+      fillModels(1, null);
+      setStatus("Ollama недоступен — правая колонка выключена", false);
+    }
+  }
+
   async function refreshModels() {
     try {
       var response = await fetch("/api/models",
@@ -3764,6 +3798,7 @@ PAGE_HTML = """<!doctype html>
       var data = await response.json();
       catalog = Array.isArray(data.backends) ? data.backends : [];
       defaults = data.defaults || { left: null, right: null };
+      fallbackEmptySide();
       [0, 1].forEach(function (side) {
         fillBackends(side);
         setSide(side, side === 0 ? defaults.left : defaults.right);
@@ -4616,6 +4651,10 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         ВТМ считается по промпту своей колонки, а не по чужому.
         """
         events: "queue.Queue[Any]" = queue.Queue()
+        # Выключенные колонки («— нет —») не запускают ни модель, ни поток:
+        # им хватает start+done, которые отдаются сразу после открытия SSE.
+        disabled = [i for i, side in enumerate(sides) if side.get("disabled")]
+        active = [i for i in range(len(sides)) if i not in disabled]
         stop = threading.Event()
         started = time.monotonic()
         # CPU-время процесса на запрос: ``process_time`` считает все потоки
@@ -4624,7 +4663,8 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         cpu_started = time.process_time()
         questions = [_last_question(messages) for messages in side_messages]
         threads: list[threading.Thread] = []
-        for index, side in enumerate(sides):
+        for index in active:
+            side = sides[index]
             messages = list(side_messages[index])
             thread = threading.Thread(
                 target=_run_side,
@@ -4645,9 +4685,31 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             thread.start()
             threads.append(thread)
 
-        remaining = len(sides)
+        remaining = len(active)
         try:
             self._open_sse()
+            for index in disabled:
+                side = sides[index]
+                self._send_sse_data(
+                    {
+                        "type": "start",
+                        "side": index,
+                        "backend": "none",
+                        "backend_label": "выключена",
+                        "model": "",
+                        "model_label": "",
+                        "cold": False,
+                    }
+                )
+                self._send_sse_data(
+                    {
+                        "type": "done",
+                        "side": index,
+                        "backend": "none",
+                        "model": "",
+                        "reason": "disabled",
+                    }
+                )
             while remaining > 0:
                 item = events.get()
                 if isinstance(item, _SideDone):
