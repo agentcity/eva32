@@ -2300,6 +2300,176 @@ int vtm_q6k_mm_batch(float *y, const uint8_t *blocks, const float *b, int m,
     return qk_tmv_batch(y, blocks, b, m, k, n_tokens, VTM_TENSOR_Q6K);
 }
 
+// --- int8 (kind 4): упакованная таблица словаря, задача 0170 ----------------
+//
+// Таблица 151936×2048 в fp32 — 1,24 ГиБ, и декод читал её целиком каждый
+// токен (36,6 мс при 34 ГБ/с — полоса памяти, потолок ~27 ток/с). Формат
+// kind 4 хранит её int8 (блок 128): загрузчик с 0170 оставляет байты q в
+// отображении, а в арену кладёт только fp32-масштабы (9,7 МиБ у 3B).
+//
+// Ядра этой секции:
+//   * vtm_i8_tmv / vtm_i8_mm — эталон в double (n == 1 и произвольное n),
+//     ровно по определению w = q·scale: сумма по блоку 128 копится в double
+//     и умножается на масштаб блока;
+//   * vtm_i8_dequant_row — одна строка таблицы (EMB; в fp32 не разворачиваем
+//     ничего, кроме неё);
+//   * vtm_i8_gemv — рабочий GEMV декода: NEON int8-dot (SDOT) с квантованными
+//     активациями (0169), иначе переносимый f32-путь по блокам 128.
+
+typedef struct {
+    float *y;
+    const int8_t *q;
+    const float *scales;
+    const float *x;
+    int rows;
+    int cols;
+} i8_tmv_job;
+
+// Строка int8 (row — указатель на её начало, base — её глобальный индекс):
+// сумма по блоку 128 в double, умножение на масштаб блока. v — x (stride 1)
+// либо столбец B (stride n).
+static double i8_dot_row(const int8_t *row, const float *scales, int64_t base,
+                         int k, const float *v, int stride) {
+    double acc = 0.0;
+    int j0 = 0;
+
+    while (j0 < k) {
+        int64_t idx = base + (int64_t)j0;
+        int block = (int)(idx / (int64_t)VTM_SCALE_BLOCK_128);
+        int n = (int)((int64_t)VTM_SCALE_BLOCK_128
+                      - idx % (int64_t)VTM_SCALE_BLOCK_128);
+        double sum = 0.0;
+        int t;
+
+        if (n > k - j0) n = k - j0;
+        for (t = 0; t < n; t++)
+            sum += (double)row[j0 + t]
+                 * (double)v[(size_t)(j0 + t) * (size_t)stride];
+        acc += sum * (double)load_f32_unaligned(scales, block);
+        j0 += n;
+    }
+    return acc;
+}
+
+int vtm_i8_tmv(float *y, const int8_t *q, const float *scales,
+               const float *x, int rows, int cols) {
+    int r;
+
+    if (!y || !q || !scales || !x || rows < 0 || cols < 0) return -1;
+    for (r = 0; r < rows; r++)
+        y[r] = (float)i8_dot_row(q + (size_t)r * (size_t)cols, scales,
+                                 (int64_t)r * (int64_t)cols, cols, x, 1);
+    return 0;
+}
+
+int vtm_i8_mm(float *y, const int8_t *q, const float *scales,
+              const float *b, int m, int k, int n) {
+    int r, c;
+
+    if (!y || !q || !scales || !b || m < 0 || k < 0 || n < 0) return -1;
+    if (!m || !k || !n) return 0;
+    for (r = 0; r < m; r++) {
+        const int8_t *row = q + (size_t)r * (size_t)k;
+        for (c = 0; c < n; c++)
+            y[(size_t)r * (size_t)n + (size_t)c] = (float)i8_dot_row(
+                row, scales, (int64_t)r * (int64_t)k, k, b + (size_t)c, n);
+    }
+    return 0;
+}
+
+// Одна строка int8 -> y (EMB). Таблица остаётся упакованной: разворачивается
+// только выбранная строка и только на время EMB.
+int vtm_i8_dequant_row(float *y, const int8_t *q, const float *scales,
+                       int64_t base, int cols) {
+    int j, block = -1;
+    double scale = 0.0;
+
+    if (!y || !q || !scales || cols < 0 || base < 0) return -1;
+    for (j = 0; j < cols; j++) {
+        int b = (int)((base + (int64_t)j) / (int64_t)VTM_SCALE_BLOCK_128);
+        if (b != block) {
+            block = b;
+            scale = (double)load_f32_unaligned(scales, b);
+        }
+        y[j] = (float)((double)q[base + (int64_t)j] * scale);
+    }
+    return 0;
+}
+
+// Переносимый рабочий путь (без SIMD): блок 128 значений деquantится на лету
+// и умножается на активации, сумма по блоки — в double. Память — O(1) от
+// размера таблицы; это же ядро считает на платформах без int8-dot.
+static void i8_tmv_rows_f32(i8_tmv_job *j, int r0, int r1) {
+    const int cols = j->cols;
+    int r;
+
+    for (r = r0; r < r1; r++) {
+        const int8_t *row = j->q + (size_t)r * (size_t)cols;
+        const int64_t base = (int64_t)r * (int64_t)cols;
+        double total = 0.0;
+        int j0 = 0;
+
+        while (j0 < cols) {
+            int64_t idx = base + (int64_t)j0;
+            int block = (int)(idx / (int64_t)VTM_SCALE_BLOCK_128);
+            int n = (int)((int64_t)VTM_SCALE_BLOCK_128
+                          - idx % (int64_t)VTM_SCALE_BLOCK_128);
+            double scale = (double)load_f32_unaligned(j->scales, block);
+            float sum = 0.0f;
+            int t;
+
+            if (n > cols - j0) n = cols - j0;
+            for (t = 0; t < n; t++)
+                sum += (float)row[j0 + t] * j->x[j0 + t];
+            total += (double)sum * scale;
+            j0 += n;
+        }
+        j->y[r] = (float)total;
+    }
+}
+
+static void i8_tmv_worker(void *p, int tid, int r0, int r1) {
+    (void)tid;
+    i8_tmv_rows_f32((i8_tmv_job *)p, r0, r1);
+}
+
+#if VTM_Q4_NEON
+// NEON-ядро int8-dot GEMV (backend_neon.c). Отказ (-1) — CPU без FEAT_DotProd,
+// cols не кратен 128 или нет памяти: тогда работает переносимый f32-путь.
+extern int vtm_neon_i8_gemv(float *y, const int8_t *q, const float *scales,
+                            const float *x, int rows, int cols, int planes);
+#endif
+
+// GEMV по упакованной int8-таблице: y[r] = Σ_j q[r,j]·sc[j/128]·x[j].
+// Режим int8-точен как у декода (VTM_Q4_I8, число плоскостей): 0 — активации
+// точно в f32 (переносимый путь), 1..3 — SDOT с int8-плоскостями.
+// 0 — успех, -1 — неверные аргументы.
+int vtm_i8_gemv(float *y, const int8_t *q, const float *scales,
+                const float *x, int rows, int cols) {
+    i8_tmv_job job;
+
+    if (!y || !q || !scales || !x) return -1;
+    if (rows < 0 || cols < 0) return -1;
+    if (!rows || !cols) return 0;
+#if VTM_Q4_NEON
+    if (q4_simd_enabled() && vtm_simd_available()) {
+        const int planes = q4k_strict_env() ? 0 : vtm_q4k_i8_mode();
+
+        if (planes > 0
+            && vtm_neon_i8_gemv(y, q, scales, x, rows, cols, planes) == 0)
+            return 0;
+    }
+#endif
+    job.y = y;
+    job.q = q;
+    job.scales = scales;
+    job.x = x;
+    job.rows = rows;
+    job.cols = cols;
+    vtm_parallel_rows(rows, (double)rows * (double)cols, i8_tmv_worker, &job);
+    return 0;
+}
+
 // --- публичные описатели бэкендов -----------------------------------------
 
 const vtm_backend vtm_backend_scalar_lut = {

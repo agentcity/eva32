@@ -2801,6 +2801,168 @@ int vtm_neon_qk_gemv_i8(float *y, const uint8_t *blocks, const float *x,
     return 0;
 }
 
+// --- NEON: GEMV по упакованной int8-таблице (kind 4), задача 0170 ----------
+//
+// Зачем. Таблица словаря 3B (tied lm_head) — [151936, 2048]: в fp32 это
+// 1,24 ГиБ на токен декода, 36,6 мс при 34 ГБ/с (упирается в полосу памяти,
+// потолок ~27 ток/с). В контейнере она уже лежит int8 (kind 4, 0,31 ГБ):
+// загрузчик с 0170 оставляет её упакованной, а этот GEMV считает
+//   y[r] = Σ_j q[r,j]·sc[j/128]·x[j],  q ∈ −127..127, sc — fp32 на блок 128.
+//
+// Точность. Веса int8 представимы в int8 ТОЧНО, поэтому ошибка — только от
+// квантования активаций; оно то же, что у декода kind 6/7 (0169): под-блоки
+// по 32 значения, у каждого свой sx = max|x|/127, плоскости — int8 (шаг sx)
+// и остатки (sx/254, sx/(254·127)). Сетка масштабов таблицы (блок 128) кратна
+// под-блокам, поэтому масштаб таблицы применяется к сумме четырёх под-блоков.
+//
+// Отказ (−1): CPU без FEAT_DotProd, cols не кратен 128 (строка начинается не
+// с границы блока масштабов) или нет памяти — диспетчер backend_scalar.c
+// (vtm_i8_gemv) идёт переносимым f32-путём, прогон не падает.
+
+typedef struct {
+    float *y;
+    const int8_t *q;
+    const float *scales;
+    int8_t *xq;        // cols: 1-я int8-плоскость активаций
+    int8_t *xr;        // cols: остаток (planes >= 2; иначе NULL)
+    int8_t *xs;        // cols: остаток второй плоскости (planes = 3)
+    float *sx;         // cols/32: масштаб под-блока активаций
+    int rows;
+    int cols;
+    int planes;        // 1..3
+} i8t_job;
+
+// Одна строка: 128 значений = 4 под-блока по 32, у каждого свой sx; масштаб
+// таблицы — один на блок. Тело под-блока развёрнуто литералами (S = 0..3),
+// у каждого под-блока свой f32-аккумулятор — 4 независимые цепочки vfma.
+static float i8t_row_dot(const i8t_job *j, int r) {
+    const int nblk = j->cols / (int)VTM_SCALE_BLOCK_128;
+    const int8_t *row = j->q + (size_t)r * (size_t)j->cols;
+    const float *sc = j->scales + (size_t)r * (size_t)nblk;
+    const float k254 = 1.0f / 254.0f;
+    const float k254_127 = 1.0f / (254.0f * 127.0f);
+    double total = 0.0;
+    int b;
+
+    for (b = 0; b < nblk; b++) {
+        const int8_t *bp = row + (size_t)b * VTM_SCALE_BLOCK_128;
+        const int sb0 = b * 4;
+        float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = acc0;
+        float32x4_t acc2 = acc0, acc3 = acc0;
+
+#define I8T_SUB(S, acc)                                                    \
+        do {                                                               \
+            const int8_t *wp = bp + (size_t)(S) * 32u;                     \
+            const int8_t *xp = j->xq + (size_t)(sb0 + (S)) * 32u;          \
+            const int8x16_t w0 = vld1q_s8(wp);                             \
+            const int8x16_t w1 = vld1q_s8(wp + 16);                        \
+            const float sx = j->sx[sb0 + (S)];                             \
+            int32x4_t i1 = VTM_SDOT(                                       \
+                VTM_SDOT(vdupq_n_s32(0), w0, vld1q_s8(xp)),                \
+                w1, vld1q_s8(xp + 16));                                    \
+            acc = vfmaq_n_f32(acc, vcvtq_f32_s32(i1), sx);                 \
+            if (j->planes >= 2) {                                          \
+                const int8_t *rp = j->xr + (size_t)(sb0 + (S)) * 32u;      \
+                int32x4_t i2 = VTM_SDOT(                                   \
+                    VTM_SDOT(vdupq_n_s32(0), w0, vld1q_s8(rp)),            \
+                    w1, vld1q_s8(rp + 16));                                \
+                acc = vfmaq_n_f32(acc, vcvtq_f32_s32(i2), sx * k254);      \
+                if (j->planes >= 3) {                                      \
+                    const int8_t *sp = j->xs + (size_t)(sb0 + (S)) * 32u;  \
+                    int32x4_t i3 = VTM_SDOT(                               \
+                        VTM_SDOT(vdupq_n_s32(0), w0, vld1q_s8(sp)),        \
+                        w1, vld1q_s8(sp + 16));                            \
+                    acc = vfmaq_n_f32(acc, vcvtq_f32_s32(i3),              \
+                                      sx * k254_127);                      \
+                }                                                          \
+            }                                                              \
+        } while (0)
+        I8T_SUB(0, acc0);
+        I8T_SUB(1, acc1);
+        I8T_SUB(2, acc2);
+        I8T_SUB(3, acc3);
+#undef I8T_SUB
+        total += (double)vaddvq_f32(
+                     vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)))
+               * (double)sc[b];
+    }
+    return (float)total;
+}
+
+static void i8t_rows(const i8t_job *j, int r0, int r1) {
+    int r;
+
+    for (r = r0; r < r1; r++) j->y[r] = i8t_row_dot(j, r);
+}
+
+static void i8t_worker(void *p, int tid, int r0, int r1) {
+    (void)tid;
+    i8t_rows((const i8t_job *)p, r0, r1);
+}
+
+// GEMV по упакованной int8-таблице: y[r] = Σ_j q[r,j]·sc[j/128]·x[j].
+// planes — число int8-плоскостей активаций (1..3). 0 — успех; -1 — отказ
+// (CPU/форма/память), вызывающий обязан пойти переносимым путём.
+int vtm_neon_i8_gemv(float *y, const int8_t *q, const float *scales,
+                     const float *x, int rows, int cols, int planes) {
+    i8t_job job;
+    qk_i8_job quant;
+
+    if (!y || !q || !scales || !x) return -1;
+    if (rows <= 0 || cols <= 0) return -1;
+    if (cols % (int)VTM_SCALE_BLOCK_128 != 0) return -1;
+    if (planes < 1) planes = 1;
+    if (planes > 3) planes = 3;
+    if (!vtm_dotprod_cpu()) return -1;
+
+    memset(&job, 0, sizeof job);
+    job.y = y;
+    job.q = q;
+    job.scales = scales;
+    job.cols = cols;
+    job.planes = planes;
+    job.xq = (int8_t *)malloc((size_t)cols);
+    job.sx = (float *)malloc((size_t)(cols / 32) * sizeof(float));
+    if (planes >= 2) job.xr = (int8_t *)malloc((size_t)cols);
+    if (planes >= 3) job.xs = (int8_t *)malloc((size_t)cols);
+    if (!job.xq || !job.sx
+        || (planes >= 2 && !job.xr) || (planes >= 3 && !job.xs)) {
+        free(job.xq);
+        free(job.xr);
+        free(job.xs);
+        free(job.sx);
+        return -1;
+    }
+    // Активации квантуются тем же кодом, что декод kind 6/7 (0169): сетка
+    // под-блоков 32 значения и запасная точная Σx (нужна только Q4_K).
+    memset(&quant, 0, sizeof quant);
+    quant.x = x;
+    quant.cols = cols;
+    quant.planes = planes;
+    quant.xq = job.xq;
+    quant.xr = job.xr;
+    quant.xs = job.xs;
+    quant.sx = job.sx;
+    quant.xsum = (float *)malloc((size_t)(cols / 32) * sizeof(float));
+    if (!quant.xsum) {
+        free(job.xq);
+        free(job.xr);
+        free(job.xs);
+        free(job.sx);
+        return -1;
+    }
+    qk_i8_quant(&quant);
+    free(quant.xsum);
+
+    vtm_parallel_rows(rows, (double)rows * (double)cols, i8t_worker, &job);
+    free(job.xq);
+    free(job.xr);
+    free(job.xs);
+    free(job.sx);
+    return 0;
+}
+
+
 // MM с тритовой A. n == 1 — это фактически TMV по одной строке (tied
 // lm_head: [vocab, hidden] * [hidden, 1]), поэтому идём тем же путём, что
 // и TMV. Для n > 1 — rank-1 обновление по столбцам: 16 значений t копим в

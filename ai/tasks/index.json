@@ -1129,7 +1129,7 @@
   {
     "id": "0170",
     "title": "Упакованная таблица словаря — потолок 27 ток/с",
-    "status": "in_progress",
+    "status": "done",
     "file": "0170-quant-lmhead.md",
     "assignee": "agent:quant-lmhead"
   }

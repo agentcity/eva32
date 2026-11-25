@@ -288,6 +288,32 @@ const char *vtm_q4k_i8_name(void);
 // ядер и не одновременно из разных потоков.
 int vtm_q4k_i8_set_mode(int mode);
 
+// --- int8 (kind 4): упакованная таблица словаря, задача 0170 -----------------
+//
+// kind 4 — самодостаточный INT8-сегмент (18 байт заголовка, fp32/fp16-масштабы
+// на блок 128, затем знаковые байты q, w = q·scale). С 0170 загрузчик держит
+// такую таблицу упакованной: байты q — в отображении файла, в арене только
+// fp32-масштабы (n_scales·4). VTM_I8_EMB=0 возвращает старое поведение
+// (fp32-развёртка в арене, тензор приходит как kind 1).
+//
+// Раскладка: строка r начинается с индекса r·cols, масштаб — общий на блок
+// 128 подряд идущих значений (по сплющенной матрице), т.е.
+// sc[((r·cols + j) / 128)].
+//
+// vtm_i8_tmv/vtm_i8_mm — эталон в double: y[r] = Σ_j q[r,j]·sc·x[j],
+// y[r·n+c] = Σ_t q[r,t]·sc·b[t·n+c]. vtm_i8_dequant_row — одна строка (EMB).
+// vtm_i8_gemv — рабочий GEMV декода (n == 1): NEON int8-dot (SDOT) с
+// квантованными активациями (точность как у 0169, режим VTM_Q4_I8), иначе
+// переносимый f32-путь по блокам 128. 0 — успех, -1 — неверные аргументы.
+int vtm_i8_tmv(float *y, const int8_t *q, const float *scales,
+               const float *x, int rows, int cols);
+int vtm_i8_mm(float *y, const int8_t *q, const float *scales,
+              const float *b, int m, int k, int n);
+int vtm_i8_dequant_row(float *y, const int8_t *q, const float *scales,
+                       int64_t base, int cols);
+int vtm_i8_gemv(float *y, const int8_t *q, const float *scales,
+                const float *x, int rows, int cols);
+
 // --- MM: SIMD-ядра вне `vtm_backend` ---------------------------------------
 //
 // В `vtm_backend` (vtm.h) поля MM нет, поэтому ядра MM — отдельные функции.

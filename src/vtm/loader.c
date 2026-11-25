@@ -96,6 +96,45 @@ static int vtm_env_flag(const char *name) {
     return v && *v && strcmp(v, "0") != 0;
 }
 
+// --- kind 4 (int8) в памяти: упакован или развёрнут (задача 0170) ----------
+//
+// До 0170 загрузчик разворачивал int8-сегмент в fp32 в арене: таблица словаря
+// 3B (151936×2048) занимала 1,24 ГиБ RSS, и каждый токен декода читал её
+// целиком (36,6 мс при 34 ГБ/с — потолок ~27 ток/с). Теперь по умолчанию
+// матрица остаётся упакованной: байты q — в отображении файла, в арене только
+// fp32-масштабы (n_scales·4 = 9,7 МиБ у 3B). EMB разворачивает одну строку,
+// lm_head считается GEMV по упакованной таблице (vtm_i8_tmv/vtm_i8_gemv).
+//
+// VTM_I8_EMB=0 — прежнее поведение (0044): fp32-развёртка в арене. Это и
+// эталон для A/B по сырым логитам, и откат, если упакованный путь где-то не
+// поддержан: тензор приходит в интерпретатор как kind 1, и весь старый код
+// работает без изменений. VTM_I8_EMB=1 — наоборот, заставить упакованный путь
+// даже без int8-dot (считает переносимый f32-путь).
+//
+// Не задано — АВТО: упакованная таблица только если в сборке и на CPU есть
+// int8-dot GEMV (vtm_q4k_i8_mode() > 0, то есть NEON + FEAT_DotProd). На x86
+// декодного int8-ядра нет, и там упакованная таблица означала бы GEMV
+// переносимым f32-путём — это в 2 раза медленнее прежней fp32-таблицы
+// (49,9 мс против 24,9 мс на форме 151936×2048). Так x86 остаётся на старом
+// пути, а VTM_Q4_I8=0 (он же выключает int8-декод) заодно возвращает fp32.
+// Режим фиксируется при загрузке контейнера.
+static int g_i8_emb_mode = -1;
+
+int vtm_i8_emb_mode(void) {
+    if (g_i8_emb_mode < 0) {
+        const char *v = getenv("VTM_I8_EMB");
+        if (v && *v) g_i8_emb_mode = (strcmp(v, "0") == 0) ? 0 : 1;
+        else g_i8_emb_mode = vtm_q4k_i8_mode() > 0 ? 1 : 0;
+    }
+    return g_i8_emb_mode;
+}
+
+int vtm_i8_emb_set_mode(int mode) {
+    if (mode < 0) g_i8_emb_mode = -1;
+    else g_i8_emb_mode = mode ? 1 : 0;
+    return vtm_i8_emb_mode();
+}
+
 void vtm_set_error(vtm_t *m, vtm_status st, const char *fmt, ...) {
     char buf[256];
     va_list ap;
@@ -404,6 +443,11 @@ static int tensor_arena_size(const vtm_tensor *t, size_t *out) {
         if (mul_u64(t->n_blocks, 32u, &a) != 0) return -1;
         if (mul_u64(t->n_scales, 4u, &b) != 0) return -1;
         if (add_u64(a, b, &n) != 0) return -1;
+    } else if (t->kind == VTM_TENSOR_INT8) {
+        // kind 4 (0170): упакованные байты q (n_elements) + fp32-масштабы
+        // по блоку 128 (n_scales·4). fp32-развёртки в арене нет.
+        if (mul_u64(t->n_scales, 4u, &a) != 0) return -1;
+        if (add_u64(a, t->n_elements, &n) != 0) return -1;
     } else if (t->kind == VTM_TENSOR_Q4K || t->kind == VTM_TENSOR_Q6K) {
         // kind 6/7: блоки GGML как есть (144/210 байт на 256 значений).
         if (mul_u64(t->n_qblocks, q4k_block_bytes(t->kind), &n) != 0) return -1;
@@ -436,6 +480,7 @@ typedef struct {
     int    copy_q4;     // Q4: копировать упакованные нибблы в арену
     int    copy_q4_min; // Q4_1: копировать/конвертировать min в арену
     int    copy_qblocks; // Q4_K/Q6_K: копировать блоки GGML в арену
+    int    copy_i8;     // int8: копировать байты q в арену (в mmap — ссылка)
 } tensor_plan;
 
 static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
@@ -450,6 +495,7 @@ static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
     p->copy_q4 = 0;
     p->copy_q4_min = 0;
     p->copy_qblocks = 0;
+    p->copy_i8 = 0;
 
     if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) {
         // writable и can_reference тут ни при чём: файла нет, копировать
@@ -458,6 +504,28 @@ static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
         if (mul_u64(t->n_elements, 4u, &kv_bytes) != 0) return -1;
         if (fits_size_t(kv_bytes, &p->arena_size) != 0) return -1;
         return 0;
+    }
+
+    if (t->kind == VTM_TENSOR_INT8) {
+        // kind 4 (0170): упакованная таблица вместо fp32-развёртки. Байты q
+        // в mmap-режиме остаются в отображении (offsets кратны 32, а сами
+        // байты читаются как int8 — выравнивание не нужно); в арену копии
+        // под них нет. Масштабы всегда материализуются в fp32 в арене:
+        // их 1/128 от числа значений (9,7 МиБ у таблицы 3B), зато ядро
+        // логитов читает f32 без конверсии fp16 на каждую группу.
+        // VTM_I8_EMB=0 — старый путь: вся матрица в fp32 в арене.
+        uint64_t scales_bytes = 0, total = 0;
+
+        if (vtm_i8_emb_mode() == 0) {
+            if (mul_u64(t->n_elements, 4u, &total) != 0) return -1;
+            p->copy_data = 1;
+            return fits_size_t(total, &p->arena_size);
+        }
+        if (mul_u64(t->n_scales, 4u, &scales_bytes) != 0) return -1;
+        p->copy_i8 = !(can_reference && !writable);
+        p->copy_scales = 1;
+        return fits_size_t((p->copy_i8 ? (uint64_t)t->n_elements : 0u)
+                           + scales_bytes, &p->arena_size);
     }
 
     if (t->kind == VTM_TENSOR_Q4) {
@@ -715,27 +783,53 @@ static int fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
             y[i] = vtm_half_to_float(rd16(src + (size_t)i * 2u));
         t->f32 = y;
     } else if (t->kind == VTM_TENSOR_INT8) {
-        // kind 4: расквантовать в fp32. Интерпретатор знает только kind 0..3
-        // и требует t->f32, поэтому в памяти тензор становится fp32, а
-        // источник помечается флагом VTM_TENSOR_FLAG_INT8_SOURCE (в файл он
-        // не пишется). Ленивое чтение int8 в EMB — отдельная задача: она
-        // меняет горячий цикл interp.c.
-        float *y = (float *)(void *)dst;
+        // kind 4 (задача 0044; упаковано с 0170). Два режима:
+        //
+        //  * по умолчанию таблица остаётся int8: t->i8 указывает на байты q
+        //    (в mmap — прямо в отображение), t->scales — на fp32-масштабы в
+        //    арене. fp32-копии нет: EMB разворачивает строку, lm_head —
+        //    GEMV по упакованной таблице (see op_emb/op_mm в interp.c);
+        //  * VTM_I8_EMB=0 — прежний путь: развернуть в fp32 в арене, тензор
+        //    становится kind 1, источник помечается
+        //    VTM_TENSOR_FLAG_INT8_SOURCE (в файл флаг не пишется).
         const uint8_t *src = data + t->offset;
         const uint8_t *sp = src + 18u;
         size_t ss = t->scale_is_f32 ? 4u : 2u;
         const uint8_t *qp = sp + (size_t)t->n_scales * ss;
         uint32_t i;
-        for (i = 0; i < t->n_elements; i++) {
-            uint32_t block = i / t->scale_block;
-            float scale = t->scale_is_f32
-                        ? rd_f32(sp + (size_t)block * 4u)
-                        : vtm_half_to_float(rd16(sp + (size_t)block * 2u));
-            y[i] = (float)((int)(int8_t)qp[i] * scale);
+
+        if (vtm_i8_emb_mode() == 0) {
+            float *y = (float *)(void *)dst;
+            for (i = 0; i < t->n_elements; i++) {
+                uint32_t block = i / t->scale_block;
+                float scale = t->scale_is_f32
+                            ? rd_f32(sp + (size_t)block * 4u)
+                            : vtm_half_to_float(rd16(sp + (size_t)block * 2u));
+                y[i] = (float)((int)(int8_t)qp[i] * scale);
+            }
+            t->f32 = y;
+            t->i8 = NULL;
+            t->flags |= VTM_TENSOR_FLAG_INT8_SOURCE;
+            t->kind = VTM_TENSOR_F32;
+            return 0;
         }
-        t->f32 = y;
-        t->flags |= VTM_TENSOR_FLAG_INT8_SOURCE;
-        t->kind = VTM_TENSOR_F32;
+        {
+            float *scales = (float *)(void *)dst;
+            for (i = 0; i < t->n_scales; i++) {
+                scales[i] = t->scale_is_f32
+                          ? rd_f32(sp + (size_t)i * 4u)
+                          : vtm_half_to_float(rd16(sp + (size_t)i * 2u));
+            }
+            t->scales = scales;
+            if (p->copy_i8) {
+                int8_t *q = (int8_t *)(void *)(dst + (size_t)t->n_scales * 4u);
+                memcpy(q, qp, t->n_elements);
+                t->i8 = q;
+            } else {
+                t->i8 = (const int8_t *)(const void *)qp;
+            }
+            t->f32 = NULL;
+        }
     } else { // BF16
         float *y = (float *)(void *)dst;
         uint32_t i;
@@ -1286,6 +1380,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         t->scale_block = 0;
         t->scale_is_f32 = 0;
         t->qblocks = NULL;
+        t->i8 = NULL;
         t->n_qblocks = 0;
         t->layout = VTM_LAYOUT_TRT1;
 

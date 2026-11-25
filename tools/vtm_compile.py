@@ -125,9 +125,10 @@ src/vtm/vtm run /tmp/synth_14b.vtm --tokens 1 --max-new 1
 Если `architecture.embed == "int8"` (задача 0044), таблица словаря — int8-сегмент
 (kind 4): `dtype: "int8"` в записи `non_ternary.bin`, payload — ровно
 `INT8`-сегмент (`"INT8"`, version, flags, n_values, n_scales, масштабы, q-байты;
-см. `vtm_ref.decode_int8_segment`). `EMB` в Python читает `q · scale`, C-загрузчик
-материализует сегмент в fp32 в арене. `tied lm_head` в этом режиме тоже работает:
-`MM` получает ту же dequantized-таблицу.
+см. `vtm_ref.decode_int8_segment`). `EMB` в Python читает `q · scale`; C с 0170
+держит таблицу упакованной: `EMB` разворачивает одну строку, `MM` (tied lm_head)
+считает GEMV по int8-таблице (`vtm_i8_*`), в арене — только fp32-масштабы.
+`VTM_I8_EMB=0` возвращает fp32-развёртку, если нужен прежний путь.
 
 Если в манифесте `architecture.lm_head == "q4"` (импорт GGUF, задача 0153),
 матрицы Linear и отдельный lm_head лежат Q4-сегментами kind 5 в `q4.bin`

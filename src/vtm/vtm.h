@@ -237,6 +237,12 @@ typedef struct {
     // n_qblocks = ceil(n_elements/256), layout — VTM_LAYOUT_Q4K/Q6K.
     const uint8_t *qblocks;
     uint32_t n_qblocks;
+    // kind 4 (int8 + масштабы, задача 0170): упакованные знаковые байты q
+    // (n_elements, диапазон -127..127) и fp32-масштабы по блоку 128
+    // (scales/n_scales, scale_block == 128). fp32-развёртки в арене больше
+    // нет: пока таблица нужна как f32 (VTM_I8_EMB=0, старый путь), загрузчик
+    // разворачивает её и оставляет kind == VTM_TENSOR_F32, а это поле NULL.
+    const int8_t *i8;
 } vtm_tensor;
 
 // --- инструкция ------------------------------------------------------------
@@ -396,6 +402,21 @@ void vtm_free(vtm_t *m);
 uint32_t vtm_tensor_count(const vtm_t *m);
 const vtm_tensor *vtm_tensor_by_index(const vtm_t *m, uint32_t index);
 const vtm_tensor *vtm_tensor_by_name(const vtm_t *m, const char *name);
+
+// --- kind 4 (int8) в памяти: упакован или развёрнут (задача 0170) ----------
+//
+// По умолчанию int8-таблица остаётся упакованной: в арене лежат только
+// fp32-масштабы (n_scales·4 байт), а байты q читаются из отображения файла.
+// EMB разворачивает одну строку, lm_head (MM/TMV) считает GEMV по упакованной
+// таблице. VTM_I8_EMB=0 возвращает прежнее поведение (0044): загрузчик
+// разворачивает таблицу в fp32 в арене (на 3B это +0,9 ГиБ RSS) и тензор
+// приходит в интерпретатор как kind 1.
+//
+// Режим читается при загрузке контейнера, поэтому vtm_i8_emb_set_mode()
+// действует только на контейнеры, загруженные после вызова (это же нужно
+// парному A/B: эталон — отдельно загруженная копия с VTM_I8_EMB=0).
+int vtm_i8_emb_mode(void);          // 1 — упакован (по умолчанию), 0 — fp32
+int vtm_i8_emb_set_mode(int mode);  // 0/1, -1 — снова env; возвращает режим
 
 uint32_t vtm_instr_count(const vtm_t *m);
 const vtm_instr *vtm_instruction(const vtm_t *m, uint32_t index);

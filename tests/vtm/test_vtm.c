@@ -4,6 +4,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "../../src/vtm/vtm.h"
+#include "../../src/vtm/trit.h"
 
 #include <limits.h>
 #include <math.h>
@@ -334,6 +335,35 @@ static void model_add_q4(model_t *m, const char *name, int ndim,
     tensor_def *td = model_slot(m, name, VTM_TENSOR_Q4, ndim, dims);
     buf_t b = {0};
     make_q4(&b, q, dims_product(ndim, dims), scales, mins, asym, fp32_scale, 1);
+    td->blob = b.p;
+    td->blob_len = b.len;
+}
+
+// INT8-сегмент (kind 4, задача 0044; упакован в памяти с 0170): 18 байт
+// заголовка, масштабы (fp32/fp16) на блок 128, затем знаковые байты q.
+static void make_int8(buf_t *seg, const int8_t *q, uint32_t n_values,
+                      const float *scales, int fp32_scale) {
+    uint32_t n_scales = (n_values + VTM_SCALE_BLOCK_128 - 1u)
+                      / VTM_SCALE_BLOCK_128;
+    uint32_t i;
+    buf_append(seg, "INT8", 4);
+    buf_u8(seg, 1);
+    buf_u8(seg, (uint8_t)(fp32_scale ? 1 : 0));
+    buf_u64(seg, n_values);
+    buf_u32(seg, n_scales);
+    for (i = 0; i < n_scales; i++) {
+        if (fp32_scale) buf_f32(seg, scales[i]);
+        else buf_u16(seg, vtm_float_to_half(scales[i]));
+    }
+    for (i = 0; i < n_values; i++) buf_u8(seg, (uint8_t)(int8_t)q[i]);
+}
+
+static void model_add_int8(model_t *m, const char *name, int ndim,
+                           const uint32_t *dims, const int8_t *q,
+                           const float *scales, int fp32_scale) {
+    tensor_def *td = model_slot(m, name, VTM_TENSOR_INT8, ndim, dims);
+    buf_t b = {0};
+    make_int8(&b, q, dims_product(ndim, dims), scales, fp32_scale);
     td->blob = b.p;
     td->blob_len = b.len;
 }
@@ -815,7 +845,7 @@ static void test_tmv_scale128(void) {
         for (c = 0; c < 150; c++) {
             int64_t idx = (int64_t)r * 150 + c;
             want[r] += (double)wt[idx]
-                     * (double)scales[idx / VTM_SCALE_BLOCK_128]
+                     * (double)scales[idx / (size_t)VTM_SCALE_BLOCK_128]
                      * (double)xv[c];
         }
     }
@@ -1741,6 +1771,134 @@ static void test_mm(void) {
     }
     free(img);
     model_free(&md);
+}
+
+// kind 4 (int8): таблица словаря остаётся УПАКОВАННОЙ в памяти (0170).
+// До 0170 загрузчик разворачивал её в fp32 в арене (1,24 ГиБ у словаря 3B) —
+// теперь в арене только fp32-масштабы, байты q читаются из отображения.
+// Проверяем: kind остаётся int8, t->f32 == NULL; EMB разворачивает строку, а
+// MM (tied lm_head) считает GEMV по упакованной таблице — результат равен
+// эталону q·scale·x. VTM_I8_EMB=0 возвращает прежний путь (kind 1) с тем же
+// результатом.
+static void test_int8_packed(void) {
+    static const uint32_t de[2] = {3, 256};
+    static const uint32_t dx[2] = {256, 1};
+    static const uint32_t dy[2] = {3, 1};
+    int fp32_scale;
+    int saved_mode = vtm_i8_emb_mode();
+
+    for (fp32_scale = 1; fp32_scale >= 0; fp32_scale--) {
+        model_t md;
+        int8_t q[3 * 256];
+        float scales[3 * 256 / VTM_SCALE_BLOCK_128];
+        float xv[256];
+        float yv[3] = {0.0f, 0.0f, 0.0f};
+        float ev[256];
+        uint8_t *img;
+        size_t size;
+        vtm_t *m;
+        uint32_t seed = 0x1700u + (uint32_t)fp32_scale;
+        double want[3];
+        /* Масштабы могут быть fp16: тогда эталон — округлённый масштаб, а
+           допуск сравнения относительный (fp16 даёт ~5e-4). */
+        double rel = fp32_scale ? 1e-6 : 2e-3;
+        int i, r;
+
+        for (i = 0; i < 3 * 256; i++) {
+            seed = seed * 1103515245u + 12345u;
+            q[i] = (int8_t)((int)((seed >> 16) % 255u) - 127);
+        }
+        for (i = 0; i < (int)(3u * 256u / VTM_SCALE_BLOCK_128); i++)
+            scales[i] = 0.004f + 0.01f * (float)i;
+        for (i = 0; i < 256; i++) {
+            seed = seed * 1103515245u + 12345u;
+            xv[i] = (float)((int)((seed >> 16) % 200u) - 100) / 100.0f;
+        }
+        for (i = 0; i < 256; i++) ev[i] = 0.0f;
+        for (r = 0; r < 3; r++) {
+            double acc = 0.0;
+            for (i = 0; i < 256; i++) {
+                size_t idx = (size_t)r * 256u + (size_t)i;
+                acc += (double)q[idx]
+                     * (double)scales[idx / (size_t)VTM_SCALE_BLOCK_128]
+                     * (double)xv[i];
+            }
+            want[r] = acc;
+        }
+
+        model_init(&md);
+        model_add_int8(&md, "E", 2, de, q, scales, fp32_scale);
+        model_add_f32(&md, "x", 2, dx, xv);
+        model_add_f32(&md, "logits", 2, dy, yv);
+        model_add_f32(&md, "e_out", 2, dx, ev);
+        model_inst(&md, VTM_OP_EMB, 0, 3, 0, VTM_NO_TENSOR, VTM_NO_TENSOR, 1);
+        model_inst(&md, VTM_OP_MM, 0, 2, 0, 1, VTM_NO_TENSOR, 0);
+        model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+                   VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+        model_build(&md, &img, &size);
+
+        // 1. Упакованный путь (по умолчанию): kind остаётся int8, fp32-копии
+        //    таблицы в памяти нет.
+        CHECK(vtm_i8_emb_set_mode(1) == 1);
+        m = load_ok(img, size);
+        CHECK(m != NULL);
+        if (m) {
+            const vtm_tensor *e = vtm_tensor_by_name(m, "E");
+
+            CHECK(e != NULL);
+            if (e) {
+                CHECK(e->kind == VTM_TENSOR_INT8);
+                CHECK(e->i8 != NULL);
+                CHECK(e->f32 == NULL);
+                CHECK(e->scales != NULL);
+                CHECK(e->scale_block == VTM_SCALE_BLOCK_128);
+            }
+            CHECK(run_ok(m));
+            for (i = 0; i < 256; i++) {
+                double want_e = (double)q[256 + i]
+                              * (double)scales[(size_t)(256 + i)
+                                               / VTM_SCALE_BLOCK_128];
+                CHECK_NEAR(vtm_tensor_by_name(m, "e_out")->f32[i], want_e,
+                           rel * (want_e > 1.0 ? want_e
+                                               : (want_e < -1.0 ? -want_e
+                                                                : 1.0)));
+            }
+            for (r = 0; r < 3; r++)
+                CHECK_NEAR(vtm_tensor_by_name(m, "logits")->f32[r], want[r],
+                           rel * (want[r] > 1.0 ? want[r]
+                                               : (want[r] < -1.0 ? -want[r]
+                                                                 : 1.0)));
+            vtm_free(m);
+        }
+
+        // 2. Прежний путь VTM_I8_EMB=0: fp32-развёртка в арене (kind 1),
+        //    результат тот же — эталон считает по тем же q·scale.
+        CHECK(vtm_i8_emb_set_mode(0) == 0);
+        m = load_ok(img, size);
+        CHECK(m != NULL);
+        if (m) {
+            const vtm_tensor *e = vtm_tensor_by_name(m, "E");
+
+            CHECK(e != NULL);
+            if (e) {
+                CHECK(e->kind == VTM_TENSOR_F32);
+                CHECK(e->f32 != NULL);
+                CHECK((e->flags & VTM_TENSOR_FLAG_INT8_SOURCE) != 0);
+            }
+            CHECK(run_ok(m));
+            for (r = 0; r < 3; r++)
+                CHECK_NEAR(vtm_tensor_by_name(m, "logits")->f32[r], want[r],
+                           rel * (want[r] > 1.0 ? want[r]
+                                               : (want[r] < -1.0 ? -want[r]
+                                                                 : 1.0)));
+            vtm_free(m);
+        }
+        vtm_i8_emb_set_mode(saved_mode);
+        free(img);
+        model_free(&md);
+    }
+    vtm_i8_emb_set_mode(-1);
+    printf("int8-таблица: упакована в памяти, EMB-строка и MM по ней — ok\n");
 }
 
 // --- поэлементные операции -------------------------------------------------
@@ -2964,8 +3122,9 @@ static void test_q4_bad(void) {
     model_free(&md);
 }
 
-// Старый бинарь узнавал kind 5 как «неизвестный kind» и отказывал до чтения
-// данных; новый обязан так же отвергать любой неизвестный kind, а не угадывать.
+// Старый бинарь узнавал kind 5/6/7 как «неизвестный kind» и отказывал до
+// чтения данных; новый обязан так же отвергать любой неизвестный kind
+// (здесь 8), а не угадывать.
 static void test_q4_unknown_kind_rejected(void) {
     model_t md;
     uint32_t dims[1] = {1};
@@ -2975,14 +3134,14 @@ static void test_q4_unknown_kind_rejected(void) {
     char err[256];
 
     model_init(&md);
-    model_slot(&md, "bad", 6, 1, dims);
+    model_slot(&md, "bad", 8, 1, dims);
     model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
                VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
     model_build(&md, &img, &size);
     err[0] = '\0';
     CHECK(vtm_load_mem(img, size, &st, err, sizeof err) == NULL);
     CHECK(st == VTM_E_FORMAT);
-    CHECK(strstr(err, "неизвестный kind 6") != NULL);
+    CHECK(strstr(err, "неизвестный kind 8") != NULL);
     free(img);
     model_free(&md);
 }
@@ -5513,6 +5672,7 @@ int main(void) {
     test_meta_broken();
     test_emb();
     test_mm();
+    test_int8_packed();
     test_elementwise();
     test_attn_plain();
     test_attn_causal();
