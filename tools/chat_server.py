@@ -2390,6 +2390,7 @@ PAGE_HTML = """<!doctype html>
         </div>
         <button type="button" class="mini ghost" id="collapse-0" hidden>свернуть</button>
         <label class="check tts"><input type="checkbox" id="tts-0"> озвучивать</label>
+        <button class="mini ghost" id="tts-check-0" type="button" title="Проверить звук">▶ звук</button>
         <span class="tts-note" id="tts-note-0" role="status"></span>
       </div>
       <details class="think" id="think-0" hidden>
@@ -2419,6 +2420,7 @@ PAGE_HTML = """<!doctype html>
         </div>
         <button type="button" class="mini ghost" id="collapse-1" hidden>свернуть</button>
         <label class="check tts"><input type="checkbox" id="tts-1"> озвучивать</label>
+        <button class="mini ghost" id="tts-check-1" type="button" title="Проверить звук">▶ звук</button>
         <span class="tts-note" id="tts-note-1" role="status"></span>
       </div>
       <details class="think" id="think-1" hidden>
@@ -2815,7 +2817,63 @@ PAGE_HTML = """<!doctype html>
     if (!note) { return; }
     note.textContent = "нажмите, чтобы включить звук";
     note.classList.add("clickable");
-    note.onclick = function () { note.onclick = null; unlockSpeech(); };
+    note.onclick = function () { speakCheck(side); };
+  }
+
+  // Проверка звука по клику: сначала беззвучная разблокировка (жест), затем
+  // короткая фраза. Так видно и слышно, что голос включился, и не нужно
+  // ждать следующего ответа модели.
+  function speakCheck(side) {
+    var audio = ttsAudio();
+    audio.muted = true;
+    audio.src = SILENT_WAV;
+    var start = null;
+    try { start = audio.play(); } catch (ignored) { start = null; }
+    var proceed = function () {
+      audio.muted = false;
+      fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "Звук включён. Я Ева, слушайте ответы." })
+      }).then(function (resp) {
+        if (!resp.ok) { throw new Error("tts http " + resp.status); }
+        return resp.blob();
+      }).then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var player = ttsAudio();
+        tts.current = { url: url, side: side, check: true };
+        player.onended = function () {
+          try { URL.revokeObjectURL(url); } catch (ignored) { /* уже */ }
+          tts.current = null;
+          tts.playing = false;
+          var note = byId("tts-note-" + side);
+          if (note) { note.textContent = ""; note.onclick = null; note.classList.remove("clickable"); }
+          tts.available = true;
+          if (tts.blocked) {
+            var blocked = tts.blocked;
+            tts.blocked = null;
+            tts.queue.unshift({ side: blocked.side, url: blocked.url, ready: Promise.resolve(blocked.url), generation: tts.generation });
+          }
+          pumpSpeech();
+        };
+        player.src = url;
+        tts.playing = true;
+        var played = player.play();
+        if (played && typeof played.catch === "function") {
+          played.catch(function () {
+            var note = byId("tts-note-" + side);
+            if (note) { note.textContent = "звук всё ещё заблокирован — проверьте настройки сайта"; }
+            tts.playing = false;
+          });
+        }
+      }).catch(function () {
+        var note = byId("tts-note-" + side);
+        if (note) { note.textContent = "синтез недоступен"; }
+        tts.playing = false;
+      });
+    };
+    if (start && typeof start.then === "function") { start.then(proceed, proceed); }
+    else { setTimeout(proceed, 50); }
   }
 
   function pumpSpeech() {
@@ -2853,8 +2911,8 @@ PAGE_HTML = """<!doctype html>
             if (url) { try { URL.revokeObjectURL(url); } catch (ignored) { /* уже */ } }
             return;
           }
-          releaseSpeech();
-          tts.queue.unshift(job);
+          tts.playing = false;
+          tts.blocked = { url: url, side: job.side };
           showUnlockNote(job.side);
         });
       }
@@ -3657,6 +3715,8 @@ PAGE_HTML = """<!doctype html>
     });
     // Галочка «озвучивать»: включение заново пробует голос (сервер мог
     // перезапуститься с TTS), выключение выбрасывает очередь этой колонки.
+    var check = byId("tts-check-" + side);
+    if (check) { check.addEventListener("click", function () { speakCheck(side); }); }
     byId("tts-" + side).addEventListener("change", function () {
       var box = byId("tts-" + side);
       if (box.checked) {
