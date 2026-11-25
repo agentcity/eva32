@@ -224,9 +224,15 @@ typedef struct {
     uint8_t *blob2;
     size_t blob2_len;
     int raw;
+    uint16_t flags;          // флаги записи таблицы (KV-кэш/состояние, 0176)
     uint32_t offset;
     uint32_t scale_offset;
 } tensor_def;
+
+// Значения из loader.c/vtm.h: в тесте они должны быть литералами, чтобы
+// проверять формат, а не повторять приватные макросы загрузчика.
+#define TEST_HEADER_FLAG_KV_OUT_OF_FILE 0x0004u
+#define TEST_KV_NO_OFFSET 0xFFFFFFFFu
 
 typedef struct {
     tensor_def tensors[32];
@@ -286,6 +292,14 @@ static void model_add_f32(model_t *m, const char *name, int ndim,
     for (i = 0; i < n; i++) buf_f32(&b, vals[i]);
     td->blob = b.p;
     td->blob_len = b.len;
+}
+
+// Состояние рекуррентного слоя (CONV4/GDELTA, задача 0176): payload'а нет,
+// буфер создаёт загрузчик (нули), offset — маркер KV_NO_OFFSET.
+static void model_add_state(model_t *m, const char *name, int ndim,
+                            const uint32_t *dims) {
+    tensor_def *td = model_slot(m, name, VTM_TENSOR_F32, ndim, dims);
+    td->flags = VTM_TENSOR_FLAG_STATE;
 }
 
 static void model_add_f16(model_t *m, const char *name, int ndim,
@@ -505,6 +519,16 @@ static int model_build(model_t *m, uint8_t **out, size_t *out_size) {
 
     for (i = 0; i < m->n_tensors; i++) {
         tensor_def *td = &m->tensors[i];
+        int out_of_file = (td->flags & (VTM_TENSOR_FLAG_KV_CACHE
+                                        | VTM_TENSOR_FLAG_STATE)) != 0;
+        if (out_of_file) {
+            // Буфер вне файла: payload'а нет, offset — маркер. Заголовок
+            // обязан нести флаг KV_OUT_OF_FILE (как пишет vtm_ref).
+            offsets[i] = TEST_KV_NO_OFFSET;
+            soffsets[i] = 0u;
+            m->header_flags |= TEST_HEADER_FLAG_KV_OUT_OF_FILE;
+            continue;
+        }
         cursor = align32(cursor);
         offsets[i] = (uint32_t)(cursor - data_start);
         cursor += td->blob_len;
@@ -550,8 +574,12 @@ static int model_build(model_t *m, uint8_t **out, size_t *out_size) {
             put_u32(e + 26u + (size_t)d * 4u, td->dims[d]);
         put_u32(e + 42u, td->offset = offsets[i]);
         put_u32(e + 46u, td->scale_offset = soffsets[i]);
-        memcpy(img + data_start + offsets[i], td->blob, td->blob_len);
-        if (td->raw)
+        put_u16(e + 50u, td->flags);
+        if (td->blob_len
+            && (td->flags & (VTM_TENSOR_FLAG_KV_CACHE
+                             | VTM_TENSOR_FLAG_STATE)) == 0)
+            memcpy(img + data_start + offsets[i], td->blob, td->blob_len);
+        if (td->raw && td->blob2_len)
             memcpy(img + data_start + soffsets[i], td->blob2, td->blob2_len);
     }
     if (m->meta_len)
@@ -590,6 +618,14 @@ static int model_build_v03(model_t *m, uint8_t **out, size_t *out_size) {
 
     for (i = 0; i < m->n_tensors; i++) {
         tensor_def *td = &m->tensors[i];
+        int out_of_file = (td->flags & (VTM_TENSOR_FLAG_KV_CACHE
+                                        | VTM_TENSOR_FLAG_STATE)) != 0;
+        if (out_of_file) {
+            offsets[i] = (uint64_t)TEST_KV_NO_OFFSET;
+            soffsets[i] = 0u;
+            m->header_flags |= TEST_HEADER_FLAG_KV_OUT_OF_FILE;
+            continue;
+        }
         cursor = align32(cursor);
         offsets[i] = (uint64_t)(cursor - data_start);
         cursor += td->blob_len;
@@ -634,9 +670,12 @@ static int model_build_v03(model_t *m, uint8_t **out, size_t *out_size) {
             put_u32(e + 26u + (size_t)d * 4u, td->dims[d]);
         put_u64(e + 42u, td->offset = offsets[i]);
         put_u64(e + 50u, td->scale_offset = soffsets[i]);
-        put_u16(e + 58u, 0);
-        memcpy(img + data_start + offsets[i], td->blob, td->blob_len);
-        if (td->raw)
+        put_u16(e + 58u, td->flags);
+        if (td->blob_len
+            && (td->flags & (VTM_TENSOR_FLAG_KV_CACHE
+                             | VTM_TENSOR_FLAG_STATE)) == 0)
+            memcpy(img + data_start + offsets[i], td->blob, td->blob_len);
+        if (td->raw && td->blob2_len)
             memcpy(img + data_start + soffsets[i], td->blob2, td->blob2_len);
     }
     if (m->meta_len)
@@ -6514,6 +6553,538 @@ static void test_moe_batch(void) {
     printf("  -- MoE: батчевый prefill — токены и выход совпали\n");
 }
 
+
+// --- CONV4/GDELTA (задача 0176) --------------------------------------------
+//
+// Паритет с Python-эталоном проверяется здесь на ручных числах из
+// tests/test_gated_delta.py, а случайные тензоры — в
+// tests/vtm/test_gated_delta_parity.py (крошечная C-проба против vtm_ref).
+// Состояние — f32, поэтому сверяемся с порогом 1e-6, а точные целые числа
+// (ручной CONV4) — побитово.
+
+static uint64_t g_gd_trace_count[256];
+
+static int gd_trace_cb(void *user, const vtm_trace_rec *rec) {
+    (void)user;
+    if (rec) g_gd_trace_count[rec->opcode]++;
+    return 0;
+}
+
+// Модель `EMB → CONV4` с width = 2 (ручной пример из docs/qwen35.md).
+static vtm_t *conv4_load(const float *w, const float *x_table,
+                         int inplace) {
+    static const float def_w[8] = {
+        1.0f, 10.0f, 100.0f, 1000.0f, 2.0f, 20.0f, 200.0f, 2000.0f
+    };
+    static const float def_x[8] = {
+        1.0f, 1.0f, 2.0f, 1.0f, 3.0f, 1.0f, 4.0f, 1.0f
+    };
+    uint32_t xd[1] = {2}, wd[2] = {2, 4}, sd[2] = {3, 2};
+    uint32_t yd[1] = {2}, td[2] = {4, 2};
+    float zero2[2] = {0.0f, 0.0f};
+    uint8_t *img = NULL;
+    size_t size = 0;
+    model_t md;
+    vtm_t *m;
+
+    model_init(&md);
+    model_add_f32(&md, "x", 1, xd, zero2);
+    model_add_f32(&md, "w", 2, wd, w ? w : def_w);
+    model_add_state(&md, "conv.state", 2, sd);
+    model_add_f32(&md, "y", 1, yd, zero2);
+    model_add_f32(&md, "x.table", 2, td, x_table ? x_table : def_x);
+    model_inst(&md, VTM_OP_EMB, VTM_FLAG_EMB_INPUT, 0, 4,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_CONV4, 0, inplace ? 0 : 3, 0, 1, 2, 0);
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    free(img);
+    model_free(&md);
+    return m;
+}
+
+// Модель `EMB×6 → GDELTA`. Банк — ровно шесть подряд идущих тензоров:
+// состояние, v, beta, g, z, norm_w (индексы 2..7); q/k — 0/1, y — 8.
+// Входы задаются таблицами по токенам, поэтому одна машина считает
+// последовательность шагов и состояние переживает vtm_run().
+static vtm_t *gdelta_load(int nk, int nv, int dk, int dv,
+                          const float *qtab, const float *ktab,
+                          const float *vtab, const float *btab,
+                          const float *gtab, const float *ztab,
+                          const float *nw, int ntok, int eps) {
+    uint32_t qd[2], vd[2], bd[1], zd[2], nd[1], yd[2], tq[2], tv[2],
+             tb[2], tz[2];
+    size_t nq = (size_t)nk * (size_t)dk, nv_el = (size_t)nv * (size_t)dv;
+    float *zero_q = (float *)xmalloc(nq * sizeof(float));
+    float *zero_v = (float *)xmalloc(nv_el * sizeof(float));
+    uint8_t *img = NULL;
+    size_t size = 0;
+    model_t md;
+    vtm_t *m;
+
+    memset(zero_q, 0, nq * sizeof(float));
+    memset(zero_v, 0, nv_el * sizeof(float));
+    qd[0] = (uint32_t)nk; qd[1] = (uint32_t)dk;
+    vd[0] = (uint32_t)nv; vd[1] = (uint32_t)dv;
+    bd[0] = (uint32_t)nv;
+    zd[0] = (uint32_t)nv; zd[1] = (uint32_t)dv;
+    nd[0] = (uint32_t)dv;
+    yd[0] = (uint32_t)nv; yd[1] = (uint32_t)dv;
+    tq[0] = (uint32_t)ntok; tq[1] = (uint32_t)(nk * dk);
+    tv[0] = (uint32_t)ntok; tv[1] = (uint32_t)(nv * dv);
+    tb[0] = (uint32_t)ntok; tb[1] = (uint32_t)nv;
+    tz[0] = (uint32_t)ntok; tz[1] = (uint32_t)(nv * dv);
+
+    model_init(&md);
+    model_add_f32(&md, "q", 2, qd, zero_q);
+    model_add_f32(&md, "k", 2, qd, zero_q);
+    model_add_state(&md, "gd.state", 3, (uint32_t[3]){nv, dk, dv});
+    model_add_f32(&md, "v", 2, vd, zero_v);
+    model_add_f32(&md, "beta", 1, bd, zero_v);
+    model_add_f32(&md, "g", 1, bd, zero_v);
+    model_add_f32(&md, "z", 2, zd, zero_v);
+    model_add_f32(&md, "norm_w", 1, nd, nw);
+    model_add_f32(&md, "y", 2, yd, zero_v);
+    model_add_f32(&md, "q.table", 2, tq, qtab);
+    model_add_f32(&md, "k.table", 2, tq, ktab);
+    model_add_f32(&md, "v.table", 2, tv, vtab);
+    model_add_f32(&md, "beta.table", 2, tb, btab);
+    model_add_f32(&md, "g.table", 2, tb, gtab);
+    model_add_f32(&md, "z.table", 2, tz, ztab);
+    model_inst(&md, VTM_OP_EMB, VTM_FLAG_EMB_INPUT, 0, 9, 0, 0, 0);
+    model_inst(&md, VTM_OP_EMB, VTM_FLAG_EMB_INPUT, 1, 10, 0, 0, 0);
+    model_inst(&md, VTM_OP_EMB, VTM_FLAG_EMB_INPUT, 3, 11, 0, 0, 0);
+    model_inst(&md, VTM_OP_EMB, VTM_FLAG_EMB_INPUT, 4, 12, 0, 0, 0);
+    model_inst(&md, VTM_OP_EMB, VTM_FLAG_EMB_INPUT, 5, 13, 0, 0, 0);
+    model_inst(&md, VTM_OP_EMB, VTM_FLAG_EMB_INPUT, 6, 14, 0, 0, 0);
+    model_inst(&md, VTM_OP_GDELTA, 0, 8, 0, 1, 2, eps);
+    model_build(&md, &img, &size);
+    m = load_ok(img, size);
+    free(img);
+    model_free(&md);
+    free(zero_q);
+    free(zero_v);
+    return m;
+}
+
+static const float GD_Q3[] = {1,0, 1,0, 1,0};
+static const float GD_K3[] = {1,0, 1,0, 1,0};
+static const float GD_V3[] = {2,4, 4,2, 1,1};
+static const float GD_B3[] = {0, 0, 0};
+static const float GD_G3[] = {0, 0, 0};
+static const float GD_Z3[] = {1,1, 1,1, 1,1};
+static const float GD_N2[] = {1,1};
+
+static void test_conv4(void) {
+    static const float want_y[4][2] = {
+        {1000.0f, 2000.0f}, {2100.0f, 2200.0f},
+        {3210.0f, 2220.0f}, {4321.0f, 2222.0f}
+    };
+    static const float want_state[4][6] = {
+        {0,0,0,0,1,1}, {0,0,1,1,2,1}, {1,1,2,1,3,1}, {2,1,3,1,4,1}
+    };
+    vtm_t *m = conv4_load(NULL, NULL, 0);
+    const vtm_tensor *state;
+    int step, i;
+
+    CHECK(m != NULL);
+    if (!m) return;
+    state = vtm_tensor_by_name(m, "conv.state");
+    CHECK(state != NULL);
+    if (state) {
+        CHECK((state->flags & VTM_TENSOR_FLAG_STATE) != 0);
+        CHECK(state->offset == TEST_KV_NO_OFFSET);
+        CHECK(state->f32 != NULL);
+        CHECK(state->n_elements == 6);
+        for (i = 0; i < 6; i++) CHECK(state->f32[i] == 0.0f);
+    }
+    for (step = 0; step < 4; step++) {
+        const vtm_tensor *y;
+        vtm_set_position(m, step);
+        vtm_set_token(m, step);
+        CHECK(vtm_run(m, NULL, NULL) == VTM_OK);
+        y = vtm_tensor_by_name(m, "y");
+        state = vtm_tensor_by_name(m, "conv.state");
+        CHECK(y != NULL && state != NULL);
+        if (y) {
+            CHECK(y->f32[0] == want_y[step][0]);
+            CHECK(y->f32[1] == want_y[step][1]);
+        }
+        if (state)
+            for (i = 0; i < 6; i++)
+                CHECK(state->f32[i] == want_state[step][i]);
+    }
+    // Состояние не течёт между «сессиями»: vtm_reset() обнуляет его, и
+    // следующий прогон с того же токена даёт те же числа, что первый.
+    vtm_reset(m);
+    state = vtm_tensor_by_name(m, "conv.state");
+    CHECK(state != NULL);
+    if (state)
+        for (i = 0; i < 6; i++) CHECK(state->f32[i] == 0.0f);
+    vtm_set_token(m, 0);
+    CHECK(vtm_run(m, NULL, NULL) == VTM_OK);
+    {
+        const vtm_tensor *y = vtm_tensor_by_name(m, "y");
+        CHECK(y != NULL);
+        if (y) {
+            CHECK(y->f32[0] == 1000.0f);
+            CHECK(y->f32[1] == 2000.0f);
+        }
+    }
+    // In-place: dst совпадает с x. Свёртка обязана посчитать y по старым
+    // state/x и сдвинуть состояние до записи y (тот же результат, что с
+    // отдельным тензором y).
+    {
+        vtm_t *mi = conv4_load(NULL, NULL, 1);
+        CHECK(mi != NULL);
+        if (mi) {
+            for (step = 0; step < 4; step++) {
+                const vtm_tensor *x;
+                vtm_set_position(mi, step);
+                vtm_set_token(mi, step);
+                CHECK(vtm_run(mi, NULL, NULL) == VTM_OK);
+                x = vtm_tensor_by_name(mi, "x");
+                CHECK(x != NULL);
+                if (x) {
+                    CHECK(x->f32[0] == want_y[step][0]);
+                    CHECK(x->f32[1] == want_y[step][1]);
+                }
+            }
+            vtm_free(mi);
+        }
+    }
+    // --trace-summary считает новые опкоды через общий callback: проверяем,
+    // что имена есть, а записи доходят (main.c печатает по opcode).
+    memset(g_gd_trace_count, 0, sizeof g_gd_trace_count);
+    vtm_reset(m);
+    vtm_set_trace(m, gd_trace_cb, NULL);
+    vtm_set_token(m, 0);
+    CHECK(vtm_run(m, NULL, NULL) == VTM_OK);
+    vtm_set_trace(m, NULL, NULL);
+    CHECK(g_gd_trace_count[VTM_OP_EMB] == 1);
+    CHECK(g_gd_trace_count[VTM_OP_CONV4] == 1);
+    CHECK(strcmp(vtm_opcode_name(VTM_OP_CONV4), "CONV4") == 0);
+    vtm_free(m);
+    printf("  -- CONV4: ручные числа, состояние f32, reset и трасса\n");
+}
+
+static void test_gdelta_manual(void) {
+    static const float want_y[3][2] = {
+        {0.4623620423f, 0.9247240846f},
+        {0.8073191449f, 0.6458553159f},
+        {0.7849748684f, 0.6728356015f}
+    };
+    static const float want_state[3][4] = {
+        {1,2,0,0}, {2.5f,2,0,0}, {1.75f,1.5f,0,0}
+    };
+    vtm_t *m = gdelta_load(1, 1, 2, 2, GD_Q3, GD_K3, GD_V3, GD_B3, GD_G3,
+                           GD_Z3, GD_N2, 3, 0);
+    const vtm_tensor *state;
+    float last_y[2] = {0, 0};
+    int step, i;
+
+    CHECK(m != NULL);
+    if (!m) return;
+    state = vtm_tensor_by_name(m, "gd.state");
+    CHECK(state != NULL);
+    if (state) {
+        CHECK((state->flags & VTM_TENSOR_FLAG_STATE) != 0);
+        CHECK(state->offset == TEST_KV_NO_OFFSET);
+        CHECK(state->ndim == 3 && state->dims[0] == 1 && state->dims[1] == 2
+              && state->dims[2] == 2);
+    }
+    for (step = 0; step < 3; step++) {
+        const vtm_tensor *y;
+        vtm_set_position(m, step);
+        vtm_set_token(m, step);
+        CHECK(vtm_run(m, NULL, NULL) == VTM_OK);
+        y = vtm_tensor_by_name(m, "y");
+        state = vtm_tensor_by_name(m, "gd.state");
+        CHECK(y != NULL && state != NULL);
+        if (y) {
+            CHECK_NEAR(y->f32[0], want_y[step][0], 1e-6);
+            CHECK_NEAR(y->f32[1], want_y[step][1], 1e-6);
+            last_y[0] = y->f32[0];
+            last_y[1] = y->f32[1];
+        }
+        if (state)
+            for (i = 0; i < 4; i++)
+                CHECK_NEAR(state->f32[i], want_state[step][i], 1e-6);
+    }
+    // Батчевый prefill: состояние сквозное, поэтому GDELTA обязан считаться
+    // по токенам в порядке пачки. Результат — тот же, что у трёх vtm_run().
+    vtm_reset(m);
+    {
+        int32_t ids[3] = {0, 1, 2};
+        CHECK(vtm_run_batch(m, ids, 3) == VTM_OK);
+        state = vtm_tensor_by_name(m, "gd.state");
+        {
+            const vtm_tensor *y = vtm_tensor_by_name(m, "y");
+            CHECK(y != NULL && state != NULL);
+            if (y) {
+                CHECK_NEAR(y->f32[0], last_y[0], 1e-6);
+                CHECK_NEAR(y->f32[1], last_y[1], 1e-6);
+            }
+            if (state)
+                for (i = 0; i < 4; i++)
+                    CHECK_NEAR(state->f32[i], want_state[2][i], 1e-6);
+        }
+        CHECK(vtm_position(m) == 2);
+    }
+    // Кэш префикса (0081) не хранит состояние: для графа со STATE он обязан
+    // быть выключен. Иначе попадание восстановило бы K/V, но не S, и хвост
+    // считался бы от чужого состояния. Проверяем: длины кэша нет, а
+    // vtm_run_cached() даёт те же y/S, что обычный полный прогон.
+    {
+        int32_t ids[3] = {0, 1, 2};
+        const vtm_tensor *y;
+
+        vtm_reset(m);
+        CHECK(vtm_cache_prefix(m, ids, 3) == VTM_OK);
+        CHECK(vtm_cache_prefix_len(m) == 0);
+        CHECK(vtm_run_cached(m, ids, 3) == VTM_OK);
+        y = vtm_tensor_by_name(m, "y");
+        state = vtm_tensor_by_name(m, "gd.state");
+        CHECK(y != NULL && state != NULL);
+        if (y) {
+            CHECK_NEAR(y->f32[0], last_y[0], 1e-6);
+            CHECK_NEAR(y->f32[1], last_y[1], 1e-6);
+        }
+        if (state)
+            for (i = 0; i < 4; i++)
+                CHECK_NEAR(state->f32[i], want_state[2][i], 1e-6);
+    }
+    // Сброс и трасса (main.c --trace-summary печатает эти опкоды по имени).
+    vtm_reset(m);
+    state = vtm_tensor_by_name(m, "gd.state");
+    CHECK(state != NULL);
+    if (state)
+        for (i = 0; i < 4; i++) CHECK(state->f32[i] == 0.0f);
+    memset(g_gd_trace_count, 0, sizeof g_gd_trace_count);
+    vtm_set_trace(m, gd_trace_cb, NULL);
+    vtm_set_token(m, 0);
+    CHECK(vtm_run(m, NULL, NULL) == VTM_OK);
+    vtm_set_trace(m, NULL, NULL);
+    CHECK(g_gd_trace_count[VTM_OP_EMB] == 6);
+    CHECK(g_gd_trace_count[VTM_OP_GDELTA] == 1);
+    CHECK(strcmp(vtm_opcode_name(VTM_OP_GDELTA), "GDELTA") == 0);
+    vtm_free(m);
+    printf("  -- GDELTA: ручные числа, пачка, reset и трасса\n");
+}
+
+static void test_gdelta_properties(void) {
+    // 1. Две value-головы на одну key-голову: kh = h / 2, у каждой свой
+    //    участок состояния [Hv, Dk, Dv].
+    {
+        static const float q1[] = {1,0};
+        static const float k1[] = {1,0};
+        static const float v1[] = {2,0, 0,1};
+        static const float b1[] = {0,0};
+        static const float g1[] = {0,0};
+        static const float z1[] = {1,1, 1,1};
+        static const float nw1[] = {1,1};
+        vtm_t *m = gdelta_load(1, 2, 2, 2, q1, k1, v1, b1, g1, z1, nw1, 1, 0);
+        const vtm_tensor *state, *y;
+        double root_two = sqrt(2.0), silu1 = 1.0 / (1.0 + exp(-1.0));
+
+        CHECK(m != NULL);
+        if (!m) return;
+        vtm_set_token(m, 0);
+        CHECK(vtm_run(m, NULL, NULL) == VTM_OK);
+        state = vtm_tensor_by_name(m, "gd.state");
+        y = vtm_tensor_by_name(m, "y");
+        CHECK(state != NULL && y != NULL);
+        if (state) {
+            static const float want[8] = {1,0,0,0, 0,0.5f,0,0};
+            int i;
+            for (i = 0; i < 8; i++) CHECK_NEAR(state->f32[i], want[i], 1e-6);
+        }
+        if (y) {
+            CHECK_NEAR(y->f32[0], root_two * silu1, 1e-6);
+            CHECK_NEAR(y->f32[1], 0.0, 1e-6);
+            CHECK_NEAR(y->f32[2], 0.0, 1e-6);
+            CHECK_NEAR(y->f32[3], root_two * silu1, 1e-6);
+        }
+        vtm_free(m);
+    }
+    // 2. L2-нормировка: q ⊥ k → o = 0, а состояние всё равно обновляется.
+    //    Состояние [[0,0],[1,2]] проверяет и ось: k̂ идёт во вторую строку.
+    {
+        static const float q1[] = {3,0};
+        static const float k1[] = {0,5};
+        static const float v1[] = {2,4};
+        static const float b1[] = {0};
+        static const float g1[] = {0};
+        static const float z1[] = {1,1};
+        vtm_t *m = gdelta_load(1, 1, 2, 2, q1, k1, v1, b1, g1, z1, GD_N2, 1, 0);
+        const vtm_tensor *state, *y;
+        int i;
+
+        CHECK(m != NULL);
+        if (!m) return;
+        vtm_set_token(m, 0);
+        CHECK(vtm_run(m, NULL, NULL) == VTM_OK);
+        state = vtm_tensor_by_name(m, "gd.state");
+        y = vtm_tensor_by_name(m, "y");
+        CHECK(state != NULL && y != NULL);
+        if (state) {
+            static const float want[4] = {0,0,1,2};
+            for (i = 0; i < 4; i++) CHECK_NEAR(state->f32[i], want[i], 1e-6);
+        }
+        if (y) {
+            CHECK_NEAR(y->f32[0], 0.0, 1e-6);
+            CHECK_NEAR(y->f32[1], 0.0, 1e-6);
+        }
+        vtm_free(m);
+    }
+    // 3. Затухание: k = v = 0, g = ln 0.5 → состояние ровно вдвое меньше.
+    {
+        static const float q2[] = {1,0, 0,0};
+        static const float k2[] = {1,0, 0,0};
+        static const float v2[] = {2,4, 0,0};
+        static const float b2[] = {0,0};
+        static const float g2[] = {0, (float)-0.6931471805599453};
+        static const float z2[] = {1,1, 1,1};
+        vtm_t *m = gdelta_load(1, 1, 2, 2, q2, k2, v2, b2, g2, z2, GD_N2, 2, 0);
+        const vtm_tensor *state, *y;
+        int i;
+
+        CHECK(m != NULL);
+        if (!m) return;
+        vtm_set_token(m, 0);
+        CHECK(vtm_run(m, NULL, NULL) == VTM_OK);
+        vtm_set_position(m, 1);
+        vtm_set_token(m, 1);
+        CHECK(vtm_run(m, NULL, NULL) == VTM_OK);
+        state = vtm_tensor_by_name(m, "gd.state");
+        y = vtm_tensor_by_name(m, "y");
+        CHECK(state != NULL && y != NULL);
+        if (state) {
+            static const float want[4] = {0.5f,1.0f,0,0};
+            for (i = 0; i < 4; i++) CHECK_NEAR(state->f32[i], want[i], 1e-6);
+        }
+        if (y) {
+            CHECK_NEAR(y->f32[0], 0.0, 1e-6);
+            CHECK_NEAR(y->f32[1], 0.0, 1e-6);
+        }
+        vtm_free(m);
+    }
+    // 4. q = 0 при eps = 0: нулевая строка q̂ остаётся нулевой (а не NaN),
+    //    выход нулевой, но состояние обновляется — «выход 0» не значит
+    //    «шаг не сделан».
+    {
+        static const float q1[] = {0,0};
+        static const float k1[] = {1,0};
+        static const float v1[] = {2,4};
+        static const float b1[] = {0};
+        static const float g1[] = {0};
+        static const float z1[] = {1,1};
+        vtm_t *m = gdelta_load(1, 1, 2, 2, q1, k1, v1, b1, g1, z1, GD_N2, 1, 0);
+        const vtm_tensor *state, *y;
+        int i;
+
+        CHECK(m != NULL);
+        if (!m) return;
+        vtm_set_token(m, 0);
+        CHECK(vtm_run(m, NULL, NULL) == VTM_OK);
+        state = vtm_tensor_by_name(m, "gd.state");
+        y = vtm_tensor_by_name(m, "y");
+        CHECK(state != NULL && y != NULL);
+        if (state) {
+            static const float want[4] = {1,2,0,0};
+            for (i = 0; i < 4; i++) CHECK_NEAR(state->f32[i], want[i], 1e-6);
+        }
+        if (y) {
+            CHECK_NEAR(y->f32[0], 0.0, 1e-6);
+            CHECK_NEAR(y->f32[1], 0.0, 1e-6);
+        }
+        vtm_free(m);
+    }
+    printf("  -- GDELTA: две value-головы, L2-нормировка, затухание, q=0\n");
+}
+
+static void test_gated_delta_errors(void) {
+    // 1. Обрезанный банк: c+5 за границей таблицы — отказ до чтения z/norm_w.
+    {
+        uint32_t qd[2] = {1, 2}, vd[2] = {1, 2}, bd[1] = {1};
+        float qv[2] = {1, 0}, kv[2] = {1, 0}, vv[2] = {2, 4};
+        float bv[1] = {0}, gv[1] = {0};
+        uint8_t *img = NULL;
+        size_t size = 0;
+        model_t md;
+        vtm_t *m;
+
+        model_init(&md);
+        model_add_f32(&md, "q", 2, qd, qv);
+        model_add_f32(&md, "k", 2, qd, kv);
+        model_add_state(&md, "state", 3, (uint32_t[3]){1, 2, 2});
+        model_add_f32(&md, "v", 2, vd, vv);
+        model_add_f32(&md, "beta", 1, bd, bv);
+        model_add_f32(&md, "g", 1, bd, gv);
+        model_add_f32(&md, "y", 2, vd, vv);
+        model_inst(&md, VTM_OP_GDELTA, 0, 6, 0, 1, 2, 0);
+        model_build(&md, &img, &size);
+        m = load_ok(img, size);
+        free(img);
+        model_free(&md);
+        CHECK(m != NULL);
+        if (m) {
+            vtm_status st = vtm_run(m, NULL, NULL);
+            CHECK(st == VTM_E_TENSOR);
+            CHECK(strstr(vtm_error_message(m), "GDELTA") != NULL);
+            vtm_free(m);
+        }
+    }
+    // 2. Отрицательный eps (imm) — отказ, а не тихая нормировка.
+    {
+        vtm_t *m = gdelta_load(1, 1, 2, 2, GD_Q3, GD_K3, GD_V3, GD_B3, GD_G3,
+                               GD_Z3, GD_N2, 1, -1);
+        CHECK(m != NULL);
+        if (m) {
+            vtm_status st;
+            vtm_set_token(m, 0);
+            st = vtm_run(m, NULL, NULL);
+            CHECK(st == VTM_E_ARG);
+            CHECK(strstr(vtm_error_message(m), "eps") != NULL);
+            vtm_free(m);
+        }
+    }
+    // 3. Бит STATE у тритов — это хранение тритов (биты 1..2), а не буфер:
+    //    загрузчик обязан отказать, а не принять трит за состояние.
+    {
+        uint8_t *img = NULL;
+        size_t size = 0;
+        model_t md;
+        vtm_t *m;
+        int8_t trits[4] = {1, -1, 0, 1};
+        float scales[1] = {1.0f};
+        uint32_t wd[1] = {4};
+        float vals[4] = {0, 0, 0, 0};
+
+        model_init(&md);
+        model_add_trit_scaled(&md, "w", 1, wd, trits, scales, 1,
+                              (int)VTM_SCALE_BLOCK_128);
+        md.tensors[0].flags = VTM_TENSOR_FLAG_STATE;
+        model_add_f32(&md, "y", 1, wd, vals);
+        model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+                   VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+        model_build(&md, &img, &size);
+        m = vtm_load_mem(img, size, NULL, NULL, 0);
+        CHECK(m == NULL);
+        CHECK(strstr(vtm_last_error(), "fp-тензор") != NULL);
+        free(img);
+        model_free(&md);
+    }
+    printf("  -- GDELTA: обрезанный банк, eps, бит STATE у тритов\n");
+}
+
+static void test_gated_delta(void) {
+    test_conv4();
+    test_gdelta_manual();
+    test_gdelta_properties();
+    test_gated_delta_errors();
+}
+
 // --- main ------------------------------------------------------------------
 
 int main(void) {
@@ -6568,6 +7139,7 @@ int main(void) {
     test_cache_prefix_ring();
     test_cache_batch();
     test_run_batch();
+    test_gated_delta();
     test_moe_pread_cache();
     test_moe_prefetch();
     test_moe_batch();

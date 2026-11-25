@@ -1171,7 +1171,7 @@
   {
     "id": "0176",
     "title": "Gated Delta linear attention",
-    "status": "in_progress",
+    "status": "done",
     "file": "0176-gated-delta.md",
     "assignee": "agent:gated-delta"
   },

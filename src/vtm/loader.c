@@ -1469,23 +1469,25 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                 t->kind == VTM_TENSOR_Q4 || t->kind == VTM_TENSOR_Q4K ||
                 t->kind == VTM_TENSOR_Q6K)
                 FAIL(VTM_E_FORMAT,
-                     "тензор %u (%s): KV-кэш обязан быть fp-тензором (kind %u)",
+                     "тензор %u (%s): буфер вне файла (KV-кэш/состояние) обязан "
+                     "быть fp-тензором (kind %u)",
                      i, t->name, (unsigned)t->kind);
             if (t->scale_offset64 != 0)
                 FAIL(VTM_E_FORMAT,
-                     "тензор %u (%s): у KV-кэша scale_offset=%llu, ожидался 0",
+                     "тензор %u (%s): у буфера вне файла scale_offset=%llu, "
+                     "ожидался 0",
                      i, t->name, (unsigned long long)t->scale_offset64);
             if (kv_flag) {
                 if (t->offset64 != VTM_KV_NO_OFFSET)
                     FAIL(VTM_E_FORMAT,
-                         "тензор %u (%s): у KV-кэша offset=%llu, ожидался 0x%08X "
+                         "тензор %u (%s): у буфера вне файла offset=%llu, ожидался 0x%08X "
                          "(payload'а нет; флаг KV_OUT_OF_FILE)",
                          i, t->name, (unsigned long long)t->offset64,
                          (unsigned)VTM_KV_NO_OFFSET);
             } else if (t->offset64 != 0) {
                 FAIL(VTM_E_FORMAT,
-                     "тензор %u (%s): KV-кэш без флага KV_OUT_OF_FILE, но "
-                     "offset=%llu (ожидался 0)",
+                     "тензор %u (%s): буфер вне файла без флага KV_OUT_OF_FILE, "
+                     "но offset=%llu (ожидался 0)",
                      i, t->name, (unsigned long long)t->offset64);
             }
             // Кэп на суммарный размер: один помеченный тензор в 192-байтном
@@ -1494,7 +1496,8 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
             if (bytes > VTM_MAX_KV_BYTES ||
                 kv_bytes > VTM_MAX_KV_BYTES - bytes)
                 FAIL(VTM_E_FORMAT,
-                     "KV-кэши: суммарный размер %llu байт больше предела %llu "
+                     "буферы вне файла (KV-кэши/состояния): суммарный размер %llu "
+                     "байт больше предела %llu "
                      "(VTM_MAX_KV_BYTES); тензор %u (%s) — %u элементов",
                      (unsigned long long)(kv_bytes + bytes),
                      (unsigned long long)VTM_MAX_KV_BYTES,
@@ -2007,7 +2010,8 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
     // флага читаются по-прежнему, их KV-записи несут offset=0.
     if (kv_flag && !has_kv)
         FAIL(VTM_E_FORMAT,
-             "флаг KV_OUT_OF_FILE поднят, но в таблице нет KV-кэшей");
+             "флаг KV_OUT_OF_FILE поднят, но в таблице нет буферов вне "
+             "файла (KV-кэшей/состояний)");
 
     m->n_instr = n_instr;
     if (n_instr) {
@@ -2031,10 +2035,13 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         // Проверка «свой/чужой опкод» остаётся tripwire'ом: неизвестный
         // опкод отвергается до чтения данных, поэтому контейнер с новыми
         // операциями не может быть исполнен старым бинарём «почти верно».
-        // Новые опкоды (0172) перечислены явно, а не «всё, что <= 0x11».
+        // Новые опкоды (0172: MOE/RMSH; 0176: CONV4/GDELTA) перечислены
+        // явно, а не «всё, что <= 0x13».
         if (in->opcode < VTM_OP_TMV
             || (in->opcode > VTM_OP_HALT && in->opcode != VTM_OP_MOE
-                && in->opcode != VTM_OP_RMSH))
+                && in->opcode != VTM_OP_RMSH
+                && in->opcode != VTM_OP_CONV4
+                && in->opcode != VTM_OP_GDELTA))
             FAIL(VTM_E_OPCODE, "инструкция %u: неизвестный opcode 0x%02x",
                  i, (unsigned)in->opcode);
         if ((in->dst != VTM_NO_TENSOR && in->dst >= n_tensors) ||
@@ -2603,12 +2610,26 @@ int vtm_generated(const vtm_t *m) {
 }
 
 void vtm_reset(vtm_t *m) {
+    uint32_t i;
+
     if (!m) return;
     m->position = 0;
     m->input_token = -1;
     m->generated = 0;
     m->halted = 0;
     m->error[0] = '\0';
+    // Состояния рекуррентных слоёв (CONV4/GDELTA, задача 0176) — единственные
+    // тензоры, которые переживают vtm_run() и обязаны обнуляться вместе с
+    // позицией: иначе новый диалог на той же машине начнётся с чужого
+    // состояния. KV-кэш по-прежнему сбрасывает хост (KVW перезаписывает
+    // слоты), поэтому его здесь не трогаем.
+    for (i = 0; i < m->n_tensors; i++) {
+        vtm_tensor *t = &m->tensors[i];
+
+        if ((t->flags & VTM_TENSOR_FLAG_STATE) != 0 && t->f32 != NULL
+            && t->n_elements > 0)
+            memset(t->f32, 0, (size_t)t->n_elements * sizeof(float));
+    }
 }
 
 const char *vtm_error_message(const vtm_t *m) {

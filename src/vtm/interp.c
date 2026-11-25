@@ -2615,6 +2615,333 @@ static vtm_status op_attn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     return VTM_OK;
 }
 
+// --- CONV4/GDELTA (задача 0176) --------------------------------------------
+//
+// Эталон — `tools/vtm_ref.py` (op CONV4/GDELTA). C повторяет его порядок
+// действий и округлений: считает в double, а в f32 пишет только выход и
+// состояние. Состояние округляется на КАЖДОМ шаге — иначе длинный прогон
+// разойдётся с эталоном (в Qwen3.5 состояние и так `float32`).
+//
+// Гейт `silu`, стабильная сигмоида и `exp` для лога затухания — ровно те же
+// формулы, что `_silu`/`_sigmoid`/`_exp_decay` в эталоне: на переполнении
+// `exp` даёт `inf`, а не исключение (C ведёт себя так же).
+
+static double gd_sigmoid(double value) {
+    if (value >= 0.0) return 1.0 / (1.0 + exp(-value));
+    {
+        double scaled = exp(value);
+        return scaled / (1.0 + scaled);
+    }
+}
+
+static double gd_silu(double value) {
+    if (value < -700.0) return 0.0;
+    return value / (1.0 + exp(-value));
+}
+
+// Построчная L2-нормировка `x / sqrt(x·x + eps)` в double-буфер. Нулевая
+// строка остаётся нулевой (как `_l2_normalize_rows`): при eps = 0 деление на
+// ноль дало бы NaN, которого во входе нет.
+static void gd_l2_row(const float *row, int dim, double eps, double *out) {
+    double square = 0.0, denominator, norm;
+    int i;
+
+    for (i = 0; i < dim; i++)
+        square += (double)row[i] * (double)row[i];
+    denominator = square + eps;
+    if (denominator <= 0.0) {
+        for (i = 0; i < dim; i++) out[i] = 0.0;
+        return;
+    }
+    norm = sqrt(denominator);
+    for (i = 0; i < dim; i++) out[i] = (double)row[i] / norm;
+}
+
+// Состояние — тензор с флагом STATE: буфер в арене, который обнуляет
+// vtm_reset(). Без флага писать в него нельзя (тензор мог остаться в mmap).
+static vtm_status gd_need_state(vtm_t *m, uint32_t ins, const vtm_tensor *t,
+                                const char *role) {
+    if (!(t->flags & VTM_TENSOR_FLAG_STATE))
+        return fail(m, ins, VTM_E_TENSOR,
+                    "%s: тензор без флага STATE (VTM_TENSOR_FLAG_STATE)", role);
+    return VTM_OK;
+}
+
+static vtm_status op_conv4(vtm_t *m, uint32_t ins, const vtm_instr *in) {
+    vtm_status st;
+    const vtm_tensor *x = need(m, in->a, ins, "a (x)", &st);
+    const vtm_tensor *w;
+    const vtm_tensor *state;
+    const vtm_tensor *out;
+    const float *xp, *wp;
+    float *sp, *yp;
+    uint32_t width, channel;
+    size_t base;
+
+    if (!x) return st;
+    w = need(m, in->b, ins, "b (w)", &st);
+    if (!w) return st;
+    state = need(m, in->c, ins, "c (состояние)", &st);
+    if (!state) return st;
+    out = need(m, in->dst, ins, "dst (y)", &st);
+    if (!out) return st;
+    if ((st = req_f32(m, x, ins, "a (x)")) != VTM_OK) return st;
+    if ((st = req_f32(m, w, ins, "b (w)")) != VTM_OK) return st;
+    if ((st = req_f32(m, state, ins, "c (состояние)")) != VTM_OK) return st;
+    if ((st = req_f32(m, out, ins, "dst (y)")) != VTM_OK) return st;
+    if (w->ndim != 2 || w->dims[1] != VTM_CONV4_KERNEL)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "CONV4: w должен быть [width, %u], dims=[%u, %u]",
+                    (unsigned)VTM_CONV4_KERNEL,
+                    w->ndim > 0 ? w->dims[0] : 0,
+                    w->ndim > 1 ? w->dims[1] : 0);
+    width = w->dims[0];
+    if (width == 0)
+        return fail(m, ins, VTM_E_SHAPE, "CONV4: width = 0");
+    if (x->n_elements != width)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "CONV4: x длиной %u, а w ждёт width=%u", x->n_elements,
+                    width);
+    if (state->ndim != 2 || state->dims[0] != VTM_CONV4_KERNEL - 1u
+        || state->dims[1] != width)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "CONV4: состояние должно быть [%u, %u], dims=[%u, %u]",
+                    (unsigned)(VTM_CONV4_KERNEL - 1u), width,
+                    state->ndim > 0 ? state->dims[0] : 0,
+                    state->ndim > 1 ? state->dims[1] : 0);
+    if ((st = gd_need_state(m, ins, state, "CONV4: c (состояние)")) != VTM_OK)
+        return st;
+    if (out->n_elements != width)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "CONV4: y длиной %u, ожидалось %u", out->n_elements,
+                    width);
+    // dst == state не поддерживается: у y длина width, у состояния 3·width,
+    // и запись затёрла бы состояние, из которого только что считали. dst == x
+    // (in-place, как подсказка INPLACE) — законен: канал читает только свой
+    // x[c], поэтому сначала сдвигаем состояние, затем пишем y по каналам.
+    if (out == state)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "CONV4: dst совпадает с c (состояние)");
+
+    xp = x->f32;
+    wp = w->f32;
+    sp = state->f32;
+    yp = out->f32;
+    // Один канал за итерацию: посчитать y по старым state/x, сдвинуть
+    // состояние (f32 на каждом шаге) и только потом записать y. Так x можно
+    // писать на месте: y[c] и сдвиг читают x[c] до записи yp[c].
+    for (channel = 0; channel < width; channel++) {
+        double value;
+
+        base = (size_t)channel * (size_t)VTM_CONV4_KERNEL;
+        value = (double)wp[base] * (double)sp[channel]
+              + (double)wp[base + 1] * (double)sp[(size_t)width + channel]
+              + (double)wp[base + 2]
+                * (double)sp[2u * (size_t)width + channel]
+              + (double)wp[base + 3] * (double)xp[channel];
+        sp[channel] = sp[(size_t)width + channel];
+        sp[(size_t)width + channel] = sp[2u * (size_t)width + channel];
+        sp[2u * (size_t)width + channel] = xp[channel];
+        yp[channel] = (float)value;
+    }
+    return VTM_OK;
+}
+
+static vtm_status op_gdelta(vtm_t *m, uint32_t ins, const vtm_instr *in) {
+    vtm_status st;
+    uint32_t bank = in->c;
+    const vtm_tensor *state, *v, *beta_t, *g_t, *z_t, *norm_t, *q, *k, *out;
+    int n_k_heads, key_dim, n_v_heads, value_dim, group, kh, h, dk, dv;
+    double eps, alpha, beta_head, inverse;
+    size_t state_base, scratch_len;
+    double *scratch = NULL, *qhat, *khat, *u, *gamma;
+
+    if (in->c == VTM_NO_TENSOR
+        || (uint64_t)bank + VTM_GDELTA_BANK_SIZE > (uint64_t)m->n_tensors)
+        return fail(m, ins, VTM_E_TENSOR,
+                    "GDELTA: банк — %u подряд идущих тензоров (c..c+%u), c=%u "
+                    "вне таблицы (%u записей)",
+                    (unsigned)VTM_GDELTA_BANK_SIZE,
+                    (unsigned)(VTM_GDELTA_BANK_SIZE - 1u), (unsigned)bank,
+                    (unsigned)m->n_tensors);
+    state = &m->tensors[bank];
+    v = &m->tensors[bank + 1u];
+    beta_t = &m->tensors[bank + 2u];
+    g_t = &m->tensors[bank + 3u];
+    z_t = &m->tensors[bank + 4u];
+    norm_t = &m->tensors[bank + 5u];
+    q = need(m, in->a, ins, "a (q)", &st);
+    if (!q) return st;
+    k = need(m, in->b, ins, "b (k)", &st);
+    if (!k) return st;
+    out = need(m, in->dst, ins, "dst (y)", &st);
+    if (!out) return st;
+    if (q->ndim != 2)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "GDELTA: q должен быть [Hk, Dk], dims=%uD", q->ndim);
+    n_k_heads = (int)q->dims[0];
+    key_dim = (int)q->dims[1];
+    if (n_k_heads <= 0 || key_dim <= 0)
+        return fail(m, ins, VTM_E_SHAPE, "GDELTA: пустая форма q");
+    if (k->ndim != 2 || (int)k->dims[0] != n_k_heads
+        || (int)k->dims[1] != key_dim)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "GDELTA: k dims=[%u, %u], ожидались [%d, %d]",
+                    k->ndim > 0 ? k->dims[0] : 0,
+                    k->ndim > 1 ? k->dims[1] : 0, n_k_heads, key_dim);
+    if (v->ndim != 2)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "GDELTA: v должен быть [Hv, Dv], dims=%uD", v->ndim);
+    n_v_heads = (int)v->dims[0];
+    value_dim = (int)v->dims[1];
+    if (n_v_heads <= 0 || value_dim <= 0)
+        return fail(m, ins, VTM_E_SHAPE, "GDELTA: пустая форма v");
+    if (n_v_heads % n_k_heads != 0)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "GDELTA: %d value-голов не делятся на %d key-голов",
+                    n_v_heads, n_k_heads);
+    if (state->ndim != 3 || (int)state->dims[0] != n_v_heads
+        || (int)state->dims[1] != key_dim
+        || (int)state->dims[2] != value_dim)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "GDELTA: состояние dims=[%u, %u, %u], ожидалось "
+                    "[%d, %d, %d]",
+                    state->ndim > 0 ? state->dims[0] : 0,
+                    state->ndim > 1 ? state->dims[1] : 0,
+                    state->ndim > 2 ? state->dims[2] : 0,
+                    n_v_heads, key_dim, value_dim);
+    if (beta_t->ndim != 1 || (int)beta_t->dims[0] != n_v_heads)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "GDELTA: beta dims=[%u], ожидалось [%d]",
+                    beta_t->ndim > 0 ? beta_t->dims[0] : 0, n_v_heads);
+    if (g_t->ndim != 1 || (int)g_t->dims[0] != n_v_heads)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "GDELTA: g dims=[%u], ожидалось [%d]",
+                    g_t->ndim > 0 ? g_t->dims[0] : 0, n_v_heads);
+    if (z_t->ndim != 2 || (int)z_t->dims[0] != n_v_heads
+        || (int)z_t->dims[1] != value_dim)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "GDELTA: z dims=[%u, %u], ожидалось [%d, %d]",
+                    z_t->ndim > 0 ? z_t->dims[0] : 0,
+                    z_t->ndim > 1 ? z_t->dims[1] : 0, n_v_heads, value_dim);
+    if (norm_t->ndim != 1 || (int)norm_t->dims[0] != value_dim)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "GDELTA: norm_w dims=[%u], ожидалось [%d]",
+                    norm_t->ndim > 0 ? norm_t->dims[0] : 0, value_dim);
+    if ((st = req_f32(m, q, ins, "a (q)")) != VTM_OK) return st;
+    if ((st = req_f32(m, k, ins, "b (k)")) != VTM_OK) return st;
+    if ((st = req_f32(m, state, ins, "c (состояние)")) != VTM_OK) return st;
+    if ((st = req_f32(m, v, ins, "c+1 (v)")) != VTM_OK) return st;
+    if ((st = req_f32(m, beta_t, ins, "c+2 (beta)")) != VTM_OK) return st;
+    if ((st = req_f32(m, g_t, ins, "c+3 (g)")) != VTM_OK) return st;
+    if ((st = req_f32(m, z_t, ins, "c+4 (z)")) != VTM_OK) return st;
+    if ((st = req_f32(m, norm_t, ins, "c+5 (norm_w)")) != VTM_OK) return st;
+    if ((st = req_f32(m, out, ins, "dst (y)")) != VTM_OK) return st;
+    if ((st = gd_need_state(m, ins, state, "GDELTA: c (состояние)")) != VTM_OK)
+        return st;
+    if (in->imm < 0)
+        return fail(m, ins, VTM_E_ARG,
+                    "GDELTA: eps (imm) не может быть отрицательным: %d",
+                    (int)in->imm);
+    if (out->ndim != 2 || (int)out->dims[0] != n_v_heads
+        || (int)out->dims[1] != value_dim)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "GDELTA: dst dims=[%u, %u], ожидалось [%d, %d]",
+                    out->ndim > 0 ? out->dims[0] : 0,
+                    out->ndim > 1 ? out->dims[1] : 0, n_v_heads, value_dim);
+    // Состояние обновляется до записи выхода; совпадение dst с любым входом
+    // или состоянием дало бы не «почти то же», а другой тензор в таблице.
+    if (out == q || out == k || out == state || out == v || out == beta_t
+        || out == g_t || out == z_t || out == norm_t)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "GDELTA: dst совпадает с входом операции");
+
+    scratch_len = (size_t)2u * ((size_t)key_dim + (size_t)value_dim);
+    if (scratch_len > SIZE_MAX / sizeof(double))
+        return fail(m, ins, VTM_E_NOMEM, "GDELTA: размер аккумулятора");
+    scratch = (double *)malloc(scratch_len * sizeof(double));
+    if (!scratch)
+        return fail(m, ins, VTM_E_NOMEM,
+                    "GDELTA: нет памяти под аккумулятор (%.1f КиБ)",
+                    (double)(scratch_len * sizeof(double)) / 1024.0);
+    qhat = scratch;
+    khat = qhat + key_dim;
+    u = khat + key_dim;
+    gamma = u + value_dim;
+
+    eps = (double)in->imm / 1e6;
+    group = n_v_heads / n_k_heads;
+    for (kh = 0; kh < n_k_heads; kh++) {
+        size_t key_base = (size_t)kh * (size_t)key_dim;
+
+        // Нормировка одна на key-голову: все её value-головы видят тот же k̂.
+        gd_l2_row(q->f32 + key_base, key_dim, eps, qhat);
+        gd_l2_row(k->f32 + key_base, key_dim, eps, khat);
+        for (h = kh * group; h < (kh + 1) * group; h++) {
+            alpha = exp((double)g_t->f32[h]);
+            beta_head = gd_sigmoid((double)beta_t->f32[h]);
+            state_base = (size_t)h * (size_t)key_dim * (size_t)value_dim;
+
+            // u[dv] = Σ_dk S[dk,dv]·k̂[dk]   (u = k̂ᵀS)
+            for (dv = 0; dv < value_dim; dv++) u[dv] = 0.0;
+            for (dk = 0; dk < key_dim; dk++) {
+                double k_value = khat[dk];
+                const float *row;
+
+                if (k_value == 0.0) continue;
+                row = state->f32 + state_base
+                    + (size_t)dk * (size_t)value_dim;
+                for (dv = 0; dv < value_dim; dv++)
+                    u[dv] += (double)row[dv] * k_value;
+            }
+            // γ = v − α·u
+            for (dv = 0; dv < value_dim; dv++)
+                gamma[dv] = (double)v->f32[(size_t)h * (size_t)value_dim + dv]
+                          - alpha * u[dv];
+            // S_t = α·S_{t-1} + β·γ·k̂ᵀ; состояние — f32 сразу, как в эталоне.
+            for (dk = 0; dk < key_dim; dk++) {
+                double k_value = khat[dk];
+                float *row = state->f32 + state_base
+                           + (size_t)dk * (size_t)value_dim;
+
+                for (dv = 0; dv < value_dim; dv++)
+                    row[dv] = (float)(alpha * (double)row[dv]
+                                      + beta_head * gamma[dv] * k_value);
+            }
+            // o = S_t·q̂ — уже по обновлённому состоянию.
+            for (dv = 0; dv < value_dim; dv++) u[dv] = 0.0;
+            for (dk = 0; dk < key_dim; dk++) {
+                double q_value = qhat[dk];
+                const float *row;
+
+                if (q_value == 0.0) continue;
+                row = state->f32 + state_base
+                    + (size_t)dk * (size_t)value_dim;
+                for (dv = 0; dv < value_dim; dv++)
+                    u[dv] += (double)row[dv] * q_value;
+            }
+            // Выходной RMS-гейт: y = o/rms(o)·norm_w·silu(z), rms по Dv.
+            {
+                double mean_square = 0.0, denominator;
+
+                for (dv = 0; dv < value_dim; dv++)
+                    mean_square += u[dv] * u[dv];
+                mean_square /= (double)value_dim;
+                denominator = mean_square + eps;
+                inverse = (denominator <= 0.0)
+                        ? 0.0 : 1.0 / sqrt(denominator);
+            }
+            for (dv = 0; dv < value_dim; dv++)
+                out->f32[(size_t)h * (size_t)value_dim + dv] = (float)(
+                    u[dv] * inverse * (double)norm_t->f32[dv]
+                    * gd_silu((double)z_t->f32[(size_t)h * (size_t)value_dim
+                                               + dv]));
+        }
+    }
+    free(scratch);
+    return VTM_OK;
+}
+
 // --- SAMP ------------------------------------------------------------------
 //
 // imm — номер стратегии (см. vtm.h):
@@ -3413,8 +3740,26 @@ static void cache_restore(vtm_t *m) {
 }
 
 // Годен ли снимок для текущего состояния машины.
+//
+// Снимок кэша префикса (0081) хранит K/V в самих тензорах, а позицию,
+// счётчик и сэмплер — в машине. Состояния CONV4/GDELTA (0176) в снимок не
+// входят, а восстановить их из K/V нельзя. Поэтому для графа с такими
+// операциями кэш префикса выключен: лучше посчитать заново, чем отдать
+// неверное состояние. Полноценный снимок состояний — отдельная задача.
+static int program_has_state(const vtm_t *m) {
+    uint32_t i;
+
+    for (i = 0; i < m->n_instr; i++) {
+        uint8_t op = m->instr[i].opcode;
+
+        if (op == VTM_OP_CONV4 || op == VTM_OP_GDELTA) return 1;
+    }
+    return 0;
+}
+
 static int cache_usable(const vtm_t *m) {
     if (!m->cache_valid || m->cache_len <= 0) return 0;
+    if (program_has_state(m)) return 0;
     // Смена бэкенда (vtm_set_backend) — другой численный путь, K/V префикса
     // посчитаны не им. Модель сменить в одной машине нельзя: загрузка даёт
     // новую vtm_t, а у неё кэш пуст.
@@ -5168,6 +5513,13 @@ static vtm_status batch_op_one(vtm_t *m, uint32_t i, const vtm_instr *in) {
     case VTM_OP_MOE:
         // Запасной путь батчевого MOE: геометрия не та или нет памяти.
         return op_moe(m, i, in);
+    case VTM_OP_CONV4:
+        // Состояние — сквозное: op_conv4 вызывается по токену в порядке
+        // пачки (batch_token_op), а не батчевым ядром (задача 0176).
+        return op_conv4(m, i, in);
+    case VTM_OP_GDELTA:
+        // То же: состояние GDELTA обновляется последовательно по токенам.
+        return op_gdelta(m, i, in);
     case VTM_OP_ROPE:
         return op_rope(m, i, in);
     case VTM_OP_SM:
@@ -5520,6 +5872,12 @@ vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {
             break;
         case VTM_OP_RMSH:
             st = op_rmsh(m, i, in);
+            break;
+        case VTM_OP_CONV4:
+            st = op_conv4(m, i, in);
+            break;
+        case VTM_OP_GDELTA:
+            st = op_gdelta(m, i, in);
             break;
         case VTM_OP_HALT:
             m->halted = 1;
