@@ -1157,7 +1157,7 @@
   {
     "id": "0174",
     "title": "Потоковый импорт GGUF → .vtm",
-    "status": "in_progress",
+    "status": "done",
     "file": "0174-stream-import.md",
     "assignee": "agent:stream-import"
   }
