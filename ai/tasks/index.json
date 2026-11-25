@@ -1146,5 +1146,19 @@
     "status": "done",
     "file": "0172-moe-support.md",
     "assignee": "agent:moe"
+  },
+  {
+    "id": "0173",
+    "title": "Контейнер v0.3 с u64-смещениями",
+    "status": "in_progress",
+    "file": "0173-u64-container.md",
+    "assignee": "agent:u64"
+  },
+  {
+    "id": "0174",
+    "title": "Потоковый импорт GGUF → .vtm",
+    "status": "in_progress",
+    "file": "0174-stream-import.md",
+    "assignee": "agent:stream-import"
   }
 ]
