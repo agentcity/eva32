@@ -2820,7 +2820,20 @@ PAGE_HTML = """<!doctype html>
       src.start(0);
     }).catch(function (err) {
       var name = (err && (err.name || err.message)) || String(err);
-      onError(name);
+      // Запасной путь: иногда декодер молчит на конкретном WAV, а <audio>
+      // тот же файл играет. Проблема автоплея здесь уже снята тем, что мы
+      // внутри жеста (или после разблокированного контекста).
+      try {
+        var fallback = new Audio(url);
+        fallback.onended = function () { onDone(); };
+        fallback.onerror = function () { onError(name); };
+        var played = fallback.play();
+        if (played && typeof played.catch === "function") {
+          played.catch(function (e) { onError(name + " / audio: " + (e && e.name ? e.name : e)); });
+        }
+      } catch (ignored) {
+        onError(name);
+      }
     });
   }
 
@@ -2837,7 +2850,7 @@ PAGE_HTML = """<!doctype html>
   function speakCheck(side) {
     var ctx = unlockSpeech();
     if (!ctx) { setVoiceNote(side, "браузер не поддерживает Web Audio"); return; }
-    setVoiceNote(side, "проверяю звук…");
+    setVoiceNote(side, "гружу голос… (AudioContext: " + ctx.state + ")");
     fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

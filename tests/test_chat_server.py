@@ -2621,7 +2621,10 @@ class TestTtsPage(ServerTestCase):
         # Web Audio, а не <audio>: автоплей блокировал play() после fetch, а
         # AudioContext разблокируется один раз в жесте пользователя. Один
         # источник звука на страницу — фразы играют последовательно.
-        self.assertEqual(page.count("new Audio("), 0, "остался элемент <audio>")
+        # Основной путь — Web Audio; <audio> допустим только как запасной,
+        # поэтому он не должен быть создан заранее/на странице.
+        self.assertEqual(page.count("new Audio("), 1, "ожидался только запасной <audio>")
+        self.assertIn("fallback", page)
         self.assertIn("AudioContext", page)
         self.assertEqual(page.count("decodeAudioData"), 1, "ожидался один декодер")
         self.assertIn('byId("stop").addEventListener("click", stopAll)', page)
