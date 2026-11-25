@@ -1237,5 +1237,12 @@
     "status": "in_progress",
     "file": "0185-cancel-propagation.md",
     "assignee": "agent:cancel"
+  },
+  {
+    "id": "0186",
+    "title": "Большой круг Евы: волна/думаю/говорю",
+    "status": "in_progress",
+    "file": "0186-eva-circle-visual.md",
+    "assignee": "agent:eva-circle"
   }
 ]
