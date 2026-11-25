@@ -6468,6 +6468,49 @@ static void test_moe_batch(void) {
         free(img);
     }
 
+    // 5. Пачка короче промпта (0181): несколько пачек по 8 и бюджет auto.
+    //    Между пачками машина переносит только live-in активации, остальные
+    //    пересчитываются — состояние обязано остаться побитово тем же, что у
+    //    40 прогонов по токену (это и есть проверка упаковки слота по
+    //    интервалам жизни и возврата тензоров в момент последнего касания).
+    {
+        vtm_t *a = moe_batch_model();
+        vtm_t *b = moe_batch_model();
+        CHECK(a != NULL && b != NULL);
+        if (a && b) {
+            setenv("VTM_MOE_BATCH_MB", "auto", 1);
+            setenv("VTM_MOE_BATCH_TOKENS", "8", 1);
+            cache_run_plain(a, ids, 40);
+            vtm_set_position(b, 0);
+            CHECK(vtm_run_batch(b, ids, 40) == VTM_OK);
+            batch_check_same(a, b, "MoE 40 пачками по 8 (бюджет auto)", 0.0);
+            unsetenv("VTM_MOE_BATCH_MB");
+            unsetenv("VTM_MOE_BATCH_TOKENS");
+            vtm_free(a);
+            vtm_free(b);
+        }
+    }
+
+    // 6. Бюджет auto принимается и на граничных значениях потолка: пачка 40
+    //    при явном потолке 40 — одна пачка, результат тот же.
+    {
+        vtm_t *a = moe_batch_model();
+        vtm_t *b = moe_batch_model();
+        CHECK(a != NULL && b != NULL);
+        if (a && b) {
+            setenv("VTM_MOE_BATCH_MB", "auto", 1);
+            setenv("VTM_MOE_BATCH_TOKENS", "40", 1);
+            cache_run_plain(a, ids, 40);
+            vtm_set_position(b, 0);
+            CHECK(vtm_run_batch(b, ids, 40) == VTM_OK);
+            batch_check_same(a, b, "MoE 40 одной пачкой (бюджет auto)", 0.0);
+            unsetenv("VTM_MOE_BATCH_MB");
+            unsetenv("VTM_MOE_BATCH_TOKENS");
+            vtm_free(a);
+            vtm_free(b);
+        }
+    }
+
     printf("  -- MoE: батчевый prefill — токены и выход совпали\n");
 }
 

@@ -3665,22 +3665,25 @@ vtm_status vtm_run_cached(vtm_t *m, const int32_t *ids, int n) {
 // токенов, поэтому 32 — слишком мало (см. «батчевый MOE»).
 #define VTM_BATCH_TOKENS_MAX    256
 
-// Батчевый MOE (задача 0179): потолок пачки и бюджет активаций на неё.
+// Батчевый MOE (задачи 0179, 0181): потолок пачки и бюджет активаций на неё.
 //
-// Потолок 128 — не про L1, как у плотных графов (VTM_BATCH_TOKENS = 32), а про
+// Потолок — не про L1, как у плотных графов (VTM_BATCH_TOKENS = 32), а про
 // смысл группировки: эксперт читается один раз на всех, кому он нужен в этой
-// пачке, и выигрыш растёт как 1-(1-top_k/n_experts)^C. На 30B (128 экспертов,
-// top-8) при C=8 общих экспертов почти нет (36 % перекрытия, замер 0177), при
-// C=32 уникальных ~112 из 256 обращений, а при C=77 — 127 из 616, то есть
-// 4,8× меньше байт. Поэтому пачка 77 токенов в одну не должна упираться в
-// потолок 32.
+// пачке, и число чтений в слое падает до числа уникальных экспертов. На 30B
+// (128 экспертов, top-8) уже при C=32 уникальных ~112 из 256 обращений, при
+// C=77 — 127 из 616, а при C=256 в слое читаются все 128 экспертов (или
+// меньше, если у модели есть «горячие») — то есть вся секция по одному разу за
+// промпт вместо раза на пачку.
 //
-// Бюджет 384 МиБ: 30B держит ~3,57 МБ активаций на токен (48 слоёв своих
-// h1/q/k/v/attn/o/h2 + logits 152 КБ), то есть 107 токенов; 77-токенный
-// промпт — 275 МБ, один проход. VTM_MOE_BATCH_MB уменьшает/увеличивает бюджет
-// (на 16 ГиБ больше ~512 МБ брать не стоит: кэш экспертов 1792 МБ и dense уже
-// занимают память).
-#define VTM_MOE_BATCH_TOKENS 128
+// До 0181 потолок был 128, и это было следствием бюджета, а не смыслом: слот
+// токена считался как сумма ВСЕХ активаций графа (30B: 3,57 МБ — 48 слоёв
+// h1/q/k/v/attn/o/h2 + logits), и 384 МиБ давали 104 токена. С 0181 слот
+// упакован по интервалам жизни (одновременно живут единицы тензоров: 0,60 МБ
+// на токен, из них 607 КБ — одни logits), поэтому 256 токенов занимают ~154 МБ
+// и потолок 256 (VTM_BATCH_TOKENS_MAX — предел стековых буферов ядер) работает
+// при бюджете 384 МиБ. Промпт 256 токенов — одна пачка, эксперты читаются один
+// раз. Практический предел пачки теперь — 256, а не бюджет.
+#define VTM_MOE_BATCH_TOKENS 256
 #define VTM_MOE_BATCH_MB 384
 
 // Ядра kind 6/7 внутри группы.
@@ -3725,13 +3728,73 @@ static long moe_env_long(const char *name, long def, long lo, long hi) {
     return v;
 }
 
+// Бюджет активаций пачки «по машине»: VTM_MOE_BATCH_MB=auto (задача 0181).
+//
+// Смысл бюджета — верхняя граница памяти под активации пачки, а не размер,
+// который выделяется всегда: выделяется C·slot, и после упаковки слота по
+// интервалам (0,60 МБ на токен у 30B вместо 3,41) бюджет 384–512 МиБ перестаёт
+// быть ограничением для пачки 256 токенов. Поэтому auto можно выбирать по
+// объёму RAM без риска: 16 ГиБ — 512 МиБ, 32 ГиБ — 1024 (RAM/32), но не больше
+// четверти доступной сейчас памяти и не меньше 256 МиБ (иначе на 16 ГиБ под
+// давлением пачка 256 не поместится в слот совсем).
+//
+// Свободная память. _SC_AVPHYS_PAGES есть в Linux и не выставлен в macOS SDK
+// (там он вернул бы «free» без inactive, то есть 60 МБ на занятой машине, —
+// это не оценка доступного, а мусор). Поэтому на macOS база — объём RAM, а
+// свободная память сужает бюджет там, где её вообще можно спросить. Для auto
+// этого достаточно: бюджет — верхняя граница, а выделяется C·slot.
+static size_t moe_batch_mb_auto(void) {
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t mb, total_mb;
+    long apages = 0;
+
+    if (pages <= 0 || ps <= 0) return (size_t)VTM_MOE_BATCH_MB;
+    total_mb = ((size_t)pages * (size_t)ps) >> 20;
+    mb = total_mb / 32u;
+    if (mb < 384u) mb = 384u;
+    if (mb > 1024u) mb = 1024u;
+#if defined(_SC_AVPHYS_PAGES)
+    apages = sysconf(_SC_AVPHYS_PAGES);
+#endif
+    if (apages > 0) {
+        size_t avail_mb = ((size_t)apages * (size_t)ps) >> 20;
+        size_t by_avail = avail_mb / 4u;
+        if (by_avail < 256u) by_avail = 256u;
+        if (mb > by_avail) mb = by_avail;
+    }
+    return mb;
+}
+
+static int moe_env_is_auto(const char *v) {
+    return v && (v[0] == 'a' || v[0] == 'A')
+        && (v[1] == 'u' || v[1] == 'U')
+        && (v[2] == 't' || v[2] == 'T')
+        && (v[3] == 'o' || v[3] == 'O') && v[4] == '\0';
+}
+
 // Потолок пачки и бюджет активаций для MoE-графа.
 static void moe_batch_limits(int *cap, size_t *bytes) {
-    long mb = moe_env_long("VTM_MOE_BATCH_MB", VTM_MOE_BATCH_MB, 1, 16384);
+    const char *env = getenv("VTM_MOE_BATCH_MB");
+    size_t mb;
 
+    if (moe_env_is_auto(env)) {
+        mb = moe_batch_mb_auto();
+        if (moe_trace_enabled()) {
+            static int warned;
+            if (!warned) {
+                fprintf(stderr, "VTM MOE: VTM_MOE_BATCH_MB=auto -> %zu МиБ\n",
+                        mb);
+                warned = 1;
+            }
+        }
+    } else {
+        mb = (size_t)moe_env_long("VTM_MOE_BATCH_MB", VTM_MOE_BATCH_MB, 1,
+                                  16384);
+    }
     *cap = (int)moe_env_long("VTM_MOE_BATCH_TOKENS", VTM_MOE_BATCH_TOKENS, 4,
                              VTM_BATCH_TOKENS_MAX);
-    *bytes = (size_t)mb << 20;
+    *bytes = mb << 20;
 }
 
 // Минимальная пачка для батчевого плотного (fp32) TMV/MM: ядро 0159
@@ -3760,6 +3823,37 @@ static float batch_load_f32(const float *scales, size_t i) {
     return v;
 }
 
+// Рабочие буферы батчевого MOE (задача 0181).
+//
+// До 0181 они выделялись calloc'ом на КАЖДУЮ инструкцию MOE, то есть на каждый
+// слой каждой пачки: part — C·top_k·hidden, на 30B при C=256 это 33 МБ, и
+// 48 слоёв × 3 пачки давали 144 выделения и 144 освобождения посреди прогона,
+// где каждое освобождение возвращает в систему десятки мегабайт. Теперь они
+// живут в batch_scratch: одно выделение на прогон (рост — только если
+// встретилась пачка длиннее или другая геометрия MOE), дальше переиспользуются
+// между пачками и слоями.
+//
+// part — float, а не double. В него кладётся выход эксперта, который и так
+// float (out ядра); в double он переводится точно, поэтому вклады складываются
+// теми же числами в том же порядке — побитовое равенство с поштучным путём
+// сохраняется, а буфер вдвое меньше (16 МБ против 33 на 256 токенах).
+typedef struct {
+    int      top_k, hidden, inter, n_experts; // геометрия, под которую выделено
+    int      cap_C;                            // на сколько токенов хватает
+    float   *part;        // [C * top_k * hidden]
+    double  *all_logits;  // [C * n_experts]
+    double  *logits;      // [n_experts]
+    double  *weights;     // [C * top_k]
+    double  *acc1;        // [hidden]
+    int     *chosen;      // [C * top_k]
+    int     *list;        // [C * top_k]
+    int     *count;       // [n_experts]
+    int     *start;       // [n_experts]
+    int     *pos;         // [n_experts]
+    int     *uniq;        // [n_experts]
+    float   *work;        // [C * (2*hidden + 3*inter)]
+} batch_moe_ws;
+
 typedef struct {
     int       C;          // токенов в текущей пачке
     int       has_moe;    // в программе есть MOE (свой потолок пачки, 0179)
@@ -3769,28 +3863,94 @@ typedef struct {
     uint32_t *idx;        // [n_local] индексы этих тензоров
     size_t   *off;        // [n_tensors] смещение в слоте токена, float
     size_t    slot;       // float на токен
+    // Интервалы жизни активаций (0181). Без них slot — сумма ВСЕХ активаций
+    // графа (30B: 3,41 МБ на токен), хотя одновременно живут единицы: h1/q/k/v/
+    // attn/o/h2 текущего слоя, остаток x и logits. Упаковка по интервалам даёт
+    // 0,60 МБ на токен (потолок — logits, 607 КБ), то есть пачка 256 токенов
+    // занимает 154 МБ вместо 873.
+    uint32_t *first;      // [n_tensors] pc первого касания (чтение или запись)
+    uint32_t *last;       // [n_tensors] pc последнего касания
+    uint8_t  *live_in;    // [n_tensors] 1 — читается до первой записи
+    size_t    livein_slot;// float: зона live-in в начале слота
+    // Сумма ВСЕХ активаций на токен — столько слот стоил бы без упаковки. Для
+    // плотных графов по ней по-прежнему считается предел пачки: 96 МиБ / 6,9 МБ
+    // = 13 → пачка 12 (замер 0168: при C > 12 пачка упирается в L1 и стоит на
+    // токен дороже на 24 %). Упаковка уменьшила память, но менять из-за этого
+    // выбранный в 0168 размер пачки — значит менять числа плотных моделей,
+    // которых эта задача не касается.
+    size_t    sum_slot;
     float    *mem;        // C * slot
     float   **real;       // [n_tensors] настоящие указатели f32
     float    *xt;         // [cols * C] транспонированный вход батчевого ядра
     float    *yt;         // [rows * C] транспонированный выход
     size_t    xcap, ycap; // ёмкости xt/yt, float
+    batch_moe_ws moe_ws;  // рабочие буферы MOE, переживают пачки (0181)
 } batch_scratch;
+
+// Прямоугольник упакованного слота: [off, off+sz) занят тензором до pc end.
+typedef struct {
+    size_t   off, sz;
+    uint32_t end;
+} batch_live_blk;
+
+static void batch_moe_ws_drop(batch_moe_ws *w) {
+    free(w->part);
+    free(w->all_logits);
+    free(w->logits);
+    free(w->weights);
+    free(w->acc1);
+    free(w->chosen);
+    free(w->list);
+    free(w->count);
+    free(w->start);
+    free(w->pos);
+    free(w->uniq);
+    free(w->work);
+    memset(w, 0, sizeof *w);
+}
 
 static void batch_free(batch_scratch *b) {
     free(b->local);
     free(b->idx);
     free(b->off);
+    free(b->first);
+    free(b->last);
+    free(b->live_in);
     free(b->mem);
     free(b->real);
     free(b->xt);
     free(b->yt);
+    batch_moe_ws_drop(&b->moe_ws);
     memset(b, 0, sizeof *b);
 }
 
-// Разметить тензоры: какие получают копию на токена, и сколько float на токен.
-// 1 — размечено (n_local > 0), 0 — батчить нечего/нет памяти.
+// Отметить касание тензора в текущей инструкции. Чтения можно отмечать с
+// запасом (лишнее чтение только удлиняет интервал, то есть слот становится
+// больше, а не меньше), а вот пропущенное чтение сломало бы упаковку — поэтому
+// сюда попадают все поля-операнды инструкции, а не только те, что читает
+// конкретный opcode.
+static void batch_touch(uint32_t pc, uint32_t t, int rd, int wr, uint32_t n,
+                        uint32_t *first_rd, uint32_t *first_wr, uint32_t *first,
+                        uint32_t *last) {
+    if (t == VTM_NO_TENSOR || t >= n) return;
+    if (rd && first_rd[t] == UINT32_MAX) first_rd[t] = pc;
+    if (wr && first_wr[t] == UINT32_MAX) first_wr[t] = pc;
+    if (first[t] == UINT32_MAX) first[t] = pc;
+    last[t] = pc;   // pc идут по возрастанию, поэтому это и есть максимум
+}
+
+static size_t batch_align8(size_t n) {
+    return (n + 7u) & ~(size_t)7u;   // выравнивание под 4-lane
+}
+
+// Разметить тензоры: какие получают копию на токена, сколько float на токен и
+// какие тензоры живут одновременно. 1 — размечено (n_local > 0), 0 — батчить
+// нечего/нет памяти.
 static int batch_classify(vtm_t *m, batch_scratch *b) {
-    uint32_t i, n = m->n_tensors;
+    uint32_t i, t, k, n = m->n_tensors;
+    uint32_t *first_rd = NULL, *first_wr = NULL;
+    uint8_t *accum = NULL;
+    int ok = 0;
 
     memset(b, 0, sizeof *b);
     b->n_tensors = n;
@@ -3798,7 +3958,19 @@ static int batch_classify(vtm_t *m, batch_scratch *b) {
     b->off = (size_t *)calloc(n ? n : 1u, sizeof *b->off);
     b->idx = (uint32_t *)calloc(n ? n : 1u, sizeof *b->idx);
     b->real = (float **)calloc(n ? n : 1u, sizeof *b->real);
-    if (!b->local || !b->off || !b->idx || !b->real) return 0;
+    b->first = (uint32_t *)malloc((n ? n : 1u) * sizeof *b->first);
+    b->last = (uint32_t *)malloc((n ? n : 1u) * sizeof *b->last);
+    b->live_in = (uint8_t *)calloc(n ? n : 1u, 1u);
+    first_rd = (uint32_t *)malloc((n ? n : 1u) * sizeof *first_rd);
+    first_wr = (uint32_t *)malloc((n ? n : 1u) * sizeof *first_wr);
+    accum = (uint8_t *)calloc(n ? n : 1u, 1u);
+    if (!b->local || !b->off || !b->idx || !b->real || !b->first || !b->last
+        || !b->live_in || !first_rd || !first_wr || !accum)
+        goto done;
+    for (i = 0; i < n; i++) {
+        b->first[i] = b->last[i] = UINT32_MAX;
+        first_rd[i] = first_wr[i] = UINT32_MAX;
+    }
 
     // Есть ли в программе MOE. У MoE-графов свой потолок пачки и свой бюджет
     // активаций (moe_batch_limits): смысл пачки там не в L1, а в том, чтобы
@@ -3811,49 +3983,174 @@ static int batch_classify(vtm_t *m, batch_scratch *b) {
     // VTM_MOE_BATCH=0 — прежний путь целиком: пачки нет вовсе (так же, как до
     // 0179, когда MOE выключал батчевый prefill). Смешанный вариант «TMV
     // пачкой, MOE по токену» не нужен ни для замера, ни для смысла.
-    if (b->has_moe && !moe_batch_enabled()) return 0;
+    if (b->has_moe && !moe_batch_enabled()) goto done;
 
+    // Один проход: локальные тензоры (dst), интервалы их жизни и «входные»
+    // тензоры (читаются раньше, чем пишутся, — их значение в начале пачки
+    // надо скопировать в слот).
     for (i = 0; i < m->n_instr; i++) {
         const vtm_instr *in = &m->instr[i];
+        uint32_t d = in->dst;
         // RMSH (QK-norm) батчевых ядер не имеет, но он дешёвый и считается по
         // токену в batch_token_op. Раньше он выключал пачку целиком — вместе с
         // MOE, из-за чего у Qwen3-MoE батчевого prefill не было вообще (0179).
         // Для графов без MOE поведение прежнее: пачка по-прежнему только там,
         // где её проверяли (плотные модели), — RMSH значит Qwen3, а его
         // ARGMAX-паритет с поштучным путём на 30B не проверялся до 0179.
-        if (in->opcode == VTM_OP_RMSH && !b->has_moe) return 0;
-        // KV-кэш — общий: его строки адресуются глобальной позицией, а не
-        // токеном пачки. KVW пишет в него напрямую (см. op_kvw).
-        if (in->opcode == VTM_OP_KVW) {
-            if (in->dst != VTM_NO_TENSOR && in->dst < n) b->local[in->dst] = 0;
-            if (in->b != VTM_NO_TENSOR && in->b < n) b->local[in->b] = 0;
-            continue;
-        }
+        if (in->opcode == VTM_OP_RMSH && !b->has_moe) goto done;
         // У HALT dst — мусор из байткода (как в trace_out_elems): он ничего
         // не пишет, и «приёмником» его считать нельзя, иначе в активации
         // попадёт случайный тензор (в demo это emb.w в read-only mmap).
         if (in->opcode == VTM_OP_HALT) continue;
-        if (in->dst == VTM_NO_TENSOR || in->dst >= n) continue;
-        if (m->tensors[in->dst].kind == VTM_TENSOR_TRIT) continue;
-        if (m->tensors[in->dst].flags & VTM_TENSOR_FLAG_KV_CACHE) continue;
-        b->local[in->dst] = 1;
+        // KV-кэш — общий: его строки адресуются глобальной позицией, а не
+        // токеном пачки. KVW пишет в него напрямую (см. op_kvw).
+        if (in->opcode == VTM_OP_KVW) {
+            if (d != VTM_NO_TENSOR && d < n) b->local[d] = 0;
+            if (in->b != VTM_NO_TENSOR && in->b < n) b->local[in->b] = 0;
+        } else if (d != VTM_NO_TENSOR && d < n
+                   && m->tensors[d].kind != VTM_TENSOR_TRIT
+                   && !(m->tensors[d].flags & VTM_TENSOR_FLAG_KV_CACHE)) {
+            b->local[d] = 1;
+        }
+        // Чтения: a, b, c (и банки MOE/GDELTA, если в них активации). У ROPE
+        // b — число голов, а не тензор: лишнее «чтение» безвредно.
+        batch_touch(i, in->a, 1, 0, n, first_rd, first_wr, b->first, b->last);
+        batch_touch(i, in->b, 1, 0, n, first_rd, first_wr, b->first, b->last);
+        batch_touch(i, in->c, 1, 0, n, first_rd, first_wr, b->first, b->last);
+        if (in->opcode == VTM_OP_MOE) {
+            batch_touch(i, (uint32_t)in->c + 1u, 1, 0, n, first_rd, first_wr,
+                        b->first, b->last);
+            batch_touch(i, (uint32_t)in->c + 2u, 1, 0, n, first_rd, first_wr,
+                        b->first, b->last);
+            // MOE копит в dst (y += acc), поэтому его значение до первой
+            // записи нужно так же, как у прочитанного тензора.
+            if (d != VTM_NO_TENSOR && d < n && first_wr[d] == UINT32_MAX)
+                accum[d] = 1;
+            batch_touch(i, d, 1, 1, n, first_rd, first_wr, b->first, b->last);
+        } else if (in->opcode == VTM_OP_GDELTA) {
+            // c — первый из шести подряд идущих тензоров банка (0176):
+            // состояние, v, beta, g, z, norm_w. Состояние и norm_w не
+            // активации, но v/beta/g/z пишутся инструкциями графа.
+            for (k = 1; k <= 5u; k++)
+                batch_touch(i, (uint32_t)in->c + k, 1, 0, n, first_rd, first_wr,
+                            b->first, b->last);
+            batch_touch(i, d, 0, 1, n, first_rd, first_wr, b->first, b->last);
+        } else {
+            batch_touch(i, d, 0, 1, n, first_rd, first_wr, b->first, b->last);
+        }
     }
 
     b->n_local = 0;
     b->slot = 0;
+    b->sum_slot = 0;
     for (i = 0; i < n; i++) {
         size_t sz;
         if (!b->local[i]) continue;
-        sz = (size_t)m->tensors[i].n_elements;
-        sz = (sz + 7u) & ~(size_t)7u;   // выравнивание под 4-lane
-        if (b->slot > SIZE_MAX - sz) return 0;
-        // Дальше слот умножается на C и sizeof(float) — не даём переполнить.
-        if (b->slot + sz > VTM_BATCH_SCRATCH_BYTES / sizeof(float)) return 0;
+        if (b->first[i] == UINT32_MAX) continue;   // ни разу не тронут
+        b->live_in[i] = (uint8_t)(accum[i]
+            || (first_rd[i] != UINT32_MAX
+                && (first_wr[i] == UINT32_MAX || first_rd[i] < first_wr[i])));
+        sz = batch_align8(m->tensors[i].n_elements);
+        if (b->sum_slot > SIZE_MAX - sz) goto done;
+        b->sum_slot += sz;
         b->idx[b->n_local++] = i;
-        b->off[i] = b->slot;
-        b->slot += sz;
     }
-    return b->n_local > 0 && b->slot > 0;
+    if (b->n_local == 0) goto done;
+
+    // Слот: live-in — отдельная зона в начале (она нужна весь прогон и ни с
+    // чем не пересекается, иначе первая же запись затрёт вход), остальные
+    // тензоры упаковываются по интервалам жизни: тензор получает область,
+    // свободную на всём своём [first, last].
+    {
+        int *ord = (int *)malloc((size_t)b->n_local * sizeof *ord);
+        batch_live_blk *act = (batch_live_blk *)calloc(b->n_local, sizeof *act);
+        size_t peak;
+        int nact = 0, j;
+
+        if (!ord || !act) {
+            free(ord);
+            free(act);
+            goto done;
+        }
+        for (k = 0; k < b->n_local; k++) {
+            t = b->idx[k];
+            if (!b->live_in[t]) continue;
+            b->off[t] = b->livein_slot;
+            b->livein_slot += batch_align8(m->tensors[t].n_elements);
+        }
+        peak = b->livein_slot;
+        // Порядок — по первому касанию (вставками: n_local — сотни).
+        for (k = 0; k < b->n_local; k++) {
+            int v = (int)k, q;
+            ord[v] = v;
+            for (q = v; q > 0; q--) {
+                int a = ord[q - 1], c = ord[q];
+                if (b->first[b->idx[a]] <= b->first[b->idx[c]]) break;
+                ord[q - 1] = c;
+                ord[q] = a;
+            }
+        }
+        for (k = 0; k < b->n_local; k++) {
+            size_t sz, off;
+            int hit;
+
+            t = b->idx[ord[k]];
+            if (b->live_in[t]) continue;
+            sz = batch_align8(m->tensors[t].n_elements);
+            // Освободить области, чей тензор уже мёртв.
+            for (j = 0; j < nact; ) {
+                if (act[j].end < b->first[t]) {
+                    act[j] = act[--nact];
+                } else {
+                    j++;
+                }
+            }
+            off = b->livein_slot;
+            for (;;) {
+                int q;
+                size_t aoff = batch_align8(off);
+                hit = 0;
+                for (q = 0; q < nact; q++) {
+                    if (aoff < act[q].off + act[q].sz
+                        && act[q].off < aoff + sz) {
+                        off = act[q].off + act[q].sz;
+                        hit = 1;
+                        break;
+                    }
+                }
+                if (!hit) {
+                    off = aoff;
+                    break;
+                }
+            }
+            b->off[t] = off;
+            act[nact].off = off;
+            act[nact].sz = sz;
+            act[nact].end = b->last[t];
+            nact++;
+            if (off + sz > peak) peak = off + sz;
+        }
+        free(ord);
+        free(act);
+        // Слот умножается на C и sizeof(float) — не даём переполнить.
+        if (peak > VTM_BATCH_SCRATCH_BYTES / sizeof(float)) goto done;
+        b->slot = peak;
+        // Диагностика 0181: сколько активаций пачки стоит токен и сколько
+        // стоило бы без упаковки по интервалам (сумма всех тензоров).
+        if (moe_trace_enabled()) {
+            fprintf(stderr, "VTM BATCH: слот активаций %zu КиБ/токен "
+                            "(без упаковки %zu КиБ, live-in %zu КиБ)\n",
+                    (peak * sizeof(float)) >> 10,
+                    (b->sum_slot * sizeof(float)) >> 10,
+                    (b->livein_slot * sizeof(float)) >> 10);
+        }
+    }
+    ok = (b->n_local > 0 && b->slot > 0);
+done:
+    free(first_rd);
+    free(first_wr);
+    free(accum);
+    return ok;
 }
 
 // Выделить память пачки и разложить по копиям текущее состояние активаций
@@ -3875,8 +4172,13 @@ static int batch_scratch_alloc(vtm_t *m, batch_scratch *b, int C) {
 // Каждый токен пачки начинает проход с состояния, которое оставил
 // предыдущий прогон (так же, как n вызовов vtm_run: активации в машине
 // сохраняются между прогонами). После пачки это состояние — значения
-// последнего токена (batch_store_last), поэтому одного и того же копирования
+// последнего токена (batch_store_*), поэтому одного и того же копирования
 // достаточно и на первый, и на все следующие пачки.
+//
+// Копируются только live-in тензоры: у остальных первое касание в программе —
+// запись, поэтому их содержимое на входе пачки не читается (batch_classify
+// проверил это по интервалам). Без этого пришлось бы на каждую пачку писать в
+// слот весь граф (30B: 3,41 МБ × C), хотя нужны единицы.
 static void batch_reinit(vtm_t *m, const batch_scratch *b) {
     uint32_t k;
     int j;
@@ -3884,6 +4186,7 @@ static void batch_reinit(vtm_t *m, const batch_scratch *b) {
         uint32_t t = b->idx[k];
         const float *src = b->real[t];
         size_t n_el = (size_t)m->tensors[t].n_elements;
+        if (!b->live_in[t]) continue;
         if (!src || n_el == 0) continue;
         for (j = 0; j < b->C; j++)
             memcpy(b->mem + (size_t)j * b->slot + b->off[t], src,
@@ -3909,19 +4212,26 @@ static void batch_unbind(vtm_t *m, const batch_scratch *b) {
     }
 }
 
-// После пачки активации — это значения последнего токена: ровно то, что
-// оставил бы последний vtm_run (по ним читают логиты тесты и хост).
-static void batch_store_last(vtm_t *m, const batch_scratch *b) {
+// Отдать в настоящий тензор значение последнего токена пачки.
+static void batch_store_one(vtm_t *m, const batch_scratch *b, uint32_t t) {
+    float *dst = b->real[t];
+    size_t n_el = (size_t)m->tensors[t].n_elements;
+    if (!dst || n_el == 0) return;
+    memcpy(dst, b->mem + (size_t)(b->C - 1) * b->slot + b->off[t],
+           n_el * sizeof(float));
+}
+
+// Тензор, чей интервал кончился на этом pc, дальше в слоте не живёт: его
+// область переиспользует следующий тензор. Поэтому «мёртвые» тензоры
+// сохраняются в момент последнего касания — тогда состояние машины после
+// vtm_run_batch побитово равно n вызовам vtm_run, включая промежуточные
+// активации (это проверяет batch_check_same в тестах).
+static void batch_store_ended(vtm_t *m, const batch_scratch *b, uint32_t pc) {
     uint32_t k;
-    int last = b->C - 1;
     for (k = 0; k < b->n_local; k++) {
         uint32_t t = b->idx[k];
-        float *dst = b->real[t];
-        if (!dst || m->tensors[t].n_elements == 0) continue;
-        memcpy(dst, b->mem + (size_t)last * b->slot + b->off[t],
-               (size_t)m->tensors[t].n_elements * sizeof(float));
+        if (b->last[t] == pc) batch_store_one(m, b, t);
     }
-    (void)m;
 }
 
 // Батчевый путь включается для скалярных бэкендов (батчевые ядра interp.c
@@ -4484,6 +4794,65 @@ static void moe_route_rows(void *p, int tid, int r0, int r1) {
     }
 }
 
+// Выделить (или переиспользовать) рабочие буферы батчевого MOE. Растут только
+// при увеличении пачки или смене геометрии MOE — у 30B она одна на все 48
+// слоёв, поэтому на прогон приходится одно выделение вместо 144 (по одному на
+// слой и пачку в 0179). Возвращает 0, если памяти нет: вызывающий уходит в
+// поштучный путь, как и при непригодной геометрии.
+static int batch_moe_ws_reserve(batch_moe_ws *w, int C, int top_k, int hidden,
+                                int inter, int n_experts) {
+    size_t nsel = (size_t)C * (size_t)top_k;
+    size_t part_n = nsel * (size_t)hidden;
+    size_t log_n = (size_t)C * (size_t)n_experts;
+    size_t work_n = (size_t)C * ((size_t)hidden * 2u + (size_t)inter * 3u);
+    float *part = NULL, *work = NULL;
+    double *all_logits = NULL, *logits = NULL, *weights = NULL, *acc1 = NULL;
+    int *chosen = NULL, *list = NULL, *count = NULL, *start = NULL, *pos = NULL;
+    int *uniq = NULL;
+
+    if (w->part && w->cap_C >= C && w->top_k == top_k && w->hidden == hidden
+        && w->inter == inter && w->n_experts == n_experts)
+        return 1;
+    batch_moe_ws_drop(w);
+    part = (float *)calloc(part_n ? part_n : 1u, sizeof *part);
+    work = (float *)calloc(work_n ? work_n : 1u, sizeof *work);
+    all_logits = (double *)calloc(log_n ? log_n : 1u, sizeof *all_logits);
+    logits = (double *)calloc((size_t)n_experts, sizeof *logits);
+    weights = (double *)calloc(nsel ? nsel : 1u, sizeof *weights);
+    acc1 = (double *)calloc((size_t)hidden, sizeof *acc1);
+    chosen = (int *)calloc(nsel ? nsel : 1u, sizeof *chosen);
+    list = (int *)calloc(nsel ? nsel : 1u, sizeof *list);
+    count = (int *)calloc((size_t)n_experts, sizeof *count);
+    start = (int *)calloc((size_t)n_experts, sizeof *start);
+    pos = (int *)calloc((size_t)n_experts, sizeof *pos);
+    uniq = (int *)calloc((size_t)n_experts, sizeof *uniq);
+    if (!part || !work || !all_logits || !logits || !weights || !acc1
+        || !chosen || !list || !count || !start || !pos || !uniq) {
+        free(part); free(work); free(all_logits); free(logits);
+        free(weights); free(acc1); free(chosen); free(list); free(count);
+        free(start); free(pos); free(uniq);
+        return 0;
+    }
+    w->top_k = top_k;
+    w->hidden = hidden;
+    w->inter = inter;
+    w->n_experts = n_experts;
+    w->cap_C = C;
+    w->part = part;
+    w->work = work;
+    w->all_logits = all_logits;
+    w->logits = logits;
+    w->weights = weights;
+    w->acc1 = acc1;
+    w->chosen = chosen;
+    w->list = list;
+    w->count = count;
+    w->start = start;
+    w->pos = pos;
+    w->uniq = uniq;
+    return 1;
+}
+
 // --- батчевый MOE (задача 0179) --------------------------------------------
 //
 // Зачем. Поштучный prefill считает каждый токен отдельным проходом, поэтому
@@ -4516,16 +4885,17 @@ static vtm_status batch_moe_apply(vtm_t *m, uint32_t pc, const vtm_instr *in,
     vtm_status st = VTM_OK;
     moe_geom g;
     moe_source src;
+    batch_moe_ws *ws = &b->moe_ws;
     int use_pread;
     int C = b->C;
     int top_k, hidden, inter, n_experts;
     int j, k, t, e, ne, nt;
-    size_t nsel, i, nwork;
-    int *chosen = NULL, *count = NULL, *start = NULL, *pos = NULL;
-    int *list = NULL, *uniq = NULL;
-    double *weights = NULL, *logits = NULL, *part = NULL, *acc1 = NULL;
-    double *all_logits = NULL;
-    float *work = NULL;
+    size_t nsel, i;
+    int *chosen, *count, *start, *pos;
+    int *list, *uniq;
+    double *weights, *logits, *acc1;
+    double *all_logits;
+    float *part, *work;
     int (*silu)(float *, const float *, int);
     int exact = 0;
 
@@ -4544,30 +4914,37 @@ static vtm_status batch_moe_apply(vtm_t *m, uint32_t pc, const vtm_instr *in,
     n_experts = g.n_experts;
     nsel = (size_t)C * (size_t)top_k;
 
-    chosen = (int *)calloc(nsel ? nsel : 1u, sizeof *chosen);
-    count = (int *)calloc((size_t)n_experts, sizeof *count);
-    start = (int *)calloc((size_t)n_experts, sizeof *start);
-    pos = (int *)calloc((size_t)n_experts, sizeof *pos);
-    uniq = (int *)calloc((size_t)n_experts, sizeof *uniq);
-    list = (int *)calloc(nsel ? nsel : 1u, sizeof *list);
-    weights = (double *)calloc(nsel ? nsel : 1u, sizeof *weights);
-    logits = (double *)calloc((size_t)n_experts, sizeof *logits);
-    all_logits = (double *)calloc((size_t)C * (size_t)n_experts,
-                                  sizeof *all_logits);
-    // part[токен][k][i] — выход эксперта, которого токен выбрал k-м. Копим
-    // сюда, а не в acc[токен], чтобы сложить вклады в том же порядке, что и
-    // поштучный путь (k по возрастанию): тогда при VTM_MOE_BATCH_KERNEL=0
-    // (поштучные ядра) результат побитово равен поштучному пути, а при
-    // батчевых ядрах отличается только их арифметикой.
-    part = (double *)calloc(nsel * (size_t)hidden, sizeof *part);
-    acc1 = (double *)calloc((size_t)hidden, sizeof *acc1);
-    nwork = (size_t)C * ((size_t)hidden * 2u + (size_t)inter * 3u);
-    work = (float *)calloc(nwork ? nwork : 1u, sizeof *work);
+    // Буферы — из batch_scratch (0181): одно выделение на прогон, а не на
+    // каждый слой каждой пачки. part[токен][k][i] — выход эксперта, которого
+    // токен выбрал k-м. Копим сюда, а не в acc[токен], чтобы сложить вклады в
+    // том же порядке, что и поштучный путь (k по возрастанию): тогда при
+    // VTM_MOE_BATCH_KERNEL=0 (поштучные ядра) результат побитово равен
+    // поштучному пути, а при батчевых ядрах отличается только их арифметикой.
+    if (!batch_moe_ws_reserve(ws, C, top_k, hidden, inter, n_experts)) {
+        st = fail(m, pc, VTM_E_NOMEM, "MOE (пачка): нет памяти под буферы");
+        goto done;
+    }
+    chosen = ws->chosen;
+    count = ws->count;
+    start = ws->start;
+    pos = ws->pos;
+    uniq = ws->uniq;
+    list = ws->list;
+    weights = ws->weights;
+    logits = ws->logits;
+    all_logits = ws->all_logits;
+    part = ws->part;
+    acc1 = ws->acc1;
+    work = ws->work;
     if (!chosen || !count || !start || !pos || !uniq || !list || !weights
         || !logits || !part || !acc1 || !work || !all_logits) {
         st = fail(m, pc, VTM_E_NOMEM, "MOE (пачка): нет памяти под буферы");
         goto done;
     }
+    // Счётчики групп копятся между вызовами, а part переиспользуется: всё, что
+    // читается до записи, обнуляется здесь (остальное пишется по месту).
+    memset(count, 0, (size_t)n_experts * sizeof *count);
+    memset(uniq, 0, (size_t)n_experts * sizeof *uniq);
 
     // 1. Роутер по каждому токену — тем же кодом, что и поштучно. Логиты всех
     //    токенов считаются параллельно (строки независимы), выбор top-k —
@@ -4710,7 +5087,7 @@ static vtm_status batch_moe_apply(vtm_t *m, uint32_t pc, const vtm_instr *in,
                 for (j = 0; j < nt; j++) {
                     int s = list[e + j];
                     const float *xj = batch_src(m, b, in->b, s / top_k);
-                    double *aj = part + (size_t)s * (size_t)hidden;
+                    float *aj = part + (size_t)s * (size_t)hidden;
                     if (k1(gate, gb, xj, inter, hidden) != 0
                         || k1(up, ub, xj, inter, hidden) != 0
                         || silu(gate, gate, inter) != 0) {
@@ -4726,7 +5103,7 @@ static vtm_status batch_moe_apply(vtm_t *m, uint32_t pc, const vtm_instr *in,
                         goto done;
                     }
                     for (i = 0; i < (size_t)hidden; i++)
-                        aj[i] = (double)out[i];
+                        aj[i] = out[i];   // float -> float, в double точно
                 }
             } else {
                 if (kbatch(gate, gb, xt, inter, hidden, nt) != 0
@@ -4745,9 +5122,9 @@ static vtm_status batch_moe_apply(vtm_t *m, uint32_t pc, const vtm_instr *in,
                 }
                 for (j = 0; j < nt; j++) {
                     int s = list[e + j];
-                    double *aj = part + (size_t)s * (size_t)hidden;
+                    float *aj = part + (size_t)s * (size_t)hidden;
                     for (i = 0; i < (size_t)hidden; i++)
-                        aj[i] = (double)out[i * (size_t)nt + (size_t)j];
+                        aj[i] = out[i * (size_t)nt + (size_t)j];
                 }
             }
             g_moe_compute_ns += moe_now_ns() - t_c;
@@ -4767,10 +5144,10 @@ static vtm_status batch_moe_apply(vtm_t *m, uint32_t pc, const vtm_instr *in,
         for (i = 0; i < (size_t)hidden; i++) acc1[i] = 0.0;
         for (k = 0; k < top_k; k++) {
             double w = weights[(size_t)j * top_k + k];
-            const double *pk = part
-                             + ((size_t)j * top_k + (size_t)k) * (size_t)hidden;
+            const float *pk = part
+                            + ((size_t)j * top_k + (size_t)k) * (size_t)hidden;
             for (i = 0; i < (size_t)hidden; i++)
-                acc1[i] += w * pk[i];
+                acc1[i] += w * (double)pk[i];
         }
         for (i = 0; i < (size_t)hidden; i++)
             yj[i] = (float)((double)yj[i] + acc1[i]);
@@ -4778,18 +5155,6 @@ static vtm_status batch_moe_apply(vtm_t *m, uint32_t pc, const vtm_instr *in,
     *handled = 1;
 
 done:
-    free(chosen);
-    free(count);
-    free(start);
-    free(pos);
-    free(uniq);
-    free(list);
-    free(weights);
-    free(logits);
-    free(all_logits);
-    free(part);
-    free(acc1);
-    free(work);
     return st;
 }
 
@@ -4924,9 +5289,14 @@ static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
             g_bt_calls[in->opcode]++;
         }
         if (st != VTM_OK) break;
+        // Тензоры, для которых это последнее касание, надо вернуть в машину
+        // сейчас: дальше их область в слоте переиспользует следующий тензор.
+        batch_store_ended(m, b, pc);
     }
     batch_unbind(m, b);
-    if (st == VTM_OK) batch_store_last(m, b);
+    // Всё остальное уже отдано машине в момент последнего касания
+    // (batch_store_ended); отдельных «живых на конце» тензоров нет: последнее
+    // касание каждого из них — та же инструкция, на которой сработал store.
     m->position = pos0 + C - 1;
     return st;
 }
@@ -4980,7 +5350,9 @@ vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
             moe_batch_limits(&cap, &budget);
             cmax = cap;
         }
-        lim = budget / (b.slot * sizeof(float));
+        // У плотных графов единица — сумма активаций (размер пачки выбран в
+        // 0168 по L1), у MoE — упакованный слот (0181: память под пачку).
+        lim = budget / ((b.has_moe ? b.slot : b.sum_slot) * sizeof(float));
         if (lim < 1u) lim = 1u;
         if ((size_t)cmax > lim) cmax = (int)lim;
     }

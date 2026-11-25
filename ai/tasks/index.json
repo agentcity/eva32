@@ -1206,7 +1206,7 @@
   {
     "id": "0181",
     "title": "MoE-пачка больше 128",
-    "status": "in_progress",
+    "status": "done",
     "file": "0181-moe-batch-bigger.md",
     "assignee": "agent:moe-batch-big"
   }

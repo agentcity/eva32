@@ -76,7 +76,7 @@ class TestConfig(unittest.TestCase):
         cfg = VTMConfig.from_env({})
         self.assertEqual(cfg.backend, "auto")
         self.assertEqual(cfg.max_tokens, 64)
-        self.assertEqual(cfg.prefill_batch, 128)
+        self.assertEqual(cfg.prefill_batch, 256)
         self.assertFalse(cfg.cache_prefix)
         self.assertIsNone(cfg.threads)
         self.assertIsNone(cfg.library)
