@@ -557,6 +557,91 @@ static int model_build(model_t *m, uint8_t **out, size_t *out_size) {
     return 0;
 }
 
+// Та же модель, но контейнер v0.3: запись тензора 60 байт (offset и
+// scale_offset — u64), в «резерве» заголовка meta_offset u64 + meta_len u32.
+static int model_build_v03(model_t *m, uint8_t **out, size_t *out_size) {
+    size_t table_size = 32u + (size_t)m->n_tensors * VTM_TENSOR_ENTRY_SIZE_V03;
+    size_t data_start = align32(table_size);
+    size_t cursor = data_start;
+    size_t meta_off = 0, program_off, total;
+    uint64_t *offsets = (uint64_t *)xmalloc(sizeof(uint64_t)
+                                            * (size_t)m->n_tensors);
+    uint64_t *soffsets = (uint64_t *)xmalloc(sizeof(uint64_t)
+                                             * (size_t)m->n_tensors);
+    uint8_t *img;
+    int i;
+
+    for (i = 0; i < m->n_tensors; i++) {
+        tensor_def *td = &m->tensors[i];
+        cursor = align32(cursor);
+        offsets[i] = (uint64_t)(cursor - data_start);
+        cursor += td->blob_len;
+        if (td->raw) {
+            cursor = align32(cursor);
+            soffsets[i] = (uint64_t)(cursor - data_start);
+            cursor += td->blob2_len;
+        } else {
+            soffsets[i] = VTM_NO_OFFSET;
+        }
+    }
+    program_off = align32(cursor);
+    if (m->meta_len) {
+        meta_off = program_off;
+        program_off = meta_off + align32(m->meta_len);
+    }
+    total = program_off + (size_t)m->n_instr * VTM_INSTR_SIZE;
+    img = (uint8_t *)calloc(1, total ? total : 1u);
+    if (!img) {
+        fprintf(stderr, "OOM\n");
+        exit(2);
+    }
+
+    memcpy(img, "VTM1", 4);
+    put_u16(img + 4, VTM_FORMAT_VERSION_V03);
+    put_u16(img + 6, m->header_flags);
+    put_u32(img + 8, (uint32_t)m->n_instr);
+    put_u32(img + 12, (uint32_t)m->n_tensors);
+    put_u32(img + 16, (uint32_t)m->n_instr * VTM_INSTR_SIZE);
+    // v0.3: program_offset не хранится; meta_offset u64 в 20..27, meta_len 28.
+    put_u64(img + 20, m->meta_len ? (uint64_t)meta_off : 0);
+    put_u32(img + 28, (uint32_t)m->meta_len);
+
+    for (i = 0; i < m->n_tensors; i++) {
+        tensor_def *td = &m->tensors[i];
+        uint8_t *e = img + 32u + (size_t)i * VTM_TENSOR_ENTRY_SIZE_V03;
+        int d;
+        memcpy(e, td->name, 24);
+        e[24] = td->kind;
+        e[25] = td->ndim;
+        for (d = 0; d < 4; d++)
+            put_u32(e + 26u + (size_t)d * 4u, td->dims[d]);
+        put_u64(e + 42u, td->offset = offsets[i]);
+        put_u64(e + 50u, td->scale_offset = soffsets[i]);
+        put_u16(e + 58u, 0);
+        memcpy(img + data_start + offsets[i], td->blob, td->blob_len);
+        if (td->raw)
+            memcpy(img + data_start + soffsets[i], td->blob2, td->blob2_len);
+    }
+    if (m->meta_len)
+        memcpy(img + meta_off, m->meta, m->meta_len);
+    for (i = 0; i < m->n_instr; i++) {
+        const vtm_instr *in = &m->prog[i];
+        uint8_t *p = img + program_off + (size_t)i * VTM_INSTR_SIZE;
+        p[0] = in->opcode;
+        p[1] = in->flags;
+        put_u16(p + 2, in->dst);
+        put_u16(p + 4, in->a);
+        put_u16(p + 6, in->b);
+        put_u16(p + 8, in->c);
+        put_i32(p + 12, in->imm);
+    }
+    free(offsets);
+    free(soffsets);
+    *out = img;
+    *out_size = total;
+    return 0;
+}
+
 static vtm_t *load_ok(const uint8_t *img, size_t size) {
     vtm_status st = VTM_OK;
     char err[256];
@@ -918,6 +1003,61 @@ static void test_raw_trit_layout(void) {
 }
 
 // --- порча файла -----------------------------------------------------------
+
+// Контейнер v0.3 (ADR 0019): 60-байтная запись, u64-смещения, meta_offset
+// в «резерве» заголовка. Значения и TMV те же, что у v0.2.
+static void test_v03_container(void) {
+    model_t md;
+    uint32_t dw[2] = {2, 3};
+    uint32_t dx[1] = {3};
+    uint32_t dy[1] = {2};
+    int8_t wt[6] = {1, 0, -1, -1, 1, 1};
+    float scales[1] = {2.0f};
+    float xv[3] = {2.0f, 3.0f, 4.0f};
+    float yv[2] = {0.0f, 0.0f};
+    uint8_t *img;
+    size_t size;
+    vtm_t *m;
+    const vtm_tensor *t;
+
+    model_init(&md);
+    model_set_meta(&md, "{\"rope_theta\": 10000.0}");
+    model_add_trit(&md, "W", 2, dw, wt, scales, 1);
+    model_add_f32(&md, "x", 1, dx, xv);
+    model_add_f32(&md, "y", 1, dy, yv);
+    model_inst(&md, VTM_OP_TMV, 0, 2, 0, 1, VTM_NO_TENSOR, 0);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build_v03(&md, &img, &size);
+
+    CHECK(get_u32(img + 32u + 42u) == 0u);  // offset u64, младшие 32
+    CHECK(get_u32(img + 32u + 46u) == 0u);  // offset u64, старшие 32
+    m = load_ok(img, size);
+    CHECK(m != NULL);
+    if (!m) { free(img); model_free(&md); return; }
+    CHECK(vtm_tensor_count(m) == 3);
+    t = vtm_tensor_by_name(m, "W");
+    CHECK(t != NULL && t->kind == VTM_TENSOR_TRIT);
+    CHECK(t != NULL && t->layout == VTM_LAYOUT_TRT1);
+    CHECK(run_ok(m));
+    t = vtm_tensor_by_name(m, "y");
+    CHECK(t != NULL);
+    if (t) {
+        CHECK_NEAR(t->f32[0], -4.0, 1e-6);
+        CHECK_NEAR(t->f32[1], 10.0, 1e-6);
+    }
+    CHECK(strcmp(vtm_meta_json(m), "{\"rope_theta\": 10000.0}") == 0);
+    vtm_free(m);
+
+    // v0.3 с битой версией таблицы не должен читаться как v0.2: это
+    // отдельная версия, а не флаг.
+    put_u16(img + 4, 99);
+    m = vtm_load_mem(img, size, NULL, NULL, 0);
+    CHECK(m == NULL);
+    CHECK(strstr(vtm_last_error(), "версия контейнера") != NULL);
+    free(img);
+    model_free(&md);
+}
 
 static void test_bad_files(void) {
     model_t md;
@@ -5658,6 +5798,7 @@ static void bench_cache_prefix(void) {
 int main(void) {
     test_trit_codec();
     test_load_and_tmv();
+    test_v03_container();
     test_tmv_blocks();
     test_tmv_scale128();
     test_raw_trit_layout();

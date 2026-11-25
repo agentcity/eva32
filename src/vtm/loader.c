@@ -1,8 +1,12 @@
-// Загрузчик .vtm: заголовок 32 байта, таблица тензоров по 52 байта,
-// секция данных с выравниванием на 32 и программа в конце файла.
+// Загрузчик .vtm: заголовок 32 байта, таблица тензоров по 52 байта (v0.2)
+// или 60 байт (v0.3), секция данных с выравниванием на 32 и программа в конце.
 //
-// Формат v0.2 (ADR 0011): dims — u32×4. Файлы v0.1 отвергаются: ценных
-// артефактов v0.1 нет, синтетика пересобирается.
+// Формат v0.2 (ADR 0011): dims — u32×4, offset/scale_offset — u32.
+// Формат v0.3 (ADR 0019, задача 0173): offset/scale_offset — u64, поэтому
+// файл может быть >4 ГиБ; meta_offset в заголовке — u64, program_offset
+// не хранится (программа последняя). Версия в заголовке выбирает ширину
+// записи таблицы; старый бинарь на version=3 отказывает по версии.
+// Файлы v0.1 отвергаются: ценных артефактов v0.1 нет, синтетика пересобирается.
 //
 // Все проверки границ делаются до выделения памяти и до исполнения. Кривой
 // файл обязан вернуть NULL и внятную причину, а не уронить процесс.
@@ -244,9 +248,9 @@ static int align_up(size_t v, size_t a, size_t *out) {
     return 0;
 }
 
-static int range_ok(uint32_t offset, uint64_t len, size_t data_size) {
-    if ((uint64_t)offset > (uint64_t)data_size) return 0;
-    return len <= (uint64_t)data_size - (uint64_t)offset;
+static int range_ok(uint64_t offset, uint64_t len, size_t data_size) {
+    if (offset > (uint64_t)data_size) return 0;
+    return len <= (uint64_t)data_size - offset;
 }
 
 // --- sha256: контроль целостности контейнера (задачи 0066, 0078) ----------
@@ -326,7 +330,7 @@ static int json_object_key_present(const uint8_t *p, size_t n,
 // 1 — блок integrity есть и хеши сошлись; 0 — блока нет (старый контейнер);
 // -1 — блок есть, но хеш/формат не сошёлся (текст ошибки в err).
 static int verify_integrity(const uint8_t *file, size_t data_start,
-                            uint32_t meta_off, uint32_t meta_len,
+                            size_t meta_off, uint32_t meta_len,
                             char *err, size_t errcap) {
     const uint8_t *meta = file + meta_off;
     size_t data_pos, meta_pos;
@@ -628,14 +632,14 @@ static int plan_tensor(const vtm_tensor *t, int writable, int can_reference,
 static const uint8_t *trit_words_ptr(const vtm_tensor *t, const uint8_t *data) {
     if (t->layout == VTM_LAYOUT_TRT1) {
         size_t ss = t->scale_is_f32 ? 4u : 2u;
-        return data + t->offset + 18u + (size_t)t->n_scales * ss;
+        return data + t->offset64 + 18u + (size_t)t->n_scales * ss;
     }
-    return data + t->offset;
+    return data + t->offset64;
 }
 
 static const uint8_t *trit_scales_ptr(const vtm_tensor *t, const uint8_t *data) {
-    if (t->layout == VTM_LAYOUT_TRT1) return data + t->offset + 18u;
-    return data + t->scale_offset;
+    if (t->layout == VTM_LAYOUT_TRT1) return data + t->offset64 + 18u;
+    return data + t->scale_offset64;
 }
 
 // Разложить тензор по арене (copy_*) или выставить указатели в отображение.
@@ -707,7 +711,7 @@ static int fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
         // масштабы — scales, у Q4_1 ещё min'ы q4_mins. В mmap-режиме
         // упакованные байты (и fp32-масштабы/min при VTM_UNALIGNED_LOADS)
         // ссылаются прямо в отображение.
-        const uint8_t *seg = data + t->offset;
+        const uint8_t *seg = data + t->offset64;
         size_t ss = t->scale_is_f32 ? 4u : 2u;
         size_t groups = t->n_scales;
         size_t header_size = t->q4_is_asym
@@ -758,7 +762,7 @@ static int fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
         // В mmap-режиме и при VTM_UNALIGNED_LOADS указатель смотрит в
         // отображение (блоки читаются через memcpy — выравнивание не нужно),
         // иначе блоки лежат в арене (calloc'нутый буфер уже выровнен).
-        const uint8_t *seg = data + t->offset;
+        const uint8_t *seg = data + t->offset64;
         size_t bytes = (size_t)t->n_qblocks * q4k_block_bytes(t->kind);
         if (p->copy_qblocks) {
             memcpy(dst, seg + VTM_Q4K_HEADER_SIZE, bytes);
@@ -771,19 +775,19 @@ static int fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
         if (p->copy_data) {
             float *y = (float *)(void *)dst;
             uint32_t i;
-            const uint8_t *src = data + t->offset;
+            const uint8_t *src = data + t->offset64;
             for (i = 0; i < t->n_elements; i++)
                 y[i] = rd_f32(src + (size_t)i * 4u);
             t->f32 = y;
         } else {
             // Немодифицируемый fp32 лежит в отображении как есть: offset
             // кратен 32, отображение выровнено на страницу, float* валиден.
-            t->f32 = (float *)(void *)(uintptr_t)(data + t->offset);
+            t->f32 = (float *)(void *)(uintptr_t)(data + t->offset64);
         }
     } else if (t->kind == VTM_TENSOR_F16) {
         float *y = (float *)(void *)dst;
         uint32_t i;
-        const uint8_t *src = data + t->offset;
+        const uint8_t *src = data + t->offset64;
         for (i = 0; i < t->n_elements; i++)
             y[i] = vtm_half_to_float(rd16(src + (size_t)i * 2u));
         t->f32 = y;
@@ -797,7 +801,7 @@ static int fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
         //  * VTM_I8_EMB=0 — прежний путь: развернуть в fp32 в арене, тензор
         //    становится kind 1, источник помечается
         //    VTM_TENSOR_FLAG_INT8_SOURCE (в файл флаг не пишется).
-        const uint8_t *src = data + t->offset;
+        const uint8_t *src = data + t->offset64;
         const uint8_t *sp = src + 18u;
         size_t ss = t->scale_is_f32 ? 4u : 2u;
         const uint8_t *qp = sp + (size_t)t->n_scales * ss;
@@ -838,7 +842,7 @@ static int fill_tensor_planned(vtm_tensor *t, const uint8_t *data,
     } else { // BF16
         float *y = (float *)(void *)dst;
         uint32_t i;
-        const uint8_t *src = data + t->offset;
+        const uint8_t *src = data + t->offset64;
         for (i = 0; i < t->n_elements; i++)
             y[i] = vtm_bf16_to_float(rd16(src + (size_t)i * 2u));
         t->f32 = y;
@@ -1193,8 +1197,11 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
     vtm_t *m;
     const uint8_t *p = (const uint8_t *)data;
     uint32_t n_instr, n_tensors, n_program;
-    size_t table_end, data_start, program_bytes, program_off, data_size;
-    uint32_t meta_off = 0, meta_len = 0;
+    uint16_t version;
+    size_t entry_size, table_end, data_start, program_bytes, program_off, data_size;
+    uint64_t meta_off64 = 0;
+    size_t meta_off = 0;
+    uint32_t meta_len = 0;
     int meta_valid = 0;
     int kv_flag = 0;
     int has_kv = 0;
@@ -1262,11 +1269,27 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
 
     if (memcmp(p, "VTM1", 4) != 0)
         FAIL(VTM_E_MAGIC, "нет магии VTM1");
-    if (rd16(p + 4) == VTM_FORMAT_VERSION_V01)
+    version = rd16(p + 4);
+    if (version == VTM_FORMAT_VERSION_V01)
         FAIL(VTM_E_VERSION, "формат v0.1 не поддерживается");
-    if (rd16(p + 4) != VTM_FORMAT_VERSION)
-        FAIL(VTM_E_VERSION, "версия контейнера %u, ожидали %u",
-             (unsigned)rd16(p + 4), (unsigned)VTM_FORMAT_VERSION);
+    if (version != VTM_FORMAT_VERSION_V02 &&
+        version != VTM_FORMAT_VERSION_V03)
+        FAIL(VTM_E_VERSION,
+             "версия контейнера %u, ожидали %u (v0.2) или %u (v0.3)",
+             (unsigned)version,
+             (unsigned)VTM_FORMAT_VERSION_V02,
+             (unsigned)VTM_FORMAT_VERSION_V03);
+    // У v0.2 смещения u32 — файл в 4 ГиБ и больше он не представляет.
+    // Проверяем после версии: v0.3-файл отвергается не «по размеру», а
+    // внятным «версия 3» старым бинарём и грузится новым.
+    if (version == VTM_FORMAT_VERSION_V02 &&
+        size >= (size_t)VTM_MAX_FILE_BYTES_V02)
+        FAIL(VTM_E_BOUNDS,
+             "файл v0.2 (%zu байт) больше предела 4 ГиБ: смещения u32; "
+             "нужен контейнер v0.3 (u64-смещения, ADR 0019)", size);
+    entry_size = (version == VTM_FORMAT_VERSION_V03)
+               ? (size_t)VTM_TENSOR_ENTRY_SIZE_V03
+               : (size_t)VTM_TENSOR_ENTRY_SIZE;
 
     m->header_flags = rd16(p + 6);
     kv_flag = (m->header_flags & VTM_HEADER_FLAG_KV_OUT_OF_FILE) != 0;
@@ -1277,11 +1300,12 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
     if (n_tensors > VTM_MAX_TENSORS)
         FAIL(VTM_E_FORMAT, "n_tensors=%u больше предела %u",
              n_tensors, (unsigned)VTM_MAX_TENSORS);
-    if ((uint64_t)n_tensors * VTM_TENSOR_ENTRY_SIZE > (uint64_t)(size - 32))
+    if ((uint64_t)n_tensors * (uint64_t)entry_size >
+        (uint64_t)(size - 32))
         FAIL(VTM_E_TRUNCATED,
              "таблица тензоров (%u × %u) не влезает в файл", n_tensors,
-             (unsigned)VTM_TENSOR_ENTRY_SIZE);
-    table_end = 32u + (size_t)n_tensors * VTM_TENSOR_ENTRY_SIZE;
+             (unsigned)entry_size);
+    table_end = 32u + (size_t)n_tensors * entry_size;
     if (align_up(table_end, VTM_DATA_ALIGN, &data_start) != 0 || data_start > size)
         FAIL(VTM_E_TRUNCATED, "не удалось выровнять начало данных");
     m->data_start = data_start;
@@ -1298,16 +1322,26 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
     data_size = program_off - data_start;
 
     // Метаданные — JSON между секцией данных и программой (docs/vtm.md).
-    // Смещение и длину берём из «резерва» заголовка (байты 24 и 28). Если они
-    // врут или указывают мимо программы — это битая мета, а не битый файл:
-    // мету просто не читаем, данные трактуем как раньше (до программы).
-    meta_off = rd32(p + 24);
-    meta_len = rd32(p + 28);
-    if (meta_off != 0 && meta_len != 0 &&
-        (uint64_t)meta_off >= (uint64_t)data_start &&
-        (uint64_t)meta_off + (uint64_t)meta_len <= (uint64_t)program_off) {
+    // v0.2: program_offset u32, meta_offset u32, meta_len u32 (байты 20/24/28).
+    // v0.3: program_offset не хранится (он всегда file_size - n_instr*16,
+    // программа последняя), зато meta_offset — u64 в байтах 20..27, meta_len —
+    // u32 в 28..31. Иначе мета за 4 ГиБ была бы недостижима.
+    // Если смещения врут или указывают мимо программы — это битая мета, а не
+    // битый файл: мету просто не читаем, данные трактуем до программы.
+    if (version == VTM_FORMAT_VERSION_V03) {
+        meta_off64 = rd64(p + 20);
+        meta_len = rd32(p + 28);
+    } else {
+        meta_off64 = (uint64_t)rd32(p + 24);
+        meta_len = rd32(p + 28);
+    }
+    if (meta_off64 != 0 && meta_len != 0 &&
+        meta_off64 >= (uint64_t)data_start &&
+        meta_off64 <= (uint64_t)program_off &&
+        (uint64_t)meta_len <= (uint64_t)program_off - meta_off64) {
         meta_valid = 1;
-        data_size = (size_t)meta_off - data_start;
+        meta_off = (size_t)meta_off64;
+        data_size = meta_off - data_start;
     }
 
     // Контроль целостности (задача 0066). Проверяем до разбора тензоров:
@@ -1337,7 +1371,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
     }
 
     for (i = 0; i < n_tensors; i++) {
-        const uint8_t *e = p + 32u + (size_t)i * VTM_TENSOR_ENTRY_SIZE;
+        const uint8_t *e = p + 32u + (size_t)i * entry_size;
         vtm_tensor *t = &m->tensors[i];
         const uint8_t *nul = (const uint8_t *)memchr(e, 0, 24);
         uint64_t n_el = 1;
@@ -1375,11 +1409,21 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
             }
         }
         t->n_elements = (uint32_t)n_el;
-        t->offset = rd32(e + 42u);
-        t->scale_offset = rd32(e + 46u);
-        // Резерв таблицы (байты 50-51) — флаги записи; старые контейнеры
-        // присылают 0. Неизвестные биты игнорируются: резерв для того и есть.
-        t->flags = rd16(e + 50u);
+        // v0.2: offset u32 (42), scale_offset u32 (46), flags u16 (50).
+        // v0.3: offset u64 (42..49), scale_offset u64 (50..57), flags u16 (58).
+        if (version == VTM_FORMAT_VERSION_V03) {
+            t->offset64 = rd64(e + 42u);
+            t->scale_offset64 = rd64(e + 50u);
+            t->flags = rd16(e + 58u);
+        } else {
+            t->offset64 = (uint64_t)rd32(e + 42u);
+            t->scale_offset64 = (uint64_t)rd32(e + 46u);
+            t->flags = rd16(e + 50u);
+        }
+        // ABI-поля: младшие 32 бита. Для v0.3 полный адрес — только в
+        // offset64/scale_offset64; main.c печатает старое поле как раньше.
+        t->offset = (uint32_t)t->offset64;
+        t->scale_offset = (uint32_t)t->scale_offset64;
         t->n_blocks = 0;
         t->n_scales = 0;
         t->scale_block = 0;
@@ -1407,21 +1451,22 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                 FAIL(VTM_E_FORMAT,
                      "тензор %u (%s): KV-кэш обязан быть fp-тензором (kind %u)",
                      i, t->name, (unsigned)t->kind);
-            if (t->scale_offset != 0)
+            if (t->scale_offset64 != 0)
                 FAIL(VTM_E_FORMAT,
-                     "тензор %u (%s): у KV-кэша scale_offset=%u, ожидался 0",
-                     i, t->name, t->scale_offset);
+                     "тензор %u (%s): у KV-кэша scale_offset=%llu, ожидался 0",
+                     i, t->name, (unsigned long long)t->scale_offset64);
             if (kv_flag) {
-                if (t->offset != VTM_KV_NO_OFFSET)
+                if (t->offset64 != VTM_KV_NO_OFFSET)
                     FAIL(VTM_E_FORMAT,
-                         "тензор %u (%s): у KV-кэша offset=%u, ожидался 0x%08X "
+                         "тензор %u (%s): у KV-кэша offset=%llu, ожидался 0x%08X "
                          "(payload'а нет; флаг KV_OUT_OF_FILE)",
-                         i, t->name, t->offset, (unsigned)VTM_KV_NO_OFFSET);
-            } else if (t->offset != 0) {
+                         i, t->name, (unsigned long long)t->offset64,
+                         (unsigned)VTM_KV_NO_OFFSET);
+            } else if (t->offset64 != 0) {
                 FAIL(VTM_E_FORMAT,
                      "тензор %u (%s): KV-кэш без флага KV_OUT_OF_FILE, но "
-                     "offset=%u (ожидался 0)",
-                     i, t->name, t->offset);
+                     "offset=%llu (ожидался 0)",
+                     i, t->name, (unsigned long long)t->offset64);
             }
             // Кэп на суммарный размер: один помеченный тензор в 192-байтном
             // файле иначе просит calloc до VTM_MAX_ELEMENTS×4 байт.
@@ -1439,12 +1484,14 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
             continue;
         }
 
-        if ((t->offset % VTM_DATA_ALIGN) != 0)
-            FAIL(VTM_E_FORMAT, "тензор %u (%s): offset=%u не кратен %u",
-                 i, t->name, t->offset, (unsigned)VTM_DATA_ALIGN);
-        if ((uint64_t)t->offset >= (uint64_t)data_size)
-            FAIL(VTM_E_BOUNDS, "тензор %u (%s): offset=%u за концом данных (%zu)",
-                 i, t->name, t->offset, data_size);
+        if ((t->offset64 % VTM_DATA_ALIGN) != 0)
+            FAIL(VTM_E_FORMAT, "тензор %u (%s): offset=%llu не кратен %u",
+                 i, t->name, (unsigned long long)t->offset64,
+                 (unsigned)VTM_DATA_ALIGN);
+        if ((uint64_t)t->offset64 >= (uint64_t)data_size)
+            FAIL(VTM_E_BOUNDS,
+                 "тензор %u (%s): offset=%llu за концом данных (%zu)",
+                 i, t->name, (unsigned long long)t->offset64, data_size);
 
         if (t->kind == VTM_TENSOR_TRIT) {
             uint64_t need;
@@ -1455,8 +1502,8 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                 FAIL(VTM_E_FORMAT,
                      "тензор %u (%s): неизвестное хранение тритов %u в flags",
                      i, t->name, entry_storage);
-            if (t->scale_offset == VTM_NO_OFFSET) {
-                const uint8_t *seg = p + data_start + t->offset;
+            if (t->scale_offset64 == VTM_NO_OFFSET) {
+                const uint8_t *seg = p + data_start + t->offset64;
                 uint64_t n_trits;
                 uint32_t n_scales, storage_blocks, n128, n160, n_words;
                 uint32_t scale_block;
@@ -1464,7 +1511,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                 size_t ss, seg_bytes;
                 char werr[160];
 
-                if (!range_ok(t->offset, 18u, data_size))
+                if (!range_ok(t->offset64, 18u, data_size))
                     FAIL(VTM_E_BOUNDS,
                          "тензор %u (%s): TRT1-заголовок за границей данных",
                          i, t->name);
@@ -1546,7 +1593,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                         FAIL(VTM_E_BOUNDS, "тензор %u (%s): TRT1 слишком велик",
                              i, t->name);
                 }
-                if (!range_ok(t->offset, (uint64_t)seg_bytes, data_size))
+                if (!range_ok(t->offset64, (uint64_t)seg_bytes, data_size))
                     FAIL(VTM_E_BOUNDS,
                          "тензор %u (%s): TRT1-сегмент (%zu байт) за границей",
                          i, t->name, seg_bytes);
@@ -1589,22 +1636,23 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                 if (storage_blocks == 0 || n_scales == 0)
                     FAIL(VTM_E_FORMAT, "тензор %u (%s): пустой raw-трит",
                          i, t->name);
-                if ((t->scale_offset % VTM_DATA_ALIGN) != 0)
+                if ((t->scale_offset64 % VTM_DATA_ALIGN) != 0)
                     FAIL(VTM_E_FORMAT,
-                         "тензор %u (%s): scale_offset=%u не кратен %u",
-                         i, t->name, t->scale_offset, (unsigned)VTM_DATA_ALIGN);
+                         "тензор %u (%s): scale_offset=%llu не кратен %u",
+                         i, t->name, (unsigned long long)t->scale_offset64,
+                         (unsigned)VTM_DATA_ALIGN);
                 ss = (m->header_flags & VTM_HEADER_FLAG_F32_SCALES) ? 4u : 2u;
-                if (!range_ok(t->offset,
+                if (!range_ok(t->offset64,
                               (uint64_t)storage_blocks * 32u, data_size))
                     FAIL(VTM_E_BOUNDS,
                          "тензор %u (%s): слова тритов за границей данных",
                          i, t->name);
-                if (!range_ok(t->scale_offset,
+                if (!range_ok(t->scale_offset64,
                               (uint64_t)n_scales * ss, data_size))
                     FAIL(VTM_E_BOUNDS,
                          "тензор %u (%s): масштабы за границей данных",
                          i, t->name);
-                if (validate_words(p + data_start + t->offset,
+                if (validate_words(p + data_start + t->offset64,
                                    storage_blocks * VTM_WORDS_PER_BLOCK,
                                    werr, sizeof werr) != 0)
                     FAIL(VTM_E_SCALE, "тензор %u (%s): %s",
@@ -1621,16 +1669,17 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
             // Самодостаточный сегмент kind 4 (задача 0044): 18-байтовый
             // заголовок "INT8" (как у TRT1), масштабы, затем n_elements
             // знаковых байт q. w = q · scale, масштаб на блок 128.
-            const uint8_t *seg = p + data_start + t->offset;
+            const uint8_t *seg = p + data_start + t->offset64;
             uint64_t n_values;
             uint32_t n_scales, expected_scales, k;
             size_t ss, seg_bytes;
-            if (t->scale_offset != VTM_NO_OFFSET)
+            if (t->scale_offset64 != VTM_NO_OFFSET)
                 FAIL(VTM_E_FORMAT,
                      "тензор %u (%s): kind=int8 требует scale_offset=0x%08X "
-                     "(масштабы внутри сегмента), а пришло %u",
-                     i, t->name, (unsigned)VTM_NO_OFFSET, t->scale_offset);
-            if (!range_ok(t->offset, 18u, data_size))
+                     "(масштабы внутри сегмента), а пришло %llu",
+                     i, t->name, (unsigned)VTM_NO_OFFSET,
+                     (unsigned long long)t->scale_offset64);
+            if (!range_ok(t->offset64, 18u, data_size))
                 FAIL(VTM_E_BOUNDS,
                      "тензор %u (%s): INT8-заголовок за границей данных",
                      i, t->name);
@@ -1669,7 +1718,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                     FAIL(VTM_E_BOUNDS, "тензор %u (%s): INT8 слишком велик",
                          i, t->name);
             }
-            if (!range_ok(t->offset, (uint64_t)seg_bytes, data_size))
+            if (!range_ok(t->offset64, (uint64_t)seg_bytes, data_size))
                 FAIL(VTM_E_BOUNDS,
                      "тензор %u (%s): INT8-сегмент (%zu байт) за границей",
                      i, t->name, seg_bytes);
@@ -1703,18 +1752,19 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
             // байт j = значение j + значение j+16). В fp32 НЕ расквантовываем:
             // t->words указывает на упакованные байты, t->scales — на fp32-
             // масштабы, t->q4_mins — на min (Q4_1).
-            const uint8_t *seg = p + data_start + t->offset;
+            const uint8_t *seg = p + data_start + t->offset64;
             uint64_t n_values, total;
             uint32_t n_groups, expected_groups, n_mins, k;
             size_t header_size, ss, scales_bytes, mins_bytes, packed_bytes;
             int asym;
 
-            if (t->scale_offset != VTM_NO_OFFSET)
+            if (t->scale_offset64 != VTM_NO_OFFSET)
                 FAIL(VTM_E_FORMAT,
                      "тензор %u (%s): kind=Q4 требует scale_offset=0x%08X "
-                     "(масштабы внутри сегмента), а пришло %u",
-                     i, t->name, (unsigned)VTM_NO_OFFSET, t->scale_offset);
-            if (!range_ok(t->offset, VTM_Q4_HEADER_SIZE, data_size))
+                     "(масштабы внутри сегмента), а пришло %llu",
+                     i, t->name, (unsigned)VTM_NO_OFFSET,
+                     (unsigned long long)t->scale_offset64);
+            if (!range_ok(t->offset64, VTM_Q4_HEADER_SIZE, data_size))
                 FAIL(VTM_E_BOUNDS,
                      "тензор %u (%s): Q4-заголовок за границей данных",
                      i, t->name);
@@ -1753,7 +1803,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
             if (asym) {
                 // Q4_1 несёт явное n_mins: без него отсутствие min в
                 // обрезанном сегменте не отличить от выравнивающего padding'а.
-                if (!range_ok(t->offset, VTM_Q4_ASYM_HEADER_SIZE, data_size))
+                if (!range_ok(t->offset64, VTM_Q4_ASYM_HEADER_SIZE, data_size))
                     FAIL(VTM_E_FORMAT,
                          "тензор %u (%s): Q4_1 без n_mins — тихо считать "
                          "Q4_0 нельзя", i, t->name);
@@ -1777,7 +1827,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                 FAIL(VTM_E_BOUNDS, "тензор %u (%s): Q4 слишком велик",
                      i, t->name);
             if (asym &&
-                !range_ok(t->offset,
+                !range_ok(t->offset64,
                           (uint64_t)header_size + scales_bytes
                           + mins_bytes, data_size))
                 FAIL(VTM_E_FORMAT,
@@ -1789,7 +1839,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                 add_u64(total, packed_bytes, &total) != 0)
                 FAIL(VTM_E_BOUNDS, "тензор %u (%s): Q4 слишком велик",
                      i, t->name);
-            if (!range_ok(t->offset, total, data_size))
+            if (!range_ok(t->offset64, total, data_size))
                 FAIL(VTM_E_BOUNDS,
                      "тензор %u (%s): Q4-сегмент (%llu байт) за границей",
                      i, t->name, (unsigned long long)total);
@@ -1831,18 +1881,19 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
             // НЕ расквантовываем: t->qblocks смотрит в отмеченные блоки,
             // t->f32 == NULL. d/dmin каждого блока проверяются на конечность:
             // NaN в контейнере дал бы тихие NaN-логиты.
-            const uint8_t *seg = p + data_start + t->offset;
+            const uint8_t *seg = p + data_start + t->offset64;
             const char *magic = t->kind == VTM_TENSOR_Q4K
                               ? VTM_Q4K_MAGIC : VTM_Q6K_MAGIC;
             uint64_t n_values, total, block_bytes;
             uint32_t n_blk, expected_blocks, k;
 
-            if (t->scale_offset != VTM_NO_OFFSET)
+            if (t->scale_offset64 != VTM_NO_OFFSET)
                 FAIL(VTM_E_FORMAT,
                      "тензор %u (%s): kind=Q4_K/Q6_K требует "
-                     "scale_offset=0x%08X (масштабы внутри блока), а пришло %u",
-                     i, t->name, (unsigned)VTM_NO_OFFSET, t->scale_offset);
-            if (!range_ok(t->offset, VTM_Q4K_HEADER_SIZE, data_size))
+                     "scale_offset=0x%08X (масштабы внутри блока), а пришло %llu",
+                     i, t->name, (unsigned)VTM_NO_OFFSET,
+                     (unsigned long long)t->scale_offset64);
+            if (!range_ok(t->offset64, VTM_Q4K_HEADER_SIZE, data_size))
                 FAIL(VTM_E_BOUNDS,
                      "тензор %u (%s): заголовок Q4_K/Q6_K за границей данных",
                      i, t->name);
@@ -1878,7 +1929,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                 add_u64(total, VTM_Q4K_HEADER_SIZE, &total) != 0)
                 FAIL(VTM_E_BOUNDS, "тензор %u (%s): Q4_K слишком велик",
                      i, t->name);
-            if (!range_ok(t->offset, total, data_size))
+            if (!range_ok(t->offset64, total, data_size))
                 FAIL(VTM_E_BOUNDS,
                      "тензор %u (%s): Q4_K-сегмент (%llu байт) за границей",
                      i, t->name, (unsigned long long)total);
@@ -1923,7 +1974,7 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         } else {
             size_t esize = (t->kind == VTM_TENSOR_F32) ? 4u : 2u;
             uint64_t bytes = (uint64_t)t->n_elements * esize;
-            if (!range_ok(t->offset, bytes, data_size))
+            if (!range_ok(t->offset64, bytes, data_size))
                 FAIL(VTM_E_BOUNDS,
                      "тензор %u (%s): данные (%llu байт) за границей",
                      i, t->name, (unsigned long long)bytes);
@@ -2180,7 +2231,7 @@ static void map_trim_copied(vtm_t *m) {
         // его страницы в отображении не занимались — трогать их madvise'ом
         // нельзя.
         if ((t->flags & VTM_TENSOR_FLAG_KV_CACHE) != 0) continue;
-        begin = base + (uintptr_t)m->data_start + (uintptr_t)t->offset;
+        begin = base + (uintptr_t)m->data_start + (uintptr_t)t->offset64;
         end = begin + (uintptr_t)t->n_elements * 2u;
         lo = begin & ~(uintptr_t)(page - 1u);
         hi = (end + (uintptr_t)page - 1u) & ~(uintptr_t)(page - 1u);

@@ -1150,7 +1150,7 @@
   {
     "id": "0173",
     "title": "Контейнер v0.3 с u64-смещениями",
-    "status": "in_progress",
+    "status": "done",
     "file": "0173-u64-container.md",
     "assignee": "agent:u64"
   },

@@ -1,4 +1,4 @@
-// VTM — виртуальная троичная машина, публичный API (v0.2).
+// VTM — виртуальная троичная машина, публичный API (v0.2/v0.3).
 //
 // Единственный вход для хоста: vtm_load()/vtm_load_mem(), затем vtm_run().
 // Формат контейнера описан в docs/vtm.md; решения, которых в спеке не было,
@@ -51,19 +51,31 @@ extern "C" {
 
 // --- размеры контейнера -----------------------------------------------------
 // v0.2: dims — u32×4 (ADR 0011), запись тензора 52 байта вместо 44.
-#define VTM_FORMAT_VERSION   2u
-#define VTM_FORMAT_VERSION_V01 1u
+// v0.3: offset/scale_offset — u64 (ADR 0019), запись 60 байт; dims остаются
+// u32×4 (элементов всё равно не больше VTM_MAX_ELEMENTS = 2^30).
+// VTM_FORMAT_VERSION — версия, которую по умолчанию пишут старые писатели;
+// загрузчик принимает обе: VTM_FORMAT_VERSION_V02 и VTM_FORMAT_VERSION_V03.
+#define VTM_FORMAT_VERSION      2u
+#define VTM_FORMAT_VERSION_V02  2u
+#define VTM_FORMAT_VERSION_V03  3u
+#define VTM_FORMAT_VERSION_V01  1u
 #define VTM_HEADER_SIZE      32u
 #define VTM_TENSOR_ENTRY_SIZE 52u
+#define VTM_TENSOR_ENTRY_SIZE_V03 60u
 #define VTM_INSTR_SIZE       16u
 #define VTM_DATA_ALIGN       32u
 #define VTM_ARENA_ALIGN      64u
 
 // Максимумы нужны, чтобы кривой заголовок не приводил к гигантским calloc.
+// Общий предел — 1 ТиБ (v0.3, u64-смещения). У v0.2 свой предел 4 ГиБ:
+// его проверяет загрузчик после чтения версии, иначе v0.3-файл отвергался бы
+// по размеру до внятного «версия 3».
 #if SIZE_MAX > 0xFFFFFFFFu
-#define VTM_MAX_FILE_BYTES   ((size_t)4u << 30)   // 4 ГиБ — с запасом для v0.1
+#define VTM_MAX_FILE_BYTES      ((size_t)1u << 40)  // 1 ТиБ — потолок v0.3
+#define VTM_MAX_FILE_BYTES_V02  ((size_t)4u << 30)  // 4 ГиБ — потолок v0.2
 #else
-#define VTM_MAX_FILE_BYTES   ((size_t)0xFFFFFFFFu)
+#define VTM_MAX_FILE_BYTES      ((size_t)0xFFFFFFFFu)
+#define VTM_MAX_FILE_BYTES_V02  ((size_t)0xFFFFFFFFu)
 #endif
 #define VTM_MAX_TENSORS      (1u << 20)
 #define VTM_MAX_INSTR        (1u << 24)
@@ -75,6 +87,8 @@ extern "C" {
 // Индекс «тензора нет» в полях инструкции.
 #define VTM_NO_TENSOR        0xFFFFu
 // scale_offset == VTM_NO_OFFSET: масштабы лежат внутри TRT1-сегмента.
+// Маркер один для v0.2 и v0.3: настоящие offset/scale_offset кратны 32,
+// поэтому 0xFFFFFFFF адресом быть не может даже при u64-поле.
 #define VTM_NO_OFFSET        0xFFFFFFFFu
 
 // --- троичный формат -------------------------------------------------------
@@ -209,8 +223,15 @@ typedef struct {
     uint8_t ndim;           // 1..4
     uint32_t dims[4];       // dims[0] — старшая ось, dims[ndim-1] — младшая
     uint32_t n_elements;    // произведение dims[0..ndim-1]
-    uint32_t offset;        // от начала секции данных, кратен 32
-    uint32_t scale_offset;  // VTM_NO_OFFSET для встроенного TRT1
+    // Полные смещения контейнера v0.3 (u64). В v0.2 старшие 32 бита нулевые.
+    // Поля offset/scale_offset ниже оставлены для ABI: в них младшие 32 бита
+    // (у v0.2-файла это ровно значение из таблицы). Новый код обязан читать
+    // offset64/scale_offset64: у контейнера >4 ГиБ младшие 32 бита адреса
+    // бессмысленны сами по себе.
+    uint64_t offset64;      // от начала секции данных, кратен 32
+    uint64_t scale_offset64;// VTM_NO_OFFSET для встроенного TRT1
+    uint32_t offset;        // ABI/диагностика: младшие 32 бита offset64
+    uint32_t scale_offset;  // ABI/диагностика: младшие 32 бита scale_offset64
     uint32_t n_blocks;      // kind == TRIT: блоков хранения по 160 тритов
     uint32_t n_scales;      // kind == TRIT: число масштабов
     uint32_t scale_block;   // kind == TRIT: 128 (VTM/Python) или 160 (docs)

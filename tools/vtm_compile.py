@@ -102,9 +102,10 @@ KV-кэш (`2 × слоёв × ctx × kv_dim × 4` байт) живёт в ар�
 тензоры/инструкции/KV-кэши, что у обученной модели) с нулевыми весами:
 `vtm_ref.write_vtm_stream` пишет payload нулями, поэтому 32B не требует ни HF,
 ни миллиардов тритов в памяти. Файл пишется для 1.5B (~0,34 ГиБ), 7B (~1,5 ГиБ)
-и 14B (~3,0 ГиБ); 32B-раскладка — ~6,9 ГиБ, а формат v0.2 адресует файл
-u32-смещениями (предел 4 ГиБ), поэтому `--out` для 32B даёт внятную ошибку, а
-`--shape 32b` без `--out` печатает план и KV-бюджет. Проверка C-рантаймом:
+и 14B (~3,0 ГиБ) в v0.2; 32B-раскладка — ~6,9 ГиБ, и `auto` выбирает для неё
+v0.3 (u64-смещения, ADR 0019), печатая выбор в stderr. `--container-version 2`
+на 32B даёт внятную ошибку про предел 4 ГиБ, `--container-version 3` —
+принудительную v0.3 (в том числе для маленьких форм). Проверка C-рантаймом:
 
 ```
 src/vtm/vtm run /tmp/synth_14b.vtm --tokens 1 --max-new 1
@@ -2086,11 +2087,9 @@ def make_synthetic(seed: int = 1, size: int = 128, mode: str = "attn") -> vtm_re
 #: поэтому `fit_context_window` урежет 14B и 32B до ctx 1024 (384/512 МиБ);
 #: 7B и 1.5B остаются на 2048.
 #:
-#: 32B-раскладка в packed20 — ~6,9 ГиБ, а контейнер v0.2 адресует файл
-#: u32-смещениями (предел 4 ГиБ): граф и KV-бюджет поддержаны, но записать
-#: такой файл формат не может — `write_vtm_stream` откажет с числами и
-#: вариантами (u64-смещения/шардирование). 7B (~1,5 ГиБ) и 14B (~3,0 ГиБ)
-#: пишутся и запускаются C-рантаймом.
+#: 32B-раскладка в packed20 — ~6,9 ГиБ: v0.2 (u32-смещения, предел 4 ГиБ)
+#: её не представляет, поэтому `auto` пишет v0.3 (u64-смещения, ADR 0019) и
+#: печатает выбор в stderr. 1.5B/7B/14B (0,34/1,5/3,0 ГиБ) остаются на v0.2.
 SYNTHETIC_SHAPES: dict[str, dict[str, Any]] = {
     "1.5b": {
         "hidden": 1536,
@@ -2165,9 +2164,9 @@ def make_synthetic_shape(
     а `vtm_ref.write_vtm_stream` пишет вместо payload'ов нули. Этого хватает,
     чтобы проверить сборку, загрузку C-рантаймом и проход по 1 токену на
     реальных размерностях (7B — ~1,5 ГиБ файла, 14B — ~3,0 ГиБ), не поднимая
-    в памяти списки на миллиарды тритов и не качая HF. 32B (~6,9 ГиБ) в
-    контейнер v0.2 не влезает (u32-смещения, предел 4 ГиБ): для него доступен
-    граф/план без записи и честная ошибка при `--out`.
+    в памяти списки на миллиарды тритов и не качая HF. 32B (~6,9 ГиБ) в v0.2
+    не влезает, поэтому `auto` пишет v0.3 (u64-смещения, ADR 0019); `--out`
+    без явной версии для 32B даёт v0.3, `--container-version 2` — отказ.
 
     `context_len` переопределяет форму; KV-бюджет (`max_kv_bytes`) передаётся
     в `compile_model`, который сам урежет ctx и напечатает предупреждение.
@@ -2455,6 +2454,7 @@ def _print_shape(
     build_s: float,
     write_s: float | None = None,
     integrity: bool = False,
+    container_version: int | str = "auto",
 ) -> None:
     """Отчёт по большой синтетической форме: размеры, KV, время сборки."""
     synthetic = vtm.meta.get("synthetic") or {}
@@ -2475,13 +2475,17 @@ def _print_shape(
     print("операции: " + ", ".join(f"{name}×{count}" for name, count in sorted(ops.items())))
     for line in kv_budget_lines(vtm):
         print(line)
-    estimated = vtm.estimated_file_size()
-    print(f"оценка размера: {_human_bytes(estimated)}")
-    if estimated >= 2 ** 32:
+    size_v02 = vtm.estimated_file_size(2)
+    version = vtm_ref.choose_container_version(size_v02, container_version)
+    estimated = vtm.estimated_file_size(version)
+    print(f"оценка размера: {_human_bytes(estimated)} (контейнер v0.{version})")
+    if version == 3 and size_v02 >= 2 ** 32:
         print(
-            "файл не влезет в контейнер v0.2: смещения u32 (предел 4 ГиБ); "
-            "нужен формат с u64-смещениями (ADR) или шардирование модели"
+            "v0.2 не влезает: смещения u32 (предел 4 ГиБ); auto/--container-version "
+            "выбирает v0.3 (u64-смещения, запись 60 байт, ADR 0019)"
         )
+    elif version == 3:
+        print("контейнер v0.3 запрошен явно (u64-смещения, запись 60 байт)")
     print(f"сборка графа: {build_s:.2f} с")
     if path:
         actual = os.path.getsize(path)
@@ -2527,6 +2531,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--integrity",
         action="store_true",
         help="считать sha256 при записи --shape (по умолчанию решает VTM_WRITE_HASH)",
+    )
+    parser.add_argument(
+        "--container-version",
+        choices=("auto", "2", "3"),
+        default="auto",
+        help="версия контейнера: auto — v0.2, пока файл < 4 ГиБ, иначе v0.3 "
+             "(u64-смещения); 2/3 — принудительно",
     )
     parser.add_argument("--out", help="куда записать .vtm (--synthetic/--manifest)")
     parser.add_argument("--qwen-config", help="YAML Qwen-конфига (только план, без весов)")
@@ -2575,6 +2586,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             vtm_ref.write_vtm(
                 args.out, vtm.tensors, vtm.program, vtm.meta,
                 integrity=integrity,
+                container_version=args.container_version,
             )
             _print_manifest(export, vtm, args.out)
             return 0
@@ -2597,11 +2609,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 vtm_ref.write_vtm_stream(
                     args.out, vtm.tensors, vtm.program, vtm.meta,
                     integrity=True if args.integrity else None,
+                    container_version=args.container_version,
                 )
                 write_s = time.perf_counter() - started
             _print_shape(
                 vtm, args.out, build_s=build_s, write_s=write_s,
                 integrity=bool(args.integrity),
+                container_version=args.container_version,
             )
             return 0
 
@@ -2610,7 +2624,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             out_dir = os.path.dirname(os.path.abspath(args.out))
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
-            vtm_ref.write_vtm(args.out, vtm.tensors, vtm.program, vtm.meta, integrity=True)
+            vtm_ref.write_vtm(
+                args.out, vtm.tensors, vtm.program, vtm.meta,
+                integrity=True, container_version=args.container_version,
+            )
     except (ValueError, OSError) as exc:
         print(f"ошибка: {exc}", file=sys.stderr)
         return 2

@@ -263,26 +263,34 @@ class TestShapeGraphs(unittest.TestCase):
         self.assertGreater(sizes["14b"], 3 * 1024 ** 3)
         self.assertGreater(sizes["7b"], 1 * 1024 ** 3)
 
-    def test_32b_exceeds_the_4gib_format_limit(self):
-        # Находка 0135: 32B-раскладка (~6,9 ГиБ тритов в packed20) не влезает
-        # в контейнер v0.2 — смещения u32, предел 4 ГиБ. Граф и KV-бюджет при
-        # этом считаются, а писатель обязан отказать с числами и вариантами.
+    def test_32b_auto_chooses_v03_and_v02_still_refuses(self):
+        # 32B-раскладка (~6,9 ГиБ тритов в packed20) не влезает в v0.2
+        # (u32-смещения, 4 ГиБ). Задача 0173: auto выбирает v0.3 (u64), а
+        # принудительная v0.2 обязана отказать с числами — до записи файла.
         vtm, _ = build_shape("32b")
-        size = vtm.estimated_file_size()
-        self.assertGreater(size, 2 ** 32)
-        self.assertLess(build_shape("14b")[0].estimated_file_size(), 2 ** 32)
-        self.assertLess(build_shape("7b")[0].estimated_file_size(), 2 ** 32)
+        size_v02 = vtm.estimated_file_size(2)
+        self.assertGreater(size_v02, 2 ** 32)
+        self.assertEqual(vtm.estimated_file_size("auto"),
+                         vtm.estimated_file_size(3))
+        self.assertLess(build_shape("14b")[0].estimated_file_size(2), 2 ** 32)
+        self.assertLess(build_shape("7b")[0].estimated_file_size(2), 2 ** 32)
+        self.assertEqual(
+            vtm_ref.choose_container_version(size_v02, "auto"), 3
+        )
         with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "32b.vtm")
             with self.assertRaises(ValueError) as caught:
                 vtm_ref.write_vtm_stream(
-                    os.path.join(tmp, "32b.vtm"),
-                    vtm.tensors, vtm.program, vtm.meta,
+                    path, vtm.tensors, vtm.program, vtm.meta,
+                    container_version=2,
                 )
             text = str(caught.exception)
             self.assertIn("32-битными", text)
-            self.assertIn(f"{size} байт", text)
+            self.assertIn(f"{size_v02} байт", text)
             self.assertIn("предел 4 ГиБ", text)
             self.assertIn("u64", text)
+            # Отказ — до открытия файла: мусора на диске не осталось.
+            self.assertFalse(os.path.exists(path))
 
     def test_unknown_shape_lists_known_forms(self):
         with self.assertRaises(ValueError) as caught:
@@ -469,8 +477,10 @@ class TestCliShape(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("VTM синтетика формы 32b", proc.stdout)
         self.assertIn("KV-кэш: 512.0 МиБ при context_len=1024", proc.stdout)
-        self.assertIn("файл не влезет в контейнер v0.2", proc.stdout)
+        self.assertIn("оценка размера: 6.9 ГиБ (контейнер v0.3)", proc.stdout)
+        self.assertIn("v0.2 не влезает", proc.stdout)
         self.assertIn("предел 4 ГиБ", proc.stdout)
+        self.assertIn("u64", proc.stdout)
 
     def test_budget_too_small_is_a_clear_error(self):
         proc = self._run(
@@ -516,14 +526,14 @@ class TestLargeEndToEnd(unittest.TestCase):
                 results.append((name, size, build_s))
                 os.unlink(path)
 
-            # 32B: формат v0.2 адресует файл u32-смещениями (4 ГиБ), а
-            # раскладка — ~6,9 ГиБ. Проверяем, что CLI объясняет это, а не
-            # падает стектрейсом; граф при этом собирается.
+            # 32B: auto выбрал бы v0.3 (~6,9 ГиБ), но проверяем отказ
+            # принудительной v0.2 — CLI обязан объяснить числами, а не
+            # падать стектрейсом; файла на диске не остаётся.
             started = time.perf_counter()
             proc = subprocess.run(
                 [sys.executable, os.path.join(TOOLS, "vtm_compile.py"),
-                 "--synthetic", "--shape", "32b", "--out",
-                 os.path.join(tmp, "synth_32b.vtm")],
+                 "--synthetic", "--shape", "32b", "--container-version", "2",
+                 "--out", os.path.join(tmp, "synth_32b.vtm")],
                 cwd=ROOT, capture_output=True, text=True, timeout=3600,
             )
             graph_s = time.perf_counter() - started
@@ -535,7 +545,7 @@ class TestLargeEndToEnd(unittest.TestCase):
             )
         for name, size, build_s in results:
             print(f"{name}: файл {size / 2**30:.2f} ГиБ, сборка {build_s:.1f} с")
-        print(f"32b: граф собран, файл не пишется (u32), попытка {graph_s:.1f} с")
+        print(f"32b: граф собран, v0.2 отвергнута (4 ГиБ), попытка {graph_s:.1f} с")
 
 
 if __name__ == "__main__":

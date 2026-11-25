@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VTM v0.2 — эталонная Python-реализация: контейнер, исполнитель, семантика.
+"""VTM v0.2/v0.3 — эталонная Python-реализация: контейнер, исполнитель, семантика.
 
 Это **наша истина**. C-интерпретатор (`src/vtm/`) обязан воспроизводить
 поведение этого модуля; если результаты расходятся — прав Python, а не C.
@@ -77,6 +77,26 @@ KV-кэши вне контейнера (задачи 0101, 0118). Поле по
 (version=1, запись 44 байта) не читаются: `read_vtm` бросает `ValueError`
 «формат v0.1 не поддерживается» — ценных артефактов v0.1 нет, синтетика
 пересобирается за секунды.
+
+Версия 3 (ADR 0019, задача 0173): смещения перестают быть u32.
+```
+32                       таблица тензоров: n_tensors * 60 байт
+  0  name[24] | kind u8 | ndim u8 | dims u32[4]
+ 42  offset u64                    от начала секции данных, кратно 32
+ 50  scale_offset u64              0xFFFFFFFF (NO_OFFSET) или адрес, кратно 32
+ 58  flags/резерв u16
+20  meta_offset u64 (0 = меты нет)
+28  meta_len u32
+```
+`program_offset` в v0.3 не хранится: программа по-прежнему последняя, поэтому
+читатель берёт `file_size - n_instr*16`; так мета и данные могут лежать за
+4 ГиБ. Маркер `NO_OFFSET`/`KV_NO_OFFSET` остался `0xFFFFFFFF`: настоящие
+смещения кратны 32, адресом это число быть не может.
+
+Запись: `container_version="auto"` (умолчание) пишет v0.2, пока файл < 4 ГиБ,
+и v0.3 — когда иначе не влезает (выбор v0.3 печатается в stderr). Явные 2/3
+принудительны; для v0.2 на файле ≥ 4 ГиБ — `ValueError` с числами. `read_vtm`
+читает обе версии.
 
 Тензор тритов (kind 0) — сегмент TRT1 (см. `docs/trit-format.md`):
 
@@ -299,7 +319,11 @@ except ImportError:  # pragma: no cover - запуск как `python3 tools/vtm
 # ---------------------------------------------------------------------------
 
 VTM_MAGIC = b"VTM1"
+#: Версия по умолчанию (v0.2): её выбирает auto, пока файл < 4 ГиБ.
 VTM_VERSION = 2
+VTM_VERSION_V02 = 2
+#: v0.3 (ADR 0019): offset/scale_offset — u64, запись тензора 60 байт.
+VTM_VERSION_V03 = 3
 VTM_VERSION_V01 = 1
 TRT1_MAGIC = b"TRT1"
 #: Версия TRT1 по умолчанию: только pack20, так писали контейнеры до 0057.
@@ -312,6 +336,10 @@ TRT1_HEADER_SIZE = 18
 
 HEADER_SIZE = 32
 TENSOR_ENTRY_SIZE = 52
+#: v0.3: запись таблицы 60 байт (offset и scale_offset — u64).
+TENSOR_ENTRY_SIZE_V03 = 60
+#: Предел v0.2: все смещения u32, поэтому файл обязан быть < 2^32 байт.
+MAX_FILE_BYTES_V02 = 1 << 32
 INSTR_SIZE = 16
 ALIGNMENT = 32
 NAME_SIZE = 24
@@ -510,7 +538,11 @@ OP_NAMES = {int(op): op.name for op in Op}
 
 _HEADER_STRUCT = struct.Struct("<4sHHIII")
 _RESERVED_STRUCT = struct.Struct("<III")
+#: v0.3: program_offset не хранится (программа последняя, он = size - n*16),
+#: meta_offset — u64, meta_len — u32. Иначе мета за 4 ГиБ недостижима.
+_RESERVED_STRUCT_V03 = struct.Struct("<QI")
 _TENSOR_STRUCT = struct.Struct("<24sBB4IIIH")
+_TENSOR_STRUCT_V03 = struct.Struct("<24sBB4IQQH")
 _INSTR_STRUCT = struct.Struct("<BBHHHH2xi")
 _TRT1_STRUCT = struct.Struct("<4sBBQI")
 
@@ -518,6 +550,10 @@ if _HEADER_STRUCT.size + _RESERVED_STRUCT.size != HEADER_SIZE:  # pragma: no cov
     raise RuntimeError("заголовок VTM должен быть 32 байта")
 if _TENSOR_STRUCT.size != TENSOR_ENTRY_SIZE:  # pragma: no cover
     raise RuntimeError("запись таблицы тензоров должна быть 52 байта")
+if _TENSOR_STRUCT_V03.size != TENSOR_ENTRY_SIZE_V03:  # pragma: no cover
+    raise RuntimeError("запись таблицы тензоров v0.3 должна быть 60 байт")
+if _HEADER_STRUCT.size + _RESERVED_STRUCT_V03.size != HEADER_SIZE:  # pragma: no cover
+    raise RuntimeError("заголовок VTM v0.3 должен быть 32 байта")
 if _INSTR_STRUCT.size != INSTR_SIZE:  # pragma: no cover
     raise RuntimeError("инструкция VTM должна быть 16 байт")
 if _TRT1_STRUCT.size != TRT1_HEADER_SIZE:  # pragma: no cover
@@ -536,6 +572,53 @@ def align_up(value: int, alignment: int = ALIGNMENT) -> int:
     if value < 0:
         raise ValueError("выравнивать отрицательное смещение нельзя")
     return (value + alignment - 1) // alignment * alignment
+
+
+def parse_container_version(value: Any) -> int | str:
+    """Разобрать `container_version`: "auto", 2 или 3.
+
+    Принимаются строки "auto"/"2"/"3" (и "v0.2"/"v0.3") — так удобнее CLI;
+    bool отвергается: True молча стал бы версией 1.
+    """
+    if value is None:
+        return "auto"
+    if isinstance(value, bool):
+        raise ValueError(f"container_version={value!r}: ожидалось auto|2|3")
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "auto"):
+            return "auto"
+        aliases = {"2": 2, "v2": 2, "v0.2": 2, "3": 3, "v3": 3, "v0.3": 3}
+        if text in aliases:
+            return aliases[text]
+        raise ValueError(
+            f"container_version={value!r}: ожидалось auto|2|3 "
+            "(v0.2 — u32-смещения, v0.3 — u64)"
+        )
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"container_version={value!r}: ожидалось auto|2|3"
+        ) from exc
+    if number not in (2, 3):
+        raise ValueError(f"container_version={number}: поддерживаются 2 и 3")
+    return number
+
+
+def choose_container_version(file_size_v02: int, requested: int | str = "auto") -> int:
+    """Выбрать версию контейнера: v0.2 пока файл < 4 ГиБ, иначе v0.3.
+
+    `file_size_v02` — размер, который получился бы с 52-байтной записью.
+    Явная версия 2 разрешена и для большого файла: отказ с числами даёт
+    вызывающий (`file_size_limit_error`), чтобы текст был один.
+    """
+    requested = parse_container_version(requested)
+    if requested == 3:
+        return 3
+    if requested == 2:
+        return 2
+    return 2 if file_size_v02 < MAX_FILE_BYTES_V02 else 3
 
 
 def n_scale_blocks(n_values: int, block_size: int = SCALE_BLOCK) -> int:
@@ -2626,9 +2709,8 @@ class VTM:
             counts[key] = counts.get(key, 0) + 1
         return counts
 
-    def estimated_file_size(self) -> int:
-        """Размер файла, который получится после `write_vtm`."""
-        table_end = HEADER_SIZE + TENSOR_ENTRY_SIZE * len(self.tensors)
+    def _estimated_file_size(self, entry_size: int) -> int:
+        table_end = HEADER_SIZE + entry_size * len(self.tensors)
         data_start = align_up(table_end)
         data_size = 0
         for tensor in self.tensors:
@@ -2637,6 +2719,22 @@ class VTM:
         meta_offset = data_start + data_size
         program_offset = meta_offset + align_up(len(meta_bytes))
         return program_offset + len(self.program) * INSTR_SIZE
+
+    def estimated_file_size(self, container_version: int | str = "auto") -> int:
+        """Размер файла, который получится после `write_vtm`/`write_vtm_stream`.
+
+        `container_version="auto"` — размер для той версии, которую выберет
+        писатель: v0.2, пока < 4 ГиБ, иначе v0.3 (запись 60 байт).
+        """
+        requested = parse_container_version(container_version)
+        size_v02 = self._estimated_file_size(TENSOR_ENTRY_SIZE)
+        if requested == 3:
+            return self._estimated_file_size(TENSOR_ENTRY_SIZE_V03)
+        if requested == 2:
+            return size_v02
+        if size_v02 < MAX_FILE_BYTES_V02:
+            return size_v02
+        return self._estimated_file_size(TENSOR_ENTRY_SIZE_V03)
 
 
 def _encode_meta(meta: dict[str, Any]) -> bytes:
@@ -2837,12 +2935,12 @@ def file_size_limit_error(file_size: int) -> str:
     выглядеть загадочным «не влезает».
     """
     return (
-        "VTM адресует файл 32-битными смещениями: "
+        "VTM v0.2 адресует файл 32-битными смещениями: "
         f"{file_size} байт ({file_size / 2 ** 30:.2f} ГиБ) не влезает в "
         "контейнер (предел 4 ГиБ). Раскладка 32B (64 слоя, hidden 5120, "
-        "intermediate 27648) — это ~6,9 ГиБ тритов, формат v0.2 её не "
-        "представляет; 7B (~1,5 ГиБ) и 14B (~3,0 ГиБ) влезают. Для 32B нужен "
-        "формат с u64-смещениями (ADR) или шардирование модели."
+        "intermediate 27648) — это ~6,9 ГиБ тритов. Нужен контейнер v0.3 "
+        "(u64-смещения, ADR 0019): container_version=3/\"auto\" или "
+        "--container-version 3; auto пишет v0.3, только когда v0.2 не влезает."
     )
 
 
@@ -2886,12 +2984,18 @@ def write_vtm(
     meta: dict[str, Any] | None = None,
     *,
     integrity: bool | None = None,
+    container_version: int | str = "auto",
 ) -> VTM:
     """Собрать контейнер `.vtm` строго по спеке и записать на диск.
 
     Возвращает собранный `VTM` (с проставленными offset'ами) — его можно
     сразу передать в `execute`. Порядок `tensors` = порядок таблицы, индексы
     в `program` ссылаются на него.
+
+    `container_version="auto"` (по умолчанию) пишет v0.2, пока файл < 4 ГиБ,
+    и переключается на v0.3 (u64-смещения, запись 60 байт, ADR 0019), когда
+    иначе не влезает; выбор v0.3 печатается в stderr. Явные 2/3 — принудительно;
+    для версии 2 на файле ≥ 4 ГиБ — `ValueError` с числами.
 
     `integrity=True` кладёт в мету `meta["integrity"]` с sha256 секции данных
     и самой меты (задача 0066). По умолчанию это делает `VTM_WRITE_HASH=1`,
@@ -2952,10 +3056,9 @@ def write_vtm(
         else:
             payloads.append(encode_tensor_payload(tensor))
     write_integrity = _integrity_requested(integrity)
+    requested_version = parse_container_version(container_version)
 
     n_tensors = len(tensor_list)
-    table_end = HEADER_SIZE + TENSOR_ENTRY_SIZE * n_tensors
-    data_start = align_up(table_end)
 
     digest = hashlib.sha256() if write_integrity else None
     has_kv = bool(kv_caches)
@@ -2997,12 +3100,31 @@ def write_vtm(
 
     meta_bytes = _encode_meta(meta_dict) if meta_dict else b""
     meta_len = len(meta_bytes)
-    meta_offset = data_start + data_size if meta_bytes else 0
-    program_offset = data_start + data_size + align_up(len(meta_bytes))
     program_bytes = b"".join(instr.pack() for instr in program_list)
+
+    # Размер зависит от ширины записи таблицы; data_size от неё не зависит
+    # (data_start выровнен на 32 при обеих версиях). v0.2 — пока < 4 ГиБ.
+    file_size_v02 = (
+        align_up(HEADER_SIZE + TENSOR_ENTRY_SIZE * n_tensors)
+        + data_size + align_up(meta_len) + len(program_bytes)
+    )
+    version = choose_container_version(file_size_v02, requested_version)
+    if version == VTM_VERSION_V02 and file_size_v02 >= MAX_FILE_BYTES_V02:
+        raise ValueError(file_size_limit_error(file_size_v02))
+    entry_size = (
+        TENSOR_ENTRY_SIZE_V03 if version == VTM_VERSION_V03 else TENSOR_ENTRY_SIZE
+    )
+    table_end = HEADER_SIZE + entry_size * n_tensors
+    data_start = align_up(table_end)
+    meta_offset = data_start + data_size if meta_bytes else 0
+    program_offset = data_start + data_size + align_up(meta_len)
     file_size = program_offset + len(program_bytes)
-    if file_size >= 2 ** 32:
-        raise ValueError(file_size_limit_error(file_size))
+    if requested_version == "auto" and version == VTM_VERSION_V03:
+        print(
+            f"VTM: контейнер v0.3 (u64-смещения, запись {entry_size} байт): "
+            f"v0.2 не влезает — файл {file_size / 2 ** 30:.2f} ГиБ > 4 ГиБ",
+            file=sys.stderr,
+        )
 
     flags = VFLAG_CAUSAL
     if all(t.kind != KIND_TRITS or t.scale_dtype == "float32" for t in tensor_list):
@@ -3014,8 +3136,16 @@ def write_vtm(
         flags |= VFLAG_KV_OUT_OF_FILE
 
     header = _HEADER_STRUCT.pack(
-        VTM_MAGIC, VTM_VERSION, flags, len(program_list), n_tensors, len(program_bytes)
-    ) + _RESERVED_STRUCT.pack(program_offset, meta_offset, len(meta_bytes))
+        VTM_MAGIC, version, flags, len(program_list), n_tensors,
+        len(program_bytes),
+    )
+    if version == VTM_VERSION_V03:
+        # program_offset не хранится: он всегда file_size - n_instr*16.
+        header += _RESERVED_STRUCT_V03.pack(meta_offset, len(meta_bytes))
+    else:
+        header += _RESERVED_STRUCT.pack(
+            program_offset, meta_offset, len(meta_bytes)
+        )
 
     table = bytearray()
     for tensor in tensor_list:
@@ -3028,10 +3158,16 @@ def write_vtm(
             tflags = (tflags & ~TFLAG_STORAGE_MASK) | (
                 TRIT_STORAGE_IDS[tensor.storage] << TFLAG_STORAGE_SHIFT
             )
-        table += _TENSOR_STRUCT.pack(
-            name_bytes, tensor.kind, len(tensor.dims), *dims,
-            tensor.offset, tensor.scale_offset, tflags,
-        )
+        if version == VTM_VERSION_V03:
+            table += _TENSOR_STRUCT_V03.pack(
+                name_bytes, tensor.kind, len(tensor.dims), *dims,
+                tensor.offset, tensor.scale_offset, tflags,
+            )
+        else:
+            table += _TENSOR_STRUCT.pack(
+                name_bytes, tensor.kind, len(tensor.dims), *dims,
+                tensor.offset, tensor.scale_offset, tflags,
+            )
 
     with open(path, "wb") as handle:
         handle.write(header)
@@ -3096,7 +3232,7 @@ def write_vtm(
         tensors=tensor_list,
         program=program_list,
         meta=meta_dict,
-        version=VTM_VERSION,
+        version=version,
         flags=flags,
         data_offset=data_start,
         program_offset=program_offset,
@@ -3167,6 +3303,7 @@ def write_vtm_stream(
     *,
     integrity: bool | None = None,
     chunk: int = STREAM_CHUNK,
+    container_version: int | str = "auto",
 ) -> VTM:
     """Записать контейнер потоком, не держа payload'ы весов в памяти.
 
@@ -3185,6 +3322,9 @@ def write_vtm_stream(
     KV-кэши, как и в `write_vtm`, в файл не пишутся (флаг
     `VFLAG_KV_OUT_OF_FILE`, offset `KV_NO_OFFSET`), а их суммарный размер
     проверяется по `MAX_KV_BYTES` — ровно так же, как это сделает загрузчик.
+
+    `container_version` — как у `write_vtm`: "auto" пишет v0.2, пока файл
+    < 4 ГиБ, и v0.3 (u64-смещения, 60-байтная запись) — когда иначе нельзя.
     """
     tensor_list = [_as_tensor(item) for item in tensors]
     program_list = [_as_instr(item) for item in program]
@@ -3223,9 +3363,8 @@ def write_vtm_stream(
         )
 
     write_integrity = _integrity_requested(integrity)
+    requested_version = parse_container_version(container_version)
     n_tensors = len(tensor_list)
-    table_end = HEADER_SIZE + TENSOR_ENTRY_SIZE * n_tensors
-    data_start = align_up(table_end)
     has_kv = bool(kv_caches)
 
     digest = hashlib.sha256() if write_integrity else None
@@ -3262,12 +3401,28 @@ def write_vtm_stream(
         meta_dict[INTEGRITY_KEY] = block
 
     meta_bytes = _encode_meta(meta_dict) if meta_dict else b""
+    program_bytes = b"".join(instr.pack() for instr in program_list)
+    file_size_v02 = (
+        align_up(HEADER_SIZE + TENSOR_ENTRY_SIZE * n_tensors)
+        + data_size + align_up(len(meta_bytes)) + len(program_bytes)
+    )
+    version = choose_container_version(file_size_v02, requested_version)
+    if version == VTM_VERSION_V02 and file_size_v02 >= MAX_FILE_BYTES_V02:
+        raise ValueError(file_size_limit_error(file_size_v02))
+    entry_size = (
+        TENSOR_ENTRY_SIZE_V03 if version == VTM_VERSION_V03 else TENSOR_ENTRY_SIZE
+    )
+    table_end = HEADER_SIZE + entry_size * n_tensors
+    data_start = align_up(table_end)
     meta_offset = data_start + data_size if meta_bytes else 0
     program_offset = data_start + data_size + align_up(len(meta_bytes))
-    program_bytes = b"".join(instr.pack() for instr in program_list)
     file_size = program_offset + len(program_bytes)
-    if file_size >= 2 ** 32:
-        raise ValueError(file_size_limit_error(file_size))
+    if requested_version == "auto" and version == VTM_VERSION_V03:
+        print(
+            f"VTM: контейнер v0.3 (u64-смещения, запись {entry_size} байт): "
+            f"v0.2 не влезает — файл {file_size / 2 ** 30:.2f} ГиБ > 4 ГиБ",
+            file=sys.stderr,
+        )
 
     flags = VFLAG_CAUSAL
     if all(t.kind != KIND_TRITS or t.scale_dtype == "float32" for t in tensor_list):
@@ -3276,9 +3431,15 @@ def write_vtm_stream(
         flags |= VFLAG_KV_OUT_OF_FILE
 
     header = _HEADER_STRUCT.pack(
-        VTM_MAGIC, VTM_VERSION, flags, len(program_list), n_tensors,
+        VTM_MAGIC, version, flags, len(program_list), n_tensors,
         len(program_bytes),
-    ) + _RESERVED_STRUCT.pack(program_offset, meta_offset, len(meta_bytes))
+    )
+    if version == VTM_VERSION_V03:
+        header += _RESERVED_STRUCT_V03.pack(meta_offset, len(meta_bytes))
+    else:
+        header += _RESERVED_STRUCT.pack(
+            program_offset, meta_offset, len(meta_bytes)
+        )
 
     table = bytearray()
     for tensor in tensor_list:
@@ -3289,10 +3450,16 @@ def write_vtm_stream(
             tflags = (tflags & ~TFLAG_STORAGE_MASK) | (
                 TRIT_STORAGE_IDS[tensor.storage] << TFLAG_STORAGE_SHIFT
             )
-        table += _TENSOR_STRUCT.pack(
-            name_bytes, tensor.kind, len(tensor.dims), *dims,
-            tensor.offset, tensor.scale_offset, tflags,
-        )
+        if version == VTM_VERSION_V03:
+            table += _TENSOR_STRUCT_V03.pack(
+                name_bytes, tensor.kind, len(tensor.dims), *dims,
+                tensor.offset, tensor.scale_offset, tflags,
+            )
+        else:
+            table += _TENSOR_STRUCT.pack(
+                name_bytes, tensor.kind, len(tensor.dims), *dims,
+                tensor.offset, tensor.scale_offset, tflags,
+            )
 
     def _write_zeros(handle: Any, count: int) -> None:
         remaining = int(count)
@@ -3344,7 +3511,7 @@ def write_vtm_stream(
         tensors=tensor_list,
         program=program_list,
         meta=meta_dict,
-        version=VTM_VERSION,
+        version=version,
         flags=flags,
         data_offset=data_start,
         program_offset=program_offset,
@@ -3501,10 +3668,20 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     if version == VTM_VERSION_V01:
         raise ValueError(
             "формат v0.1 не поддерживается: пересоберите контейнер в v0.2 "
-            "(dims u32, запись тензора 52 байта)"
+            "(dims u32, запись тензора 52 байта) или v0.3 (u64-смещения, 60)"
         )
-    if version != VTM_VERSION:
-        raise ValueError(f"неизвестная версия контейнера: {version}")
+    if version not in (VTM_VERSION_V02, VTM_VERSION_V03):
+        raise ValueError(
+            f"неизвестная версия контейнера: {version}; "
+            f"поддерживаются {VTM_VERSION_V02} (v0.2) и "
+            f"{VTM_VERSION_V03} (v0.3)"
+        )
+    entry_size = (
+        TENSOR_ENTRY_SIZE_V03 if version == VTM_VERSION_V03 else TENSOR_ENTRY_SIZE
+    )
+    tensor_struct = (
+        _TENSOR_STRUCT_V03 if version == VTM_VERSION_V03 else _TENSOR_STRUCT
+    )
     # Задача 0118: флаг «KV-кэши вне файла». Старые контейнеры его не ставят
     # и читаются прежним путём; контейнер с флагом обязан нести KV-кэши, а их
     # offset — маркер KV_NO_OFFSET, а не адрес.
@@ -3512,7 +3689,7 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     if n_tensors > MAX_TENSORS:
         raise ValueError(f"n_tensors={n_tensors} больше предела {MAX_TENSORS}")
 
-    table_end = HEADER_SIZE + TENSOR_ENTRY_SIZE * n_tensors
+    table_end = HEADER_SIZE + entry_size * n_tensors
     if table_end > len(data):
         raise ValueError(
             f"таблица тензоров ({n_tensors} записей) выходит за конец файла "
@@ -3525,9 +3702,19 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     if n_instr * INSTR_SIZE > len(data) - HEADER_SIZE:
         raise ValueError(f"n_instr={n_instr} не влезает в файл")
 
-    program_offset, meta_offset, meta_len = _RESERVED_STRUCT.unpack_from(data, HEADER_SIZE - 12)
-    if program_offset == 0:
+    if version == VTM_VERSION_V03:
+        # v0.3: program_offset не хранится (программа последняя), meta_offset
+        # занимает байты 20..27 как u64, meta_len — 28..31.
+        meta_offset, meta_len = _RESERVED_STRUCT_V03.unpack_from(
+            data, HEADER_SIZE - 12
+        )
         program_offset = len(data) - n_instr * INSTR_SIZE
+    else:
+        program_offset, meta_offset, meta_len = _RESERVED_STRUCT.unpack_from(
+            data, HEADER_SIZE - 12
+        )
+        if program_offset == 0:
+            program_offset = len(data) - n_instr * INSTR_SIZE
     if program_offset < table_end:
         raise ValueError(f"program_offset={program_offset} заходит на таблицу тензоров")
     program_end = program_offset + n_instr * INSTR_SIZE
@@ -3561,9 +3748,9 @@ def read_vtm(path: str | os.PathLike[str]) -> VTM:
     kv_bytes = 0
     has_kv = False
     for index in range(n_tensors):
-        entry_offset = HEADER_SIZE + TENSOR_ENTRY_SIZE * index
+        entry_offset = HEADER_SIZE + entry_size * index
         raw_name, kind, ndim, d0, d1, d2, d3, offset, scale_offset, tflags = (
-            _TENSOR_STRUCT.unpack_from(data, entry_offset)
+            tensor_struct.unpack_from(data, entry_offset)
         )
         name_bytes = raw_name.split(b"\x00", 1)[0]
         try:
