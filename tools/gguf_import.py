@@ -645,8 +645,15 @@ def _read_metadata_value(
     )
 
 
-def read_gguf(path: str | os.PathLike[str]) -> GgufFile:
-    """Прочитать заголовок GGUF (v2/v3) без загрузки весов."""
+def read_gguf(
+    path: str | os.PathLike[str], *, check_data: bool = True
+) -> GgufFile:
+    """Прочитать заголовок GGUF (v2/v3) без загрузки весов.
+
+    `check_data=False` — не проверять, что каждый тензор влезает в файл.
+    Нужно срезу MoE (tools/moe_slice.py): заголовок скачан по HTTP Range
+    раньше данных, и «тензор за файлом» там нормальное состояние, а не порча.
+    """
     path = Path(path).expanduser()
     try:
         size = path.stat().st_size
@@ -742,16 +749,17 @@ def read_gguf(path: str | os.PathLike[str]) -> GgufFile:
             f"{path.name}: секция данных начинается за файлом "
             f"({data_offset} > {size})"
         )
-    for info in tensors:
-        try:
-            n_bytes = info.n_bytes
-        except GgufError:
-            continue  # неподдержанный тип проверится при импорте
-        if info.offset + n_bytes > size - data_offset:
-            raise GgufError(
-                f"{path.name}: тензор {info.name!r} выходит за файл: "
-                f"offset {info.offset} + {n_bytes} > {size - data_offset}"
-            )
+    if check_data:
+        for info in tensors:
+            try:
+                n_bytes = info.n_bytes
+            except GgufError:
+                continue  # неподдержанный тип проверится при импорте
+            if info.offset + n_bytes > size - data_offset:
+                raise GgufError(
+                    f"{path.name}: тензор {info.name!r} выходит за файл: "
+                    f"offset {info.offset} + {n_bytes} > {size - data_offset}"
+                )
     return GgufFile(
         path=path,
         version=version,

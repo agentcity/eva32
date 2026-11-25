@@ -185,6 +185,11 @@ const char *vtm_op_name(uint8_t opcode) {
     case VTM_OP_CPY:  return "CPY";
     case VTM_OP_SCAL: return "SCAL";
     case VTM_OP_HALT: return "HALT";
+    // Задача 0172: имена новых опкодов нужны трассе, сообщениям об ошибках и
+    // сверке docs/vtm.md с кодом (tools/check_vtm_docs.py). Сами операции —
+    // в interp.c; загрузчик о них по-прежнему ничего не знает.
+    case VTM_OP_MOE:  return "MOE";
+    case VTM_OP_RMSH: return "RMSH";
     default:          return "?";
     }
 }
@@ -1877,7 +1882,22 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
                 FAIL(VTM_E_BOUNDS,
                      "тензор %u (%s): Q4_K-сегмент (%llu байт) за границей",
                      i, t->name, (unsigned long long)total);
-            {
+            // VTM_Q4K_CHECK=0 (задача 0172) снимает по-блочную проверку
+            // d/dmin. Она читает по 2-4 байта из КАЖДОГО блока, то есть
+            // трогает все страницы всех kind 6/7 — на 19 ГиБ MoE это 19 ГиБ
+            // page faults на загрузке и RSS размером с модель, то есть
+            // разреженного чтения экспертов не получается вовсе. Проверки
+            // заголовка, magic, версии, размеров и n_blocks остаются: снимается
+            // только скан блоков. По умолчанию поведение прежнее (0165).
+            if (vtm_env_flag("VTM_Q4K_CHECK_OFF")) {
+                static int warned;
+                if (!warned) {
+                    fprintf(stderr, "VTM: VTM_Q4K_CHECK_OFF=1 — по-блочная "
+                                    "проверка d/dmin Q4_K/Q6_K пропущена "
+                                    "(заголовки и размеры проверены)\n");
+                    warned = 1;
+                }
+            } else {
                 const uint8_t *bp = seg + VTM_Q4K_HEADER_SIZE;
                 // Q4_K: d в байтах 0-1, dmin в 2-3. Q6_K: d — последние два
                 // байта блока (208-209), dmin у него нет (масштабы — int8).
@@ -1937,7 +1957,13 @@ static vtm_t *load_core(const void *data, size_t size, int can_reference,
         // Раскладка 16 байт как в Python-эталоне (<BBHHHH2xi>):
         // байты 10-11 — выравнивание, imm i32 — по смещению 12.
         in->imm = rd_i32(ip + 12);
-        if (in->opcode < VTM_OP_TMV || in->opcode > VTM_OP_HALT)
+        // Проверка «свой/чужой опкод» остаётся tripwire'ом: неизвестный
+        // опкод отвергается до чтения данных, поэтому контейнер с новыми
+        // операциями не может быть исполнен старым бинарём «почти верно».
+        // Новые опкоды (0172) перечислены явно, а не «всё, что <= 0x11».
+        if (in->opcode < VTM_OP_TMV
+            || (in->opcode > VTM_OP_HALT && in->opcode != VTM_OP_MOE
+                && in->opcode != VTM_OP_RMSH))
             FAIL(VTM_E_OPCODE, "инструкция %u: неизвестный opcode 0x%02x",
                  i, (unsigned)in->opcode);
         if ((in->dst != VTM_NO_TENSOR && in->dst >= n_tensors) ||

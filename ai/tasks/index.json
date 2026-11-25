@@ -1143,7 +1143,7 @@
   {
     "id": "0172",
     "title": "MoE в ВТМ — Qwen3-30B-A3B",
-    "status": "in_progress",
+    "status": "done",
     "file": "0172-moe-support.md",
     "assignee": "agent:moe"
   }

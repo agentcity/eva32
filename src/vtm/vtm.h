@@ -281,8 +281,34 @@ typedef enum {
     VTM_OP_SAMP  = 0x0C,
     VTM_OP_CPY   = 0x0D,
     VTM_OP_SCAL  = 0x0E,
-    VTM_OP_HALT  = 0x0F
+    VTM_OP_HALT  = 0x0F,
+    // Расширение для MoE (задача 0172). Коды 0x10/0x11 additive: старые
+    // контейнеры их не содержат, а старый интерпретатор отвергает их как
+    // неизвестный opcode ещё до чтения данных (тот же tripwire, что у kind
+    // 5/6/7, ADR 0015/0017/0018).
+    //
+    // MOE: dst += Σ_e w_e · down_e( silu(gate_e·x) ⊙ (up_e·x) ),
+    //      a — роутер [n_experts, hidden] (fp32),
+    //      b — вход x (hidden),
+    //      c — банк gate; **c+1 — банк up, c+2 — банк down** (см. ниже),
+    //      imm — top_k, flags 0x01 — не нормировать веса top-k.
+    //      Банк — kind 6/7 (Q4_K/Q6_K) с dims [n_experts, rows, cols];
+    //      gate/up: [n_experts, inter, hidden], down: [n_experts, hidden, inter].
+    //      Смежность трёх банков в таблице тензоров — часть ABI инструкции:
+    //      в 16-байтовую инструкцию не влезает больше ссылок, а разносить
+    //      банки по разным опкодам значит потерять общий top-k. Компилятор
+    //      добавляет банки подряд, интерпретатор проверяет смежность и
+    //      dims каждого и отказывает с текстом, а не читает «почти то же».
+    VTM_OP_MOE   = 0x10,
+    // RMSH: построчный RMSN по последней оси (QK-norm Qwen3): y[i] =
+    //      x[i]/rms(x[row])·w[i % head_dim]; w задаётся на head_dim и
+    //      повторяется по строкам. a — x, b — w, dst — y, imm — eps×1000.
+    VTM_OP_RMSH  = 0x11
 } vtm_opcode;
+
+// Флаг MOE: не нормировать веса top-k на единицу (Qwen3 norm_topk_prob=true —
+// умолчание, флаг НЕ выставлен). Флаг нужен моделям без нормировки (Mixtral).
+#define VTM_MOE_FLAG_NO_RENORM 0x01u
 
 // --- SAMP: стратегии и параметры ------------------------------------------
 //

@@ -270,9 +270,32 @@ class ModelConfig(LayerConfig):
     #: "trit" — сегмент ternary.trit (kind: trit, задача 0043),
     #: "int8" — INT8-сегмент в non_ternary.bin (kind 4, задача 0044).
     embed_quant: str = "none"
+    #: MoE (задача 0172): вместо плотного FFN — роутер, top-k и разреженные
+    #: эксперты. `intermediate` при этом не используется (у Qwen3-MoE там
+    #: dense-размер, которого в графе нет), размер эксперта — `expert_inter`.
+    moe: bool = False
+    n_experts: int = 0
+    top_k: int = 0
+    expert_inter: int = 0
+    #: QK-norm (Qwen3): RMSH по head_dim на Q и K до RoPE.
+    qk_norm: bool = False
+    #: Общий эксперт (Qwen2-MoE: shared_expert): плотный FFN, прибавляется к
+    #: residual рядом с суммой экспертов. 0 — общего эксперта нет (Qwen3).
+    shared_inter: int = 0
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.moe:
+            if self.n_experts <= 0:
+                raise ValueError("moe=true, а n_experts <= 0")
+            if not 0 < self.top_k <= self.n_experts:
+                raise ValueError(
+                    f"top_k={self.top_k} вне 1..n_experts={self.n_experts}"
+                )
+            if self.expert_inter <= 0:
+                raise ValueError("moe=true, а expert_inter <= 0")
+            if self.shared_inter < 0:
+                raise ValueError("shared_inter не может быть отрицательным")
         self.embed_quant = str(self.embed_quant or "none").lower()
         if self.embed_quant not in ("none", "trit", "int8"):
             raise ValueError(
@@ -503,6 +526,60 @@ def vector_tensor(graph: Graph, name: str, dims: Sequence[int], spec: Any) -> in
     return graph.add(vtm_ref.Tensor.f32(name, dims, _spec_floats(spec, n_values)))
 
 
+def expert_bank(
+    graph: Graph, name: str, dims: Sequence[int], spec: Any
+) -> int:
+    """Добавить банк экспертов MoE: kind 6/7, dims [n_experts, rows, cols].
+
+    Банк — это все эксперты одного веса (gate/up/down) в одном тензоре:
+    блоки GGML лежат подряд, эксперт `e` занимает `rows·cols/256` блоков с
+    начала. Так ядро читает только выбранные эксперты, а не всю матрицу, и
+    в таблице тензоров остаётся одна запись на вес вместо 128.
+
+    `spec` — готовый `vtm_ref.Tensor` (окно в mmap q4.bin из импорта GGUF).
+    Три инструкции MOE требуют, чтобы gate, up и down шли в таблице подряд
+    (c, c+1, c+2) — компилятор добавляет их именно так, без вставок между
+    вызовами (см. compile_layer и vtm.h).
+    """
+    dims = tuple(int(d) for d in dims)
+    if spec is None:
+        return graph.add(vtm_ref.Tensor.placeholder(name, dims, vtm_ref.KIND_Q4K))
+    if not isinstance(spec, vtm_ref.Tensor):
+        raise ValueError(
+            f"банк {name!r}: ожидался готовый Tensor из импорта, а пришло "
+            f"{type(spec).__name__}"
+        )
+    if spec.kind not in (vtm_ref.KIND_Q4K, vtm_ref.KIND_Q6K, vtm_ref.KIND_Q4):
+        raise ValueError(
+            f"банк {name!r}: нужен kind 6/7 (Q4_K/Q6_K), а пришёл "
+            f"{spec.kind_name}"
+        )
+    if tuple(spec.dims) != dims:
+        raise ValueError(
+            f"банк {name!r}: форма {tuple(spec.dims)}, ожидалась {dims}"
+        )
+    spec.name = name
+    return graph.add(spec)
+
+
+def _expert_bank_dims(cfg: ModelConfig, key: str) -> tuple[int, ...]:
+    """Форма банка по роли: gate/up — [n_exp, inter, hidden], down — наоборот."""
+    if key in ("expert_gate", "expert_up"):
+        return (cfg.n_experts, cfg.expert_inter, cfg.hidden)
+    if key == "expert_down":
+        return (cfg.n_experts, cfg.hidden, cfg.expert_inter)
+    raise ValueError(f"не экспертный ключ: {key!r}")
+
+
+def _shared_dims(cfg: ModelConfig, key: str) -> tuple[int, int]:
+    inter = cfg.shared_inter
+    return {
+        "shared_gate": (inter, cfg.hidden),
+        "shared_up": (inter, cfg.hidden),
+        "shared_down": (cfg.hidden, inter),
+    }[key]
+
+
 def add_bias(
     graph: Graph, dst: int, dims: Sequence[int], spec: Any, name: str
 ) -> None:
@@ -571,6 +648,15 @@ def compile_layer(
     add_bias(g, k, (cfg.n_kv_heads, 1, cfg.head_dim), w.get("k_bias"), f"{prefix}.k_bias")
     add_bias(g, v, (cfg.n_kv_heads, 1, cfg.head_dim), w.get("v_bias"), f"{prefix}.v_bias")
 
+    # QK-norm (Qwen3): RMSN по head_dim на каждую голову, ДО RoPE. RMSN
+    # нормирует весь тензор, поэтому здесь отдельный опкод RMSH — иначе 32
+    # головы получили бы один общий масштаб.
+    if cfg.qk_norm:
+        q_norm = vector_tensor(g, f"{prefix}.q_norm.w", (cfg.head_dim,), w.get("q_norm"))
+        k_norm = vector_tensor(g, f"{prefix}.k_norm.w", (cfg.head_dim,), w.get("k_norm"))
+        g.emit(Op.RMSH, dst=q, a=q, b=q_norm, imm=cfg.eps_imm)
+        g.emit(Op.RMSH, dst=k, a=k, b=k_norm, imm=cfg.eps_imm)
+
     rope_flags = (
         vtm_ref.IFLAG_ROPE_INTERLEAVED if cfg.rope_layout == "interleaved" else 0
     )
@@ -597,6 +683,60 @@ def compile_layer(
     h2 = g.act(f"{prefix}.h2", (hidden,))
     norm2 = vector_tensor(g, f"{prefix}.norm2.w", (hidden,), w.get("norm2"))
     g.emit(Op.RMSN, dst=h2, a=x, b=norm2, imm=cfg.eps_imm)
+
+    if cfg.moe:
+        # MoE (задача 0172): роутер -> top-k -> взвешенная сумма экспертов.
+        # Всё одной инструкцией MOE: индекс эксперта зависит от данных, а
+        # граф из TMV его не выражает (TMV берёт матрицу из инструкции).
+        # gate/up/down добавляются строго подряд — это часть ABI MOE.
+        router = matrix_tensor(
+            g, f"{prefix}.router.w", cfg.n_experts, hidden, w.get("router"),
+            dense=True,
+        )
+        gate_bank = expert_bank(
+            g, f"{prefix}.gate_bank",
+            _expert_bank_dims(cfg, "expert_gate"), w.get("expert_gate"),
+        )
+        up_bank = expert_bank(
+            g, f"{prefix}.up_bank",
+            _expert_bank_dims(cfg, "expert_up"), w.get("expert_up"),
+        )
+        down_bank = expert_bank(
+            g, f"{prefix}.down_bank",
+            _expert_bank_dims(cfg, "expert_down"), w.get("expert_down"),
+        )
+        if (up_bank != gate_bank + 1 or down_bank != gate_bank + 2):
+            raise ValueError(
+                "MOE: банки gate/up/down обязаны идти в таблице тензоров "
+                "подряд (c, c+1, c+2) — между ними добавлен другой тензор"
+            )
+        g.emit(Op.MOE, dst=x, a=router, b=h2, c=gate_bank, imm=cfg.top_k)
+
+        # Общий эксперт (Qwen2-MoE): обычный плотный FFN, прибавляется к
+        # residual рядом с суммой экспертов. У Qwen3-30B-A3B его нет
+        # (shared_inter=0), поддержка — ради 35B/будущих моделей.
+        if cfg.shared_inter:
+            sinter = cfg.shared_inter
+            sgate = g.act(f"{prefix}.sgate", (sinter,))
+            sup = g.act(f"{prefix}.sup", (sinter,))
+            sgate_w = matrix_tensor(
+                g, f"{prefix}.shared_gate.w", sinter, hidden, w.get("shared_gate")
+            )
+            sup_w = matrix_tensor(
+                g, f"{prefix}.shared_up.w", sinter, hidden, w.get("shared_up")
+            )
+            g.emit(Op.TMV, dst=sgate, a=sgate_w, b=h2)
+            g.emit(Op.TMV, dst=sup, a=sup_w, b=h2)
+            g.emit(Op.SILU, dst=sgate, a=sgate)
+            smul = g.act(f"{prefix}.smul", (sinter,))
+            g.emit(Op.MUL, dst=smul, a=sgate, b=sup)
+            sdown = g.act(f"{prefix}.sdown", (hidden,))
+            sdown_w = matrix_tensor(
+                g, f"{prefix}.shared_down.w", hidden, sinter, w.get("shared_down")
+            )
+            g.emit(Op.TMV, dst=sdown, a=sdown_w, b=smul)
+            g.emit(Op.ADD, dst=x, a=x, b=sdown)
+        return g, x
 
     inter = cfg.intermediate
     gate = g.act(f"{prefix}.gate", (inter,))
@@ -695,6 +835,8 @@ def compile_model(
     if isinstance(embed_spec, vtm_ref.Tensor) and embed_spec.kind in (
         vtm_ref.KIND_TRITS,
         vtm_ref.KIND_INT8,
+        vtm_ref.KIND_Q4K,
+        vtm_ref.KIND_Q6K,
     ):
         if tuple(embed_spec.dims) != (cfg.vocab, hidden):
             raise ValueError(
@@ -703,9 +845,12 @@ def compile_model(
             )
         embed_spec.name = "emb.w"
         embed = g.add(embed_spec)
-        embed_storage = (
-            "trit" if embed_spec.kind == vtm_ref.KIND_TRITS else "int8"
-        )
+        embed_storage = {
+            vtm_ref.KIND_TRITS: "trit",
+            vtm_ref.KIND_INT8: "int8",
+            vtm_ref.KIND_Q4K: "q4_k",
+            vtm_ref.KIND_Q6K: "q6_k",
+        }[embed_spec.kind]
     else:
         embed = matrix_tensor(g, "emb.w", cfg.vocab, hidden, embed_spec, dense=True)
         embed_storage = "fp32"
@@ -790,6 +935,14 @@ def compile_model(
         "tied_embeddings": tied,
         "tie_word_embeddings": tied,
         "lm_head": cfg.lm_head,
+        # MoE (0172): по этим ключам tools/moe_program.py и отладка понимают,
+        # что FFN — разреженный, и сколько экспертов считается на токен.
+        "moe": bool(cfg.moe),
+        "n_experts": int(cfg.n_experts),
+        "top_k": int(cfg.top_k),
+        "expert_intermediate": int(cfg.expert_inter),
+        "qk_norm": bool(cfg.qk_norm),
+        "shared_expert_intermediate": int(cfg.shared_inter),
         # Где лежит таблица словаря: по этому ключу C/B-код и отладка
         # понимают, что EMB читает триты (kind 0), а не fp32.
         "embed": embed_storage,
@@ -1025,6 +1178,33 @@ def _weight_role(name: str) -> tuple[str, int | None, str]:
     if tail in _NORM_KEYS:
         key = _NORM_KEYS[tail]
         return ("norm" if not is_bias else "unknown"), layer, key
+    if is_bias:
+        key = _MATRIX_KEYS.get(tail)
+        if key is not None:
+            return "bias", layer, key[:-len("_proj")] + "_bias"
+        return "unknown", layer, tail
+    # MoE (задача 0172): роутер, экспертные банки и общий эксперт. Имена —
+    # HF-раскладка Qwen2/3-MoE; в GGUF им соответствуют ffn_gate_inp,
+    # ffn_{gate,up,down}_exps и ffn_{gate,up,down}_shexp (маппинг — в
+    # tools/moe_import.py).
+    if tail in ("mlp.gate", "moe.gate", "feed_forward.gate", "router"):
+        return "router", layer, "router"
+    if tail in ("mlp.experts.gate_proj", "experts.gate_proj", "moe.experts.gate_proj"):
+        return "expert_gate", layer, "expert_gate"
+    if tail in ("mlp.experts.up_proj", "experts.up_proj", "moe.experts.up_proj"):
+        return "expert_up", layer, "expert_up"
+    if tail in ("mlp.experts.down_proj", "experts.down_proj", "moe.experts.down_proj"):
+        return "expert_down", layer, "expert_down"
+    if tail in ("mlp.shared_expert.gate_proj", "shared_expert.gate_proj"):
+        return "shared_gate", layer, "shared_gate"
+    if tail in ("mlp.shared_expert.up_proj", "shared_expert.up_proj"):
+        return "shared_up", layer, "shared_up"
+    if tail in ("mlp.shared_expert.down_proj", "shared_expert.down_proj"):
+        return "shared_down", layer, "shared_down"
+    if tail in ("self_attn.q_norm", "attn.q_norm", "attention.q_norm"):
+        return "norm", layer, "q_norm"
+    if tail in ("self_attn.k_norm", "attn.k_norm", "attention.k_norm"):
+        return "norm", layer, "k_norm"
     key = _MATRIX_KEYS.get(tail)
     if key is None:
         return "unknown", layer, tail
@@ -1185,7 +1365,8 @@ def _short_weight_name(kind: str, layer: int | None, key: str) -> str:
         return "lm_head.w"
     if layer is None:
         return key
-    if kind in ("matrix", "norm"):
+    if kind in ("matrix", "norm", "router", "expert_gate", "expert_up",
+                "expert_down", "shared_gate", "shared_up", "shared_down"):
         return f"l{layer}.{key}.w"
     return f"l{layer}.{key}"
 
@@ -1236,6 +1417,12 @@ def _manifest_architecture(manifest: dict[str, Any]) -> ModelConfig:
                 or (manifest.get("embeddings") or {}).get("mode")
                 or "none"
             ),
+            moe=bool(arch.get("moe", False)),
+            n_experts=int(arch.get("n_experts") or 0),
+            top_k=int(arch.get("top_k") or 0),
+            expert_inter=int(arch.get("expert_intermediate") or 0),
+            qk_norm=bool(arch.get("qk_norm", False)),
+            shared_inter=int(arch.get("shared_expert_intermediate") or 0),
         )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"architecture в манифесте некорректна: {exc}") from exc
@@ -1353,16 +1540,22 @@ def load_export(
                     f"{name}: Q4 допустим только для матриц Linear и lm_head; "
                     "нормы/bias должны лежать в non_ternary.bin"
                 )
-            if role == "embed":
-                raise ValueError(
-                    f"{name}: Q4-таблица словаря не поддержана — EMB ждёт "
-                    "fp32/int8/триты; импорт GGUF (0153) кладёт словарь "
-                    "в non_ternary.bin (int8)"
-                )
-            tensor_name = (
-                f"l{layer}.{key}.w" if role == "matrix" else "lm_head.w"
-            )
             native_kind = _q4k_kind_of(entry)
+            if role == "embed" and native_kind is None:
+                raise ValueError(
+                    f"{name}: Q4 (kind 5) в таблице словаря не поддержана — "
+                    "EMB ждёт fp32/int8/триты или нативные блоки Q4_K/Q6_K "
+                    "(kind 6/7, они читаются ядром EMB без fp32-копии)"
+                )
+            if role == "embed":
+                tensor_name = "emb.w"
+            elif role in (
+                "matrix", "expert_gate", "expert_up", "expert_down",
+                "shared_gate", "shared_up", "shared_down",
+            ):
+                tensor_name = f"l{layer}.{key}.w"
+            else:
+                tensor_name = "lm_head.w"
             if native_kind is not None:
                 # kind 6/7 (0165): блоки GGML как есть, окно в mmap q4.bin.
                 # Масштабы и min внутри блоков, отдельных массивов нет.
@@ -1401,16 +1594,38 @@ def load_export(
                     )
                 _expect_shape(shape, (cfg.vocab, cfg.hidden), name)
                 weights["lm_head"] = tensor
+            elif role == "embed":
+                _expect_shape(shape, (cfg.vocab, cfg.hidden), name)
+                weights["embed"] = tensor
             elif role == "matrix":
                 expected = _layer_matrix_dims(cfg, key)
                 _expect_shape(shape, expected, name)
+                _layer_bucket(layer, name)[key] = tensor
+            elif role in ("expert_gate", "expert_up", "expert_down"):
+                if not cfg.moe:
+                    raise ValueError(
+                        f"{name}: экспертный банк, а в architecture нет "
+                        "moe=true — граф не MoE"
+                    )
+                _expect_shape(shape, _expert_bank_dims(cfg, key), name)
+                _layer_bucket(layer, name)[key] = tensor
+            elif role in ("shared_gate", "shared_up", "shared_down"):
+                if not cfg.shared_inter:
+                    raise ValueError(
+                        f"{name}: общий эксперт, а в architecture "
+                        "shared_expert_intermediate=0"
+                    )
+                _expect_shape(shape, _shared_dims(cfg, key), name)
                 _layer_bucket(layer, name)[key] = tensor
             elif role == "unknown":
                 unknown.append(name)
                 continue
             else:  # pragma: no cover - роли выше перечислены
                 raise ValueError(f"{name}: неожиданная роль {role!r}")
-            if len(shape) != 2 or not all(shape):
+            if role not in (
+                "expert_gate", "expert_up", "expert_down",
+                "shared_gate", "shared_up", "shared_down",
+            ) and (len(shape) != 2 or not all(shape)):
                 raise ValueError(f"{name}: у матрицы плохая shape={shape}")
             q4_params += vtm_ref.prod(shape)
             continue
@@ -1567,13 +1782,38 @@ def load_export(
                 )
             _expect_shape(shape, (cfg.vocab, cfg.hidden), name)
             weights["lm_head"] = tensor
+        elif kind == "router":
+            if not cfg.moe:
+                raise ValueError(
+                    f"{name}: роутер MoE, а в architecture нет moe=true"
+                )
+            _expect_shape(shape, (cfg.n_experts, cfg.hidden), name)
+            _layer_bucket(layer, name)["router"] = tensor
+        elif kind in ("expert_gate", "expert_up", "expert_down"):
+            if not cfg.moe:
+                raise ValueError(
+                    f"{name}: экспертный банк, а в architecture нет moe=true"
+                )
+            _expect_shape(shape, _expert_bank_dims(cfg, key), name)
+            _layer_bucket(layer, name)[key] = tensor
+        elif kind in ("shared_gate", "shared_up", "shared_down"):
+            if not cfg.shared_inter:
+                raise ValueError(
+                    f"{name}: общий эксперт, а shared_expert_intermediate=0"
+                )
+            _expect_shape(shape, _shared_dims(cfg, key), name)
+            _layer_bucket(layer, name)[key] = tensor
         elif kind in ("matrix", "norm", "bias"):
             bucket = _layer_bucket(layer, name)
             if kind == "matrix":
                 _expect_shape(shape, _layer_matrix_dims(cfg, key), name)
                 bucket[key] = tensor
             elif kind == "norm":
-                _expect_shape(shape, (cfg.hidden,), name)
+                expect = (
+                    (cfg.head_dim,) if key in ("q_norm", "k_norm")
+                    else (cfg.hidden,)
+                )
+                _expect_shape(shape, expect, name)
                 bucket[key] = tensor
             else:
                 _expect_shape(shape, (_layer_bias_dim(cfg, key),), name)
@@ -1618,8 +1858,19 @@ def load_export(
             "lm_head.weight нет в экспорте, а tie_word_embeddings=false; "
             "экспортируйте lm_head в non_ternary.bin"
         )
+    if cfg.moe:
+        required_keys = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "router", "expert_gate", "expert_up", "expert_down",
+        ]
+        if cfg.qk_norm:
+            required_keys += ["q_norm", "k_norm"]
+        if cfg.shared_inter:
+            required_keys += ["shared_gate", "shared_up", "shared_down"]
+    else:
+        required_keys = list(_MATRIX_ORDER)
     for index, layer in enumerate(weights["layers"]):
-        missing = [key for key in _MATRIX_ORDER if key not in layer]
+        missing = [key for key in required_keys if key not in layer]
         if missing:
             raise ValueError(
                 f"слой {index}: нет матриц {', '.join(missing)}; "
@@ -2312,7 +2563,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             out_dir = os.path.dirname(os.path.abspath(args.out))
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
-            vtm_ref.write_vtm(args.out, vtm.tensors, vtm.program, vtm.meta, integrity=True)
+            # MoE (задача 0172): контейнер с разреженными экспертами НЕ
+            # получает integrity-блок. Загрузчик, увидев его, сверяет sha256
+            # всей секции данных — то есть читает все веса на старте и
+            # занимает RSS размером с модель. Ровно это MoE и обходит: 19 ГиБ
+            # весов, из которых на токен нужны ~1,2 ГБ. Целостность при этом
+            # не теряется: импорт пишет blocks_sha256 каждого сегмента
+            # (tools/moe_import.py) и сверяет регионы с GGUF. Для плотных
+            # моделей поведение прежнее — хеш пишется.
+            integrity = bool(args.integrity) or not export.cfg.moe
+            vtm_ref.write_vtm(
+                args.out, vtm.tensors, vtm.program, vtm.meta,
+                integrity=integrity,
+            )
             _print_manifest(export, vtm, args.out)
             return 0
 

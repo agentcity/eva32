@@ -19,10 +19,16 @@
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 // --- диагностика -----------------------------------------------------------
 
@@ -614,6 +620,560 @@ static vtm_status op_rmsn(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     if (!fn) return fail(m, ins, VTM_E_UNSUPPORTED, "нет ядра RMSN");
     if (fn(y->f32, x->f32, w->f32, n, eps) != 0)
         return fail(m, ins, VTM_E_TENSOR, "ядро RMSN вернуло ошибку");
+    return VTM_OK;
+}
+
+// --- RMSH: RMSN по последней оси (QK-norm Qwen3), задача 0172 ---------------
+//
+// Qwen3 (и dense, и MoE) нормирует каждую голову Q/K отдельно: для головы h
+// и вектора длины head_dim
+//     y[i] = x[i] / sqrt(mean(x²) + eps) · w[i],
+// где w задан на head_dim и повторяется по головам. RMSN этого не умеет: он
+// нормирует весь тензор (n = произведение dims) — на 32 головах это дало бы
+// один общий масштаб вместо 32 и логиты, не имеющие отношения к модели.
+// Поэтому отдельный опкод, а не «RMSN с другой формой».
+//
+// Арифметика — та же, что у backend_scalar rmsnorm: сумма квадратов в double,
+// деление в double, округление в float на выходе. eps берётся из меты
+// (rms_norm_eps приоритетнее imm/1000), как у RMSN.
+static vtm_status op_rmsh(vtm_t *m, uint32_t ins, const vtm_instr *in) {
+    vtm_status st;
+    const vtm_tensor *x = need(m, in->a, ins, "a (x)", &st);
+    const vtm_tensor *w;
+    const vtm_tensor *y;
+    uint32_t dim, rows, r, i;
+    float eps;
+
+    if (!x) return st;
+    w = need(m, in->b, ins, "b (w)", &st);
+    if (!w) return st;
+    y = need(m, in->dst, ins, "dst (y)", &st);
+    if (!y) return st;
+    if ((st = req_f32(m, x, ins, "a (x)")) != VTM_OK) return st;
+    if ((st = req_f32(m, w, ins, "b (w)")) != VTM_OK) return st;
+    if ((st = req_f32(m, y, ins, "dst (y)")) != VTM_OK) return st;
+    if ((st = same_count(m, x, y, ins, "dst (y)")) != VTM_OK) return st;
+    if (in->imm < 0)
+        return fail(m, ins, VTM_E_ARG, "RMSH: eps не может быть отрицательным");
+    if (x->ndim < 1 || x->dims[x->ndim - 1] == 0)
+        return fail(m, ins, VTM_E_SHAPE, "RMSH: последняя ось пустая");
+    dim = x->dims[x->ndim - 1];
+    if (w->n_elements != dim)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "RMSH: w длиной %u, а последняя ось %u", w->n_elements,
+                    dim);
+    rows = x->n_elements / dim;
+    eps = (float)meta_number(m, "rms_norm_eps", (double)in->imm / 1000.0);
+    for (r = 0; r < rows; r++) {
+        const float *xr = x->f32 + (size_t)r * dim;
+        float *yr = y->f32 + (size_t)r * dim;
+        double sum = 0.0, mean, rms;
+        for (i = 0; i < dim; i++) sum += (double)xr[i] * (double)xr[i];
+        mean = sum / (double)dim;
+        rms = sqrt(mean + (double)eps);
+        if (rms == 0.0) {
+            memset(yr, 0, (size_t)dim * sizeof(float));
+            continue;
+        }
+        for (i = 0; i < dim; i++)
+            yr[i] = (float)((double)xr[i] / rms * (double)w->f32[i]);
+    }
+    return VTM_OK;
+}
+
+// --- MOE: разреженный MoE-слой (задача 0172) -------------------------------
+//
+// Одна инструкция = полный MoE-блок Qwen3: роутер, softmax, top-k, эксперты,
+// взвешенная сумма. Так сделано не ради «меньше опкодов», а потому что
+// эксперты выбираются на лету: граф из TMV их не выражает (TMV берёт матрицу
+// по индексу из инструкции, а индекс зависит от данных).
+//
+// Раскладка (ABI, см. vtm.h и docs/moe.md):
+//   dst — выход (hidden, fp32), прибавляется к текущему значению;
+//   a   — роутер [n_experts, hidden] (fp32);
+//   b   — вход x (hidden, fp32);
+//   c   — банк gate; c+1 — банк up; c+2 — банк down;
+//   imm — top_k (1..n_experts); flags & VTM_MOE_FLAG_NO_RENORM — не
+//         нормировать веса выбранных экспертов.
+//   Банк — kind 6/7, dims [n_experts, rows, cols]: у gate/up rows=inter,
+//   cols=hidden, у down rows=hidden, cols=inter.
+//
+// Разреженная загрузка. Банки лежат блоками GGML в mmap-отображении
+// контейнера; op_moe трогает только выбранные эксперты. Перед счётом по всем
+// выбранным выдаётся madvise(MADV_WILLNEED) на их диапазоны — ядро читает
+// 8×3 диапазона параллельно, пока считается первый (образец — упреждающая
+// подкачка 0161). VTM_MOE_MADVISE=0 отключает.
+//
+// Кэш экспертов (LRU). Горячие блоки можно держать в своей памяти, а не в
+// page cache: на 16 ГиБ и 19 ГиБ файла page cache вытесняется целиком, и
+// каждый токен снова читает свои 1,2 ГБ с диска. VTM_MOE_CACHE_MB=N (0 —
+// выключен, по умолчанию) включает LRU на N МиБ с копированием блоков.
+// Ключ — (указатель банка, номер эксперта): указатель однозначно задаёт
+// отображение, поэтому кэш можно держать общим для машин процесса.
+#define VTM_MOE_MAX_EXPERTS 65535
+#define VTM_MOE_TRACE_DEFAULT 0
+
+typedef struct moe_cache_entry {
+    struct moe_cache_entry *prev, *next;
+    const void *base;   // t->qblocks банка (идентифицирует отображение)
+    uint32_t expert;
+    size_t nbytes;
+    uint8_t *data;
+} moe_cache_entry;
+
+typedef struct {
+    moe_cache_entry *head, *tail;   // head — самый свежий
+    size_t bytes, cap;
+    int ready;
+} moe_cache;
+
+static moe_cache g_moe_cache;
+static uint64_t g_moe_hits, g_moe_misses, g_moe_advised;
+static int g_moe_cache_registered;
+
+static void moe_cache_drop(void) {
+    moe_cache_entry *e = g_moe_cache.head;
+    while (e) {
+        moe_cache_entry *next = e->next;
+        free(e->data);
+        free(e);
+        e = next;
+    }
+    memset(&g_moe_cache, 0, sizeof g_moe_cache);
+}
+
+static void moe_cache_init(void) {
+    const char *env;
+    long mb;
+
+    if (g_moe_cache_registered) return;
+    g_moe_cache_registered = 1;
+    memset(&g_moe_cache, 0, sizeof g_moe_cache);
+    env = getenv("VTM_MOE_CACHE_MB");
+    if (!env || !*env) return;
+    mb = strtol(env, NULL, 10);
+    if (mb <= 0) return;
+    g_moe_cache.cap = (size_t)mb << 20;
+    g_moe_cache.ready = 1;
+    atexit(moe_cache_drop);
+}
+
+static void moe_cache_unlink(moe_cache_entry *e) {
+    if (e->prev) e->prev->next = e->next; else g_moe_cache.head = e->next;
+    if (e->next) e->next->prev = e->prev; else g_moe_cache.tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+static void moe_cache_push(moe_cache_entry *e) {
+    e->next = g_moe_cache.head;
+    e->prev = NULL;
+    if (g_moe_cache.head) g_moe_cache.head->prev = e;
+    g_moe_cache.head = e;
+    if (!g_moe_cache.tail) g_moe_cache.tail = e;
+}
+
+static const uint8_t *moe_cache_get(const void *base, uint32_t expert,
+                                    size_t nbytes) {
+    moe_cache_entry *e;
+    if (!g_moe_cache.ready) return NULL;
+    for (e = g_moe_cache.head; e; e = e->next) {
+        if (e->base != base || e->expert != expert || e->nbytes != nbytes)
+            continue;
+        moe_cache_unlink(e);
+        moe_cache_push(e);
+        g_moe_hits++;
+        return e->data;
+    }
+    g_moe_misses++;
+    return NULL;
+}
+
+static void moe_cache_put(const void *base, uint32_t expert, const void *src,
+                          size_t nbytes) {
+    moe_cache_entry *e;
+    uint8_t *copy;
+
+    if (!g_moe_cache.ready || nbytes == 0 || nbytes > g_moe_cache.cap) return;
+    while (g_moe_cache.tail &&
+           g_moe_cache.bytes + nbytes > g_moe_cache.cap) {
+        moe_cache_entry *old = g_moe_cache.tail;
+        moe_cache_unlink(old);
+        g_moe_cache.bytes -= old->nbytes;
+        free(old->data);
+        free(old);
+    }
+    e = (moe_cache_entry *)calloc(1u, sizeof *e);
+    copy = (uint8_t *)malloc(nbytes);
+    if (!e || !copy) {
+        free(e);
+        free(copy);
+        return;
+    }
+    memcpy(copy, src, nbytes);
+    e->base = base;
+    e->expert = expert;
+    e->nbytes = nbytes;
+    e->data = copy;
+    moe_cache_push(e);
+    g_moe_cache.bytes += nbytes;
+}
+
+// Упреждающая подкачка диапазона из отображения: madvise требует выровненный
+// на страницу адрес, а блоки GGML лежат с шагом 144/210 байт — поэтому
+// расширяем диапазон до страниц (лишние страницы и так читаются рядом).
+static void moe_advise(const void *p, size_t len) {
+#if !defined(_WIN32) && defined(MADV_WILLNEED)
+    long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t lo, hi;
+    if (!p || !len) return;
+    if (ps <= 0) ps = 4096;
+    lo = (uintptr_t)p & ~((uintptr_t)ps - 1u);
+    hi = ((uintptr_t)p + len + (uintptr_t)ps - 1u) & ~((uintptr_t)ps - 1u);
+    if (madvise((void *)lo, (size_t)(hi - lo), MADV_WILLNEED) == 0)
+        g_moe_advised++;
+#else
+    (void)p;
+    (void)len;
+#endif
+}
+
+static int moe_madvise_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("VTM_MOE_MADVISE");
+        cached = (env && *env && strcmp(env, "0") == 0) ? 0 : 1;
+    }
+    return cached;
+}
+
+// Диагностика: VTM_MOE_TRACE=1 печатает в stderr счётчики на HALT (одна
+// строка на прогон). Счётчики — на процесс, а не на машину: это диагностика
+// одного прогона, а не часть ABI.
+static int moe_trace_level(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("VTM_MOE_TRACE");
+        if (!env || !*env) {
+            cached = VTM_MOE_TRACE_DEFAULT;
+        } else {
+            long level = strtol(env, NULL, 10);
+            cached = (level > 0) ? (int)level : 0;
+        }
+    }
+    return cached;
+}
+
+static int moe_trace_enabled(void) {
+    return moe_trace_level() > 0;
+}
+
+// Страничные отказы считает не C, а хост: на macOS struct rusage под
+// _POSIX_C_SOURCE не отдаёт ru_minflt/ru_majflt, а тащить сюда task_info
+// ради диагностики незачем. Хост читает getrusage(RUSAGE_SELF) до/после
+// прогона (tools/moe_program.py) — там счётчики есть.
+static void moe_trace_report(void) {
+    if (!moe_trace_enabled()) return;
+    fprintf(stderr, "VTM MOE: hits=%llu misses=%llu cache=%zu КиБ advised=%llu\n",
+            (unsigned long long)g_moe_hits,
+            (unsigned long long)g_moe_misses,
+            (size_t)(g_moe_cache.bytes >> 10),
+            (unsigned long long)g_moe_advised);
+}
+
+// Банк экспертов: kind 6/7, dims [n_experts, rows, cols], блоки GGML.
+static vtm_status moe_check_bank(vtm_t *m, uint32_t ins, const vtm_tensor *t,
+                                 const char *role, int n_experts, int rows,
+                                 int cols) {
+    if (!t || (t->kind != VTM_TENSOR_Q4K && t->kind != VTM_TENSOR_Q6K) ||
+        !t->qblocks)
+        return fail(m, ins, VTM_E_TENSOR,
+                    "MOE: %s — нужен банк kind 6/7 (Q4_K/Q6_K) с блоками GGML",
+                    role);
+    if (t->ndim != 3)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "MOE: %s — банк должен быть 3-D [n_experts, rows, cols], "
+                    "а dims=%u", role, (unsigned)t->ndim);
+    if ((int)t->dims[0] != n_experts)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "MOE: %s — экспертов %u, у роутера %d", role,
+                    (unsigned)t->dims[0], n_experts);
+    if ((int)t->dims[1] != rows || (int)t->dims[2] != cols)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "MOE: %s — матрица эксперта [%u, %u], ожидалась [%d, %d]",
+                    role, (unsigned)t->dims[1], (unsigned)t->dims[2], rows,
+                    cols);
+    if (((uint64_t)rows * (uint64_t)cols) % VTM_Q4K_BLOCK_VALUES)
+        return fail(m, ins, VTM_E_FORMAT,
+                    "MOE: %s — %d×%d не кратно блоку GGML %u", role, rows, cols,
+                    (unsigned)VTM_Q4K_BLOCK_VALUES);
+    return VTM_OK;
+}
+
+static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
+    vtm_status st;
+    const vtm_tensor *router = need(m, in->a, ins, "a (router)", &st);
+    const vtm_tensor *x;
+    const vtm_tensor *y;
+    const vtm_tensor *gate_bank;
+    const vtm_tensor *up_bank;
+    const vtm_tensor *down_bank;
+    int n_experts, hidden, inter, top_k, e, i, j, k;
+    int64_t bank_blocks, expert_blocks;
+    size_t gate_block_bytes, down_block_bytes;
+    double *logits = NULL, *acc = NULL;
+    int *chosen = NULL;
+    double *weights = NULL;
+    float *scratch = NULL;
+    int renorm;
+
+    if (!router) return st;
+    x = need(m, in->b, ins, "b (x)", &st);
+    if (!x) return st;
+    y = need(m, in->dst, ins, "dst (y)", &st);
+    if (!y) return st;
+    if ((st = req_f32(m, router, ins, "a (router)")) != VTM_OK) return st;
+    if ((st = req_f32(m, x, ins, "b (x)")) != VTM_OK) return st;
+    if ((st = req_f32(m, y, ins, "dst (y)")) != VTM_OK) return st;
+    if (router->ndim != 2)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "MOE: роутер должен быть [n_experts, hidden]");
+    n_experts = (int)router->dims[0];
+    hidden = (int)router->dims[1];
+    if (n_experts <= 0 || n_experts > VTM_MOE_MAX_EXPERTS)
+        return fail(m, ins, VTM_E_SHAPE, "MOE: экспертов %d", n_experts);
+    if ((int)x->n_elements != hidden || (int)y->n_elements != hidden)
+        return fail(m, ins, VTM_E_SHAPE,
+                    "MOE: x/y длиной %u/%u, у роутера hidden=%d",
+                    x->n_elements, y->n_elements, hidden);
+    top_k = (int)in->imm;
+    if (top_k <= 0 || top_k > n_experts)
+        return fail(m, ins, VTM_E_ARG,
+                    "MOE: top_k (imm) = %d, допустимо 1..%d", top_k,
+                    n_experts);
+    renorm = (in->flags & VTM_MOE_FLAG_NO_RENORM) == 0;
+
+    // Банки: c, c+1, c+2 — смежность в таблице тензоров (ABI, vtm.h).
+    if (in->c == VTM_NO_TENSOR || (uint32_t)in->c + 2u >= m->n_tensors)
+        return fail(m, ins, VTM_E_TENSOR,
+                    "MOE: банки экспертов — три подряд идущих тензора "
+                    "(c, c+1, c+2), c=%u вне таблицы (%u)",
+                    (unsigned)in->c, m->n_tensors);
+    gate_bank = &m->tensors[in->c];
+    up_bank = &m->tensors[(uint32_t)in->c + 1u];
+    down_bank = &m->tensors[(uint32_t)in->c + 2u];
+    if (gate_bank->kind != up_bank->kind)
+        return fail(m, ins, VTM_E_FORMAT,
+                    "MOE: gate (%s) и up (%s) разного вида; ожидались "
+                    "одинаковые банки",
+                    gate_bank->kind == VTM_TENSOR_Q4K ? "Q4_K" : "Q6_K",
+                    up_bank->kind == VTM_TENSOR_Q4K ? "Q4_K" : "Q6_K");
+    if (gate_bank->ndim == 3 && gate_bank->dims[1] && gate_bank->dims[2])
+        inter = (int)gate_bank->dims[1];
+    else
+        return fail(m, ins, VTM_E_SHAPE, "MOE: у банка gate нет dims");
+    if ((st = moe_check_bank(m, ins, gate_bank, "gate", n_experts, inter,
+                             hidden)) != VTM_OK)
+        return st;
+    if ((st = moe_check_bank(m, ins, up_bank, "up", n_experts, inter,
+                             hidden)) != VTM_OK)
+        return st;
+    if ((st = moe_check_bank(m, ins, down_bank, "down", n_experts, hidden,
+                             inter)) != VTM_OK)
+        return st;
+    if (inter <= 0 || hidden <= 0)
+        return fail(m, ins, VTM_E_SHAPE, "MOE: inter=%d hidden=%d", inter,
+                    hidden);
+
+    // Размер блока у gate/up и у down может быть разным: в Q4_K_M gate/up —
+    // Q4_K (144 байта на 256 значений), down — Q6_K (210). Один общий
+    // block_bytes здесь означал бы чтение down со сдвигом на чужой размер
+    // блока — правдоподобный мусор вместо весов.
+    gate_block_bytes = gate_bank->kind == VTM_TENSOR_Q4K ? VTM_Q4K_BLOCK_BYTES
+                                                         : VTM_Q6K_BLOCK_BYTES;
+    down_block_bytes = down_bank->kind == VTM_TENSOR_Q4K ? VTM_Q4K_BLOCK_BYTES
+                                                         : VTM_Q6K_BLOCK_BYTES;
+    expert_blocks = ((int64_t)inter * hidden) / VTM_Q4K_BLOCK_VALUES;
+    bank_blocks = (int64_t)n_experts * expert_blocks;
+
+    logits = (double *)calloc((size_t)n_experts, sizeof *logits);
+    chosen = (int *)calloc((size_t)top_k, sizeof *chosen);
+    weights = (double *)calloc((size_t)top_k, sizeof *weights);
+    acc = (double *)calloc((size_t)hidden, sizeof *acc);
+    scratch = (float *)calloc((size_t)inter * 3u + (size_t)hidden,
+                              sizeof *scratch);
+    if (!logits || !chosen || !weights || !acc || !scratch) {
+        free(logits); free(chosen); free(weights); free(acc); free(scratch);
+        return fail(m, ins, VTM_E_NOMEM, "MOE: нет памяти под рабочие буферы");
+    }
+
+    moe_cache_init();
+
+    // 1. Роутер: logits[e] = router[e]·x, затем softmax по всем экспертам.
+    {
+        double peak = -INFINITY, sum = 0.0;
+        for (e = 0; e < n_experts; e++) {
+            const float *row = router->f32 + (size_t)e * hidden;
+            double dot = 0.0;
+            for (i = 0; i < hidden; i++)
+                dot += (double)row[i] * (double)x->f32[i];
+            logits[e] = dot;
+            if (dot > peak) peak = dot;
+        }
+        for (e = 0; e < n_experts; e++) {
+            logits[e] = exp(logits[e] - peak);
+            sum += logits[e];
+        }
+        if (sum > 0.0)
+            for (e = 0; e < n_experts; e++) logits[e] /= sum;
+    }
+
+    // 2. top-k: выбор k старших (порядок — по убыванию вероятности).
+    for (k = 0; k < top_k; k++) {
+        int best = -1;
+        double best_p = -INFINITY;
+        for (e = 0; e < n_experts; e++) {
+            int used = 0;
+            for (j = 0; j < k; j++)
+                if (chosen[j] == e) { used = 1; break; }
+            if (used) continue;
+            if (logits[e] > best_p) { best_p = logits[e]; best = e; }
+        }
+        chosen[k] = best < 0 ? 0 : best;
+        weights[k] = best < 0 ? 0.0 : best_p;
+    }
+
+    // 3. Нормировка весов выбранных (Qwen3 norm_topk_prob=true) — но только
+    //    когда флаг NO_RENORM не выставлен.
+    if (renorm) {
+        double sum = 0.0;
+        for (k = 0; k < top_k; k++) sum += weights[k];
+        if (sum > 0.0)
+            for (k = 0; k < top_k; k++) weights[k] /= sum;
+    }
+
+    // VTM_MOE_TRACE=2 — не только счётчики на HALT, но и выбор экспертов
+    // (id:вес) по каждой инструкции: по нему видно, какие эксперты считаются
+    // и где роутер оказался на границе top-k.
+    if (moe_trace_level() >= 2) {
+        fprintf(stderr, "MOE ins=%u top=%d:", (unsigned)ins, top_k);
+        for (k = 0; k < top_k; k++)
+            fprintf(stderr, " %d:%.6f", chosen[k], weights[k]);
+        fprintf(stderr, "\n");
+    }
+    // 4. Упреждающая подкачка всех выбранных экспертов до счёта: 3×top_k
+    //    диапазонов уходят ядру одним заходом (0161).
+    if (moe_madvise_enabled()) {
+        for (k = 0; k < top_k; k++) {
+            int64_t off_gate = (int64_t)chosen[k] * expert_blocks
+                             * (int64_t)gate_block_bytes;
+            int64_t off_down = (int64_t)chosen[k] * expert_blocks
+                             * (int64_t)down_block_bytes;
+            moe_advise((const uint8_t *)gate_bank->qblocks + off_gate,
+                       (size_t)(expert_blocks * (int64_t)gate_block_bytes));
+            moe_advise((const uint8_t *)up_bank->qblocks + off_gate,
+                       (size_t)(expert_blocks * (int64_t)gate_block_bytes));
+            moe_advise((const uint8_t *)down_bank->qblocks + off_down,
+                       (size_t)(expert_blocks * (int64_t)down_block_bytes));
+        }
+    }
+
+    // 5. Эксперты: gate/up → silu(gate)*up → down → acc += w·out.
+    {
+        float *gate = scratch;
+        float *up = gate + inter;
+        float *mul = up + inter;
+        float *out = mul + inter;
+        int (*silu)(float *, const float *, int) =
+            (m->backend && m->backend->silu) ? m->backend->silu
+                                             : vtm_backend_scalar_lut.silu;
+        for (k = 0; k < top_k; k++) {
+            int ex = chosen[k];
+            const uint8_t *gb = (const uint8_t *)gate_bank->qblocks +
+                                (int64_t)ex * expert_blocks
+                                * (int64_t)gate_block_bytes;
+            const uint8_t *ub = (const uint8_t *)up_bank->qblocks +
+                                (int64_t)ex * expert_blocks
+                                * (int64_t)gate_block_bytes;
+            const uint8_t *db = (const uint8_t *)down_bank->qblocks +
+                                (int64_t)ex * expert_blocks
+                                * (int64_t)down_block_bytes;
+            size_t expert_bytes = (size_t)(expert_blocks
+                                           * (int64_t)gate_block_bytes);
+            size_t down_bytes = (size_t)(expert_blocks
+                                         * (int64_t)down_block_bytes);
+            const uint8_t *cached;
+            int hit_gate = 0, hit_up = 0, hit_down = 0;
+            int (*kernel)(float *, const uint8_t *, const float *, int, int) =
+                gate_bank->kind == VTM_TENSOR_Q4K ? vtm_q4k_tmv : vtm_q6k_tmv;
+            int (*kernel_down)(float *, const uint8_t *, const float *, int,
+                               int) =
+                down_bank->kind == VTM_TENSOR_Q4K ? vtm_q4k_tmv : vtm_q6k_tmv;
+
+            if ((cached = moe_cache_get(gate_bank->qblocks, (uint32_t)ex,
+                                        expert_bytes)) != NULL) {
+                gb = cached;
+                hit_gate = 1;
+            }
+            if ((cached = moe_cache_get(up_bank->qblocks, (uint32_t)ex,
+                                        expert_bytes)) != NULL) {
+                ub = cached;
+                hit_up = 1;
+            }
+            if ((cached = moe_cache_get(down_bank->qblocks, (uint32_t)ex,
+                                        down_bytes)) != NULL) {
+                db = cached;
+                hit_down = 1;
+            }
+
+            if (kernel(gate, gb, x->f32, inter, hidden) != 0 ||
+                kernel(up, ub, x->f32, inter, hidden) != 0) {
+                free(logits); free(chosen); free(weights); free(acc);
+                free(scratch);
+                return fail(m, ins, VTM_E_TENSOR,
+                            "MOE: ядро gate/up вернуло ошибку (эксперт %d)",
+                            ex);
+            }
+            if (silu(gate, gate, inter) != 0) {
+                free(logits); free(chosen); free(weights); free(acc);
+                free(scratch);
+                return fail(m, ins, VTM_E_TENSOR,
+                            "MOE: ядро SILU вернуло ошибку (эксперт %d)", ex);
+            }
+            for (i = 0; i < inter; i++) mul[i] = gate[i] * up[i];
+            if (kernel_down(out, db, mul, hidden, inter) != 0) {
+                free(logits); free(chosen); free(weights); free(acc);
+                free(scratch);
+                return fail(m, ins, VTM_E_TENSOR,
+                            "MOE: ядро down вернуло ошибку (эксперт %d)", ex);
+            }
+            for (i = 0; i < hidden; i++)
+                acc[i] += weights[k] * (double)out[i];
+
+            // Пополняем кэш только тем, чего в нём не было: чтение блока из
+            // отображения — это и есть страничный отказ, который кэш снимает.
+            if (g_moe_cache.ready) {
+                if (!hit_gate)
+                    moe_cache_put(gate_bank->qblocks, (uint32_t)ex, gb,
+                                  expert_bytes);
+                if (!hit_up)
+                    moe_cache_put(up_bank->qblocks, (uint32_t)ex, ub,
+                                  expert_bytes);
+                if (!hit_down)
+                    moe_cache_put(down_bank->qblocks, (uint32_t)ex, db,
+                                  down_bytes);
+            }
+        }
+    }
+
+    for (i = 0; i < hidden; i++)
+        y->f32[i] = (float)((double)y->f32[i] + acc[i]);
+
+    (void)bank_blocks;
+    free(logits);
+    free(chosen);
+    free(weights);
+    free(acc);
+    free(scratch);
     return VTM_OK;
 }
 
@@ -2282,6 +2842,12 @@ static int batch_classify(vtm_t *m, batch_scratch *b) {
 
     for (i = 0; i < m->n_instr; i++) {
         const vtm_instr *in = &m->instr[i];
+        // MOE выбирает экспертов по данным и читает банки с диска; RMSH
+        // нормирует по последней оси. Батчевых ядер у них нет, а батчевый
+        // путь гоняет инструкцию на каждый токен пачки — для MOE это была бы
+        // не пачка, а k-кратное чтение тех же банков. Честно уходим на путь
+        // по токену (как при отсутствии батчевых ядер).
+        if (in->opcode == VTM_OP_MOE || in->opcode == VTM_OP_RMSH) return 0;
         // KV-кэш — общий: его строки адресуются глобальной позицией, а не
         // токеном пачки. KVW пишет в него напрямую (см. op_kvw).
         if (in->opcode == VTM_OP_KVW) {
@@ -3200,9 +3766,16 @@ vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {
         case VTM_OP_SCAL:
             st = op_scal(m, i, in);
             break;
+        case VTM_OP_MOE:
+            st = op_moe(m, i, in);
+            break;
+        case VTM_OP_RMSH:
+            st = op_rmsh(m, i, in);
+            break;
         case VTM_OP_HALT:
             m->halted = 1;
             if (tracing) (void)trace_emit(m, &seq, i, in, trace_t0);
+            moe_trace_report();
             return VTM_OK;
         default:
             st = fail(m, i, VTM_E_OPCODE, "неизвестный opcode 0x%02x",

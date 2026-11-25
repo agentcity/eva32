@@ -474,6 +474,9 @@ IFLAG_EMB_INPUT = 0x01         # EMB: токен из состояния хос�
 IFLAG_INPLACE = 0x02           # подсказка: dst может совпадать с a
 IFLAG_ROPE_INTERLEAVED = 0x02  # ROPE: пары (2i, 2i+1), иначе половинки
 IFLAG_KNOWN = IFLAG_CAUSAL | IFLAG_INPLACE
+#: MOE: не нормировать веса выбранных экспертов на единицу (по умолчанию
+#: нормируются — Qwen3 norm_topk_prob=true; флаг нужен Mixtral-подобным).
+IFLAG_MOE_NO_RENORM = 0x01
 
 
 class Op(IntEnum):
@@ -494,6 +497,13 @@ class Op(IntEnum):
     CPY = 0x0D
     SCAL = 0x0E
     HALT = 0x0F
+    # MoE (задача 0172): роутер, top-k и разреженные эксперты одной
+    # инструкцией — индекс эксперта зависит от данных, граф из TMV его не
+    # выражает. Раскладка полей — vtm.h/docs/moe.md.
+    MOE = 0x10
+    # RMSH (задача 0172): RMSN по последней оси — QK-norm Qwen3, где w задан
+    # на head_dim и повторяется по головам.
+    RMSH = 0x11
 
 
 OP_NAMES = {int(op): op.name for op in Op}
@@ -4539,6 +4549,146 @@ class _Interpreter:
             x = self._read(int(instr.a))
             factor = instr.imm / 1000.0
             self._write(int(instr.dst), [value * factor for value in x])
+        elif op == Op.RMSH:
+            # RMSN по последней оси: w задан на head_dim и повторяется по
+            # строкам (QK-norm Qwen3). Арифметика — как у C: сумма квадратов
+            # в double, деление в double, округление в float на выходе.
+            x = self._read(int(instr.a))
+            w = self._read(int(instr.b))
+            if instr.imm < 0:
+                raise ValueError(
+                    f"RMSH: eps (imm) не может быть отрицательным: {instr.imm}"
+                )
+            dims = self.tensors[int(instr.a)].dims
+            dim = dims[-1] if dims else 0
+            if dim <= 0 or len(x) % dim:
+                raise ValueError(f"RMSH: {len(x)} значений не делятся на {dim}")
+            if len(w) != dim:
+                raise ValueError(
+                    f"RMSH: w длиной {len(w)}, а последняя ось {dim}"
+                )
+            eps = _f32(instr.imm / 1000.0)
+            out: list[float] = []
+            for base in range(0, len(x), dim):
+                row = x[base:base + dim]
+                mean = math.fsum(value * value for value in row) / dim
+                rms = math.sqrt(mean + eps)
+                if rms == 0.0:
+                    out.extend([0.0] * dim)
+                    continue
+                out.extend([_f32(value / rms * w[i]) for i, value in enumerate(row)])
+            self._write(int(instr.dst), out)
+        elif op == Op.MOE:
+            # dst += Σ_e w_e·down_e(silu(gate_e·x) ⊙ (up_e·x)); банки — три
+            # подряд идущих тензора (c, c+1, c+2), см. vtm.h.
+            router = self.tensors[int(instr.a)]
+            x = self._read(int(instr.b))
+            if len(router.dims) != 2:
+                raise ValueError("MOE: роутер должен быть [n_experts, hidden]")
+            n_experts, hidden = router.dims
+            if len(x) != hidden:
+                raise ValueError(
+                    f"MOE: x длиной {len(x)}, у роутера hidden={hidden}"
+                )
+            top_k = int(instr.imm)
+            if top_k <= 0 or top_k > n_experts:
+                raise ValueError(
+                    f"MOE: top_k (imm) = {top_k}, допустимо 1..{n_experts}"
+                )
+            base_index = int(instr.c)
+            if base_index + 2 >= len(self.tensors):
+                raise ValueError(
+                    f"MOE: банки экспертов — три подряд идущих тензора "
+                    f"(c, c+1, c+2), c={base_index} вне таблицы"
+                )
+            gate_t = self.tensors[base_index]
+            up_t = self.tensors[base_index + 1]
+            down_t = self.tensors[base_index + 2]
+            for label, bank in (("gate", gate_t), ("up", up_t), ("down", down_t)):
+                if bank.kind not in (KIND_Q4K, KIND_Q6K, KIND_Q4):
+                    raise ValueError(
+                        f"MOE: {label} — нужен банк kind 6/7, а пришёл "
+                        f"{bank.kind_name}"
+                    )
+                if len(bank.dims) != 3:
+                    raise ValueError(
+                        f"MOE: {label} — банк должен быть 3-D "
+                        f"[n_experts, rows, cols], а dims={bank.dims}"
+                    )
+            inter = int(gate_t.dims[1])
+            if tuple(gate_t.dims) != (n_experts, inter, hidden):
+                raise ValueError(
+                    f"MOE: gate dims={gate_t.dims}, ожидались "
+                    f"{(n_experts, inter, hidden)}"
+                )
+            if tuple(up_t.dims) != (n_experts, inter, hidden):
+                raise ValueError(
+                    f"MOE: up dims={up_t.dims}, ожидались "
+                    f"{(n_experts, inter, hidden)}"
+                )
+            if tuple(down_t.dims) != (n_experts, hidden, inter):
+                raise ValueError(
+                    f"MOE: down dims={down_t.dims}, ожидались "
+                    f"{(n_experts, hidden, inter)}"
+                )
+            router_values = router.dense()
+            gate_values = gate_t.dense()
+            up_values = up_t.dense()
+            down_values = down_t.dense()
+            # 1. логиты роутера и softmax по всем экспертам (double, как в C).
+            logits = [0.0] * n_experts
+            for e in range(n_experts):
+                row = router_values[e * hidden:(e + 1) * hidden]
+                logits[e] = sum(a * b for a, b in zip(row, x))
+            peak = max(logits)
+            exp_values = [math.exp(value - peak) for value in logits]
+            total = sum(exp_values)
+            if total > 0.0:
+                exp_values = [value / total for value in exp_values]
+            # 2. top-k по убыванию (порядок — как в C: стабильный выбор
+            #    старшего, затем исключение выбранных).
+            chosen: list[int] = []
+            weights: list[float] = []
+            for _ in range(top_k):
+                best = -1
+                best_p = -math.inf
+                for e in range(n_experts):
+                    if e in chosen:
+                        continue
+                    if exp_values[e] > best_p:
+                        best_p = exp_values[e]
+                        best = e
+                chosen.append(best if best >= 0 else 0)
+                weights.append(best_p if best >= 0 else 0.0)
+            if not (int(instr.flags) & IFLAG_MOE_NO_RENORM):
+                weight_sum = sum(weights)
+                if weight_sum > 0.0:
+                    weights = [value / weight_sum for value in weights]
+            # 3. эксперты.
+            expert_stride = inter * hidden
+            down_stride = hidden * inter
+            acc = [0.0] * hidden
+            for k, expert in enumerate(chosen):
+                gate = _tmv_dense(
+                    gate_values[expert * expert_stride:(expert + 1) * expert_stride],
+                    x, inter, hidden,
+                )
+                up = _tmv_dense(
+                    up_values[expert * expert_stride:(expert + 1) * expert_stride],
+                    x, inter, hidden,
+                )
+                mul = [_silu(g) * u for g, u in zip(gate, up)]
+                out = _tmv_dense(
+                    down_values[expert * down_stride:(expert + 1) * down_stride],
+                    mul, hidden, inter,
+                )
+                for i in range(hidden):
+                    acc[i] += weights[k] * out[i]
+            y = self._read(int(instr.dst))
+            self._write(
+                int(instr.dst),
+                [_f32(old + delta) for old, delta in zip(y, acc)],
+            )
         elif op == Op.HALT:
             state.halted = True
         else:  # pragma: no cover - Instr уже проверил opcode
