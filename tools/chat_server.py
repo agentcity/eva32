@@ -23,6 +23,20 @@ Qwen одновременно, с временем и скоростью. Скр
   RSS-дельта, причина остановки, кэш префикса), ``end`` (CPU-время запроса и
   снимок системы), ``error`` (человеческий текст). Терминальное событие —
   ``data: [DONE]``, как у ``eva/server.py``;
+* память диалога (задача 0182) — своя история ``user``/``assistant`` на
+  колонку: в запрос уходит ``[system, ...история, user]``, ответ дописывается
+  в историю после ``done`` (пустой/ошибочный — не дописывается). Бюджет —
+  ``--history-tokens`` (0 — без истории) и ``--history-turns``; старые пары
+  выбрасываются целиком, системный промпт остаётся. Без токенизатора счёт
+  по символам (~3 символа на токен) и помечен как оценка;
+* ``POST /api/reset`` — новый диалог: сброс истории колонки
+  (``{"side": 0}``) или обеих (``{}``); в шапке колонки — «история: N реплик ·
+  ~M токенов», счётчик приходит в ``history`` у ``GET /api/models``;
+* ``POST /api/tts`` — озвучка (задача 0183): ``{"text", "voice"}`` →
+  ``audio/wav`` (``Cache-Control: no-store``). Текст чистится от
+  ``<think>…</think>``, markdown и URL, длиннее 600 символов — 400. Синтез —
+  ``eva/tts.py``: Piper → системный ``say``/``espeak`` → null; нет движка или
+  он упал — 503 «голос недоступен», чат при этом работает как раньше;
 * ``POST /api/load`` / ``POST /api/unload`` — явная загрузка/выгрузка
   ВТМ-модели (задача 0166). Тело — ``{"backend": "vtm", "model": "<id>"}``,
   неизвестная модель — 400, чужой бэкенд (Ollama) — 400: её памятью
@@ -84,10 +98,12 @@ import ctypes
 import ctypes.util
 import gc
 import json
+import math
 import pathlib
 import logging
 import os
 import queue
+import re
 import shutil
 import struct
 import subprocess
@@ -108,20 +124,28 @@ except ImportError:  # pragma: no cover - не наш случай, но пад�
 __all__ = [
     "BackendSpec",
     "ChatHTTPServer",
+    "ChatHistory",
     "ClientError",
+    "DEFAULT_HISTORY_TOKENS",
+    "DEFAULT_HISTORY_TURNS",
     "DEFAULT_MAX_TOKENS",
     "DEFAULT_PORT",
     "HOST",
     "ModelBusy",
     "ModelSpec",
     "OLLAMA_BASE",
+    "TTS_MAX_CHARS",
     "ChatCliAdapter",
     "StreamPiece",
     "VtmInspect",
+    "clean_tts_text",
     "create_server",
     "default_adapters",
     "default_registry",
+    "estimate_tokens",
+    "default_tts_speech",
     "inspect_vtm",
+    "looks_like_wav",
     "main",
     "system_snapshot",
 ]
@@ -144,6 +168,14 @@ if str(ROOT) not in sys.path:
 OLLAMA_BASE = "http://127.0.0.1:11434/v1"
 #: Сколько новых токенов просим у обеих моделей (сравнение на равных).
 DEFAULT_MAX_TOKENS = 256
+#: Бюджет истории диалога на колонку, токенов (задача 0182).
+#: ``0`` — истории нет: каждая колонка спрашивается с чистого листа.
+DEFAULT_HISTORY_TOKENS = 1024
+#: Сколько последних реплик (пар вопрос/ответ) держать в истории колонки.
+DEFAULT_HISTORY_TURNS = 8
+#: Оценка токенов без токенизатора: средний BPE-токен — 3–4 символа
+#: латиницы и 2–3 кириллицы, берём 3 (как ``tools/chat.py::estimate_tokens``).
+HISTORY_CHARS_PER_TOKEN = 3
 #: Потолок тела запроса: вопрос + две ссылки на модели, больше не нужно.
 MAX_BODY_BYTES = 64 * 1024
 #: Потолок вопроса в символах; защита от случайной вставки книги.
@@ -1454,6 +1486,8 @@ def _model_cards(server: "ChatHTTPServer") -> dict[str, Any]:
         "max_tokens": server.max_tokens,
         # Политика автовыгрузки: null — выключена, 0 — держать всегда.
         "keep_alive": getattr(server, "keep_alive", None),
+        # Память диалога (задача 0182): реплики и оценка токенов по колонкам.
+        "history": _history_json(server),
     }
 
 
@@ -1537,6 +1571,145 @@ def load_system_prompt(path: pathlib.Path | None = None) -> str:
         return target.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+
+
+def estimate_tokens(text: str) -> int:
+    """Оценка токенов по символам: ~3 символа на токен.
+
+    Токенизатор есть только у ВТМ, да и тот про свой словарь; для бюджета
+    истории это не нужно. Правило то же, что в ``tools/chat.py``: средний
+    BPE-токен — 3–4 символа латиницы и 2–3 кириллицы, поэтому число ниже
+    честно помечается как оценка (``estimated: true``), а не выдаётся за
+    измерение провайдера.
+    """
+    if not text:
+        return 0
+    return max(1, math.ceil(len(text) / HISTORY_CHARS_PER_TOKEN))
+
+
+class ChatHistory:
+    """Память диалога: своя история ``user``/``assistant`` на каждую колонку.
+
+    Задача 0182. Раньше запрос всегда собирался как ``[system, user]``, и
+    модель не видела, о чём говорили раньше. Теперь история живёт на сервере
+    отдельно для левой и правой колонки: сравнение моделей остаётся честным
+    (у каждой свой диалог), а системный промпт — общий и всегда первый.
+
+    Обрезка — по двум лимитам: ``max_turns`` последних реплик (пара
+    вопрос/ответ) и ``max_tokens`` бюджета. Старые пары выбрасываются
+    целиком — обрубков реплик в истории не бывает. Последняя пара остаётся
+    даже если одна не влезает в бюджет: иначе «второй вопрос не видит
+    первый» на длинном ответе. ``max_tokens == 0`` выключает историю совсем.
+
+    Потокобезопасно: HTTP-поток читает историю при сборке запроса, а
+    дописывает после ``done``; два запроса могут идти одновременно.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_tokens: int = DEFAULT_HISTORY_TOKENS,
+        max_turns: int = DEFAULT_HISTORY_TURNS,
+        counter: Callable[[str], int] | None = None,
+    ) -> None:
+        self.max_tokens = max(0, int(max_tokens))
+        # Одна реплика — минимум одна пара: меньше не имеет смысла.
+        self.max_turns = max(1, int(max_turns))
+        self._counter = counter or estimate_tokens
+        self._lock = threading.Lock()
+        self._sides: dict[int, list[dict[str, str]]] = {0: [], 1: []}
+
+    @property
+    def enabled(self) -> bool:
+        """Есть ли история: ``--history-tokens 0`` выключает её целиком."""
+        return self.max_tokens > 0
+
+    def messages(self, side: int) -> list[dict[str, str]]:
+        """Копия истории колонки — ровно то, что уйдёт в модель."""
+        with self._lock:
+            return [dict(message) for message in self._sides.get(side, ())]
+
+    def append(
+        self, side: int, question: str, answer: str
+    ) -> list[dict[str, str]]:
+        """Дописать реплику (вопрос + ответ) и подрезать историю под лимиты."""
+        if not self.enabled:
+            return []
+        with self._lock:
+            items = self._sides.setdefault(side, [])
+            items.append({"role": "user", "content": question})
+            items.append({"role": "assistant", "content": answer})
+            self._fit(items)
+            return [dict(message) for message in items]
+
+    def reset(self, side: int | None = None) -> None:
+        """Забыть историю колонки; ``side=None`` — обеих."""
+        with self._lock:
+            sides = self._sides.keys() if side is None else (side,)
+            for index in sides:
+                self._sides[index] = []
+
+    def stats(self, side: int) -> dict[str, Any]:
+        """Счётчик для UI: реплик, сообщений, оценка токенов."""
+        with self._lock:
+            items = self._sides.get(side) or []
+            tokens = self._tokens(items)
+            return {
+                "side": side,
+                "turns": len(items) // 2,
+                "messages": len(items),
+                "tokens": tokens,
+                "estimated": True,
+            }
+
+    # -- внутреннее ----------------------------------------------------------
+
+    def _tokens(self, messages: Sequence[Mapping[str, str]]) -> int:
+        return sum(
+            self._counter(str(message.get("content") or ""))
+            for message in messages
+        )
+
+    def _fit(self, items: list[dict[str, str]]) -> None:
+        """Выбросить самые старые пары, пока история не влезет в лимиты."""
+        while len(items) > self.max_turns * 2:
+            del items[:2]
+        while len(items) > 2 and self._tokens(items) > self.max_tokens:
+            del items[:2]
+
+
+def _history_json(server: "ChatHTTPServer") -> dict[str, Any]:
+    """История обеих колонок для ``/api/models`` и ``/api/reset``.
+
+    Токены помечены ``estimated: true``: точного токенизатора у сервера нет,
+    счёт идёт по символам (~3 символа на токен).
+    """
+    history = getattr(server, "history", None)
+    if not isinstance(history, ChatHistory):
+        return {"enabled": False, "estimated": True, "sides": []}
+    return {
+        "enabled": history.enabled,
+        "limit_tokens": history.max_tokens,
+        "limit_turns": history.max_turns,
+        "estimated": True,
+        "sides": [history.stats(0), history.stats(1)],
+    }
+
+
+def _prompt_text(messages: Sequence[Mapping[str, str]]) -> str:
+    """Промпт одной колонки строкой — для оценки кэша префикса."""
+    return "\n".join(
+        "{}: {}".format(message.get("role", ""), message.get("content", ""))
+        for message in messages
+    )
+
+
+def _last_question(messages: Sequence[Mapping[str, str]]) -> str:
+    """Вопрос колонки: последнее сообщение пользователя в её запросе."""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return str(message.get("content") or "")
+    return ""
 
 
 def _registry_json(
@@ -1734,10 +1907,17 @@ def _validate_model_target(
 
 
 class _SideDone:
-    """Внутренний маркер очереди: колонка закончила (в SSE не уходит)."""
+    """Внутренний маркер очереди: колонка закончила (в SSE не уходит).
 
-    def __init__(self, side: int) -> None:
+    ``answer`` — весь текст ответа колонки, если генерация дошла до ``done``.
+    По нему HTTP-поток дописывает историю диалога (задача 0182): пустая
+    строка значит «ответа нет» (ошибка, отмена, пустая генерация), и такая
+    реплика в историю не попадает.
+    """
+
+    def __init__(self, side: int, answer: str = "") -> None:
         self.side = side
+        self.answer = answer
 
 
 def _run_side(
@@ -1785,6 +1965,11 @@ def _run_side(
     request_load_ms: float | None = None
     char_count = 0
     completed = False
+    # Полный текст ответа — для истории диалога (задача 0182). Складываем
+    # здесь, а не по delta в HTTP-потоке: склейка кусков живёт в этом же
+    # цикле, и ответ известен целиком к моменту ``done``.
+    answer_parts: list[str] = []
+    answer_for_history = ""
     delta_buffer: list[str] = []
     delta_flushed = time.monotonic()
     try:
@@ -1796,6 +1981,7 @@ def _run_side(
                 text = piece.text if isinstance(piece, StreamPiece) else str(piece)
                 if text:
                     char_count += len(text)
+                    answer_parts.append(text)
                     if first_token_ms is None:
                         first_token_ms = max(
                             0, int((time.monotonic() - started) * 1000)
@@ -1947,6 +2133,9 @@ def _run_side(
             if server is not None:
                 with server.state_lock:
                     server.last_answers[key] = dict(metrics)
+            # done уходит в поток как есть (формат события не меняется), а
+            # полный текст запомним для истории — её допишет HTTP-поток.
+            answer_for_history = "".join(answer_parts)
             events.put(
                 {
                     "type": "done",
@@ -1958,8 +2147,9 @@ def _run_side(
             )
     finally:
         # Маркер — всегда последним: HTTP-поток закрывает стрим, только
-        # когда обе колонки прислали и done/error, и маркер.
-        events.put(_SideDone(index))
+        # когда обе колонки прислали и done/error, и маркер. Пустой ответ
+        # (ошибка, отмена, пустая генерация) в историю не дописывается.
+        events.put(_SideDone(index, answer_for_history))
 
 
 # --------------------------------------------------------------------------- #
@@ -2032,6 +2222,11 @@ PAGE_HTML = """<!doctype html>
   }
   .check { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); }
   .check input { width: 16px; height: 16px; accent-color: var(--accent); }
+  /* Озвучка (задача 0183): галочка в шапке колонки и плашка деградации. */
+  .check.tts { font-size: 12px; gap: 5px; white-space: nowrap; }
+  .check.tts input { width: 14px; height: 14px; }
+  .tts-note { color: var(--danger); font-size: 11.5px; }
+  .tts-note:empty { display: none; }
   button {
     border: 0; border-radius: 9px; padding: 10px 20px; font: inherit;
     font-weight: 650; color: #fff; background: var(--accent); cursor: pointer;
@@ -2169,6 +2364,7 @@ PAGE_HTML = """<!doctype html>
         </select>
       </label>
       <button id="ask" type="button">Спросить</button>
+      <button id="stop" type="button" class="mini ghost" disabled>Стоп</button>
       <span id="status" role="status"></span>
     </div>
   </section>
@@ -2183,13 +2379,17 @@ PAGE_HTML = """<!doctype html>
         <div class="loadctl">
           <button type="button" class="mini" id="load-0" disabled>Загрузить</button>
           <button type="button" class="mini alt" id="unload-0" disabled>Выгрузить</button>
+          <button type="button" class="mini ghost" id="new-0">Новый диалог</button>
         </div>
         <div class="stats">
           <span>время: <b id="time-0">—</b></span>
           <span>ток/с: <b id="speed-0">—</b></span>
           <span>токенов: <b id="tokens-0">—</b></span>
+          <span>история: <b id="history-0">—</b></span>
         </div>
         <button type="button" class="mini ghost" id="collapse-0" hidden>свернуть</button>
+        <label class="check tts"><input type="checkbox" id="tts-0"> озвучивать</label>
+        <span class="tts-note" id="tts-note-0" role="status"></span>
       </div>
       <details class="think" id="think-0" hidden>
         <summary id="think-sum-0">рассуждение</summary>
@@ -2208,13 +2408,17 @@ PAGE_HTML = """<!doctype html>
         <div class="loadctl">
           <button type="button" class="mini" id="load-1" disabled>Загрузить</button>
           <button type="button" class="mini alt" id="unload-1" disabled>Выгрузить</button>
+          <button type="button" class="mini ghost" id="new-1">Новый диалог</button>
         </div>
         <div class="stats">
           <span>время: <b id="time-1">—</b></span>
           <span>ток/с: <b id="speed-1">—</b></span>
           <span>токенов: <b id="tokens-1">—</b></span>
+          <span>история: <b id="history-1">—</b></span>
         </div>
         <button type="button" class="mini ghost" id="collapse-1" hidden>свернуть</button>
+        <label class="check tts"><input type="checkbox" id="tts-1"> озвучивать</label>
+        <span class="tts-note" id="tts-note-1" role="status"></span>
       </div>
       <details class="think" id="think-1" hidden>
         <summary id="think-sum-1">рассуждение</summary>
@@ -2317,7 +2521,10 @@ PAGE_HTML = """<!doctype html>
       модели TTFT не содержит чтения весов с диска. «RSS модели» — дельта RSS
       процесса chat_server от загрузки, «TTFT без загрузки» — TTFT минус
       загрузка этого запроса (у тёплого совпадает с TTFT). Автовыгрузка по
-      простою задаётся сервером (--keep-alive, по умолчанию выключена).</p>
+      простою задаётся сервером (--keep-alive, по умолчанию выключена).
+      «История» в шапке колонки — реплики этой колонки и оценка их токенов
+      (~3 символа на токен): бюджет и число реплик задаёт сервер
+      (--history-tokens/--history-turns), «Новый диалог» её очищает.</p>
   </section>
 </main>
 <script>
@@ -2440,6 +2647,219 @@ PAGE_HTML = """<!doctype html>
   }
   // --- think-парсер: конец ---
 
+  // --- TTS-фразы: начало (логику проверяет node из tests.test_chat_server) ---
+  // Ответ режется на фразы по мере стрима: конец предложения (. ! ? …) с
+  // пробелом после, конец предложения в конце куска (иначе первая фраза
+  // ждала бы следующего delta) и перевод строки. Длинная фраза режется по
+  // словам под серверный лимит 600 символов.
+  var TTS_LIMIT = 600;
+  var TTS_END_RE = /[.!?…]+[)\\]"»”']?(?=\\s|$)/;
+
+  function splitTtsChunks(text, limit) {
+    var chunks = [];
+    var rest = String(text || "").replace(/\\s+/g, " ").trim();
+    while (rest.length > limit) {
+      var cut = rest.lastIndexOf(" ", limit);
+      if (cut <= 0) { cut = limit; }
+      chunks.push(rest.slice(0, cut).trim());
+      rest = rest.slice(cut).trim();
+    }
+    if (rest) { chunks.push(rest); }
+    return chunks;
+  }
+
+  function takeTtsPhrase(buffer, flush) {
+    var match = TTS_END_RE.exec(buffer);
+    var newline = buffer.indexOf("\\n");
+    var cut = -1;
+    if (match) { cut = match.index + match[0].length; }
+    if (newline >= 0 && (cut < 0 || newline < cut)) { cut = newline + 1; }
+    if (cut < 0) {
+      if (!flush) { return null; }
+      return { phrase: buffer, rest: "" };
+    }
+    return { phrase: buffer.slice(0, cut), rest: buffer.slice(cut) };
+  }
+
+  function createPhraseSplitter(onPhrase) {
+    var buffer = "";
+    function emit(text) {
+      var phrase = String(text || "").trim();
+      if (!phrase) { return; }
+      splitTtsChunks(phrase, TTS_LIMIT).forEach(onPhrase);
+    }
+    function feed(chunk) {
+      buffer += chunk || "";
+      for (;;) {
+        var part = takeTtsPhrase(buffer, false);
+        if (!part) { break; }
+        buffer = part.rest;
+        emit(part.phrase);
+      }
+      // Фраза без единой точки (долгий перечень) не должна ждать конца
+      // ответа: режем по последнему пробелу, как только перевалили лимит.
+      while (buffer.length > TTS_LIMIT) {
+        var space = buffer.lastIndexOf(" ", TTS_LIMIT);
+        if (space <= 0) { space = TTS_LIMIT; }
+        emit(buffer.slice(0, space));
+        buffer = buffer.slice(space);
+      }
+    }
+    function flush() {
+      var rest = buffer;
+      buffer = "";
+      emit(rest);
+    }
+    return { feed: feed, flush: flush, pending: function () { return buffer; } };
+  }
+  // --- TTS-фразы: конец ---
+
+  // Очередь озвучки одна на страницу: <audio> тоже один, фразы играют
+  // последовательно. Синтез фразы начинается сразу, как она появилась, —
+  // пока играет первая, остальные уже готовятся.
+  var tts = {
+    available: true,
+    generation: 0,
+    queue: [],
+    playing: false,
+    audio: null,
+    current: null
+  };
+
+  function ttsBox(side) { return byId("tts-" + side); }
+
+  function ttsEnabled(side) {
+    var box = ttsBox(side);
+    return !!(box && box.checked && tts.available);
+  }
+
+  function setVoiceNote(side, text) {
+    var note = byId("tts-note-" + side);
+    if (note) { note.textContent = text || ""; }
+  }
+
+  function ttsAudio() {
+    if (!tts.audio) {
+      tts.audio = new Audio();
+      tts.audio.preload = "auto";
+    }
+    return tts.audio;
+  }
+
+  function releaseSpeech() {
+    if (!tts.current) { tts.playing = false; return; }
+    var audio = ttsAudio();
+    try { audio.pause(); } catch (ignored) { /* уже остановлено */ }
+    if (tts.current.url) {
+      try { URL.revokeObjectURL(tts.current.url); } catch (ignored) { /* уже */ }
+    }
+    audio.onended = null;
+    audio.onerror = null;
+    audio.removeAttribute("src");
+    try { audio.load(); } catch (ignored) { /* не критично */ }
+    tts.current = null;
+    tts.playing = false;
+  }
+
+  // Стоп и новый вопрос глушат и звук, и очередь: поколение растёт, и ответы
+  // уже отправленных запросов синтеза не попадут в очередь как «новые».
+  function stopSpeech() {
+    tts.generation += 1;
+    tts.queue = [];
+    releaseSpeech();
+  }
+
+  function voiceFailed(side, reason) {
+    tts.available = false;
+    stopSpeech();
+    [0, 1].forEach(function (index) {
+      if (ttsBox(index) && ttsBox(index).checked) {
+        setVoiceNote(index, "голос недоступен");
+      }
+    });
+    if (reason) {
+      setStatus("голос недоступен — текст идёт как раньше", true);
+    }
+  }
+
+  function pumpSpeech() {
+    if (tts.playing) { return; }
+    var job = tts.queue.shift();
+    if (!job) { return; }
+    tts.playing = true;
+    job.ready.then(function (url) {
+      if (job.generation !== tts.generation) {
+        // Пока фраза синтезировалась, её ответили «стопом» или новым
+        // вопросом: звук уже не нужен, ссылку освобождаем.
+        if (url) { try { URL.revokeObjectURL(url); } catch (ignored) { /* уже */ } }
+        tts.playing = false;
+        pumpSpeech();
+        return;
+      }
+      if (!url) { tts.playing = false; pumpSpeech(); return; }
+      var audio = ttsAudio();
+      tts.current = { url: url, side: job.side };
+      audio.onended = function () { releaseSpeech(); pumpSpeech(); };
+      audio.onerror = function () {
+        releaseSpeech();
+        setVoiceNote(job.side, "не удалось проиграть озвучку");
+        pumpSpeech();
+      };
+      audio.src = url;
+      var started = null;
+      try { started = audio.play(); } catch (ignored) { started = null; }
+      if (started && typeof started.catch === "function") {
+        started.catch(function () {
+          // Автоплей запрещён политикой браузера: текст ответа это не
+          // задерживает, просто звука нет до следующего включения.
+          if (job.generation !== tts.generation) { return; }
+          releaseSpeech();
+          setVoiceNote(job.side, "браузер не дал включить звук");
+          tts.available = false;
+          tts.queue = [];
+        });
+      }
+    });
+  }
+
+  function enqueueSpeech(side, phrase) {
+    if (!ttsEnabled(side)) { return; }
+    var text = String(phrase || "").trim();
+    if (!text) { return; }
+    var generation = tts.generation;
+    var ready = fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "audio/wav" },
+      body: JSON.stringify({ text: text })
+    }).then(function (response) {
+      if (!response.ok) {
+        var status = response.status;
+        return response.json().catch(function () { return null; }).then(function (data) {
+          var message = "HTTP " + status;
+          if (data && data.error && data.error.message) {
+            message = data.error.message;
+          }
+          var problem = new Error(message);
+          problem.status = status;
+          throw problem;
+        });
+      }
+      return response.blob();
+    }).then(function (blob) {
+      if (generation !== tts.generation || !blob || !blob.size) { return ""; }
+      return URL.createObjectURL(blob);
+    }).catch(function (err) {
+      if (generation !== tts.generation) { return ""; }
+      // 400 — фраза не годится (после чистки пусто, например одна ссылка):
+      // молчим только про неё, голос не выключаем.
+      if (err && err.status === 400) { return ""; }
+      voiceFailed(side, err && err.message ? err.message : String(err));
+      return "";
+    });
+    tts.queue.push({ side: side, generation: generation, ready: ready });
+    pumpSpeech();
+  }
+
   function resetPanels() {
     finishedSides = 0;
     stickToBottom = true;
@@ -2549,6 +2969,30 @@ PAGE_HTML = """<!doctype html>
     if (info.hit === true) { return "да · общий префикс " + shared + " (оценка)"; }
     if (info.hit === false) { return "нет · общий префикс " + shared + " (оценка)"; }
     return "включён, попадание неизвестно";
+  }
+
+  // История колонки (задача 0182): «N реплик · ~M токенов». Токены — оценка
+  // сервера по символам (~3 символа на токен), поэтому подпись честная.
+  function historyText(info, enabled) {
+    // enabled — флаг всей истории (--history-tokens 0), а не одной колонки.
+    if (enabled === false) { return "выключена (0 токенов)"; }
+    if (!info) { return "—"; }
+    var turns = typeof info.turns === "number" ? info.turns : 0;
+    var tokens = typeof info.tokens === "number" ? info.tokens : 0;
+    return turns + " реплик · ~" + tokens + " токенов" +
+      (info.estimated === false ? "" : " (оценка)");
+  }
+
+  function fillHistory(history) {
+    if (!history) { return; }
+    var sides = Array.isArray(history.sides) ? history.sides : [];
+    [0, 1].forEach(function (side) {
+      var info = null;
+      for (var i = 0; i < sides.length; i += 1) {
+        if (sides[i] && sides[i].side === side) { info = sides[i]; break; }
+      }
+      setText("history-" + side, historyText(info, history.enabled));
+    });
   }
 
   function fillSideMetrics(side, event) {
@@ -2706,6 +3150,7 @@ PAGE_HTML = """<!doctype html>
       } else {
         setText("sys-keepalive", "выключен");
       }
+      fillHistory(data.history);
       [0, 1].forEach(function (side) {
         var backendId = byId("backend-" + side).value;
         var modelId = byId("model-" + side).value;
@@ -2776,10 +3221,47 @@ PAGE_HTML = """<!doctype html>
     }
   }
 
+  // Новый диалог колонки (задача 0182): сервер забывает её историю, шапка
+  // сразу показывает «0 реплик». Ответ на экране не трогаем — он про уже
+  // закончившийся обмен; следующий вопрос начнётся с чистого листа.
+  async function resetDialog(side) {
+    if (running) { return; }
+    setStatus("сбрасываю историю…", false);
+    try {
+      var response = await fetch("/api/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify({ side: side })
+      });
+      var data = null;
+      try { data = await response.json(); } catch (ignored) { /* не JSON */ }
+      if (!response.ok) {
+        var message = "HTTP " + response.status;
+        if (data && data.error && data.error.message) {
+          message = data.error.message;
+        }
+        setStatus(message, true);
+        return;
+      }
+      fillHistory(data.history);
+      refreshModels();
+      setStatus(
+        "история колонки " + (side === 0 ? "слева" : "справа") + " сброшена",
+        false
+      );
+    } catch (err) {
+      setStatus("сервер недоступен: " + (err && err.message ? err.message : err), true);
+    }
+  }
+
   function appendText(side, text) {
     var answer = byId("answer-" + side);
     answer.appendChild(document.createTextNode(text));
     followStream(side);
+    // Текст печатается независимо от звука: сплиттер только копит фразы и
+    // отдаёт их в очередь, если «озвучивать» включено.
+    var state = streams[side];
+    if (state && state.tts) { state.tts.feed(text); }
   }
 
   function appendThink(side, text) {
@@ -2810,6 +3292,7 @@ PAGE_HTML = """<!doctype html>
     streams[side] = {
       thinkChars: 0,
       flushed: false,
+      tts: createPhraseSplitter(function (phrase) { enqueueSpeech(side, phrase); }),
       parser: createThinkParser({
         answer: function (text) { appendText(side, text); },
         think: function (text) { appendThink(side, text); }
@@ -2829,6 +3312,9 @@ PAGE_HTML = """<!doctype html>
     if (!state || state.flushed) { return; }
     state.flushed = true;
     state.parser.flush();
+    // Конец ответа: недопетая последняя фраза уходит в очередь, уже
+    // поставленные фразы доигрываются — очередь не чистим.
+    if (state.tts) { state.tts.flush(); }
     updateCollapseButton(side);
   }
 
@@ -2964,6 +3450,24 @@ PAGE_HTML = """<!doctype html>
     return false;
   }
 
+  // «Стоп» глушит и генерацию, и звук: новый вопрос делает то же самое сам.
+  function stopAll() {
+    if (controller) {
+      try { controller.abort(); } catch (ignored) { /* уже завершён */ }
+    }
+    // Сначала сбрасываем буфер фраз в ответ (текст не теряется), потом
+    // глушим: stopSpeech() поднимает поколение и выбрасывает очередь вместе
+    // с только что поставленной хвостовой фразой.
+    flushAnswer(0);
+    flushAnswer(1);
+    stopSpeech();
+    stopStatusTimer();
+    running = false;
+    byId("ask").disabled = false;
+    byId("stop").disabled = true;
+    setStatus("остановлено", false);
+  }
+
   async function ask() {
     if (running) { return; }
     var question = byId("question").value.trim();
@@ -2984,9 +3488,11 @@ PAGE_HTML = """<!doctype html>
     }
 
     if (controller) { controller.abort(); }
+    stopSpeech();
     controller = new AbortController();
     running = true;
     byId("ask").disabled = true;
+    byId("stop").disabled = false;
     resetPanels();
     startStatusTimer("думает");
 
@@ -3048,6 +3554,7 @@ PAGE_HTML = """<!doctype html>
     } finally {
       running = false;
       byId("ask").disabled = false;
+      byId("stop").disabled = true;
     }
   }
 
@@ -3072,6 +3579,7 @@ PAGE_HTML = """<!doctype html>
   }
 
   byId("ask").addEventListener("click", ask);
+  byId("stop").addEventListener("click", stopAll);
   byId("question").addEventListener("keydown", function (event) {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
       event.preventDefault();
@@ -3092,8 +3600,23 @@ PAGE_HTML = """<!doctype html>
     byId("unload-" + side).addEventListener("click", function () {
       loadModel(side, "unload");
     });
+    byId("new-" + side).addEventListener("click", function () {
+      resetDialog(side);
+    });
     byId("collapse-" + side).addEventListener("click", function () {
       toggleCollapse(side);
+    });
+    // Галочка «озвучивать»: включение заново пробует голос (сервер мог
+    // перезапуститься с TTS), выключение выбрасывает очередь этой колонки.
+    byId("tts-" + side).addEventListener("change", function () {
+      var box = byId("tts-" + side);
+      if (box.checked) {
+        tts.available = true;
+        setVoiceNote(0, "");
+        setVoiceNote(1, "");
+        return;
+      }
+      tts.queue = tts.queue.filter(function (job) { return job.side !== side; });
     });
   });
   // Отлистал вверх — автоскролл за потоком выключается, вернулся к концу —
@@ -3151,6 +3674,78 @@ CSP = (
 
 
 # --------------------------------------------------------------------------- #
+# Озвучка ответов (задача 0183): чистка текста и WAV для браузера
+# --------------------------------------------------------------------------- #
+
+#: Потолок одной фразы: клиент режет ответ на фразы сам, но прислать может
+#: что угодно — длинный кусок отвергается с понятным текстом, а не синтезируется.
+TTS_MAX_CHARS = 600
+#: Формат ответа: ``say`` и Piper пишут RIFF/WAVE, браузер играет его напрямую.
+TTS_CONTENT_TYPE = "audio/wav"
+
+#: ``<think>…</think>`` (и ``<thinking>``) — рассуждение моделью, не для ушей.
+_THINK_BLOCK_RE = re.compile(
+    r"<think(?:ing)?\b[^>]*>.*?</think(?:ing)?\s*>", re.IGNORECASE | re.DOTALL
+)
+#: Незакрытый ``<think>`` в конце: поток оборвался, но рассуждение — не ответ.
+_THINK_OPEN_RE = re.compile(r"<think(?:ing)?\b[^>]*>.*\Z", re.IGNORECASE | re.DOTALL)
+#: Оторванные теги (закрывающий без пары, куски разметки) — просто выкидываем.
+_THINK_TAG_RE = re.compile(r"</?think(?:ing)?\b[^>]*>", re.IGNORECASE)
+#: Markdown-ссылка: остаётся текст, адрес не произносится.
+_MD_LINK_RE = re.compile(r"\[([^\]\n]*)\]\([^)\s]*(?:\s+\"[^\"]*\")?\)")
+#: URL и «www.»-адреса: вслух их не читают.
+_URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+#: Markdown-разметка: ``*`` (курсив/жирный), ``#`` (заголовки), ``` ` ``` (код),
+#: ``~`` (зачёркнутый). Прочие символы не трогаем: они часть текста.
+_MD_DECOR_RE = re.compile(r"[*#`~]+")
+
+
+def clean_tts_text(text: object) -> str:
+    """Привести текст к произносимому виду: без разметки, URL и лишних пробелов.
+
+    Чистит сервер, а не клиент: клиент может прислать что угодно, а сказать
+    вслух нужно только то, что предназначено читателю. ``<think>`` вместе с
+    содержимым отбрасывается (включая незакрытый в конце), markdown-ссылки
+    разворачиваются в текст, URL вырезаются, служебные символы разметки
+    заменяются пробелами, пробелы схлопываются.
+    """
+    value = str(text or "")
+    if not value.strip():
+        return ""
+    value = _THINK_BLOCK_RE.sub(" ", value)
+    value = _THINK_OPEN_RE.sub(" ", value)
+    value = _THINK_TAG_RE.sub(" ", value)
+    value = _MD_LINK_RE.sub(r"\1", value)
+    value = _URL_RE.sub(" ", value)
+    value = _MD_DECOR_RE.sub(" ", value)
+    return " ".join(value.split())
+
+
+def looks_like_wav(data: bytes | bytearray | None) -> bool:
+    """Настоящий ли это RIFF/WAVE: браузер играет только такой файл."""
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 12:
+        return False
+    return bytes(data[:4]) == b"RIFF" and bytes(data[8:12]) == b"WAVE"
+
+
+def default_tts_speech(text: str, voice: str | None = None) -> bytes:
+    """Синтез через ``eva/tts.py``: Piper → say → espeak, иначе пустые байты.
+
+    Импорт ленивый: страница и метрики не должны тянуть ``eva`` без нужды.
+    ``NullTTS`` (нет ни одного движка) возвращает ``b""`` — это «голоса нет»,
+    а не сбой процесса; HTTP-слой превращает пустой ответ в понятный 503.
+    Исключения адаптера (``TTSUnavailable``/``TTSError``) не глотаются: их
+    текст уходит клиенту как «голос недоступен».
+    """
+    try:
+        from eva.tts import synthesize
+    except ImportError as exc:  # pragma: no cover - eva лежит в репозитории
+        raise RuntimeError("нет адаптера синтеза eva/tts.py") from exc
+    result = synthesize(text, voice=voice)
+    return bytes(result) if isinstance(result, (bytes, bytearray)) else b""
+
+
+# --------------------------------------------------------------------------- #
 # HTTP-сервер
 # --------------------------------------------------------------------------- #
 
@@ -3172,13 +3767,24 @@ class ChatHTTPServer(ThreadingHTTPServer):
         dynamic_models: bool = False,
         vtm_tokenizer: str | None = None,
         keep_alive: float | None = None,
+        history_tokens: int = DEFAULT_HISTORY_TOKENS,
+        history_turns: int = DEFAULT_HISTORY_TURNS,
+        tts: Callable[[str, str | None], bytes] | None = None,
     ) -> None:
         self.registry = tuple(registry)
+        # Озвучка (задача 0183): чем синтезировать фразу. Тесты подставляют
+        # заглушку, боевой путь — eva/tts.py (Piper → say/espeak → null).
+        self.tts = tts or default_tts_speech
         self.dynamic_models = bool(dynamic_models)
         self.vtm_tokenizer = vtm_tokenizer
         self.adapters = dict(adapters)
         self.system_prompt = system_prompt
         self.max_tokens = max(1, int(max_tokens))
+        # Память диалога (задача 0182): история user/assistant на колонку.
+        # 0 токенов — истории нет (каждый вопрос с чистого листа).
+        self.history = ChatHistory(
+            max_tokens=history_tokens, max_turns=history_turns
+        )
         # Метрики (задача 0145): память на старте, последние ответы по моделям
         # и промпты — для оценки кэша префикса. Всё под одним замком.
         self.state_lock = threading.Lock()
@@ -3328,6 +3934,12 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             if path in ("/api/load", "/api/unload"):
                 self._handle_memory(path)
                 return
+            if path == "/api/reset":
+                self._handle_reset()
+                return
+            if path == "/api/tts":
+                self._handle_tts()
+                return
             if path != "/api/chat":
                 self._send_json(
                     404,
@@ -3343,13 +3955,21 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             question, use_system, max_tokens, sides = _validate_payload(
                 self.server, payload
             )
-            messages: list[dict[str, str]] = []
-            if use_system and self.server.system_prompt:
-                messages.append(
-                    {"role": "system", "content": self.server.system_prompt}
-                )
-            messages.append({"role": "user", "content": question})
-            self._stream_sides(sides, messages, max_tokens)
+            # Запрос у каждой колонки свой (задача 0182): общий системный
+            # промпт, её собственная история и текущий вопрос. Историю берём
+            # снимком до старта генерации: дописывать её будет уже HTTP-поток
+            # после done, и новый вопрос не должен видеть свой же ответ.
+            side_messages: list[list[dict[str, str]]] = []
+            for index in range(len(sides)):
+                messages: list[dict[str, str]] = []
+                if use_system and self.server.system_prompt:
+                    messages.append(
+                        {"role": "system", "content": self.server.system_prompt}
+                    )
+                messages.extend(self.server.history.messages(index))
+                messages.append({"role": "user", "content": question})
+                side_messages.append(messages)
+            self._stream_sides(sides, side_messages, max_tokens)
         except ClientError as exc:
             self._send_json(
                 exc.status,
@@ -3498,6 +4118,99 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             body.update(result)
         self._send_json(200, body)
 
+    # -- новый диалог (задача 0182) ------------------------------------------
+
+    def _handle_reset(self) -> None:
+        """``POST /api/reset``: забыть историю колонки или обеих.
+
+        Тело — JSON-объект: ``{"side": 0}`` (слева), ``{"side": 1}``
+        (справа) или ``{}`` / без ``side`` — обе колонки. Ответ несёт
+        ``reset`` (какие колонки очищены) и свежий ``history`` — тот же
+        счётчик, что отдаёт ``/api/models``, чтобы страница обновила шапку
+        без второго запроса.
+        """
+        payload = self._read_json_body()
+        if not isinstance(payload, Mapping):
+            raise ClientError("Тело запроса должно быть JSON-объектом.")
+        raw_side = payload.get("side")
+        if raw_side is None:
+            sides = [0, 1]
+        else:
+            if (
+                isinstance(raw_side, bool)
+                or not isinstance(raw_side, int)
+                or raw_side not in (0, 1)
+            ):
+                raise ClientError(
+                    "Поле side: ожидалось 0 (слева), 1 (справа) или "
+                    "отсутствие поля — тогда сбрасываются обе колонки."
+                )
+            sides = [raw_side]
+        for side in sides:
+            self.server.history.reset(side)
+        self._send_json(
+            200,
+            {"reset": sides, "history": _history_json(self.server)},
+        )
+
+    # -- озвучка (задача 0183) -----------------------------------------------
+
+    def _handle_tts(self) -> None:
+        """``POST /api/tts``: фраза → WAV для ``<audio>``.
+
+        Тело — ``{"text": "...", "voice": "..."}``; ``voice`` необязателен и
+        уходит в адаптер (у Piper голос задаёт модель, у ``say`` — имя вроде
+        Milena). Ответ — ``audio/wav`` без кэша: фраза уникальна, хранить её
+        в кэше браузера незачем. Всё, что не синтезировалось (нет движка,
+        процесс упал, не WAV), — 503 с текстом «голос недоступен»: страница
+        покажет это, а чат продолжит работать.
+        """
+        payload = self._read_json_body()
+        if not isinstance(payload, Mapping):
+            raise ClientError("Тело запроса должно быть JSON-объектом.")
+        raw_text = payload.get("text")
+        if not isinstance(raw_text, str):
+            raise ClientError("Поле text: нужен текст фразы для озвучки.")
+        raw_voice = payload.get("voice")
+        voice: str | None = None
+        if raw_voice is not None:
+            if not isinstance(raw_voice, str):
+                raise ClientError("Поле voice: ожидалась строка с именем голоса.")
+            voice = raw_voice.strip() or None
+            if voice is not None and len(voice) > 64:
+                raise ClientError("Поле voice: имя голоса длиннее 64 символов.")
+        text = clean_tts_text(raw_text)
+        if not text:
+            raise ClientError(
+                "После чистки текста нечего озвучивать: остались только "
+                "разметка и пробелы.",
+                code="empty_text",
+            )
+        if len(text) > TTS_MAX_CHARS:
+            raise ClientError(
+                "Фраза длиннее {} символов — разбейте её на части.".format(
+                    TTS_MAX_CHARS
+                ),
+                code="text_too_long",
+            )
+        try:
+            wav = self.server.tts(text, voice)
+        except Exception as exc:  # noqa: BLE001 - любой сбой синтеза = 503
+            logger.warning("озвучка: %s", exc)
+            raise ClientError(
+                "голос недоступен: {}".format(_short_error(exc, 300)),
+                status=503,
+                code="voice_unavailable",
+            ) from exc
+        if not looks_like_wav(wav):
+            raise ClientError(
+                "голос недоступен: движок синтеза не вернул WAV.",
+                status=503,
+                code="voice_unavailable",
+            )
+        # ``_send_bytes`` выставляет Cache-Control: no-store и прочую защиту.
+        self._send_bytes(200, bytes(wav), TTS_CONTENT_TYPE)
+
     # -- SSE ------------------------------------------------------------------
 
     def _open_sse(self) -> None:
@@ -3547,9 +4260,15 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
     def _stream_sides(
         self,
         sides: Sequence[Mapping[str, Any]],
-        messages: Sequence[Mapping[str, str]],
+        side_messages: Sequence[Sequence[Mapping[str, str]]],
         max_tokens: int,
     ) -> None:
+        """Отдать обе колонки в SSE и дописать их ответы в историю.
+
+        ``side_messages[i]`` — свой запрос колонки ``i``: системный промпт,
+        её собственная история и текущий вопрос (задача 0182). Кэш префикса
+        ВТМ считается по промпту своей колонки, а не по чужому.
+        """
         events: "queue.Queue[Any]" = queue.Queue()
         stop = threading.Event()
         started = time.monotonic()
@@ -3557,12 +4276,10 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         # этого процесса, поэтому снимаем его вокруг всего запроса, а не
         # внутри колонки (две колонки идут параллельно).
         cpu_started = time.process_time()
-        prompt_text = "\n".join(
-            "{}: {}".format(message.get("role", ""), message.get("content", ""))
-            for message in messages
-        )
+        questions = [_last_question(messages) for messages in side_messages]
         threads: list[threading.Thread] = []
         for index, side in enumerate(sides):
+            messages = list(side_messages[index])
             thread = threading.Thread(
                 target=_run_side,
                 args=(
@@ -3574,7 +4291,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                     events,
                     stop,
                     self.server,
-                    prompt_text,
+                    _prompt_text(messages),
                 ),
                 name="chat-side-{}".format(index),
                 daemon=True,
@@ -3589,6 +4306,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 item = events.get()
                 if isinstance(item, _SideDone):
                     remaining -= 1
+                    # Ответ дописан — только теперь, после done (и только
+                    # непустой и без ошибки; см. _SideDone.answer).
+                    self._remember(item.side, questions, item.answer)
                     continue
                 if stop.is_set():
                     break
@@ -3635,6 +4355,21 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             for thread in threads:
                 thread.join(timeout=2.0)
 
+    def _remember(
+        self, side: int, questions: Sequence[str], answer: str
+    ) -> None:
+        """Дописать обмен в историю колонки (задача 0182).
+
+        Пустой ответ (ошибка генерации, отмена, пустая выдача) не попадает
+        в историю: иначе следующий вопрос «видел» бы пустую реплику
+        ассистента. Вопрос тоже не сохраняется — пара дописывается только
+        целиком.
+        """
+        question = questions[side] if 0 <= side < len(questions) else ""
+        if not question or not answer.strip():
+            return
+        self.server.history.append(side, question, answer)
+
     # -- журнал ---------------------------------------------------------------
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
@@ -3651,6 +4386,9 @@ def create_server(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: float = 120.0,
     keep_alive: float | None = None,
+    history_tokens: int = DEFAULT_HISTORY_TOKENS,
+    history_turns: int = DEFAULT_HISTORY_TURNS,
+    tts: Callable[[str, str | None], bytes] | None = None,
 ) -> ChatHTTPServer:
     """Собрать сервер; ``port=0`` — свободный порт (удобно тестам).
 
@@ -3658,6 +4396,8 @@ def create_server(
     не нужны. ``system_prompt=None`` — взять ``prompts/system.assistant.md``;
     пустая строка отключает системное сообщение. ``keep_alive`` — секунды
     простоя до автовыгрузки ВТМ (``None`` — выключено, ``0`` — держать всегда).
+    ``history_tokens`` — бюджет истории колонки в токенах (``0`` — истории
+    нет), ``history_turns`` — максимум последних реплик.
     """
     if host not in ("127.0.0.1", "::1"):
         raise ValueError(
@@ -3669,6 +4409,16 @@ def create_server(
         raise TypeError("max_tokens: ожидалось целое число")
     if max_tokens < 1:
         raise ValueError("max_tokens: ожидалось >= 1")
+    if isinstance(history_tokens, bool) or not isinstance(history_tokens, int):
+        raise TypeError("history_tokens: ожидалось целое число")
+    if history_tokens < 0:
+        raise ValueError("history_tokens: ожидалось >= 0 (0 — без истории)")
+    if isinstance(history_turns, bool) or not isinstance(history_turns, int):
+        raise TypeError("history_turns: ожидалось целое число")
+    if history_turns < 1:
+        raise ValueError(
+            "history_turns: ожидалось >= 1 (выключить историю — history_tokens=0)"
+        )
     if keep_alive is not None:
         if isinstance(keep_alive, bool) or not isinstance(keep_alive, (int, float)):
             raise TypeError("keep_alive: ожидалось число секунд или None")
@@ -3689,6 +4439,9 @@ def create_server(
         system_prompt=prompt,
         max_tokens=max_tokens,
         keep_alive=keep_alive,
+        history_tokens=history_tokens,
+        history_turns=history_turns,
+        tts=tts,
     )
 
 
@@ -3741,6 +4494,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "по умолчанию автовыгрузка выключена)",
     )
     parser.add_argument(
+        "--history-tokens",
+        type=int,
+        default=DEFAULT_HISTORY_TOKENS,
+        metavar="ТОК",
+        help="бюджет истории диалога на колонку, токенов (оценка ~3 символа "
+        "на токен; 0 — без истории, по умолчанию {})".format(
+            DEFAULT_HISTORY_TOKENS
+        ),
+    )
+    parser.add_argument(
+        "--history-turns",
+        type=int,
+        default=DEFAULT_HISTORY_TURNS,
+        metavar="N",
+        help="сколько последних реплик (пар вопрос/ответ) держать в истории "
+        "колонки (по умолчанию {})".format(DEFAULT_HISTORY_TURNS),
+    )
+    parser.add_argument(
         "--no-system-prompt",
         action="store_true",
         help="не подмешивать prompts/system.assistant.md",
@@ -3777,6 +4548,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_tokens=args.max_tokens,
             timeout=args.timeout,
             keep_alive=args.keep_alive,
+            history_tokens=args.history_tokens,
+            history_turns=args.history_turns,
         )
     except (OSError, ValueError, TypeError) as exc:
         print("не удалось запустить сервер: {}".format(exc), file=sys.stderr)
@@ -3803,6 +4576,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("автовыгрузка ВТМ: выключена (0 — держать всегда)")
     else:
         print("автовыгрузка ВТМ: после {:.0f} с бездействия".format(server.keep_alive))
+    if server.history.enabled:
+        print(
+            "история диалога: {} реплик, ~{} токенов на колонку "
+            "(оценка ~3 символа на токен)".format(
+                server.history.max_turns, server.history.max_tokens
+            )
+        )
+    else:
+        print("история диалога: выключена (--history-tokens 0)")
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

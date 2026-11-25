@@ -1,5 +1,5 @@
-"""Проверки веб-стенда сравнения двух моделей (задача 0138) и панели
-метрик под чатом (задача 0145).
+"""Проверки веб-стенда сравнения двух моделей (задача 0138), панели
+метрик под чатом (задача 0145) и памяти диалога (задача 0182).
 
 Запуск: ``python3 -m unittest tests.test_chat_server -v``
 
@@ -208,6 +208,60 @@ def stream_text(events, side=0):
         for event in events
         if event["type"] == "delta" and event["side"] == side
     )
+
+
+# --------------------------------------------------------------------------- #
+# Счётчик истории в шапке колонки (задача 0182): JS из отданной страницы
+# --------------------------------------------------------------------------- #
+
+HISTORY_UI_START = "  // История колонки (задача 0182)"
+HISTORY_UI_END = "  function fillSideMetrics"
+
+HISTORY_HARNESS = r"""
+var out = {};
+function setText(id, text) { out[id] = text; }
+__SOURCE__
+fillHistory({enabled: true, estimated: true, sides: [
+  {side: 0, turns: 2, messages: 4, tokens: 37, estimated: true},
+  {side: 1, turns: 0, messages: 0, tokens: 0, estimated: true}
+]});
+var filled = { h0: out["history-0"], h1: out["history-1"] };
+fillHistory({enabled: false, sides: [
+  {side: 0, turns: 5, messages: 10, tokens: 99, estimated: true},
+  {side: 1, turns: 5, messages: 10, tokens: 99, estimated: true}
+]});
+var off = { h0: out["history-0"], h1: out["history-1"] };
+fillHistory(null);
+var afterNull = { h0: out["history-0"], h1: out["history-1"] };
+process.stdout.write(JSON.stringify({
+  filled: filled, off: off, afterNull: afterNull
+}));
+"""
+
+
+def history_ui_source(page):
+    """Вырезать из страницы блок счётчика истории (historyText/fillHistory)."""
+    script = page_script(page)
+    start = script.index(HISTORY_UI_START)
+    end = script.index(HISTORY_UI_END)
+    return script[start:end]
+
+
+def run_history_ui(page):
+    """Прогнать счётчик истории из отданной страницы в node."""
+    if NODE is None:
+        raise unittest.SkipTest("node не установлен")
+    source = HISTORY_HARNESS.replace("__SOURCE__", history_ui_source(page))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "history_ui.js")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(source)
+        proc = subprocess.run(
+            [NODE, path], capture_output=True, text=True, timeout=60
+        )
+    if proc.returncode != 0:
+        raise AssertionError("node: " + (proc.stderr or proc.stdout))
+    return json.loads(proc.stdout)
 
 
 # --------------------------------------------------------------------------- #
@@ -695,6 +749,364 @@ class TestChatStream(ServerTestCase):
         self.assertLess(elapsed, 1.8)
 
 
+class TestChatHistory(ServerTestCase):
+    """Память диалога (задача 0182): второй вопрос видит первый."""
+
+    system_prompt = "СИСТЕМА: помни, о чём говорили."
+
+    def ask(self, question="вопрос"):
+        events, _, _ = self.post_chat_ok(
+            make_stream_payload(question=question)
+        )
+        return events
+
+    def reset(self, payload=None):
+        body = json.dumps(
+            payload if payload is not None else {}, ensure_ascii=False
+        ).encode("utf-8")
+        return self.request(
+            "POST",
+            "/api/reset",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+    def models(self):
+        status, _, raw = self.request("GET", "/api/models")
+        self.assertEqual(status, 200, raw.decode("utf-8", "replace"))
+        return json.loads(raw)
+
+    def history_of(self, side, data=None):
+        data = data if data is not None else self.models()
+        sides = [item for item in data["history"]["sides"] if item["side"] == side]
+        self.assertEqual(len(sides), 1, data["history"])
+        return sides[0]
+
+    def test_second_question_sees_the_first(self):
+        self.ask("меня зовут Юра")
+        self.ask("как меня зовут?")
+        self.assertEqual(len(self.vtm.calls), 2)
+        first = self.vtm.calls[0]["messages"]
+        second = self.vtm.calls[1]["messages"]
+        # Первый вопрос — с чистого листа, второй видит первый обмен целиком.
+        self.assertEqual([m["role"] for m in first], ["system", "user"])
+        self.assertEqual(
+            [m["role"] for m in second],
+            ["system", "user", "assistant", "user"],
+        )
+        self.assertEqual(second[0], {"role": "system", "content": self.system_prompt})
+        self.assertEqual(
+            second[1], {"role": "user", "content": "меня зовут Юра"}
+        )
+        self.assertEqual(second[2], {"role": "assistant", "content": "Привет"})
+        self.assertEqual(
+            second[3], {"role": "user", "content": "как меня зовут?"}
+        )
+
+    def test_columns_keep_their_own_history(self):
+        self.ask("меня зовут Юра")
+        self.ask("как меня зовут?")
+        vtm_second = self.vtm.calls[1]["messages"]
+        ollama_second = self.ollama.calls[1]["messages"]
+        # Каждая колонка помнит свой ответ — истории не смешиваются.
+        self.assertEqual(vtm_second[2]["content"], "Привет")
+        self.assertEqual(ollama_second[2]["content"], "Здравствуйте!")
+        vtm_text = [message["content"] for message in vtm_second]
+        ollama_text = [message["content"] for message in ollama_second]
+        self.assertNotIn("Здравствуйте!", vtm_text)
+        self.assertNotIn("Привет", ollama_text)
+
+    def test_history_does_not_leak_into_system_prompt(self):
+        self.ask("меня зовут Юра")
+        self.ask("как меня зовут?")
+        messages = self.vtm.calls[1]["messages"]
+        self.assertEqual(messages[0]["content"], self.system_prompt)
+        self.assertEqual(
+            [message["role"] for message in messages].count("system"), 1
+        )
+
+    def test_error_does_not_grow_history(self):
+        self.vtm.error = "модель упала"
+        self.ask("этот вопрос упадёт")
+        self.assertEqual(self.history_of(0)["turns"], 0)
+        # Соседняя колонка ответила — у неё история растёт независимо.
+        self.assertEqual(self.history_of(1)["turns"], 1)
+
+        self.vtm.error = None
+        self.ask("второй вопрос")
+        second = self.vtm.calls[1]["messages"]
+        self.assertEqual([m["role"] for m in second], ["system", "user"])
+        self.assertEqual(second[-1]["content"], "второй вопрос")
+
+    def test_empty_answer_does_not_grow_history(self):
+        self.vtm.pieces = ()
+        self.ask("пустой ответ")
+        self.assertEqual(self.history_of(0)["turns"], 0)
+
+        self.vtm.pieces = ("ответ",)
+        self.ask("второй вопрос")
+        roles = [m["role"] for m in self.vtm.calls[1]["messages"]]
+        self.assertEqual(roles, ["system", "user"])
+
+    def test_counter_in_models_matches_estimate(self):
+        data = self.models()["history"]
+        self.assertTrue(data["enabled"])
+        self.assertEqual(data["limit_tokens"], chat_server.DEFAULT_HISTORY_TOKENS)
+        self.assertEqual(data["limit_turns"], chat_server.DEFAULT_HISTORY_TURNS)
+        self.assertTrue(data["estimated"])
+        self.assertEqual(data["sides"][0]["turns"], 0)
+
+        self.ask("меня зовут Юра")
+        data = self.models()["history"]
+        stats = [item for item in data["sides"] if item["side"] == 0][0]
+        self.assertEqual(stats["turns"], 1)
+        self.assertEqual(stats["messages"], 2)
+        self.assertEqual(
+            stats["tokens"],
+            chat_server.estimate_tokens("меня зовут Юра")
+            + chat_server.estimate_tokens("Привет"),
+        )
+        self.assertGreater(stats["tokens"], 0)
+        other = [item for item in data["sides"] if item["side"] == 1][0]
+        self.assertEqual(
+            other["tokens"],
+            chat_server.estimate_tokens("меня зовут Юра")
+            + chat_server.estimate_tokens("Здравствуйте!"),
+        )
+
+    def test_reset_clears_one_column(self):
+        self.ask("меня зовут Юра")
+        status, headers, raw = self.reset({"side": 0})
+        self.assertEqual(status, 200, raw.decode("utf-8", "replace"))
+        self.assertIn("application/json", headers.get("Content-Type", ""))
+        body = json.loads(raw)
+        self.assertEqual(body["reset"], [0])
+        self.assertEqual(
+            [item["turns"] for item in body["history"]["sides"]], [0, 1]
+        )
+
+        self.ask("как меня зовут?")
+        vtm_second = self.vtm.calls[1]["messages"]
+        self.assertEqual([m["role"] for m in vtm_second], ["system", "user"])
+        ollama_second = self.ollama.calls[1]["messages"]
+        self.assertEqual(
+            [m["role"] for m in ollama_second],
+            ["system", "user", "assistant", "user"],
+        )
+
+    def test_reset_without_side_clears_both(self):
+        self.ask("меня зовут Юра")
+        status, _, raw = self.reset({})
+        self.assertEqual(status, 200)
+        body = json.loads(raw)
+        self.assertEqual(body["reset"], [0, 1])
+        self.assertEqual(
+            [item["turns"] for item in body["history"]["sides"]], [0, 0]
+        )
+        data = self.models()
+        self.assertEqual(
+            [self.history_of(side, data)["turns"] for side in (0, 1)], [0, 0]
+        )
+
+    def test_bad_reset_side_is_rejected(self):
+        for payload in ({"side": 2}, {"side": "0"}, {"side": True}, {"side": -1}):
+            status, headers, raw = self.reset(payload)
+            self.assertEqual(status, 400, raw.decode("utf-8", "replace"))
+            self.assertIn("application/json", headers.get("Content-Type", ""))
+            self.assertIn("error", json.loads(raw))
+
+    def test_reset_rejects_non_object_body(self):
+        status, _, raw = self.reset([0])
+        self.assertEqual(status, 400, raw.decode("utf-8", "replace"))
+        self.assertIn("invalid_request", raw.decode("utf-8"))
+
+
+class HistoryLimitsTestCase(unittest.TestCase):
+    """Сервер с явными лимитами истории: обрезка и отключение."""
+
+    system_prompt = "СИСТЕМА: коротко."
+
+    def serve(self, **kwargs):
+        self.vtm = MockAdapter(pieces=("Привет",))
+        self.ollama = MockAdapter(pieces=("Здравствуйте",))
+        server, thread = start_server(
+            REGISTRY,
+            {("vtm", "mock-vtm"): self.vtm, ("ollama", "mock-qwen"): self.ollama},
+            system_prompt=self.system_prompt,
+            **kwargs,
+        )
+        self.addCleanup(stop_server, server, thread)
+        return server, server.server_address[1]
+
+    def ask(self, port, question="вопрос"):
+        payload = json.dumps(
+            {
+                "question": question,
+                "use_system": True,
+                "sides": [
+                    {"backend": "vtm", "model": "mock-vtm"},
+                    {"backend": "ollama", "model": "mock-qwen"},
+                ],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        status, raw = http_json(
+            port,
+            "POST",
+            "/api/chat",
+            body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200, raw.decode("utf-8", "replace"))
+        events, done = parse_sse(raw)
+        self.assertTrue(done, "поток не завершился событием [DONE]")
+        return events
+
+    def models(self, port):
+        status, raw = http_json(port, "GET", "/api/models")
+        self.assertEqual(status, 200, raw.decode("utf-8", "replace"))
+        return json.loads(raw)
+
+    def history_of(self, port, side=0):
+        data = self.models(port)["history"]
+        return [item for item in data["sides"] if item["side"] == side][0]
+
+    def test_zero_tokens_disables_history(self):
+        server, port = self.serve(history_tokens=0)
+        self.assertFalse(server.history.enabled)
+        self.ask(port, "меня зовут Юра")
+        self.ask(port, "как меня зовут?")
+        second = self.vtm.calls[1]["messages"]
+        self.assertEqual([m["role"] for m in second], ["system", "user"])
+        data = self.models(port)["history"]
+        self.assertFalse(data["enabled"])
+        self.assertEqual([item["turns"] for item in data["sides"]], [0, 0])
+
+    def test_turns_limit_drops_oldest_pairs(self):
+        _, port = self.serve(history_turns=2)
+        for number in range(1, 5):
+            self.ask(port, "вопрос {}".format(number))
+        last = self.vtm.calls[-1]["messages"]
+        self.assertEqual(
+            [m["role"] for m in last],
+            ["system", "user", "assistant", "user", "assistant", "user"],
+        )
+        contents = [m["content"] for m in last]
+        # Две последних реплики: третья и четвёртая; первая и вторая ушли.
+        self.assertEqual(contents[1], "вопрос 2")
+        self.assertEqual(contents[3], "вопрос 3")
+        self.assertEqual(contents[5], "вопрос 4")
+        self.assertEqual(last[0]["content"], self.system_prompt)
+        stats = self.history_of(port)
+        self.assertLessEqual(stats["turns"], 2)
+
+    def test_token_budget_keeps_system_and_latest_pair(self):
+        _, port = self.serve(history_tokens=120)
+        self.vtm.pieces = ("я" * 300,)
+        self.vtm.usage = {"prompt_tokens": 5, "completion_tokens": 1}
+        self.ask(port, "первый вопрос")
+        self.ask(port, "второй вопрос")
+        self.ask(port, "третий вопрос")
+        last = self.vtm.calls[-1]["messages"]
+        texts = [m["content"] for m in last]
+        # Системный промпт на месте, старейшая пара выброшена целиком.
+        self.assertEqual(last[0]["content"], self.system_prompt)
+        self.assertNotIn("первый вопрос", texts)
+        self.assertIn("второй вопрос", texts)
+        self.assertEqual(texts[-1], "третий вопрос")
+        stats = self.history_of(port)
+        self.assertLessEqual(stats["tokens"], 120)
+        self.assertEqual(stats["turns"], 1)
+
+    def test_history_never_grows_past_limits(self):
+        _, port = self.serve()
+        for number in range(12):
+            self.ask(port, "вопрос номер {}".format(number))
+        last = self.vtm.calls[-1]["messages"]
+        # system + история (не больше 8 реплик) + текущий вопрос.
+        self.assertLessEqual(len(last), 2 * chat_server.DEFAULT_HISTORY_TURNS + 2)
+        stats = self.history_of(port)
+        self.assertLessEqual(stats["turns"], chat_server.DEFAULT_HISTORY_TURNS)
+
+    def test_server_validates_history_limits(self):
+        with self.assertRaises(ValueError):
+            chat_server.create_server(
+                port=0, registry=REGISTRY, adapters={}, history_tokens=-1
+            )
+        with self.assertRaises(ValueError):
+            chat_server.create_server(
+                port=0, registry=REGISTRY, adapters={}, history_turns=0
+            )
+        with self.assertRaises(TypeError):
+            chat_server.create_server(
+                port=0, registry=REGISTRY, adapters={}, history_tokens=True
+            )
+        with self.assertRaises(TypeError):
+            chat_server.create_server(
+                port=0, registry=REGISTRY, adapters={}, history_turns="8"
+            )
+
+    def test_cli_flags(self):
+        parser = chat_server._build_parser()
+        args = parser.parse_args([])
+        self.assertEqual(args.history_tokens, chat_server.DEFAULT_HISTORY_TOKENS)
+        self.assertEqual(args.history_turns, chat_server.DEFAULT_HISTORY_TURNS)
+        self.assertEqual(
+            parser.parse_args(["--history-tokens", "0"]).history_tokens, 0
+        )
+        self.assertEqual(
+            parser.parse_args(["--history-turns", "3"]).history_turns, 3
+        )
+
+
+class TestHistoryPage(ServerTestCase):
+    """UI памяти диалога: счётчик в шапке колонки и «Новый диалог»."""
+
+    def test_page_has_history_header_and_reset_button(self):
+        page = page_html(self)
+        for fragment in (
+            'id="history-0"',
+            'id="history-1"',
+            'id="new-0"',
+            'id="new-1"',
+            ">Новый диалог<",
+            "/api/reset",
+            "реплик",
+            "токенов",
+            "function historyText",
+            "function fillHistory",
+            "function resetDialog",
+        ):
+            self.assertIn(fragment, page)
+
+    def test_header_counter_is_filled_from_models(self):
+        # Счётчик приходит в /api/models — страница берёт его оттуда, а не
+        # считает сама (у клиента нет ни истории, ни токенизатора).
+        self.post_chat_ok(make_stream_payload(question="меня зовут Юра"))
+        status, _, raw = self.request("GET", "/api/models")
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        self.assertIn("history", data)
+        self.assertEqual(
+            [item["side"] for item in data["history"]["sides"]], [0, 1]
+        )
+        self.assertEqual(data["history"]["sides"][0]["turns"], 1)
+
+    def test_history_counter_text_in_page(self):
+        result = run_history_ui(page_html(self))
+        self.assertEqual(
+            result["filled"]["h0"], "2 реплик · ~37 токенов (оценка)"
+        )
+        self.assertEqual(
+            result["filled"]["h1"], "0 реплик · ~0 токенов (оценка)"
+        )
+        # --history-tokens 0: честное «выключена», а не «0 токенов».
+        self.assertEqual(result["off"]["h0"], "выключена (0 токенов)")
+        self.assertEqual(result["off"]["h1"], "выключена (0 токенов)")
+        # Нет data.history — шапка не падает и не затирает прошлое значение.
+        self.assertEqual(result["afterNull"], result["off"])
+
+
 class TestValidation(ServerTestCase):
     def assert_client_error(self, response, status=400):
         code, headers, body = response
@@ -843,9 +1255,22 @@ def _greedy_factory(blob_holder, megabytes=12):
 
 
 def start_server(
-    registry, adapters, *, max_tokens=32, system_prompt="СИСТЕМА", keep_alive=None
+    registry,
+    adapters,
+    *,
+    max_tokens=32,
+    system_prompt="СИСТЕМА",
+    keep_alive=None,
+    history_tokens=None,
+    history_turns=None,
 ):
     """Поднять сервер на свободном порту loopback; вернуть ``(server, thread)``."""
+    history = {}
+    # None — «как на сервере по умолчанию»: тест про историю задаёт лимиты явно.
+    if history_tokens is not None:
+        history["history_tokens"] = history_tokens
+    if history_turns is not None:
+        history["history_turns"] = history_turns
     server = chat_server.create_server(
         port=0,
         registry=registry,
@@ -853,6 +1278,7 @@ def start_server(
         system_prompt=system_prompt,
         max_tokens=max_tokens,
         keep_alive=keep_alive,
+        **history,
     )
     thread = threading.Thread(
         target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
@@ -1202,6 +1628,17 @@ class TestPrefixCacheMetrics(unittest.TestCase):
             if event["type"] == "done" and event["side"] == 0
         ][0]
 
+    def reset_histories(self):
+        """Новый диалог в обеих колонках (задача 0182)."""
+        status, raw = http_json(
+            self.port,
+            "POST",
+            "/api/reset",
+            body=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200, raw.decode("utf-8", "replace"))
+
     def test_first_answer_has_no_prefix_history(self):
         done = self.ask()
         self.assertTrue(done["cache_prefix"]["enabled"])
@@ -1217,8 +1654,21 @@ class TestPrefixCacheMetrics(unittest.TestCase):
         self.assertTrue(cache["hit"], cache)
         self.assertGreater(cache["shared_chars"], 0)
 
+    def test_follow_up_with_history_reuses_prefix(self):
+        # История диалога — тоже начало промпта, поэтому второй вопрос в том
+        # же диалоге законно попадает в кэш префикса ВТМ (задача 0182).
+        self.ask("меня зовут Юра")
+        done = self.ask("как меня зовут?")
+        cache = done["cache_prefix"]
+        self.assertTrue(cache["hit"], cache)
+        self.assertEqual(cache["shared_chars"], cache["previous_chars"])
+
     def test_different_prompt_is_a_miss(self):
         self.ask("первый вопрос про стрижку")
+        # С историей прошлый промпт целиком входит в новый (это попадание,
+        # см. тест выше). Промах проверяем на новом диалоге: общим остаётся
+        # только системный промпт, а вопросы разные.
+        self.reset_histories()
         done = self.ask("совсем другой вопрос про цену")
         cache = done["cache_prefix"]
         self.assertFalse(cache["hit"], cache)
@@ -1933,6 +2383,282 @@ class TestKeepAlive(MemoryServerTestCase):
             chat_server.create_server(
                 port=0, registry=REGISTRY, adapters={}, keep_alive=-1
             )
+
+
+
+# --------------------------------------------------------------------------- #
+# Озвучка ответов: /api/tts и фразы в клиенте (задача 0183)
+# --------------------------------------------------------------------------- #
+
+TTS_SPLIT_START = "// --- TTS-фразы: начало"
+TTS_SPLIT_END = "// --- TTS-фразы: конец"
+
+TTS_HARNESS = r"""
+var payload = JSON.parse(process.argv[2]);
+var phrases = [];
+var splitter = createPhraseSplitter(function (phrase) { phrases.push(phrase); });
+payload.chunks.forEach(function (chunk) { splitter.feed(chunk); });
+var during = phrases.slice();
+splitter.flush();
+process.stdout.write(JSON.stringify({ during: during, after: phrases }));
+"""
+
+
+def make_wav(payload=2048):
+    """RIFF/WAVE с настоящим заголовком: тест сверяет формат, а не звук."""
+    samples = b"\0" * int(payload)
+    fmt = struct.pack("<IHHIIHH", 16, 1, 1, 22050, 44100, 2, 16)
+    body = b"WAVE" + b"fmt " + fmt + b"data" + struct.pack("<I", len(samples)) + samples
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def tts_split_source(page):
+    """Вырезать из страницы самодостаточный блок разбиения на фразы."""
+    script = page_script(page)
+    start = script.index("\n", script.index(TTS_SPLIT_START)) + 1
+    end = script.rfind("\n", 0, script.index(TTS_SPLIT_END)) + 1
+    return script[start:end]
+
+
+def run_tts_splitter(page, chunks):
+    """Прогнать куски потока через клиентский сплиттер страницы в node."""
+    if NODE is None:
+        raise unittest.SkipTest("node не установлен")
+    source = tts_split_source(page) + TTS_HARNESS
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "tts_split.js")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(source)
+        proc = subprocess.run(
+            [
+                NODE,
+                path,
+                json.dumps({"chunks": list(chunks)}, ensure_ascii=False),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    if proc.returncode != 0:
+        raise AssertionError("node: " + (proc.stderr or proc.stdout))
+    return json.loads(proc.stdout)
+
+
+class TtsServerCase(unittest.TestCase):
+    """Сервер с подменённым синтезом: звук не запускается, WAV — заглушка."""
+
+    def setUp(self) -> None:
+        self.calls = []
+        self.server = chat_server.create_server(
+            port=0,
+            registry=REGISTRY,
+            adapters={
+                ("vtm", "mock-vtm"): MockAdapter(pieces=("Ответ",)),
+                ("ollama", "mock-qwen"): MockAdapter(pieces=("Ответ",)),
+            },
+            system_prompt="СИСТЕМА: отвечай коротко.",
+            max_tokens=32,
+            tts=self.fake_tts,
+        )
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
+        )
+        self.thread.start()
+        self.port = self.server.server_address[1]
+        self.addCleanup(self._stop_server)
+
+    def _stop_server(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5.0)
+
+    def fake_tts(self, text, voice=None):
+        self.calls.append({"text": text, "voice": voice})
+        return make_wav()
+
+    def request(self, method, path, body=None, headers=None, timeout=10):
+        conn = http.client.HTTPConnection(HOST, self.port, timeout=timeout)
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            response = conn.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            conn.close()
+
+    def post_tts(self, payload, timeout=10):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return self.request(
+            "POST",
+            "/api/tts",
+            body=body,
+            headers={"Content-Type": "application/json"},
+            timeout=timeout,
+        )
+
+
+class TestTtsEndpoint(TtsServerCase):
+    """``POST /api/tts``: WAV, чистка текста, лимит и деградация."""
+
+    def test_returns_wav_without_cache(self):
+        status, headers, body = self.post_tts({"text": "Привет, мир."})
+        self.assertEqual(status, 200, body[:300])
+        self.assertEqual(headers.get("Content-Type"), "audio/wav")
+        self.assertEqual(headers.get("Cache-Control"), "no-store")
+        self.assertEqual(body[:4], b"RIFF")
+        self.assertEqual(body[8:12], b"WAVE")
+        self.assertEqual(self.calls, [{"text": "Привет, мир.", "voice": None}])
+
+    def test_cleans_think_markdown_and_urls(self):
+        raw = (
+            "<think>внутреннее рассуждение</think> **Привет** # заголовок "
+            "`код` https://example.com/страница  и [ссылка](http://x.test/y) мир"
+        )
+        status, _, body = self.post_tts({"text": raw})
+        self.assertEqual(status, 200, body[:300])
+        self.assertEqual(self.calls[-1]["text"], "Привет заголовок код и ссылка мир")
+
+    def test_unclosed_think_is_not_spoken(self):
+        status, _, _ = self.post_tts({"text": "Ответ.<think>долгое рассуждение"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.calls[-1]["text"], "Ответ.")
+
+    def test_voice_is_forwarded(self):
+        status, _, _ = self.post_tts({"text": "Привет", "voice": " Milena "})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.calls[-1]["voice"], "Milena")
+
+    def test_empty_after_cleaning_is_400(self):
+        status, _, body = self.post_tts({"text": "**  ##  ``  "})
+        self.assertEqual(status, 400, body[:300])
+        self.assertEqual(json.loads(body)["error"]["code"], "empty_text")
+        self.assertEqual(self.calls, [])
+
+    def test_too_long_is_400_and_not_synthesized(self):
+        status, _, body = self.post_tts({"text": "а" * (chat_server.TTS_MAX_CHARS + 1)})
+        self.assertEqual(status, 400, body[:300])
+        self.assertEqual(json.loads(body)["error"]["code"], "text_too_long")
+        self.assertEqual(self.calls, [])
+
+    def test_limit_is_exactly_600_after_cleaning(self):
+        status, _, body = self.post_tts({"text": "а" * chat_server.TTS_MAX_CHARS})
+        self.assertEqual(status, 200, body[:300])
+        self.assertEqual(len(self.calls[-1]["text"]), chat_server.TTS_MAX_CHARS)
+
+    def test_bad_payloads_are_400(self):
+        cases = (
+            (["не объект"], {}),
+            ({}, {}),
+            ({"text": 42}, {}),
+            ({"text": "Привет", "voice": 7}, {}),
+            ({"text": "Привет", "voice": "я" * 65}, {}),
+        )
+        for payload, _ in cases:
+            status, _, body = self.post_tts(payload)
+            self.assertEqual(status, 400, (payload, body[:200]))
+
+    def test_unavailable_engine_is_503_and_chat_still_works(self):
+        def broken(text, voice=None):
+            raise RuntimeError("нет голоса")
+
+        self.server.tts = broken
+        status, _, body = self.post_tts({"text": "Привет"})
+        self.assertEqual(status, 503, body[:300])
+        error = json.loads(body)["error"]
+        self.assertEqual(error["code"], "voice_unavailable")
+        self.assertIn("голос недоступен", error["message"])
+
+        # Чат при этом работает: озвучка не связана со стримом.
+        chat = json.dumps(make_stream_payload(), ensure_ascii=False).encode("utf-8")
+        status, headers, _ = self.request(
+            "POST",
+            "/api/chat",
+            body=chat,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/event-stream", headers.get("Content-Type", ""))
+
+    def test_null_engine_empty_wav_is_503(self):
+        self.server.tts = lambda text, voice=None: b""
+        status, _, body = self.post_tts({"text": "Привет"})
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["error"]["code"], "voice_unavailable")
+
+    def test_non_wav_bytes_are_503(self):
+        self.server.tts = lambda text, voice=None: b"OggS not a wav at all"
+        status, _, body = self.post_tts({"text": "Привет"})
+        self.assertEqual(status, 503)
+        self.assertIn("WAV", json.loads(body)["error"]["message"])
+
+    def test_get_is_not_allowed(self):
+        status, _, _ = self.request("GET", "/api/tts")
+        self.assertEqual(status, 404)
+
+
+
+class TestTtsPage(ServerTestCase):
+    """Галочка «озвучивать», один <audio> и разбиение ответа на фразы."""
+
+    def test_page_has_voice_controls(self):
+        page = page_html(self)
+        for fragment in (
+            'id="tts-0"',
+            'id="tts-1"',
+            'id="tts-note-0"',
+            'id="tts-note-1"',
+            'id="stop"',
+            "озвучивать",
+            "/api/tts",
+            "function stopSpeech",
+            "function createPhraseSplitter",
+            "function enqueueSpeech",
+            "function stopAll",
+            "голос недоступен",
+        ):
+            self.assertIn(fragment, page)
+        # Одно <audio> на страницу: фразы играют последовательно.
+        self.assertEqual(page.count("new Audio("), 1, "ожидался один Audio")
+        self.assertIn('byId("stop").addEventListener("click", stopAll)', page)
+
+    def test_new_question_and_stop_clear_speech(self):
+        page = page_html(self)
+        # Новый вопрос глушит звук до старта генерации, «стоп» — тоже.
+        self.assertIn(
+            "stopSpeech();\n    controller = new AbortController();", page
+        )
+        self.assertIn("остановлено", page)
+        self.assertIn("tts.queue = [];", page)
+        # «Стоп» сначала сбрасывает буфер фраз в текст, потом глушит звук:
+        # иначе хвостовая фраза зазвучала бы уже после остановки.
+        self.assertIn("flushAnswer(1);\n    stopSpeech();", page)
+
+    @unittest.skipUnless(NODE, "node не установлен")
+    def test_first_phrase_ready_before_stream_end(self):
+        result = run_tts_splitter(
+            page_html(self),
+            ["При", "вет. Как де", "ла?\nЕщё текст.", "\nБез точки"],
+        )
+        self.assertEqual(result["during"], ["Привет.", "Как дела?", "Ещё текст."])
+        self.assertEqual(
+            result["after"], ["Привет.", "Как дела?", "Ещё текст.", "Без точки"]
+        )
+
+    @unittest.skipUnless(NODE, "node не установлен")
+    def test_sentence_and_newline_split(self):
+        result = run_tts_splitter(page_html(self), ["А.", " Б.\nВ"])
+        self.assertEqual(result["during"], ["А.", "Б."])
+        self.assertEqual(result["after"], ["А.", "Б.", "В"])
+
+    @unittest.skipUnless(NODE, "node не установлен")
+    def test_long_phrase_is_cut_to_server_limit(self):
+        words = " ".join(["слово"] * 300)
+        result = run_tts_splitter(page_html(self), [words])
+        self.assertGreater(len(result["after"]), 1)
+        for phrase in result["after"]:
+            self.assertLessEqual(len(phrase), chat_server.TTS_MAX_CHARS)
+        self.assertEqual(" ".join(result["after"]), words)
 
 
 if __name__ == "__main__":
