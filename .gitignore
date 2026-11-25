@@ -279,3 +279,5 @@ distill/pulled/
 export/
 /ternary.trit
 /model.vtm
+vendor/piper/
+vendor/piper-py/
