@@ -1167,5 +1167,12 @@
     "status": "in_progress",
     "file": "0175-moe-pread-cache.md",
     "assignee": "agent:moe-pread"
+  },
+  {
+    "id": "0176",
+    "title": "Gated Delta linear attention",
+    "status": "in_progress",
+    "file": "0176-gated-delta.md",
+    "assignee": "agent:gated-delta"
   }
 ]
