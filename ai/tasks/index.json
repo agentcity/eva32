@@ -1209,5 +1209,12 @@
     "status": "done",
     "file": "0181-moe-batch-bigger.md",
     "assignee": "agent:moe-batch-big"
+  },
+  {
+    "id": "0182",
+    "title": "Память диалога в чате",
+    "status": "in_progress",
+    "file": "0182-chat-memory.md",
+    "assignee": "agent:chat-memory"
   }
 ]
