@@ -1188,5 +1188,12 @@
     "status": "done",
     "file": "0178-chat-answer-ui.md",
     "assignee": "agent:chat-ui"
+  },
+  {
+    "id": "0179",
+    "title": "Батчевый prefill MoE",
+    "status": "in_progress",
+    "file": "0179-moe-batched-prefill.md",
+    "assignee": "agent:moe-prefill"
   }
 ]
