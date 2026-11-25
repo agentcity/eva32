@@ -38,6 +38,10 @@ static int g_fail;
 void vtm_internal_moe_cache_reset(void);
 void vtm_internal_moe_cache_stats(uint64_t *hits, uint64_t *misses,
                                   size_t *bytes, uint64_t *allocs);
+// Хуки prefetch-очереди (задача 0177): задания, ожидания, попадания prefetch,
+// число I/O-потоков.
+void vtm_internal_moe_prefetch_stats(uint64_t *jobs, uint64_t *waits,
+                                     uint64_t *useful, int *threads);
 
 // --- big-endian: контейнер не читается, загрузчик обязан отказать ----------
 //
@@ -5928,6 +5932,11 @@ static void test_moe_pread_cache(void) {
     }
 
     // 2. Тот же файл через pread-кэш (8 МиБ хватает на 6 слотов с запасом).
+    // VTM_MOE_IO_THREADS=0 — проверяем именно последовательный путь: с
+    // prefetch-потоками «кто прочитал ключ первым» зависит от планировщика, и
+    // точные hits/misses стали бы плавающими. Prefetch проверяется отдельным
+    // тестом ниже, где сравнивается выход, а не счётчики.
+    setenv("VTM_MOE_IO_THREADS", "0", 1);
     setenv("VTM_MOE_CACHE_MB", "8", 1);
     vtm_internal_moe_cache_reset();
     m = vtm_load(path);
@@ -5965,6 +5974,118 @@ static void test_moe_pread_cache(void) {
 
     remove(path);
     unsetenv("VTM_MOE_CACHE_MB");
+    vtm_internal_moe_cache_reset();
+    free(img);
+    model_free(&md);
+}
+
+// Prefetch экспертов в потоках (задача 0177). Проверяем не счётчики попаданий
+// (кто успел первым — дело планировщика), а то, что от этого ничего не
+// меняется: выход MOE побитово тот же, что у mmap-пути, слоты не выделяются
+// заново, а задания в очередь действительно ставятся.
+//
+// Инвариант счётчиков, который от гонки не зависит: каждое обращение главного
+// потока — либо hit, либо miss, поэтому hits + misses == 6 ключей × 2
+// инструкции = 12, сколько бы из них ни успел принести prefetch.
+static void test_moe_prefetch(void) {
+    enum { NEXP = 4, HID = 256, INTER = 256, TOPK = 2 };
+    model_t md;
+    uint32_t rd[2] = {NEXP, HID};
+    uint32_t xd[1] = {HID};
+    uint32_t yd[1] = {HID};
+    uint32_t bd[3] = {NEXP, INTER, HID};
+    uint32_t dd[3] = {NEXP, HID, INTER};
+    float router[NEXP * HID], xv[HID], yv[HID], base[HID];
+    uint8_t *img = NULL;
+    size_t size = 0;
+    char path[80];
+    long stamp = (long)time(NULL);
+    FILE *f;
+    vtm_t *m;
+    const vtm_tensor *t;
+    uint64_t hits = 0, misses = 0, allocs = 0, jobs = 0, waits = 0, useful = 0;
+    size_t bytes = 0;
+    int threads = 0, i;
+
+    for (i = 0; i < NEXP * HID; i++)
+        router[i] = (float)(((i * 11) % 17) - 8) * 0.05f;
+    for (i = 0; i < HID; i++) {
+        xv[i] = (float)(((i * 5) % 11) - 5) * 0.1f;
+        yv[i] = 0.0f;
+    }
+
+    model_init(&md);
+    model_add_f32(&md, "router", 2, rd, router);
+    model_add_f32(&md, "x", 1, xd, xv);
+    model_add_f32(&md, "y", 1, yd, yv);
+    model_add_q4k_bank(&md, "gate", 3, bd, 4);
+    model_add_q4k_bank(&md, "up", 3, bd, 5);
+    model_add_q6k_bank(&md, "down", 3, dd, 6);
+    model_inst(&md, VTM_OP_MOE, 0, 2, 0, 1, 3, TOPK);
+    model_inst(&md, VTM_OP_MOE, 0, 2, 0, 1, 3, TOPK);
+    model_inst(&md, VTM_OP_HALT, 0, VTM_NO_TENSOR, VTM_NO_TENSOR,
+               VTM_NO_TENSOR, VTM_NO_TENSOR, 0);
+    model_build(&md, &img, &size);
+
+    snprintf(path, sizeof path, "/tmp/vtm_moe_pf_%ld.vtm", stamp);
+    f = fopen(path, "wb");
+    CHECK(f != NULL);
+    if (!f) {
+        free(img);
+        model_free(&md);
+        return;
+    }
+    CHECK(fwrite(img, 1, size, f) == size);
+    fclose(f);
+
+    // 1. Эталон: кэш выключен — эксперты из mmap.
+    setenv("VTM_MOE_CACHE_MB", "0", 1);
+    vtm_internal_moe_cache_reset();
+    m = vtm_load(path);
+    CHECK(m != NULL);
+    if (m) {
+        CHECK(run_ok(m));
+        t = vtm_tensor_by_name(m, "y");
+        CHECK(t != NULL);
+        if (t) for (i = 0; i < HID; i++) base[i] = t->f32[i];
+        vtm_free(m);
+    }
+
+    // 2. Кэш + два I/O-потока.
+    setenv("VTM_MOE_CACHE_MB", "8", 1);
+    setenv("VTM_MOE_IO_THREADS", "2", 1);
+    vtm_internal_moe_cache_reset();
+    m = vtm_load(path);
+    CHECK(m != NULL);
+    if (m) {
+        CHECK(run_ok(m));
+        vtm_internal_moe_cache_stats(&hits, &misses, &bytes, &allocs);
+        vtm_internal_moe_prefetch_stats(&jobs, &waits, &useful, &threads);
+        CHECK(threads == 2);
+        CHECK(jobs >= 6);          // 6 ключей на инструкцию
+        CHECK(useful <= waits);    // «ждали» не может быть меньше успешных
+        CHECK(hits + misses == 12); // 2 инструкции × 6 ключей
+        CHECK(allocs == 6);
+        t = vtm_tensor_by_name(m, "y");
+        CHECK(t != NULL);
+        if (t) CHECK(memcmp(base, t->f32, sizeof base) == 0);
+
+        // 3. Повтор: всё из кэша, новых слотов нет.
+        if (t) for (i = 0; i < HID; i++) t->f32[i] = 0.0f;
+        CHECK(run_ok(m));
+        vtm_internal_moe_cache_stats(&hits, &misses, &bytes, &allocs);
+        vtm_internal_moe_prefetch_stats(&jobs, &waits, &useful, &threads);
+        CHECK(hits + misses == 24); // 4 инструкции × 6 ключей за два прогона
+        CHECK(allocs == 6);
+        t = vtm_tensor_by_name(m, "y");
+        CHECK(t != NULL);
+        if (t) CHECK(memcmp(base, t->f32, sizeof base) == 0);
+        vtm_free(m);
+    }
+
+    remove(path);
+    unsetenv("VTM_MOE_CACHE_MB");
+    unsetenv("VTM_MOE_IO_THREADS");
     vtm_internal_moe_cache_reset();
     free(img);
     model_free(&md);
@@ -6024,6 +6145,7 @@ int main(void) {
     test_cache_prefix_ring();
     test_run_batch();
     test_moe_pread_cache();
+    test_moe_prefetch();
     bench_cache_prefix();
     test_samp_bench_150k();
 

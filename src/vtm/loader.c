@@ -15,6 +15,13 @@
 // vtm.h даёт #error (см. «Портируемость» в docs/vtm.md), поэтому ветви
 // #if defined(_WIN32) ниже — черновик будущего порта, а не рабочий путь.
 // Big-endian проверяется один раз в load_core() (VTM_HOST_BIG_ENDIAN).
+// sysconf(_SC_PHYS_PAGES) на macOS спрятан за __DARWIN_C_FULL, а Makefile
+// задаёт строгий _POSIX_C_SOURCE: без этого define ветка «файл больше RAM»
+// не собралась бы (тот же приём, что в backend_scalar.c). Константа нужна
+// только для авто-режима VTM_DENSE_RESIDENT_MB.
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
 #include "vtm_internal.h"
 #include "vtm_backend.h"
 #include "trit.h"
@@ -2263,6 +2270,116 @@ static void map_trim_copied(vtm_t *m) {
 #endif
 }
 
+// --- резидентные dense-веса (задача 0177) -----------------------------------
+//
+// Что и зачем. Внимание (q/k/v/o_proj — 0,53 ГБ на 30B) и lm_head (0,25 ГБ)
+// читаются каждый токен. Пока контейнер влезает в page cache, это память; но
+// 18,55 ГБ в 16 ГиБ не влезают, и под давлением соседних процессов ядра этих
+// страниц вытесняются. Тогда каждый токен перечитывает их с диска: на общем
+// хосте это видно как 35 тыс. major faults и sys 5,3 с против 0,8 тыс. и 1,3 с
+// в спокойном окне (замер 0177). Экспертам это не помогает — их читает
+// pread-кэш 0175 мимо отображения.
+//
+// Здесь эти тензоры один раз читаются pread'ом в анонимную память и остаются
+// там: +0,76 ГБ RSS против надежды на page cache. Банки экспертов сюда не
+// попадают никогда: они в 20 раз больше, и их читает кэш 0175.
+//
+// Когда включать. По умолчанию ВЫКЛЮЧЕНО: замер 0177 на 16 ГиБ под давлением
+// памяти дал 2,3-2,6 с без копии против 2,9-5,0 с с ней (sys 1,4 против 3,0-6,4 с)
+// — лишние 0,77 ГБ анонимной памяти сами вызывают компрессию, ровно как кэш
+// 3072 МиБ в 0175. Копия имеет смысл только если RAM заметно больше
+// контейнера (тогда page cache и так держит веса) или на выделенной машине:
+// VTM_DENSE_RESIDENT_MB=N задаёт бюджет в МиБ, 0 — выключено.
+static size_t dense_resident_budget(size_t dense_bytes) {
+    const char *env = getenv("VTM_DENSE_RESIDENT_MB");
+    long mb = 0;
+
+    if (env && *env) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env && end && *end == '\0') mb = v;
+    }
+    if (mb <= 0) return 0;
+    {
+        size_t want = (size_t)mb << 20;
+        return want < dense_bytes ? want : dense_bytes;
+    }
+}
+
+// Один pread на тензор: короткое чтение — ошибка (файл мог измениться).
+static int dense_pread_full(int fd, uint8_t *dst, size_t n, off_t off) {
+    while (n > 0) {
+        ssize_t got = pread(fd, dst, n, off);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            return 0;
+        }
+        if (got == 0) return 0;
+        dst += (size_t)got;
+        off += (off_t)got;
+        n -= (size_t)got;
+    }
+    return 1;
+}
+
+static void dense_make_resident(vtm_t *m) {
+    uint32_t i;
+    size_t total = 0, off = 0, budget;
+    uint8_t *hot, *buf;
+
+    if (!m || m->fd < 0 || !m->mapped || !m->map) return;
+    if (m->n_tensors == 0 || m->n_instr == 0) return;
+    hot = (uint8_t *)calloc((size_t)m->n_tensors, 1u);
+    if (!hot) return;
+    // «Нужен каждый токен» — тензор, который TMV читает как матрицу весов.
+    // Так в набор попадают q/k/v/o_proj и lm_head, но не emb.w (её трогает EMB
+    // одной строкой) и не банки экспертов (у них MOE).
+    for (i = 0; i < m->n_instr; i++) {
+        const vtm_instr *in = &m->instr[i];
+        const vtm_tensor *t;
+        if (in->opcode != VTM_OP_TMV) continue;
+        if (in->a == VTM_NO_TENSOR || (uint32_t)in->a >= m->n_tensors) continue;
+        t = &m->tensors[in->a];
+        if (t->kind != VTM_TENSOR_Q4K && t->kind != VTM_TENSOR_Q6K) continue;
+        if (t->ndim != 2 || t->n_qblocks == 0) continue;
+        if ((t->flags & VTM_TENSOR_FLAG_OUT_OF_FILE) != 0) continue;
+        if (hot[in->a]) continue;
+        hot[in->a] = 1;
+        total += (size_t)t->n_qblocks * (size_t)q4k_block_bytes(t->kind);
+    }
+    budget = dense_resident_budget(total);
+    if (budget == 0 || budget < (1u << 20)) {
+        free(hot);
+        return;
+    }
+    buf = (uint8_t *)malloc(budget);
+    if (!buf) {
+        free(hot);
+        return;
+    }
+    for (i = 0; i < m->n_tensors && off < budget; i++) {
+        vtm_tensor *t;
+        size_t bytes;
+        off_t at;
+        if (!hot[i]) continue;
+        t = &m->tensors[i];
+        bytes = (size_t)t->n_qblocks * (size_t)q4k_block_bytes(t->kind);
+        if (bytes > budget - off) continue; // не влез — остаётся в отображении
+        at = (off_t)(m->data_start + t->offset64 + VTM_Q4K_HEADER_SIZE);
+        if (!dense_pread_full(m->fd, buf + off, bytes, at)) continue;
+        t->qblocks = buf + off;
+        off += bytes;
+    }
+    if (off == 0) {
+        free(buf);
+        free(hot);
+        return;
+    }
+    m->dense_raw = buf;
+    m->dense_bytes = off;
+    free(hot);
+}
+
 static vtm_t *load_mmap(const char *path) {
     int fd;
     struct stat st, again;
@@ -2346,6 +2463,7 @@ static vtm_t *load_mmap(const char *path) {
     // того же файла, не трогая страницы отображения. Закроет vtm_free().
     m->fd = fd;
     map_trim_copied(m);
+    dense_make_resident(m);
     return m;
 }
 #endif // !_WIN32
@@ -2391,6 +2509,9 @@ void vtm_free(vtm_t *m) {
         m->mapped = 0;
     }
 #endif
+    free(m->dense_raw); // резидентные dense-веса (0177)
+    m->dense_raw = NULL;
+    m->dense_bytes = 0;
     vtm_samp_free(m); // буфер кандидатов SAMP (задача 0059)
     free(m->meta_json);
     free(m->tensors);

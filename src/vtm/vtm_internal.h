@@ -43,6 +43,14 @@ struct vtm {
     int             fd;
     int             moe_fd;
 
+    // --- резидентные dense-веса (задача 0177) ------------------------------
+    // Внимание и lm_head, прочитанные pread'ом в анонимную память на загрузке:
+    // они нужны каждый токен, а page cache на контейнере 18,5 ГБ не держит их
+    // под давлением. dense_raw — один блок, dense_bytes — сколько занято;
+    // qblocks этих тензоров смотрят внутрь него. NULL/0 — режим выключен.
+    void           *dense_raw;
+    size_t          dense_bytes;
+
     uint16_t        header_flags;
     int             position;   // база позиции для ROPE/KVW/ATTN/SM
     int             input_token;// токен для EMB с флагом EMB_INPUT (-1 = нет)
@@ -186,5 +194,12 @@ void vtm_internal_moe_cache_reset(void);
 // (после прогрева не растёт — это и есть «без malloc на токен»).
 void vtm_internal_moe_cache_stats(uint64_t *hits, uint64_t *misses,
                                   size_t *bytes, uint64_t *allocs);
+
+// Счётчики prefetch-очереди (задача 0177): jobs — сколько чтений поставлено
+// воркерам, waits — сколько раз главный поток ждал конкретный ключ,
+// useful — из них успешных (данные пришли из prefetch, а не из промаха).
+// threads — сколько I/O-потоков реально создано (0 — последовательный путь).
+void vtm_internal_moe_prefetch_stats(uint64_t *jobs, uint64_t *waits,
+                                     uint64_t *useful, int *threads);
 
 #endif // VTM_INTERNAL_H

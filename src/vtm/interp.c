@@ -730,9 +730,39 @@ static vtm_status op_rmsh(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 // ни одного malloc. Ключ включает st_dev/st_ino/mtime файла, а не адрес
 // отображения: две машины одного файла делят кэш, а переиспользованный адрес
 // mmap не может отдать чужие веса.
+//
+// --- потоки (prefetch) ------------------------------------------------------
+// I/O экспертов — единственная часть MOE, которая уже умеет ждать: pread на
+// локальном SSD отдаёт ~0,8 ГБ/с одним потоком и ~2,5 ГБ/с четырьмя (замер
+// 0177 на этом же контейнере). Поэтому чтение вынесено в отдельные потоки:
+// главный считает эксперта k, а воркеры читают k+1..top_k. Без pthread
+// (VTM_NO_THREADS/_WIN32) остаётся прежний последовательный путь — поведение
+// и результат те же, только медленнее.
+#if !defined(_WIN32) && !defined(VTM_NO_THREADS)
+#define VTM_MOE_HAVE_PTHREAD 1
+#include <pthread.h>
+#else
+#define VTM_MOE_HAVE_PTHREAD 0
+#endif
+
+// Замок кэша — отдельный статический объект, а не поле в moe_cache: кэш
+// обнуляется memset'ом (moe_cache_drop), и мьютекс внутри структуры после
+// этого оказался бы неинициализированным. Статический инициализатор
+// PTHREAD_MUTEX_INITIALIZER этого не боится.
+#if VTM_MOE_HAVE_PTHREAD
+static pthread_mutex_t g_moe_cache_mu = PTHREAD_MUTEX_INITIALIZER;
+#define MOE_CACHE_LOCK() pthread_mutex_lock(&g_moe_cache_mu)
+#define MOE_CACHE_UNLOCK() pthread_mutex_unlock(&g_moe_cache_mu)
+#else
+#define MOE_CACHE_LOCK() ((void)0)
+#define MOE_CACHE_UNLOCK() ((void)0)
+#endif
+
 #define VTM_MOE_MAX_EXPERTS 65535
 #define VTM_MOE_TRACE_DEFAULT 0
-#define VTM_MOE_CACHE_DEFAULT_MB 3072
+// 1792 МиБ — оптимум на 16 ГиБ под давлением памяти (0175: 3072 вызывал
+// компрессию, 1792 проходит ниже порога). Задача 0177 фиксирует это умолчание.
+#define VTM_MOE_CACHE_DEFAULT_MB 1792
 #define VTM_MOE_SLOT_ALIGN 4096u
 #define VTM_MOE_HASH_BUCKETS 4096u
 #define VTM_MOE_MAX_CLASSES 16
@@ -740,6 +770,11 @@ static vtm_status op_rmsh(vtm_t *m, uint32_t ins, const vtm_instr *in) {
 // при смене рабочего набора (модель перестала просить down) буферы другого
 // класса должны освободиться, иначе кэш занимает заметно больше бюджета.
 #define VTM_MOE_FREE_KEEP 64
+// Потолок очереди prefetch. За одну инструкцию MOE туда кладётся 3·top_k
+// заданий (24 при top-8); 256 — запас на случай, если слой начнётся раньше,
+// чем воркеры дочитают предыдущий.
+#define VTM_MOE_PF_MAX 256
+#define VTM_MOE_PF_THREADS_MAX 8
 
 typedef struct moe_cache_entry {
     struct moe_cache_entry *lru_prev, *lru_next; // LRU (только в кэше)
@@ -750,6 +785,7 @@ typedef struct moe_cache_entry {
     uint32_t expert;
     uint32_t bucket;
     uint32_t cls;              // размерный класс (индекс в cls[])
+    uint32_t pin;              // >0 — главный поток считает по этим байтам
     size_t   nbytes;           // полезных байт
     size_t   cap;              // выровненная ёмкость слота
     uint8_t *data;
@@ -785,18 +821,66 @@ static moe_cache g_moe_cache;
 static uint64_t g_moe_hits, g_moe_misses, g_moe_advised;
 static uint64_t g_moe_pread_bytes, g_moe_pread_calls, g_moe_alloc_count;
 static uint64_t g_moe_evicted, g_moe_fallbacks;
+// Диагностика VTM_MOE_TRACE: сколько времени ушло в pread и сколько в ядра.
+// Без этих двух чисел нельзя отличить «кэш читает быстро, но редко попадает»
+// от «ядро считает медленно»: раньше время MOE в --trace-summary было чёрным
+// ящиком. Счётчики на процесс, как и остальные счётчики MOE.
+static uint64_t g_moe_pread_ns, g_moe_compute_ns, g_moe_fetch_ns;
+// Счётчики prefetch: заданий поставлено, ожиданий «дочитай этот ключ»,
+// из них успешных (эксперт был нужен главному потоку и уже читался).
+static uint64_t g_moe_pf_jobs, g_moe_pf_waits, g_moe_pf_useful;
+
+static uint64_t moe_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 static int g_moe_cache_registered;
 static int g_moe_atexit;
+
+// --- prefetch-очередь -------------------------------------------------------
+// Задание — «прочитать ключ (банк, эксперт) в кэш». Состояния: 0 свободно,
+// 1 ждёт воркера, 2 читается, 3 готово, 4 ошибка. Пока задание в очереди,
+// главный поток на этом ключе не читает сам, а ждёт (moe_pf_wait): иначе
+// получилось бы два pread одного эксперта.
+typedef struct {
+    uint64_t bank_off;
+    size_t   nbytes;
+    uint32_t expert;
+    uint32_t state;
+} moe_pf_job;
+
+typedef struct {
+    moe_pf_job jobs[VTM_MOE_PF_MAX];
+    int n_jobs, next;      // очередь: jobs[next..n_jobs) ещё не взяты
+    int outstanding;       // сколько заданий не завершено
+    moe_source src;        // дескриптор и ключ файла на время очереди
+    int ready, stop, n_io;
+#if VTM_MOE_HAVE_PTHREAD
+    pthread_t tid[VTM_MOE_PF_THREADS_MAX];
+#else
+    int tid[VTM_MOE_PF_THREADS_MAX];
+#endif
+} moe_prefetch;
+
+static moe_prefetch g_moe_pf;
 
 static void moe_cache_entry_free(moe_cache_entry *e) {
     free(e->data);
     free(e);
 }
 
+static void moe_pf_stop(void);
+
 static void moe_cache_drop(void) {
     moe_cache_entry *e = g_moe_cache.head;
     int i;
 
+    // Сначала останавливаем воркеров: они пишут в слоты, которые здесь
+    // освобождаются. Только после join можно трогать список.
+    moe_pf_stop();
+    MOE_CACHE_LOCK();
+    e = g_moe_cache.head;
     while (e) {
         moe_cache_entry *next = e->lru_next;
         moe_cache_entry_free(e);
@@ -810,6 +894,7 @@ static void moe_cache_drop(void) {
             e = next;
         }
     }
+    MOE_CACHE_UNLOCK();
     memset(&g_moe_cache, 0, sizeof g_moe_cache);
 }
 
@@ -845,6 +930,8 @@ void vtm_internal_moe_cache_reset(void) {
     g_moe_hits = g_moe_misses = g_moe_advised = 0;
     g_moe_pread_bytes = g_moe_pread_calls = g_moe_alloc_count = 0;
     g_moe_evicted = g_moe_fallbacks = 0;
+    g_moe_pread_ns = g_moe_compute_ns = g_moe_fetch_ns = 0;
+    g_moe_pf_jobs = g_moe_pf_waits = g_moe_pf_useful = 0;
 }
 
 void vtm_internal_moe_cache_stats(uint64_t *hits, uint64_t *misses,
@@ -853,6 +940,14 @@ void vtm_internal_moe_cache_stats(uint64_t *hits, uint64_t *misses,
     if (misses) *misses = g_moe_misses;
     if (bytes) *bytes = g_moe_cache.bytes;
     if (allocs) *allocs = g_moe_alloc_count;
+}
+
+void vtm_internal_moe_prefetch_stats(uint64_t *jobs, uint64_t *waits,
+                                     uint64_t *useful, int *threads) {
+    if (jobs) *jobs = g_moe_pf_jobs;
+    if (waits) *waits = g_moe_pf_waits;
+    if (useful) *useful = g_moe_pf_useful;
+    if (threads) *threads = g_moe_pf.ready ? g_moe_pf.n_io : 0;
 }
 
 static size_t moe_align_up(size_t value, size_t align) {
@@ -930,14 +1025,19 @@ static void moe_cache_dispose(moe_cache_entry *e) {
     }
 }
 
-static void moe_cache_evict_tail(void) {
+// Вытеснить самый старый незакреплённый слот. Закреплённые (pin>0) — это те,
+// по чьим байтам прямо сейчас считается эксперт; их освобождать нельзя, иначе
+// ядро прочитает освобождённую память. Возврат 0 — вытеснять нечего.
+static int moe_cache_evict_one(void) {
     moe_cache_entry *e = g_moe_cache.tail;
-    if (!e) return;
+    while (e && e->pin) e = e->lru_prev;
+    if (!e) return 0;
     moe_lru_unlink(e);
     moe_hash_remove(e);
     g_moe_cache.bytes -= e->cap;
     g_moe_evicted++;
     moe_cache_dispose(e);
+    return 1;
 }
 
 static moe_cache_entry *moe_cache_claim(size_t nbytes) {
@@ -949,8 +1049,9 @@ static moe_cache_entry *moe_cache_claim(size_t nbytes) {
     if (cap < nbytes) return NULL; // переполнение выравнивания
     ci = moe_class_for(cap);
     if (ci < 0) return NULL;
-    while (g_moe_cache.bytes + cap > g_moe_cache.cap && g_moe_cache.tail)
-        moe_cache_evict_tail();
+    while (g_moe_cache.bytes + cap > g_moe_cache.cap) {
+        if (!moe_cache_evict_one()) break;
+    }
     if (g_moe_cache.bytes + cap > g_moe_cache.cap) return NULL;
     c = &g_moe_cache.cls[ci];
     e = c->free;
@@ -958,6 +1059,7 @@ static moe_cache_entry *moe_cache_claim(size_t nbytes) {
         c->free = e->free_next;
         c->nfree--;
         e->free_next = NULL;
+        e->pin = 0;
     } else {
         e = (moe_cache_entry *)calloc(1u, sizeof *e);
         if (!e) return NULL;
@@ -979,24 +1081,23 @@ static void moe_cache_release(moe_cache_entry *e) {
     moe_cache_dispose(e);
 }
 
-static moe_cache_entry *moe_cache_find(uint64_t dev, uint64_t ino,
-                                       uint64_t mtime, uint64_t bank_off,
-                                       uint32_t expert, size_t nbytes) {
-    uint32_t bucket = moe_hash_bucket(dev, ino, mtime, bank_off, expert,
-                                      nbytes);
+// Поиск без счётчиков и без LRU-обновления: вызывающий сам решает, попадание
+// это или промах (промах может стать попаданием после ожидания prefetch).
+// Требует MOE_CACHE_LOCK.
+static moe_cache_entry *moe_cache_lookup_locked(const moe_source *src,
+                                                uint64_t bank_off,
+                                                uint32_t expert, size_t nbytes) {
+    uint32_t bucket = moe_hash_bucket(src->dev, src->ino, src->mtime, bank_off,
+                                      expert, nbytes);
     moe_cache_entry *e;
 
     for (e = g_moe_cache.hash[bucket]; e; e = e->hash_next) {
-        if (e->dev != dev || e->ino != ino || e->mtime != mtime ||
-            e->bank_off != bank_off || e->expert != expert ||
-            e->nbytes != nbytes)
+        if (e->dev != src->dev || e->ino != src->ino ||
+            e->mtime != src->mtime || e->bank_off != bank_off ||
+            e->expert != expert || e->nbytes != nbytes)
             continue;
-        moe_lru_unlink(e);
-        moe_lru_push(e);
-        g_moe_hits++;
         return e;
     }
-    g_moe_misses++;
     return NULL;
 }
 
@@ -1015,31 +1116,48 @@ static int moe_pread_full(int fd, uint8_t *dst, size_t n, off_t off) {
     return 0;
 }
 
-// Прочитать выбранный эксперт в кэш (или найти его там). NULL — кэш
-// выключен/слот не дался/чтение не удалось; вызывающий берёт mmap-указатель.
-static const uint8_t *moe_cache_fetch(const moe_source *src, uint64_t bank_off,
-                                      uint32_t expert, size_t nbytes) {
+// Прочитать ключ в кэш, если его там нет. Один pread на матрицу эксперта.
+// Слот захватывается под замком, сам pread идёт без замка (иначе воркеры
+// ждали бы друг друга), вставка в хеш/LRU — снова под замком. Слот, ещё не
+// вставленный в LRU, вытеснить нельзя: moe_cache_evict_one ходит по списку.
+// Возврат 0 — кэш выключен, нет слота или чтение не удалось.
+static int moe_cache_load(const moe_source *src, uint64_t bank_off,
+                          uint32_t expert, size_t nbytes) {
     moe_cache_entry *e;
-    uint64_t off;
+    uint64_t off, t0;
+    int rc;
 
     if (!g_moe_cache.ready || g_moe_cache.disabled || !src->use ||
         nbytes == 0)
-        return NULL;
-    e = moe_cache_find(src->dev, src->ino, src->mtime, bank_off, expert,
-                       nbytes);
-    if (e) return e->data;
+        return 0;
     off = bank_off + (uint64_t)expert * (uint64_t)nbytes;
+    MOE_CACHE_LOCK();
+    e = moe_cache_lookup_locked(src, bank_off, expert, nbytes);
+    if (e) {
+        moe_lru_unlink(e);
+        moe_lru_push(e);
+        MOE_CACHE_UNLOCK();
+        return 1;
+    }
     if (off > (uint64_t)src->file_size ||
         (uint64_t)nbytes > (uint64_t)src->file_size - off) {
         g_moe_fallbacks++;
-        return NULL;
+        MOE_CACHE_UNLOCK();
+        return 0;
     }
     e = moe_cache_claim(nbytes);
-    if (!e) return NULL;
-    if (moe_pread_full(src->fd, e->data, nbytes, (off_t)off) != 0) {
+    MOE_CACHE_UNLOCK();
+    if (!e) return 0;
+
+    t0 = moe_now_ns();
+    rc = moe_pread_full(src->fd, e->data, nbytes, (off_t)off);
+    MOE_CACHE_LOCK();
+    g_moe_pread_ns += moe_now_ns() - t0;
+    if (rc != 0) {
         g_moe_fallbacks++;
         moe_cache_release(e);
-        return NULL;
+        MOE_CACHE_UNLOCK();
+        return 0;
     }
     e->dev = src->dev;
     e->ino = src->ino;
@@ -1051,7 +1169,271 @@ static const uint8_t *moe_cache_fetch(const moe_source *src, uint64_t bank_off,
     moe_lru_push(e);
     g_moe_pread_bytes += (uint64_t)nbytes;
     g_moe_pread_calls++;
-    return e->data;
+    MOE_CACHE_UNLOCK();
+    return 1;
+}
+
+// --- prefetch: очередь заданий и воркеры ------------------------------------
+//
+// Зачем потоки. pread 860-КиБ эксперта одним потоком даёт ~0,8 ГБ/с, четырьмя
+// — ~2,5 ГБ/с (замер iobench по этому же контейнеру, 0177). Внутри одного
+// слоя выбранные эксперты известны все сразу после роутера, поэтому чтение
+// остальных можно вести параллельно со счётом текущего. Главный поток
+// «требует» ключ: если он уже в кэше — попадание, если его читает воркер —
+// ждём именно этот ключ, иначе читаем сами.
+#define VTM_MOE_IO_THREADS_DEFAULT 6
+
+// Читается один раз на жизнь кэша (moe_pf_start), а не кэшируется в static:
+// тесты сбрасывают кэш и меняют env между прогонами одной модели.
+static int moe_io_threads_cfg(void) {
+    const char *env = getenv("VTM_MOE_IO_THREADS");
+    long n = VTM_MOE_IO_THREADS_DEFAULT;
+
+    if (env && *env) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env && end && *end == '\0') n = v;
+    }
+    if (n < 0) n = 0;
+    if (n > VTM_MOE_PF_THREADS_MAX) n = VTM_MOE_PF_THREADS_MAX;
+    return (int)n;
+}
+
+#if VTM_MOE_HAVE_PTHREAD
+static pthread_mutex_t g_moe_pf_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_moe_pf_work_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_moe_pf_done_cv = PTHREAD_COND_INITIALIZER;
+
+static void *moe_pf_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        moe_pf_job job;
+        moe_source src;
+        int idx, ok;
+
+        pthread_mutex_lock(&g_moe_pf_mu);
+        while (!g_moe_pf.stop && g_moe_pf.next >= g_moe_pf.n_jobs)
+            pthread_cond_wait(&g_moe_pf_work_cv, &g_moe_pf_mu);
+        if (g_moe_pf.stop) {
+            pthread_mutex_unlock(&g_moe_pf_mu);
+            break;
+        }
+        idx = g_moe_pf.next++;
+        g_moe_pf.jobs[idx].state = 2; // читается
+        job = g_moe_pf.jobs[idx];
+        src = g_moe_pf.src;
+        pthread_mutex_unlock(&g_moe_pf_mu);
+
+        ok = moe_cache_load(&src, job.bank_off, job.expert, job.nbytes);
+
+        pthread_mutex_lock(&g_moe_pf_mu);
+        g_moe_pf.jobs[idx].state = ok ? 3u : 4u;
+        if (g_moe_pf.outstanding > 0) g_moe_pf.outstanding--;
+        if (g_moe_pf.outstanding == 0)
+            pthread_cond_broadcast(&g_moe_pf_done_cv);
+        pthread_mutex_unlock(&g_moe_pf_mu);
+    }
+    return NULL;
+}
+#endif
+
+static void moe_pf_stop(void) {
+#if VTM_MOE_HAVE_PTHREAD
+    int i;
+    if (!g_moe_pf.ready) return;
+    pthread_mutex_lock(&g_moe_pf_mu);
+    g_moe_pf.stop = 1;
+    g_moe_pf.n_jobs = g_moe_pf.next = 0;
+    g_moe_pf.outstanding = 0;
+    pthread_cond_broadcast(&g_moe_pf_work_cv);
+    pthread_cond_broadcast(&g_moe_pf_done_cv);
+    pthread_mutex_unlock(&g_moe_pf_mu);
+    for (i = 0; i < g_moe_pf.n_io; i++)
+        pthread_join(g_moe_pf.tid[i], NULL);
+    g_moe_pf.n_io = 0;
+    g_moe_pf.ready = 0;
+#else
+    g_moe_pf.ready = 0;
+    g_moe_pf.n_jobs = g_moe_pf.next = g_moe_pf.outstanding = 0;
+#endif
+}
+
+static void moe_pf_start(void) {
+    int n, i;
+    if (g_moe_pf.ready) return;
+    memset(&g_moe_pf, 0, sizeof g_moe_pf);
+    g_moe_pf.ready = 1;
+    n = VTM_MOE_HAVE_PTHREAD ? moe_io_threads_cfg() : 0;
+    g_moe_pf.n_io = 0;
+#if VTM_MOE_HAVE_PTHREAD
+    for (i = 0; i < n; i++) {
+        if (pthread_create(&g_moe_pf.tid[i], NULL, moe_pf_worker, NULL) != 0)
+            break;
+        g_moe_pf.n_io++;
+    }
+#else
+    (void)i;
+    (void)n;
+#endif
+}
+
+// Поставить в очередь чтение ключа. Ключи, которые уже стоят в очереди,
+// пропускаются: два pread одного эксперта не нужны. Если очередь переполнена
+// (не бывает при 48 заданиях на слой и потолке 256), ждём её опустошения.
+static void moe_pf_push(uint64_t bank_off, uint32_t expert, size_t nbytes) {
+    int i;
+    if (!g_moe_pf.ready || g_moe_pf.n_io <= 0) return;
+#if VTM_MOE_HAVE_PTHREAD
+    pthread_mutex_lock(&g_moe_pf_mu);
+    for (i = g_moe_pf.next; i < g_moe_pf.n_jobs; i++) {
+        if (g_moe_pf.jobs[i].bank_off == bank_off &&
+            g_moe_pf.jobs[i].expert == expert &&
+            g_moe_pf.jobs[i].nbytes == nbytes) {
+            pthread_mutex_unlock(&g_moe_pf_mu);
+            return;
+        }
+    }
+    if (g_moe_pf.n_jobs >= VTM_MOE_PF_MAX) {
+        while (g_moe_pf.outstanding > 0)
+            pthread_cond_wait(&g_moe_pf_done_cv, &g_moe_pf_mu);
+        g_moe_pf.n_jobs = g_moe_pf.next = 0;
+    }
+    i = g_moe_pf.n_jobs++;
+    g_moe_pf.jobs[i].bank_off = bank_off;
+    g_moe_pf.jobs[i].expert = expert;
+    g_moe_pf.jobs[i].nbytes = nbytes;
+    g_moe_pf.jobs[i].state = 1; // ждёт
+    g_moe_pf.outstanding++;
+    g_moe_pf_jobs++;
+    pthread_cond_signal(&g_moe_pf_work_cv);
+    pthread_mutex_unlock(&g_moe_pf_mu);
+#else
+    (void)i;
+    (void)bank_off;
+    (void)expert;
+    (void)nbytes;
+#endif
+}
+
+// Ждать, пока воркер дочитает именно этот ключ. Возврат 1 — задание было и
+// завершилось успешно (ключ теперь в кэше), 0 — задания не было или ошибка.
+static int moe_pf_wait(uint64_t bank_off, uint32_t expert, size_t nbytes) {
+    int i, found = 0;
+    uint32_t state = 0;
+    if (!g_moe_pf.ready || g_moe_pf.n_io <= 0) return 0;
+#if VTM_MOE_HAVE_PTHREAD
+    pthread_mutex_lock(&g_moe_pf_mu);
+    // Ищем во всей очереди: задание могло быть ещё не выдано воркеру
+    // (state 1). Раньше поиск шёл только по выданным, и главный поток на
+    // «ещё не начатом» ключе читал его сам — то есть терял перекрытие.
+    for (i = g_moe_pf.n_jobs - 1; i >= 0; i--) {
+        if (g_moe_pf.jobs[i].bank_off == bank_off &&
+            g_moe_pf.jobs[i].expert == expert &&
+            g_moe_pf.jobs[i].nbytes == nbytes) {
+            found = 1;
+            break;
+        }
+    }
+    if (found) {
+        while (g_moe_pf.jobs[i].state == 1 || g_moe_pf.jobs[i].state == 2)
+            pthread_cond_wait(&g_moe_pf_done_cv, &g_moe_pf_mu);
+        state = g_moe_pf.jobs[i].state;
+        g_moe_pf_waits++;
+    }
+    pthread_mutex_unlock(&g_moe_pf_mu);
+    if (found && state == 3) {
+        g_moe_pf_useful++;
+        return 1;
+    }
+#else
+    (void)i;
+    (void)state;
+#endif
+    return 0;
+}
+
+// Поставить чтение выбранных экспертов слоя. Порядок — как их спросит
+// главный поток: gate/up/down эксперта 0, потом 1 и т.д. Так первый эксперт
+// готов раньше остальных, и главный ждёт меньше.
+static void moe_pf_prefetch_experts(const moe_source *src, const int *chosen,
+                                    int top_k, uint64_t gate_off,
+                                    uint64_t up_off, uint64_t down_off,
+                                    size_t gate_bytes, size_t down_bytes) {
+    int k;
+    if (!g_moe_pf.ready || g_moe_pf.n_io <= 0) return;
+#if VTM_MOE_HAVE_PTHREAD
+    // Под замком: воркеры читают g_moe_pf.src из-под него же. Дескриптор живёт
+    // до vtm_free, так что воркеру всегда достаётся один и тот же файл.
+    pthread_mutex_lock(&g_moe_pf_mu);
+    g_moe_pf.src = *src;
+    pthread_mutex_unlock(&g_moe_pf_mu);
+#endif
+    for (k = 0; k < top_k; k++) {
+        moe_pf_push(gate_off, (uint32_t)chosen[k], gate_bytes);
+        moe_pf_push(up_off, (uint32_t)chosen[k], gate_bytes);
+        moe_pf_push(down_off, (uint32_t)chosen[k], down_bytes);
+    }
+}
+
+// Взять байты эксперта: попадание — сразу, промах — дождаться prefetch или
+// прочитать самому. Выставляемый entry закреплён: пока по нему считается,
+// вытеснение его не тронет; освобождать — moe_cache_unpin().
+static const uint8_t *moe_cache_acquire(const moe_source *src,
+                                        uint64_t bank_off, uint32_t expert,
+                                        size_t nbytes, moe_cache_entry **out) {
+    moe_cache_entry *e;
+
+    if (out) *out = NULL;
+    if (!g_moe_cache.ready || g_moe_cache.disabled || !src->use ||
+        nbytes == 0)
+        return NULL;
+    MOE_CACHE_LOCK();
+    e = moe_cache_lookup_locked(src, bank_off, expert, nbytes);
+    if (e) {
+        e->pin++;
+        moe_lru_unlink(e);
+        moe_lru_push(e);
+        g_moe_hits++;
+        MOE_CACHE_UNLOCK();
+        if (out) *out = e;
+        return e->data;
+    }
+    g_moe_misses++;
+    MOE_CACHE_UNLOCK();
+
+    if (moe_pf_wait(bank_off, expert, nbytes)) {
+        MOE_CACHE_LOCK();
+        e = moe_cache_lookup_locked(src, bank_off, expert, nbytes);
+        if (e) {
+            e->pin++;
+            moe_lru_unlink(e);
+            moe_lru_push(e);
+            MOE_CACHE_UNLOCK();
+            if (out) *out = e;
+            return e->data;
+        }
+        MOE_CACHE_UNLOCK();
+    }
+    if (!moe_cache_load(src, bank_off, expert, nbytes)) return NULL;
+    MOE_CACHE_LOCK();
+    e = moe_cache_lookup_locked(src, bank_off, expert, nbytes);
+    if (e) {
+        e->pin++;
+        moe_lru_unlink(e);
+        moe_lru_push(e);
+        MOE_CACHE_UNLOCK();
+        if (out) *out = e;
+        return e->data;
+    }
+    MOE_CACHE_UNLOCK();
+    return NULL;
+}
+
+static void moe_cache_unpin(moe_cache_entry *e) {
+    if (!e) return;
+    MOE_CACHE_LOCK();
+    if (e->pin) e->pin--;
+    MOE_CACHE_UNLOCK();
 }
 
 // Один и тот же файл? Дескриптор для pread открывается по пути, а банки
@@ -1086,7 +1468,14 @@ static void moe_source_init(vtm_t *m, moe_source *src) {
                 if (fd >= 0) {
                     if (moe_same_file(m->fd, fd)) {
 #if defined(F_NOCACHE)
-                        (void)fcntl(fd, F_NOCACHE, 1);
+                        // VTM_MOE_NOCACHE=0 — пускать чтение экспертов в
+                        // page cache (A/B-замер 0177: на 16 ГиБ под давлением
+                        // памяти это проигрывает, потому что вытесняет dense).
+                        {
+                            const char *nc = getenv("VTM_MOE_NOCACHE");
+                            if (!nc || !*nc || strcmp(nc, "0") != 0)
+                                (void)fcntl(fd, F_NOCACHE, 1);
+                        }
 #endif
                         m->moe_fd = fd;
                     } else {
@@ -1177,7 +1566,8 @@ static void moe_trace_report(void) {
     fprintf(stderr,
             "VTM MOE: hits=%llu misses=%llu cache=%zu КиБ advised=%llu "
             "pread=%llu КиБ calls=%llu allocs=%llu evicted=%llu "
-            "fallbacks=%llu\n",
+            "fallbacks=%llu fetch_ms=%llu pread_ms=%llu compute_ms=%llu "
+            "io=%d pf_jobs=%llu pf_waits=%llu pf_useful=%llu\n",
             (unsigned long long)g_moe_hits,
             (unsigned long long)g_moe_misses,
             (size_t)(g_moe_cache.bytes >> 10),
@@ -1186,7 +1576,14 @@ static void moe_trace_report(void) {
             (unsigned long long)g_moe_pread_calls,
             (unsigned long long)g_moe_alloc_count,
             (unsigned long long)g_moe_evicted,
-            (unsigned long long)g_moe_fallbacks);
+            (unsigned long long)g_moe_fallbacks,
+            (unsigned long long)(g_moe_fetch_ns / 1000000ull),
+            (unsigned long long)(g_moe_pread_ns / 1000000ull),
+            (unsigned long long)(g_moe_compute_ns / 1000000ull),
+            g_moe_pf.ready ? g_moe_pf.n_io : 0,
+            (unsigned long long)g_moe_pf_jobs,
+            (unsigned long long)g_moe_pf_waits,
+            (unsigned long long)g_moe_pf_useful);
 }
 
 // Банк экспертов: kind 6/7, dims [n_experts, rows, cols], блоки GGML.
@@ -1321,6 +1718,7 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
     moe_cache_init();
     moe_source_init(m, &src);
     use_pread = src.use && g_moe_cache.ready && !g_moe_cache.disabled;
+    if (use_pread) moe_pf_start();
     if (use_pread) {
         // Смещение банка в файле: отображение начинается с нуля файла, поэтому
         // «указатель блока минус база отображения» и есть file offset. Если
@@ -1385,6 +1783,16 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
             fprintf(stderr, " %d:%.6f", chosen[k], weights[k]);
         fprintf(stderr, "\n");
     }
+    // 3b. Prefetch: пока главный поток считает эксперта 0, воркеры читают
+    //     остальных. Порядок очереди — порядок спроса (gate/up/down на
+    //     эксперта), поэтому ожидание на первом эксперте минимально.
+    if (use_pread && top_k > 0)
+        moe_pf_prefetch_experts(&src, chosen, top_k, gate_off, up_off, down_off,
+                                (size_t)(expert_blocks
+                                         * (int64_t)gate_block_bytes),
+                                (size_t)(expert_blocks
+                                         * (int64_t)down_block_bytes));
+
     // 4. madvise — только когда pread-кэш не работает (выключен или нет
     //    дескриптора). С кэшем упреждение вредно: оно втягивает в page cache
     //    ровно те страницы, которые pread и так читает мимо отображения.
@@ -1412,6 +1820,7 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         int (*silu)(float *, const float *, int) =
             (m->backend && m->backend->silu) ? m->backend->silu
                                              : vtm_backend_scalar_lut.silu;
+        moe_cache_entry *gpin = NULL, *upin = NULL, *dpin = NULL;
         for (k = 0; k < top_k; k++) {
             int ex = chosen[k];
             const uint8_t *gb = (const uint8_t *)gate_bank->qblocks +
@@ -1433,26 +1842,37 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
                                int) =
                 down_bank->kind == VTM_TENSOR_Q4K ? vtm_q4k_tmv : vtm_q6k_tmv;
 
-            // pread в свой кэш: попадание — готовые байты, промах — один
-            // крупный pread на всю матрицу эксперта. NULL — кэш выключен или
-            // чтение не удалось, тогда остаётся mmap-указатель.
+            // pread в свой кэш: попадание — готовые байты, промах — ожидание
+            // prefetch (или один крупный pread на всю матрицу эксперта).
+            // NULL — кэш выключен или чтение не удалось, тогда остаётся
+            // mmap-указатель. Взятые слоты закреплены до конца счёта: воркеры
+            // вытесняют только незакреплённые.
             if (use_pread) {
                 const uint8_t *cached;
-                if ((cached = moe_cache_fetch(&src, gate_off, (uint32_t)ex,
-                                              expert_bytes)) != NULL)
-                    gb = cached;
-                if ((cached = moe_cache_fetch(&src, up_off, (uint32_t)ex,
-                                              expert_bytes)) != NULL)
-                    ub = cached;
-                if ((cached = moe_cache_fetch(&src, down_off, (uint32_t)ex,
-                                              down_bytes)) != NULL)
-                    db = cached;
+                uint64_t t_fetch = moe_now_ns();
+                cached = moe_cache_acquire(&src, gate_off, (uint32_t)ex,
+                                           expert_bytes, &gpin);
+                if (cached) gb = cached;
+                cached = moe_cache_acquire(&src, up_off, (uint32_t)ex,
+                                           expert_bytes, &upin);
+                if (cached) ub = cached;
+                cached = moe_cache_acquire(&src, down_off, (uint32_t)ex,
+                                           down_bytes, &dpin);
+                if (cached) db = cached;
+                g_moe_fetch_ns += moe_now_ns() - t_fetch;
             }
 
+            {
+            uint64_t t_c = moe_now_ns();
             if (kernel(gate, gb, x->f32, inter, hidden) != 0 ||
                 kernel(up, ub, x->f32, inter, hidden) != 0) {
                 free(logits); free(chosen); free(weights); free(acc);
                 free(scratch);
+                // Ошибка ядра прерывает прогон, но закреплённые слоты
+                // вернуть надо: иначе запись навсегда останется pin>0 и её
+                // нельзя будет вытеснить.
+                moe_cache_unpin(gpin); moe_cache_unpin(upin);
+                moe_cache_unpin(dpin);
                 return fail(m, ins, VTM_E_TENSOR,
                             "MOE: ядро gate/up вернуло ошибку (эксперт %d)",
                             ex);
@@ -1460,6 +1880,11 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
             if (silu(gate, gate, inter) != 0) {
                 free(logits); free(chosen); free(weights); free(acc);
                 free(scratch);
+                // Ошибка ядра прерывает прогон, но закреплённые слоты
+                // вернуть надо: иначе запись навсегда останется pin>0 и её
+                // нельзя будет вытеснить.
+                moe_cache_unpin(gpin); moe_cache_unpin(upin);
+                moe_cache_unpin(dpin);
                 return fail(m, ins, VTM_E_TENSOR,
                             "MOE: ядро SILU вернуло ошибку (эксперт %d)", ex);
             }
@@ -1467,11 +1892,23 @@ static vtm_status op_moe(vtm_t *m, uint32_t ins, const vtm_instr *in) {
             if (kernel_down(out, db, mul, hidden, inter) != 0) {
                 free(logits); free(chosen); free(weights); free(acc);
                 free(scratch);
+                // Ошибка ядра прерывает прогон, но закреплённые слоты
+                // вернуть надо: иначе запись навсегда останется pin>0 и её
+                // нельзя будет вытеснить.
+                moe_cache_unpin(gpin); moe_cache_unpin(upin);
+                moe_cache_unpin(dpin);
                 return fail(m, ins, VTM_E_TENSOR,
                             "MOE: ядро down вернуло ошибку (эксперт %d)", ex);
             }
             for (i = 0; i < hidden; i++)
                 acc[i] += weights[k] * (double)out[i];
+            g_moe_compute_ns += moe_now_ns() - t_c;
+            }
+            if (use_pread) {
+                moe_cache_unpin(gpin);
+                moe_cache_unpin(upin);
+                moe_cache_unpin(dpin);
+            }
         }
     }
 

@@ -1178,7 +1178,7 @@
   {
     "id": "0177",
     "title": "30B MoE: предзагрузка, LFU, батч-декод",
-    "status": "in_progress",
+    "status": "done",
     "file": "0177-moe-speed.md",
     "assignee": "agent:moe-speed2"
   },
