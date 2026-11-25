@@ -1132,5 +1132,19 @@
     "status": "done",
     "file": "0170-quant-lmhead.md",
     "assignee": "agent:quant-lmhead"
+  },
+  {
+    "id": "0171",
+    "title": "Декодные ядра Q4_K/Q6_K",
+    "status": "in_progress",
+    "file": "0171-qk-decode-kernels.md",
+    "assignee": "agent:qk-kernels"
+  },
+  {
+    "id": "0172",
+    "title": "MoE в ВТМ — Qwen3-30B-A3B",
+    "status": "in_progress",
+    "file": "0172-moe-support.md",
+    "assignee": "agent:moe"
   }
 ]
