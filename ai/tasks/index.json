@@ -1136,7 +1136,7 @@
   {
     "id": "0171",
     "title": "Декодные ядра Q4_K/Q6_K",
-    "status": "in_progress",
+    "status": "done",
     "file": "0171-qk-decode-kernels.md",
     "assignee": "agent:qk-kernels"
   },

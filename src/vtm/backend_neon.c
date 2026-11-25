@@ -2430,7 +2430,7 @@ int vtm_neon_q4_batch_i8(float *y, const uint8_t *q, const float *scales,
     return 0;
 }
 
-// --- NEON: int8-dot GEMV для декода kind 6/7 (задача 0169) -----------------
+// --- NEON: int8-dot GEMV для декода kind 6/7 (задачи 0169, 0171) -----------
 //
 // Зачем. Декод — это n == 1: ядро q4k_row_dot_f32 разворачивает каждый
 // под-блок 32 значения в f32 (12 инструкций на 16 значений только на
@@ -2454,13 +2454,18 @@ int vtm_neon_q4_batch_i8(float *y, const uint8_t *q, const float *scales,
 //     квантования на него не влияет;
 //   * веса и активации — по 16 байт в SDOT; 32 значения под-блока Q4_K — два
 //     SDOT, дорожки int32 — четыре независимых частичных суммы, они копятся в
-//     2 f32-аккумулятора (чётные/нечётные под-блоки), а в double сворачиваются
-//     раз на 256 значений (как f32-ядро, но с f32 внутри блока).
+//     f32-аккумулятор под-блока (у каждого своего — 8 независимых цепочек
+//     vfma), а в double сворачиваются раз на 256 значений (как f32-ядро, но с
+//     f32 внутри блока).
 //
-// Стоимость под-блока 32 значения (planes = 2): 2 загрузки весов,
-// 2 распаковки нибблов, 4 SDOT, 2 cvt, 2 vfma, 1 fma минимума и 2 скалярных
-// fmul ≈ 20 инструкций против ≈30 у f32 ⇒ потолок ×1,5 по инструкциям; замер
-// (bench_backend --q4k-i8) — 1,5×, у planes = 1 — 1,8×.
+// Стоимость под-блока 32 значения (planes = 3, задача 0171): 2 загрузки
+// весов, 2 распаковки нибблов, 6 загрузок активаций, 6 SDOT, 2 vmlaq + 1 add
+// (слияние плоскостей в int32), 1 cvt, 1 vfma и 1 выборка масштаба из вектора
+// ≈ 23 инструкции; масштабы всех 8 под-блоков блока считаются векторно один
+// раз на блок (~4 инструкции на под-блок в пересчёте). Замер
+// (bench_backend --q4k-i8, 11008x2048, A/B с версией 0169, min из трёх
+// парных прогонов): 66,5 → 80,2 Г MAC/с, planes = 2 — 80,5 → 98,4,
+// planes = 1 — 103,4 → 131,8.
 //
 // Отказ (−1) — CPU без FEAT_DotProd, cols не кратен 256 (строка не
 // начинается с границы блока) или нет памяти: диспетчер backend_scalar.c
@@ -2484,27 +2489,10 @@ static inline void q4k_i8_sub(const uint8_t *qs, int high, int8x16_t *w0,
 }
 
 // 16 значений Q6_K под-блока sub -> int8 (q − 32) ∈ [−32,31]: точное
-// представление, ошибки от весов нет.
-static inline int8x16_t q6k_i8_sub(const uint8_t *block, unsigned sub) {
-    const unsigned chunk = sub >> 3;
-    const unsigned in = sub & 7u;
-    const unsigned quad = in >> 1;
-    const unsigned half = in & 1u;
-    const uint8_t *ql = block + (size_t)chunk * 64u
-                      + (size_t)(quad & 1u) * 32u + (size_t)half * 16u;
-    const uint8_t *qh = block + 128u + (size_t)chunk * 32u
-                      + (size_t)half * 16u;
-    uint8x16_t qlb = vld1q_u8(ql);
-    uint8x16_t qhb = vld1q_u8(qh);
-    uint8x16_t nib = (quad >= 2u) ? vshrq_n_u8(qlb, 4)
-                                  : vandq_u8(qlb, vdupq_n_u8(0x0fu));
-    uint8x16_t two = vandq_u8(vshlq_u8(qhb, vdupq_n_s8(-(int)(quad * 2u))),
-                              vdupq_n_u8(0x03u));
-
-    return vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(nib,
-                                                 vshlq_n_u8(two, 4))),
-                    vdupq_n_s8(32));
-}
+// представление, ошибки от весов нет. Раскладка: ql-ниббл (младший или
+// старший — quad >= 2) плюс 2 бита qh со сдвигом quad·2, и всё минус 32.
+// Распаковка теперь в теле q6k_i8_row_q6k (там ql/qh грузятся на чанк), а
+// формула та же: 16 значений = 2 байта ql-нибблов + 2 бита qh на значение.
 
 typedef struct {
     float *y;
@@ -2580,6 +2568,54 @@ static void qk_i8_quant(qk_i8_job *j) {
     }
 }
 
+// --- int8-декод kind 6/7: масштабы блоков — вектором (задача 0171) -------
+//
+// Замер аблацией (2048x2048, 1 поток, 3 плоскости): тело без скалярного
+// get_scale_min быстрее на 18%, без min/Σx — на 12%, без cvt/vfma — на 14%.
+// Значит, из ~32 инструкций на под-блок около 24 уходило на обвязку вокруг
+// шести SDOT. Здесь обвязка перенесена в векторы и считается один раз на блок
+// (8 под-блоков), а поправки плоскостей складываются в int32 ДО cvt, так что
+// на под-блок остаётся один cvt + один vfma вместо трёх.
+//
+// Точность от слияния плоскостей в int32 не страдает: |i1·32258 + i2·127 + i3|
+// <= 246,7 млн у Q4_K и <= 526 млн у Q6_K (int32 держит 2,1 млрд), а ошибка
+// округления f32 при cvt — 6e-8 относительно, то есть на уровне f32-суммы.
+// Δ против f32-ядра остаётся ~1e-7 (проверяет bench_backend --q4k-i8/--check).
+
+// 4 байта (точные целые 0..63) -> f32x4.
+static inline float32x4_t q4k_u8x4_to_f32(uint8x8_t v) {
+    return vcvtq_f32_u32(vmovl_u16(vget_low_u16(vmovl_u8(v))));
+}
+
+// (sc, mn) восьми под-блоков Q4_K -> четыре f32-вектора. Раскладка 6-битных
+// полей — get_scale_min из ggml: sc[0..3]=s[0..3]&0x3f, mn[0..3]=s[4..7]&0x3f,
+// sc[4..7]=(s[8..11]&0x0f)|((s[0..3]&0xc0)>>2),
+// mn[4..7]=(s[8..11]>>4)|((s[4..7]&0xc0)>>2). Читаются 16 байт с bp+4: 12
+// нужных и 4 байта qs того же блока (блок 144 Б), за границу не выходим.
+static inline void q4k_scmn_f32(const uint8_t *scales, float32x4_t *sc0,
+                                float32x4_t *sc1, float32x4_t *mn0,
+                                float32x4_t *mn1) {
+    const uint8x16_t a = vld1q_u8(scales);
+    const uint8x8_t lo = vget_low_u8(a);       // s0..s7
+    const uint8x8_t hi = vget_high_u8(a);      // s8..s15 (нужны 8..11)
+    const uint8x8_t m3f = vdup_n_u8(0x3Fu);
+    const uint8x8_t m0f = vdup_n_u8(0x0Fu);
+    const uint8x8_t mc0 = vdup_n_u8(0xC0u);
+    // Байты 0..3 — sc[0..3], байты 4..7 — mn[0..3]: один and на оба.
+    const uint8x8_t ns = vand_u8(lo, m3f);
+    const uint8x8_t sch = vorr_u8(vand_u8(hi, m0f),
+                                  vshr_n_u8(vand_u8(lo, mc0), 2));
+    const uint8x8_t mnh = vorr_u8(vshr_n_u8(hi, 4),
+                                  vshr_n_u8(vand_u8(vext_u8(lo, lo, 4), mc0),
+                                            2));
+    const uint8x8_t mnl = vext_u8(ns, vdup_n_u8(0), 4);
+
+    *sc0 = q4k_u8x4_to_f32(ns);
+    *sc1 = q4k_u8x4_to_f32(sch);
+    *mn0 = q4k_u8x4_to_f32(mnl);
+    *mn1 = q4k_u8x4_to_f32(mnh);
+}
+
 // Одна строка Q4_K: y = Σ_b Σ_sb (d·sc·Σ q·x − dmin·m·Σx). Под-блоки
 // чётные/нечётные копятся в разные f32-аккумуляторы (две независимые цепочки
 // vfma), в double сворачиваются раз на 256 значений.
@@ -2587,156 +2623,195 @@ static float qk_i8_row_q4k(const qk_i8_job *j, int r) {
     const int nblocks = j->cols / (int)VTM_Q4K_BLOCK_VALUES;
     const uint8_t *bp = j->blocks
         + (size_t)r * (size_t)nblocks * (size_t)VTM_Q4K_BLOCK_BYTES;
-    const float k254 = 1.0f / 254.0f;
-    const float k254_127 = 1.0f / (254.0f * 127.0f);
+    const int planes = j->planes;
+    // Три плоскости складываются в int32 ДО cvt:
+    //   it = i1·32258 + i2·127 + i3 (32258 = 254·127, 127 — шаг 2-й плоскости),
+    //   y += cvt(it) · d·sc·sx·kf,
+    // где kf = 1/32258 (три плоскости), 1/254 (две) или 1 (одна) — ровно
+    // i1 + i2/254 + i3/(254·127) из контракта ядра.
+    const float kf = (planes >= 3) ? (1.0f / 32258.0f)
+                   : (planes == 2) ? (1.0f / 254.0f) : 1.0f;
     double total = 0.0;
     int b, sb;
 
-    // Под-блок 32 значения. S — литерал (0..7): сдвиги нибблов, ветки
-    // q4k_scale_min (j < 4) и чётность сворачиваются на компиляции, поэтому
-    // 8 под-блоков тела разворачиваются в один прямой участок без ветвей.
-    // Аккумуляторы — два (чётные/нечётные под-блоки): две независимые цепочки
-    // vfma по 4, иначе латентность fma делает ILP = 1 (замер: развёрнутое
-    // тело 2048x2048 — 1,79x против f32 вместо 1,58x).
-#define Q4K_I8_SUB(S)                                                      \
+    // Под-блок 32 значения. S — литерал (0..7): распаковка нибблов и выбор
+    // дорожки масштаба/аккумулятора сворачиваются на компиляции, поэтому 8
+    // под-блоков тела разворачиваются в один прямой участок без ветвей.
+    // Аккумулятор у каждого под-блока свой: 8 независимых цепочек vfma, иначе
+    // ILP упирается в латентность fma.
+#define Q4K_I8_SUB(S, ACC, AV, LN)                                         \
     do {                                                                   \
-        unsigned sc, mn;                                                   \
-        const float sx = j->sx[sb + (S)];                                  \
         const int8_t *xp = j->xq + (size_t)(sb + (S)) * 32u;               \
         int8x16_t w0, w1;                                                  \
-        int32x4_t i1;                                                      \
-        float a;                                                           \
-        q4k_scale_min(bp + 4, (unsigned)(S), &sc, &mn);                    \
+        int32x4_t it;                                                      \
         q4k_i8_sub(bp + 16u + (size_t)((S) >> 1) * 32u, (S) & 1,           \
                    &w0, &w1);                                              \
-        i1 = VTM_SDOT(VTM_SDOT(vdupq_n_s32(0), w0, vld1q_s8(xp)),          \
+        it = VTM_SDOT(VTM_SDOT(vdupq_n_s32(0), w0, vld1q_s8(xp)),          \
                       w1, vld1q_s8(xp + 16));                              \
-        a = d * (float)sc * sx;                                            \
-        if (j->planes >= 2) {                                              \
+        if (planes >= 2) {                                                 \
             const int8_t *rp = j->xr + (size_t)(sb + (S)) * 32u;           \
-            const int8x16_t xr0 = vld1q_s8(rp);                            \
-            const int8x16_t xr1 = vld1q_s8(rp + 16);                       \
-            int32x4_t i2 = VTM_SDOT(VTM_SDOT(vdupq_n_s32(0), w0, xr0),    \
-                                    w1, xr1);                              \
-            acc##S = vfmaq_n_f32(acc##S, vcvtq_f32_s32(i1), a);            \
-            acc##S = vfmaq_n_f32(acc##S, vcvtq_f32_s32(i2), a * k254);     \
-            if (j->planes >= 3) {                                          \
+            int32x4_t i2 = VTM_SDOT(VTM_SDOT(vdupq_n_s32(0), w0,           \
+                                             vld1q_s8(rp)),                \
+                                    w1, vld1q_s8(rp + 16));                \
+            if (planes >= 3) {                                             \
                 const int8_t *sp = j->xs + (size_t)(sb + (S)) * 32u;       \
                 int32x4_t i3 = VTM_SDOT(                                   \
                     VTM_SDOT(vdupq_n_s32(0), w0, vld1q_s8(sp)),            \
                     w1, vld1q_s8(sp + 16));                                \
-                acc##S = vfmaq_n_f32(acc##S, vcvtq_f32_s32(i3),            \
-                                     a * k254_127);                        \
+                it = vmulq_n_s32(it, 32258);                               \
+                it = vmlaq_n_s32(it, i2, 127);                             \
+                it = vaddq_s32(it, i3);                                    \
+            } else {                                                       \
+                it = vaddq_s32(vmulq_n_s32(it, 254), i2);                  \
             }                                                              \
-        } else {                                                           \
-            acc##S = vfmaq_n_f32(acc##S, vcvtq_f32_s32(i1), a);            \
         }                                                                  \
-        mn##S += (dmin * (float)mn) * j->xsum[sb + (S)];                   \
+        ACC = vfmaq_n_f32(ACC, vcvtq_f32_s32(it),                         \
+                          vgetq_lane_f32(AV, LN));                         \
     } while (0)
 
     for (b = 0; b < nblocks; b++, bp += VTM_Q4K_BLOCK_BYTES) {
         const float d = q4k_f16(bp);
         const float dmin = q4k_f16(bp + 2);
-        // 8 аккумуляторов: у каждого под-блока своя цепочка vfma, зависимости
-        // между под-блоками нет — так ILP не упирается в латентность.
+        const float dk = d * kf;
+
+        float32x4_t sc0, sc1, mn0, mn1, aq0, aq1, mq0, mq1;
         float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = acc0, acc2 = acc0;
         float32x4_t acc3 = acc0, acc4 = acc0, acc5 = acc0, acc6 = acc0;
         float32x4_t acc7 = acc0;
-        float mn0 = 0.0f, mn1 = 0.0f, mn2 = 0.0f, mn3 = 0.0f;
-        float mn4 = 0.0f, mn5 = 0.0f, mn6 = 0.0f, mn7 = 0.0f;
 
         sb = b * 8;
-        Q4K_I8_SUB(0);
-        Q4K_I8_SUB(1);
-        Q4K_I8_SUB(2);
-        Q4K_I8_SUB(3);
-        Q4K_I8_SUB(4);
-        Q4K_I8_SUB(5);
-        Q4K_I8_SUB(6);
-        Q4K_I8_SUB(7);
+        // Масштабы блока: aq = d·kf·sc·sx (на под-блок), mq = dmin·mn·Σx.
+        q4k_scmn_f32(bp + 4, &sc0, &sc1, &mn0, &mn1);
+        aq0 = vmulq_n_f32(vmulq_f32(sc0, vld1q_f32(j->sx + sb)), dk);
+        aq1 = vmulq_n_f32(vmulq_f32(sc1, vld1q_f32(j->sx + sb + 4)), dk);
+        mq0 = vmulq_n_f32(vmulq_f32(mn0, vld1q_f32(j->xsum + sb)), dmin);
+        mq1 = vmulq_n_f32(vmulq_f32(mn1, vld1q_f32(j->xsum + sb + 4)), dmin);
+        total -= (double)vaddvq_f32(vaddq_f32(mq0, mq1));
+
+        Q4K_I8_SUB(0, acc0, aq0, 0);
+        Q4K_I8_SUB(1, acc1, aq0, 1);
+        Q4K_I8_SUB(2, acc2, aq0, 2);
+        Q4K_I8_SUB(3, acc3, aq0, 3);
+        Q4K_I8_SUB(4, acc4, aq1, 0);
+        Q4K_I8_SUB(5, acc5, aq1, 1);
+        Q4K_I8_SUB(6, acc6, aq1, 2);
+        Q4K_I8_SUB(7, acc7, aq1, 3);
 #undef Q4K_I8_SUB
         total += (double)vaddvq_f32(
             vaddq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)),
                       vaddq_f32(vaddq_f32(acc4, acc5), vaddq_f32(acc6, acc7))));
-        total -= (double)((mn0 + mn1) + (mn2 + mn3))
-               + (double)((mn4 + mn5) + (mn6 + mn7));
     }
     return (float)total;
 }
 
 // Одна строка Q6_K: 16 под-блоков по 16 значений, w = d·sc·(q − 32), минимума
 // нет. Под-блок 16 значений — ровно один SDOT.
+//
+// ql и qh переиспользуются: на чанк из 128 значений (8 под-блоков) нужно 4
+// загрузки ql (16 байт) и 2 загрузки qh, а не 16 загрузок по 2, как когда
+// под-блок достаёт свои байты сам. Сдвиг qh (0/2/4/6) и старший/младший
+// ниббл ql определяются номером под-блока — литералы, ветвей нет.
+// Масштабы (16 int8) и d·sx — вектором один раз на блок, плоскости
+// складываются в int32 до cvt (см. Q4_K выше, там же замер аблацией).
 static float qk_i8_row_q6k(const qk_i8_job *j, int r) {
     const int nblocks = j->cols / (int)VTM_Q4K_BLOCK_VALUES;
     const uint8_t *bp = j->blocks
         + (size_t)r * (size_t)nblocks * (size_t)VTM_Q6K_BLOCK_BYTES;
-    const float k254 = 1.0f / 254.0f;
-    const float k254_127 = 1.0f / (254.0f * 127.0f);
+    const int planes = j->planes;
+    const float kf = (planes >= 3) ? (1.0f / 32258.0f)
+                   : (planes == 2) ? (1.0f / 254.0f) : 1.0f;
     double total = 0.0;
     int b, sb;
 
-    // 16 под-блоков по 16 значений, тело развёрнуто литералами (см. Q4_K):
-    // сдвиг qh, чётность и адреса сворачиваются, аккумулятор у каждого
-    // под-блока свой — цепочки vfma независимы.
-#define Q6K_I8_SUB(S)                                                      \
+    // S — литерал (0..15), QLB/QHB — уже загруженные векторы чанка. SBX/OFF
+    // (под-блок активаций 32 значения и его половина), SH (сдвиг qh), HIGH
+    // (старший ниббл ql) — выводятся из S на компиляции.
+#define Q6K_I8_SUB(S, ACC, AV, LN, QLB, QHB, SH, HIGH)                     \
     do {                                                                   \
-        const int8x16_t w = q6k_i8_sub(bp, (unsigned)(S));                 \
         const int sbx = sb + ((S) >> 1);                                   \
-        const int8_t *xp = j->xq + (size_t)sbx * 32u + (size_t)((S) & 1) * 16u; \
-        const float a = d * (float)(int)(int8_t)bp[192u + (unsigned)(S)]   \
-                      * j->sx[sbx];                                        \
-        int32x4_t i1 = VTM_SDOT(vdupq_n_s32(0), w, vld1q_s8(xp));          \
-        if (j->planes >= 2) {                                              \
-            const int8_t *rp = j->xr + (size_t)sbx * 32u                  \
-                             + (size_t)((S) & 1) * 16u;                    \
+        const int off = ((int)(S) & 1) * 16;                               \
+        const int8_t *xp = j->xq + (size_t)sbx * 32u + (size_t)off;        \
+        const uint8x16_t nib = (HIGH) ? vshrq_n_u8(QLB, 4)                 \
+                                      : vandq_u8(QLB, vdupq_n_u8(0x0fu));  \
+        const uint8x16_t two = vandq_u8(vshlq_u8(QHB, vdupq_n_s8(-(SH))),  \
+                                        vdupq_n_u8(0x03u));                \
+        int8x16_t w = vsubq_s8(                                            \
+            vreinterpretq_s8_u8(vorrq_u8(nib, vshlq_n_u8(two, 4))),        \
+            vdupq_n_s8(32));                                               \
+        int32x4_t it = VTM_SDOT(vdupq_n_s32(0), w, vld1q_s8(xp));          \
+        if (planes >= 2) {                                                 \
+            const int8_t *rp = j->xr + (size_t)sbx * 32u + (size_t)off;    \
             int32x4_t i2 = VTM_SDOT(vdupq_n_s32(0), w, vld1q_s8(rp));      \
-            acc##S = vfmaq_n_f32(acc##S, vcvtq_f32_s32(i1), a);            \
-            acc##S = vfmaq_n_f32(acc##S, vcvtq_f32_s32(i2), a * k254);     \
-            if (j->planes >= 3) {                                          \
-                const int8_t *sp = j->xs + (size_t)sbx * 32u              \
-                                 + (size_t)((S) & 1) * 16u;                \
+            if (planes >= 3) {                                             \
+                const int8_t *sp = j->xs + (size_t)sbx * 32u               \
+                                 + (size_t)off;                            \
                 int32x4_t i3 = VTM_SDOT(vdupq_n_s32(0), w, vld1q_s8(sp));  \
-                acc##S = vfmaq_n_f32(acc##S, vcvtq_f32_s32(i3),            \
-                                     a * k254_127);                        \
+                it = vmulq_n_s32(it, 32258);                               \
+                it = vmlaq_n_s32(it, i2, 127);                             \
+                it = vaddq_s32(it, i3);                                    \
+            } else {                                                       \
+                it = vaddq_s32(vmulq_n_s32(it, 254), i2);                  \
             }                                                              \
-        } else {                                                           \
-            acc##S = vfmaq_n_f32(acc##S, vcvtq_f32_s32(i1), a);            \
         }                                                                  \
+        ACC = vfmaq_n_f32(ACC, vcvtq_f32_s32(it),                         \
+                          vgetq_lane_f32(AV, LN));                         \
     } while (0)
 
     for (b = 0; b < nblocks; b++, bp += VTM_Q6K_BLOCK_BYTES) {
-        const float d = q4k_f16(bp + 208u);
+        const float dk = q4k_f16(bp + 208u) * kf;
+        float32x4_t aq0, aq1, aq2, aq3;
         float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = acc0, acc2 = acc0;
-        float32x4_t acc3 = acc0, acc4 = acc0, acc5 = acc0, acc6 = acc0;
-        float32x4_t acc7 = acc0, acc8 = acc0, acc9 = acc0, acc10 = acc0;
-        float32x4_t acc11 = acc0, acc12 = acc0, acc13 = acc0;
-        float32x4_t acc14 = acc0, acc15 = acc0;
+        float32x4_t acc3 = acc0;
 
         sb = b * 8;
-        Q6K_I8_SUB(0);
-        Q6K_I8_SUB(1);
-        Q6K_I8_SUB(2);
-        Q6K_I8_SUB(3);
-        Q6K_I8_SUB(4);
-        Q6K_I8_SUB(5);
-        Q6K_I8_SUB(6);
-        Q6K_I8_SUB(7);
-        Q6K_I8_SUB(8);
-        Q6K_I8_SUB(9);
-        Q6K_I8_SUB(10);
-        Q6K_I8_SUB(11);
-        Q6K_I8_SUB(12);
-        Q6K_I8_SUB(13);
-        Q6K_I8_SUB(14);
-        Q6K_I8_SUB(15);
+        {
+            // 16 int8-масштабов -> 4 f32-вектора; sx под-блока 16 значений
+            // совпадает с его половиной в 32-значном под-блоке активаций
+            // (S и S+1 делят sx), поэтому sx дублируется попарно (vzip).
+            float32x4_t scv[4];
+            const float32x4_t lo = vld1q_f32(j->sx + sb);
+            const float32x4_t hi = vld1q_f32(j->sx + sb + 4);
+
+            q4_i8x16_to_f32x4(vld1q_s8((const int8_t *)(bp + 192u)), scv);
+            aq0 = vmulq_n_f32(vmulq_f32(scv[0], vzip1q_f32(lo, lo)), dk);
+            aq1 = vmulq_n_f32(vmulq_f32(scv[1], vzip2q_f32(lo, lo)), dk);
+            aq2 = vmulq_n_f32(vmulq_f32(scv[2], vzip1q_f32(hi, hi)), dk);
+            aq3 = vmulq_n_f32(vmulq_f32(scv[3], vzip2q_f32(hi, hi)), dk);
+        }
+        {
+            const uint8x16_t ql0 = vld1q_u8(bp + 0u);
+            const uint8x16_t ql1 = vld1q_u8(bp + 16u);
+            const uint8x16_t ql2 = vld1q_u8(bp + 32u);
+            const uint8x16_t ql3 = vld1q_u8(bp + 48u);
+            const uint8x16_t ql4 = vld1q_u8(bp + 64u);
+            const uint8x16_t ql5 = vld1q_u8(bp + 80u);
+            const uint8x16_t ql6 = vld1q_u8(bp + 96u);
+            const uint8x16_t ql7 = vld1q_u8(bp + 112u);
+            const uint8x16_t qh0 = vld1q_u8(bp + 128u);
+            const uint8x16_t qh1 = vld1q_u8(bp + 144u);
+            const uint8x16_t qh2 = vld1q_u8(bp + 160u);
+            const uint8x16_t qh3 = vld1q_u8(bp + 176u);
+
+            Q6K_I8_SUB(0, acc0, aq0, 0, ql0, qh0, 0, 0);
+            Q6K_I8_SUB(1, acc1, aq0, 1, ql1, qh1, 0, 0);
+            Q6K_I8_SUB(2, acc2, aq0, 2, ql2, qh0, 2, 0);
+            Q6K_I8_SUB(3, acc3, aq0, 3, ql3, qh1, 2, 0);
+            Q6K_I8_SUB(4, acc0, aq1, 0, ql0, qh0, 4, 1);
+            Q6K_I8_SUB(5, acc1, aq1, 1, ql1, qh1, 4, 1);
+            Q6K_I8_SUB(6, acc2, aq1, 2, ql2, qh0, 6, 1);
+            Q6K_I8_SUB(7, acc3, aq1, 3, ql3, qh1, 6, 1);
+            Q6K_I8_SUB(8, acc0, aq2, 0, ql4, qh2, 0, 0);
+            Q6K_I8_SUB(9, acc1, aq2, 1, ql5, qh3, 0, 0);
+            Q6K_I8_SUB(10, acc2, aq2, 2, ql6, qh2, 2, 0);
+            Q6K_I8_SUB(11, acc3, aq2, 3, ql7, qh3, 2, 0);
+            Q6K_I8_SUB(12, acc0, aq3, 0, ql4, qh2, 4, 1);
+            Q6K_I8_SUB(13, acc1, aq3, 1, ql5, qh3, 4, 1);
+            Q6K_I8_SUB(14, acc2, aq3, 2, ql6, qh2, 6, 1);
+            Q6K_I8_SUB(15, acc3, aq3, 3, ql7, qh3, 6, 1);
+        }
 #undef Q6K_I8_SUB
         total += (double)vaddvq_f32(
-            vaddq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)),
-                      vaddq_f32(vaddq_f32(acc4, acc5), vaddq_f32(acc6, acc7)))
-            + vaddq_f32(vaddq_f32(vaddq_f32(acc8, acc9),
-                                  vaddq_f32(acc10, acc11)),
-                        vaddq_f32(vaddq_f32(acc12, acc13),
-                                  vaddq_f32(acc14, acc15))));
+            vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
     }
     return (float)total;
 }
@@ -2744,9 +2819,8 @@ static float qk_i8_row_q6k(const qk_i8_job *j, int r) {
 static void qk_i8_rows(const qk_i8_job *j, int r0, int r1) {
     int r;
 
-    for (r = r0; r < r1; r++) {
+    for (r = r0; r < r1; r++)
         j->y[r] = j->q6 ? qk_i8_row_q6k(j, r) : qk_i8_row_q4k(j, r);
-    }
 }
 
 static void qk_i8_worker(void *p, int tid, int r0, int r1) {

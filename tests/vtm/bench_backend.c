@@ -3253,6 +3253,188 @@ static int run_logits(const char *explicit_path, const vtm_backend *cand) {
 // читается N раз) против батчевого (строка деквантизуется один раз на пачку).
 // G MAC/s = rows·cols·ntok / t. Форма cols кратна 256 — работает NEON-ядро;
 // иначе оно отказывает и считается скалярный откат (медленнее, но верно).
+
+// --- проекция декода по формам модели (задача 0171) ------------------------
+//
+// Абсолютный tok/s декода этой машиной померить нельзя: токен читает ~1,7 ГБ
+// блоков Q4_K/Q6_K и 0,31 ГБ int8-таблицы, и при свопе/чужой нагрузке время
+// уходит в page fault (в сессии 0171 — 1,7-2,8 с/токен при 2,2 ГБ pageins на
+// токен, тогда как ядро на тех же формах из кэша даёт 50-80 мс). Поэтому
+// проба меряет ядра на РЕАЛЬНЫХ формах тензоров модели (блоки синтетические,
+// из памяти) и складывает время токена по составу модели:
+//
+//   t_токена = Σ_формы(6/7) count·t(форма) + t(kind 4: упакованная таблица)
+//
+// Это не заменяет замер на живой модели, но даёт воспроизводимую величину,
+// по которой видно эффект правок ядер (парный запуск двух бинарей в одном
+// окружении: до/после). Разбивка по формам печатается — видно, что дороже.
+typedef struct {
+    int kind;           // VTM_TENSOR_Q4K / VTM_TENSOR_Q6K
+    int rows, cols;
+    int count;
+    double ms;          // время одного тензора формы
+} qk_shape;
+
+static int qk_proj_group(qk_shape *g, int n, int kind, int rows, int cols) {
+    int i;
+
+    for (i = 0; i < n; i++)
+        if (g[i].kind == kind && g[i].rows == rows && g[i].cols == cols) {
+            g[i].count++;
+            return n;
+        }
+    if (n >= 64) return n;
+    g[n].kind = kind;
+    g[n].rows = rows;
+    g[n].cols = cols;
+    g[n].count = 1;
+    g[n].ms = 0.0;
+    return n + 1;
+}
+
+static int run_qk_proj(const char *explicit_path, int iters) {
+    const char *path = find_model(explicit_path);
+    qk_shape shapes[64];
+    int nshapes = 0, i, it;
+    int i8_rows = 0, i8_cols = 0;
+    vtm_t *m;
+    double total_ms = 0.0, i8_ms = 0.0;
+
+    if (!path) {
+        fprintf(stderr, "модель не найдена (--qk-proj PATH)\n");
+        return 2;
+    }
+    if (iters < 1) iters = 5;
+    m = vtm_load(path);
+    if (!m) {
+        fprintf(stderr, "vtm_load(%s): %s\n", path, vtm_last_error());
+        return 1;
+    }
+    {
+        uint32_t t, nt = vtm_tensor_count(m);
+
+        for (t = 0; t < nt; t++) {
+            const vtm_tensor *tt = vtm_tensor_by_index(m, t);
+
+            if (!tt) continue;
+            if (tt->kind == VTM_TENSOR_Q4K || tt->kind == VTM_TENSOR_Q6K) {
+                if (tt->ndim != 2) continue;
+                nshapes = qk_proj_group(shapes, nshapes, tt->kind,
+                                        (int)tt->dims[0], (int)tt->dims[1]);
+            } else if (tt->kind == VTM_TENSOR_INT8 && tt->ndim == 2
+                       && (int)tt->dims[0] > i8_rows) {
+                i8_rows = (int)tt->dims[0];
+                i8_cols = (int)tt->dims[1];
+            }
+        }
+    }
+    vtm_free(m);   // 2 ГБ модели не держим: блоки всё равно синтетические
+
+    printf("проекция декода %s\n", path);
+    printf("  режим int8: %d плоскостей (%s), потоков %d\n",
+           vtm_q4k_i8_mode(), vtm_q4k_i8_name(), vtm_threads());
+    printf("  %-5s %5s %6s %6s %8s %10s %9s %6s\n", "kind", "rows", "cols",
+           "шт", "G MAC", "мс/шт", "мс/токен", "ток/с");
+
+    for (i = 0; i < nshapes; i++) {
+        const int kind = shapes[i].kind, rows = shapes[i].rows;
+        const int cols = shapes[i].cols;
+        const uint8_t *blocks;
+        float *x, *y;
+        double best = 1e300;
+
+        if (rows <= 0 || cols <= 0 || cols % 256 != 0) continue;
+        blocks = kind == VTM_TENSOR_Q6K
+            ? make_q6k(rows * cols, 0x1710u) : make_q4k(rows * cols, 0x1711u);
+        x = make_vec((size_t)cols, 0x1712u);
+        y = (float *)calloc((size_t)rows, sizeof(float));
+        if (!blocks || !x || !y) {
+            printf("  %s: нет памяти на форму %dx%d\n",
+                   kind == VTM_TENSOR_Q6K ? "Q6_K" : "Q4_K", rows, cols);
+            free((void *)blocks);
+            free(x);
+            free(y);
+            continue;
+        }
+        for (it = 0; it < iters; it++) {
+            double t0 = now_ms(), dt;
+            int rc = kind == VTM_TENSOR_Q6K
+                ? vtm_q6k_tmv(y, blocks, x, rows, cols)
+                : vtm_q4k_tmv(y, blocks, x, rows, cols);
+
+            dt = now_ms() - t0;
+            if (rc != 0) { best = 1e300; break; }
+            if (dt < best) best = dt;
+        }
+        shapes[i].ms = best;
+        total_ms += best * (double)shapes[i].count;
+        printf("  %-5s %5d %6d %6d %8.2f %10.3f %9.2f %6.1f\n",
+               kind == VTM_TENSOR_Q6K ? "Q6_K" : "Q4_K", rows, cols,
+               shapes[i].count,
+               (double)rows * (double)cols * (double)shapes[i].count / 1e9,
+               best, best * (double)shapes[i].count,
+               1000.0 / (best > 0.0 ? best : 1.0));
+        free((void *)blocks);
+        free(x);
+        free(y);
+    }
+
+    if (i8_rows > 0 && i8_cols > 0) {
+        // Голова/эмбеддинги (kind 4, упакованная int8-таблица): 0,31 ГБ на
+        // токен, ядро упирается в полосу памяти, а не в инструкции.
+        int8_t *q = (int8_t *)malloc((size_t)i8_rows * (size_t)i8_cols);
+        float *scales = (float *)malloc(
+            ((size_t)i8_rows * (size_t)i8_cols / VTM_SCALE_BLOCK_128 + 1)
+            * sizeof(float));
+        float *x = make_vec((size_t)i8_cols, 0x1713u);
+        float *y = (float *)calloc((size_t)i8_rows, sizeof(float));
+
+        if (q && scales && x && y) {
+            size_t n = (size_t)i8_rows * (size_t)i8_cols;
+            size_t nblk = n / VTM_SCALE_BLOCK_128;
+            size_t k;
+            double best = 1e300;
+
+            for (k = 0; k < n; k++)
+                q[k] = (int8_t)((int)((k * 2654435761u >> 16) % 255u) - 127);
+            for (k = 0; k < nblk; k++) scales[k] = 0.0007f;
+            if (vtm_i8_gemv(y, q, scales, x, i8_rows, i8_cols) == 0) {
+                for (it = 0; it < (iters < 3 ? 3 : iters); it++) {
+                    double t0 = now_ms(), dt;
+
+                    if (vtm_i8_gemv(y, q, scales, x, i8_rows, i8_cols) != 0)
+                        break;
+                    dt = now_ms() - t0;
+                    if (dt < best) best = dt;
+                }
+            }
+            if (best < 1e299) {
+                i8_ms = best;
+                total_ms += best;
+                printf("  %-5s %5d %6d %6d %8.2f %10.3f %9.2f %6.1f\n",
+                       "int8", i8_rows, i8_cols, 1,
+                       (double)n / 1e9, best, best, 1000.0 / best);
+            } else {
+                printf("  int8 %dx%d: ядро вернуло ошибку\n", i8_rows, i8_cols);
+            }
+        } else {
+            printf("  int8 %dx%d: нет памяти на таблицу (%.2f ГБ)\n",
+                   i8_rows, i8_cols,
+                   (double)i8_rows * (double)i8_cols / 1e9);
+        }
+        free(q);
+        free(scales);
+        free(x);
+        free(y);
+    }
+
+    if (total_ms > 0.0)
+        printf("итого проекция: %.2f мс/токен = %.1f ток/с "
+               "(ядра kind 6/7 %.2f мс + голова %.2f мс)\n",
+               total_ms, 1000.0 / total_ms, total_ms - i8_ms, i8_ms);
+    return 0;
+}
+
 // --- int8-dot декод kind 6/7: скорость и точность по плоскостям (0169) -----
 //
 // Одна и та же матрица и один и тот же вектор активаций считаются f32-ядром
@@ -4314,11 +4496,12 @@ static void usage(const char *prog) {
            "           [--decode-limit N]]\n"
            "          [--i8-gemv [--rows N] [--cols N] [--iters N]\n"
            "           [--f32-table]]\n"
+           "          [--qk-proj PATH [--iters N]]\n"
            "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
            "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8);\n"
            "  env VTM_Q4_I8 — int8-dot (SDOT/VNNI): 0 — выключить; 1/2/3 —\n"
-           "    плоскости активаций (декод kind 6/7, задача 0169; по умолчанию\n"
-           "    2); у батчевого Q4 (0163) 1 — один проход, 2|3 — два;\n",
+           "    плоскости активаций (декод kind 6/7, задачи 0169/0171; по\n"
+           "    умолчанию 3); у батчевого Q4 (0163) 1 — один проход, 2|3 — два;\n",
            prog);
 }
 
@@ -4338,8 +4521,9 @@ int main(int argc, char **argv) {
     const char *decode_bench_path = NULL;
     int decode_reps = 2;
     const char *decode_prompts_path = NULL;
-    int decode_new = 8, decode_limit = 0, planes = 2;
+    int decode_new = 8, decode_limit = 0, planes = 3;
     int emb_check_path_set = 0, i8_gemv = 0, i8_f32_table = 0;
+    const char *qk_proj_path = NULL;
     const char *emb_check_path = NULL;
     const char *backend_name = NULL;
     const vtm_backend *cand;
@@ -4411,6 +4595,8 @@ int main(int argc, char **argv) {
             i8_f32_table = 1;
         } else if (strcmp(argv[i], "--decode-bench") == 0 && i + 1 < argc) {
             decode_bench_path = argv[++i];
+        } else if (strcmp(argv[i], "--qk-proj") == 0 && i + 1 < argc) {
+            qk_proj_path = argv[++i];
         } else if (strcmp(argv[i], "--decode-reps") == 0 && i + 1 < argc) {
             decode_reps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--decode-new") == 0 && i + 1 < argc) {
@@ -4466,6 +4652,8 @@ int main(int argc, char **argv) {
                              decode_limit);
     if (i8_gemv)
         return run_i8_gemv_bench(rows, cols, iters, i8_f32_table);
+    if (qk_proj_path)
+        return run_qk_proj(*qk_proj_path ? qk_proj_path : NULL, iters);
     if (decode_bench_path)
         return run_decode_bench(*decode_bench_path ? decode_bench_path : NULL,
                                 decode_prompts_path, decode_new, decode_reps);
