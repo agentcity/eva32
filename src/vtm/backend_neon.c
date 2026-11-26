@@ -4926,8 +4926,20 @@ const vtm_backend vtm_backend_simd = {
 // tests/vtm/test_hybrid_api_parity.py (C-ABI, 3 промпта, оба повтора с кэшем).
 // Парный замер после правки: prefill 64 — 2,03x, prefill 128 — 2,31x, декод
 // 1,02x. Условие 0198 снова выполнено, auto снова hybrid.
+//
+// 2026-11-26 (0204, фаза 3): весь токен декода идёт одним графом (RMSNorm/RoPE/
+// SiLU/KVW/attention на GPU), поэтому DECODE metal стал быстрее CPU, а не
+// только prefill. Парный замер (bench_backend --metal, один процесс, min из 2):
+// декод 30,07 мс/токен = 33,3 ток/с против 50,99 мс = 19,6 ток/с у simd
+// (1,70x), prefill 64 — 41,1 против 10,8 ток/с (3,79x), prefill 128 — 36,0
+// против 11,5 (3,13x). Условие «и декод, и prefill быстрее CPU» выполнено —
+// auto выбирает metal (FULL). Hybrid остаётся явным (VTM_BACKEND=hybrid) для
+// машин, где декод на GPU медленнее; вернуть simd — VTM_AUTO_METAL=0.
+#ifndef VTM_AUTO_METAL
+#define VTM_AUTO_METAL 1
+#endif
 #ifndef VTM_AUTO_HYBRID
-#define VTM_AUTO_HYBRID 1
+#define VTM_AUTO_HYBRID 0
 #endif
 
 // Гибридный бэкенд (0198): ядра — simd, а батчевые GEMM prefill уходят на GPU
@@ -4949,14 +4961,22 @@ static const vtm_backend *backend_hybrid_or_simd(const char *why) {
 const vtm_backend *vtm_backend_by_name(const char *name) {
     if (!name || !*name) return vtm_backend_from_env();
     if (strcmp(name, "auto") == 0) {
-        // 0198: hybrid (GPU только на prefill GEMM), иначе simd. Устройство
-        // проверяется здесь, а шейдеры компилируются лениво при первом GEMM.
+        // 0204: auto = metal (FULL), потому что парный замер показал выигрыш и
+        // в декоде, и в prefill. Иначе — прежние fallback'и: hybrid по 0198,
+        // затем simd/scalar. Устройство проверяется здесь, а шейдеры
+        // компилируются лениво при первом ядре.
         if (!vtm_simd_available()) {
             vtm_metal_set_active(0);
             return &vtm_backend_scalar_lut;
         }
-#if VTM_WITH_METAL && VTM_AUTO_HYBRID
+#if VTM_WITH_METAL && VTM_AUTO_METAL
         // Устройство, а не только сборка: на машине без GPU auto остаётся simd.
+        if (vtm_metal_compiled() && vtm_metal_available()) {
+            vtm_metal_set_mode(VTM_METAL_FULL);
+            return vtm_backend_metal();
+        }
+#endif
+#if VTM_WITH_METAL && VTM_AUTO_HYBRID
         if (vtm_metal_compiled() && vtm_metal_available()) {
             vtm_metal_set_mode(VTM_METAL_BATCH);
             return vtm_backend_hybrid();

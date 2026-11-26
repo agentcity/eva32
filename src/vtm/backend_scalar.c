@@ -56,6 +56,71 @@ int vtm_metal_i8_gemv(float *y, const int8_t *q, const float *sc,
     (void)y; (void)q; (void)sc; (void)x; (void)r; (void)c;
     return -1;
 }
+int vtm_metal_qk_gemm(int kind, float *y, const void *w, const float *sc,
+                      const float *x, int rows, int cols, int ntok) {
+    (void)kind; (void)y; (void)w; (void)sc; (void)x; (void)rows; (void)cols;
+    (void)ntok;
+    return -1;
+}
+int vtm_metal_defer_begin(void) { return -1; }
+int vtm_metal_defer_active(void) { return 0; }
+int vtm_metal_defer_gemv(int kind, float *y, const void *w, const float *sc,
+                         const float *x, int r, int c) {
+    (void)kind; (void)y; (void)w; (void)sc; (void)x; (void)r; (void)c;
+    return 1;
+}
+int vtm_metal_defer_submit(void) { return -1; }
+int vtm_metal_defer_wait(void) { return -1; }
+int vtm_metal_defer_end(void) { return -1; }
+int vtm_metal_graph_available(void) { return 0; }
+int vtm_metal_graph_active(void) { return 0; }
+int vtm_metal_graph_begin(void) { return -1; }
+int vtm_metal_graph_end(void) { return -1; }
+int vtm_metal_graph_gemv(int kind, float *y, const void *w, const float *sc,
+                         const float *x, int r, int c) {
+    (void)kind; (void)y; (void)w; (void)sc; (void)x; (void)r; (void)c;
+    return -1;
+}
+int vtm_metal_graph_norm(float *y, const float *x, const float *w, int dim,
+                         int rows, float eps) {
+    (void)y; (void)x; (void)w; (void)dim; (void)rows; (void)eps;
+    return -1;
+}
+int vtm_metal_graph_rope(float *y, const float *x, int heads, int head_dim,
+                         int interleaved, int pos, double theta) {
+    (void)y; (void)x; (void)heads; (void)head_dim; (void)interleaved;
+    (void)pos; (void)theta;
+    return -1;
+}
+int vtm_metal_graph_silu(float *y, const float *x, int n) {
+    (void)y; (void)x; (void)n;
+    return -1;
+}
+int vtm_metal_graph_copy(float *y, const float *x, int n) {
+    (void)y; (void)x; (void)n;
+    return -1;
+}
+int vtm_metal_graph_mul(float *y, const float *a, const float *b, int n) {
+    (void)y; (void)a; (void)b; (void)n;
+    return -1;
+}
+int vtm_metal_graph_add(float *y, const float *a, const float *b, int n) {
+    (void)y; (void)a; (void)b; (void)n;
+    return -1;
+}
+int vtm_metal_graph_kvw(float *kc, const float *k, float *vc, const float *v,
+                        int kv_dim, int slot) {
+    (void)kc; (void)k; (void)vc; (void)v; (void)kv_dim; (void)slot;
+    return -1;
+}
+int vtm_metal_graph_attn(float *out, const float *q, const float *kc,
+                         const float *vc, int n_heads, int n_kv_heads,
+                         int head_dim, int kv_dim, int win, int n_keys,
+                         int slot0) {
+    (void)out; (void)q; (void)kc; (void)vc; (void)n_heads; (void)n_kv_heads;
+    (void)head_dim; (void)kv_dim; (void)win; (void)n_keys; (void)slot0;
+    return -1;
+}
 void vtm_metal_stats_get(vtm_metal_stats *out) {
     if (out) memset(out, 0, sizeof *out);
 }

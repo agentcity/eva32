@@ -1360,7 +1360,7 @@
   {
     "id": "0204",
     "title": "Metal фаза 3: persistent pipeline декода",
-    "status": "in_progress",
+    "status": "done",
     "file": "0204-metal-phase3.md",
     "assignee": "agent:metal3"
   }

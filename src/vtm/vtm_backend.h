@@ -115,6 +115,39 @@ int vtm_metal_defer_submit(void);
 int vtm_metal_defer_wait(void);
 int vtm_metal_defer_end(void);
 
+// --- фаза 3 (задача 0204): граф одного токена ------------------------------
+//
+// Весь токен декода кодируется в ОДИН MTLCommandBuffer: GEMV (kind 4/6/7),
+// RMSNorm/RMSH, RoPE, SiLU, MUL, ADD, KVW и attention декода — MSL-ядрами.
+// CPU ждёт один раз, перед сэмплингом. Один поток-владелец; вторая
+// одновременная сессия получает -1 и идёт прежним (defer/CPU) путём.
+//
+// Все функции возвращают 0 — dispatch поставлен, -1 — граф не может (нет
+// ядра/буфера zero-copy/форма): interp.c выбрасывает недоотправленный
+// командный буфер (он не закоммичен, GPU ничего не записал) и пересчитывает
+// токен CPU-путём. vtm_metal_graph_end после ошибки всегда -1.
+int vtm_metal_graph_available(void);
+int vtm_metal_graph_active(void);
+int vtm_metal_graph_begin(void);
+int vtm_metal_graph_end(void);
+int vtm_metal_graph_gemv(int kind, float *y, const void *w,
+                         const float *scales, const float *x, int rows,
+                         int cols);
+int vtm_metal_graph_norm(float *y, const float *x, const float *w, int dim,
+                         int rows, float eps);
+int vtm_metal_graph_rope(float *y, const float *x, int heads, int head_dim,
+                         int interleaved, int pos, double theta);
+int vtm_metal_graph_silu(float *y, const float *x, int n);
+int vtm_metal_graph_copy(float *y, const float *x, int n);
+int vtm_metal_graph_mul(float *y, const float *a, const float *b, int n);
+int vtm_metal_graph_add(float *y, const float *a, const float *b, int n);
+int vtm_metal_graph_kvw(float *kc, const float *k, float *vc, const float *v,
+                        int kv_dim, int slot);
+int vtm_metal_graph_attn(float *out, const float *q, const float *kc,
+                         const float *vc, int n_heads, int n_kv_heads,
+                         int head_dim, int kv_dim, int win, int n_keys,
+                         int slot0);
+
 // Статистика для бенчмарка/отчёта: время инициализации (в т.ч. компиляции
 // MSL), число вызовов/отказов, сколько байт весов привязано zero-copy и
 // сколько скопировано, currentAllocatedSize до/после инициализации. Поля
@@ -137,6 +170,10 @@ typedef struct vtm_metal_stats {
     uint64_t defer_ops;     // GEMV, отложенных в общий командный буфер
     uint64_t defer_waits;   // ожиданий отданных буферов
     uint64_t wait_ns;       // суммарное время ожидания GPU
+    uint64_t graph_tokens;  // токенов, посчитанных одним графом (0204)
+    uint64_t graph_ops;     // dispatches в графах
+    uint64_t graph_fail;    // неудачных графов (откат на CPU)
+    uint64_t graph_encode_ns; // время CPU-кодирования графов (не GPU)
     char     last_error[256];
 } vtm_metal_stats;
 

@@ -225,6 +225,352 @@ static int metal_defer_try(int kind, float *y, const void *w,
     g_md->n++;
     return 1;
 }
+
+// --- фаза 3: граф токена (задача 0204, ADR 0021) ---------------------------
+//
+// Когда режим FULL и программа токена состоит только из поддержанных
+// операций, весь токен кодируется в один MTLCommandBuffer: RMSNorm/RoPE/SiLU/
+// MUL/ADD/KVW/attention — MSL-ядрами, матрицы — теми же GEMV. CPU между
+// слоями не ждёт; единственная синхронизация — перед SAMP.
+//
+// Откат. Любая ошибка (нет zero-copy буфера, командный буфер не завершился)
+// выбрасывает НЕзакоммиченный граф и перезапускает программу токена с нуля
+// CPU-путём: KVW/KV-кэш идемпотентны, EMB перезаписывает x, сэмплинг ещё не
+// исполнялся. Поэтому же преflight проверяет все инструкции ДО начала: если
+// что-то не поддержано, токен идёт прежним путём (defer/CPU) без отката.
+static __thread int g_graph_try;
+static int g_graph_trace = -1;
+
+// Определения ниже по файлу (нужны преflight'у и постановке операций).
+static double meta_number(const vtm_t *m, const char *key, double fallback);
+static uint32_t kv_window(vtm_t *m, uint32_t ctx);
+
+static int tensor_ok(const vtm_t *m, uint32_t idx) {
+    return m && idx != VTM_NO_TENSOR && idx < m->n_tensors;
+}
+
+// Поддержана ли инструкция графом. Формы проверяются здесь же — ошибки формы
+// остаются за обычным путём (там свой текст).
+static int metal_graph_eligible(vtm_t *m) {
+    uint32_t i;
+    int has_matrix = 0;
+
+    if (!m || m->trace_cb != NULL) return 0;
+    if (!vtm_metal_gemv_active()) return 0;
+    // Граф имеет смысл только если в программе есть матрицы kind 4/6/7:
+    // иначе не будим Metal (компиляция MSL стоит сотни миллисекунд, а
+    // тритовые/плотные модели и так считаются CPU-ядрами).
+    for (i = 0; i < m->n_instr; i++) {
+        const vtm_instr *in = &m->instr[i];
+        const vtm_tensor *w;
+
+        if (in->opcode != VTM_OP_TMV && in->opcode != VTM_OP_MM) continue;
+        if (!tensor_ok(m, in->a)) { has_matrix = -1; break; }
+        w = &m->tensors[in->a];
+        if (w->kind == VTM_TENSOR_Q4K || w->kind == VTM_TENSOR_Q6K
+            || w->kind == VTM_TENSOR_INT8)
+            has_matrix = 1;
+    }
+    if (has_matrix != 1) return 0;
+    if (!vtm_metal_graph_available()) return 0;
+    for (i = 0; i < m->n_instr; i++) {
+        const vtm_instr *in = &m->instr[i];
+
+        switch (in->opcode) {
+        case VTM_OP_EMB:
+            // Только в самом начале: дальше граф уже мог читать x.
+            if (i != 0) return 0;
+            break;
+        case VTM_OP_TMV: {
+            const vtm_tensor *w;
+            if (!tensor_ok(m, in->a) || !tensor_ok(m, in->b)
+                || !tensor_ok(m, in->dst))
+                return 0;
+            if ((in->flags & VTM_FLAG_TMV_TRANSPOSED) != 0) return 0;
+            w = &m->tensors[in->a];
+            if (w->ndim != 2) return 0;
+            if (w->kind == VTM_TENSOR_Q4K || w->kind == VTM_TENSOR_Q6K) {
+                if (!w->qblocks || w->dims[1] % 256u != 0) return 0;
+            } else if (w->kind == VTM_TENSOR_INT8) {
+                if (!w->i8 || !w->scales) return 0;
+            } else {
+                return 0;
+            }
+            if (m->tensors[in->b].n_elements != w->dims[1]
+                || m->tensors[in->dst].n_elements != w->dims[0])
+                return 0;
+            break;
+        }
+        case VTM_OP_MM: {
+            const vtm_tensor *a;
+            if (!tensor_ok(m, in->a) || !tensor_ok(m, in->b)
+                || !tensor_ok(m, in->dst))
+                return 0;
+            a = &m->tensors[in->a];
+            if (a->ndim != 2 || m->tensors[in->b].ndim != 2
+                || m->tensors[in->dst].ndim != 2)
+                return 0;
+            if (m->tensors[in->b].dims[1] != 1u
+                || m->tensors[in->dst].dims[1] != 1u)
+                return 0;
+            if (a->kind == VTM_TENSOR_Q4K || a->kind == VTM_TENSOR_Q6K) {
+                if (!a->qblocks || a->dims[1] % 256u != 0) return 0;
+            } else if (a->kind == VTM_TENSOR_INT8) {
+                if (!a->i8 || !a->scales) return 0;
+            } else {
+                return 0;
+            }
+            if (m->tensors[in->b].n_elements != a->dims[1]
+                || m->tensors[in->dst].n_elements != a->dims[0])
+                return 0;
+            break;
+        }
+        case VTM_OP_RMSN: {
+            if (!tensor_ok(m, in->a) || !tensor_ok(m, in->b)
+                || !tensor_ok(m, in->dst))
+                return 0;
+            if (m->tensors[in->a].n_elements == 0
+                || m->tensors[in->a].n_elements
+                   != m->tensors[in->b].n_elements)
+                return 0;
+            break;
+        }
+        case VTM_OP_RMSH: {
+            const vtm_tensor *x;
+            uint32_t dim;
+            if (!tensor_ok(m, in->a) || !tensor_ok(m, in->b)
+                || !tensor_ok(m, in->dst))
+                return 0;
+            x = &m->tensors[in->a];
+            if (x->ndim < 1) return 0;
+            dim = x->dims[x->ndim - 1];
+            if (dim == 0 || m->tensors[in->b].n_elements != dim) return 0;
+            break;
+        }
+        case VTM_OP_ROPE: {
+            const vtm_tensor *x;
+            int heads = (int)in->b;
+            uint32_t hd;
+            if (!tensor_ok(m, in->a) || !tensor_ok(m, in->dst)) return 0;
+            x = &m->tensors[in->a];
+            if (heads <= 0 || x->n_elements % (uint32_t)heads != 0) return 0;
+            hd = x->n_elements / (uint32_t)heads;
+            if (hd < 2u || (hd & 1u) || hd > 256u) return 0;
+            if (m->tensors[in->dst].n_elements != x->n_elements) return 0;
+            break;
+        }
+        case VTM_OP_CPY:
+            if (!tensor_ok(m, in->a) || !tensor_ok(m, in->dst)) return 0;
+            if (m->tensors[in->a].n_elements
+                != m->tensors[in->dst].n_elements)
+                return 0;
+            break;
+        case VTM_OP_SILU:
+            if (!tensor_ok(m, in->a) || !tensor_ok(m, in->dst)) return 0;
+            if (m->tensors[in->a].n_elements
+                != m->tensors[in->dst].n_elements)
+                return 0;
+            break;
+        case VTM_OP_MUL:
+        case VTM_OP_ADD:
+        case VTM_OP_KVW:
+        case VTM_OP_ATTN:
+            if (!tensor_ok(m, in->a) || !tensor_ok(m, in->b)
+                || !tensor_ok(m, in->c) || !tensor_ok(m, in->dst))
+                return 0;
+            if (in->opcode == VTM_OP_ATTN) {
+                const vtm_tensor *q = &m->tensors[in->a];
+                const vtm_tensor *k = &m->tensors[in->b];
+                const vtm_tensor *v = &m->tensors[in->c];
+                const vtm_tensor *o = &m->tensors[in->dst];
+                int n_heads, head_dim, kv_dim, n_kv_heads;
+                if (q->ndim != 3 || o->ndim != 3 || k->ndim != 2
+                    || v->ndim != 2)
+                    return 0;
+                if (!(in->flags & VTM_FLAG_CAUSAL)) return 0; // q_len>1/странное
+                n_heads = (int)q->dims[0];
+                head_dim = (int)q->dims[2];
+                kv_dim = (int)k->dims[1];
+                if (q->dims[1] != 1u || n_heads <= 0) return 0;
+                if (head_dim <= 0 || head_dim > 256) return 0;
+                if (k->dims[0] != v->dims[0] || kv_dim != (int)v->dims[1])
+                    return 0;
+                if (kv_dim % head_dim != 0) return 0;
+                n_kv_heads = kv_dim / head_dim;
+                if (n_kv_heads <= 0 || n_heads % n_kv_heads != 0) return 0;
+            } else if (in->opcode == VTM_OP_KVW) {
+                const vtm_tensor *kc = &m->tensors[in->dst];
+                if (kc->ndim != 2) return 0;
+                if (m->tensors[in->b].ndim != 2) return 0;
+                if (m->tensors[in->a].n_elements != kc->dims[1]
+                    || m->tensors[in->c].n_elements != kc->dims[1])
+                    return 0;
+            } else {
+                if (m->tensors[in->a].n_elements
+                        != m->tensors[in->b].n_elements
+                    || m->tensors[in->a].n_elements
+                        != m->tensors[in->dst].n_elements)
+                    return 0;
+            }
+            break;
+        case VTM_OP_SAMP:
+        case VTM_OP_HALT:
+            break;
+        default:
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// Поставить инструкцию в граф. 1 — поставлена, 0 — оставить CPU (EMB),
+// -1 — граф не может (вызывающий выбрасывает его и пересчитывает токен).
+static int metal_graph_op(vtm_t *m, const vtm_instr *in, int *handled) {
+    const vtm_tensor *t;
+    int rc = 0;
+
+    *handled = 1;
+    switch (in->opcode) {
+    case VTM_OP_EMB:
+        *handled = 0;   // дешёвая распаковка строки — на CPU, граф ещё пуст
+        return 0;
+    case VTM_OP_TMV: {
+        const vtm_tensor *w = &m->tensors[in->a];
+        const vtm_tensor *x = &m->tensors[in->b];
+        const vtm_tensor *y = &m->tensors[in->dst];
+        int kind = w->kind == VTM_TENSOR_Q4K ? 0
+                 : (w->kind == VTM_TENSOR_Q6K ? 1 : 2);
+        rc = vtm_metal_graph_gemv(kind, y->f32,
+                                  kind == 2 ? (const void *)w->i8
+                                            : (const void *)w->qblocks,
+                                  kind == 2 ? w->scales : NULL, x->f32,
+                                  (int)w->dims[0], (int)w->dims[1]);
+        return rc == 0 ? 0 : -1;
+    }
+    case VTM_OP_MM: {
+        const vtm_tensor *w = &m->tensors[in->a];
+        const vtm_tensor *x = &m->tensors[in->b];
+        const vtm_tensor *y = &m->tensors[in->dst];
+        int kind = w->kind == VTM_TENSOR_Q4K ? 0
+                 : (w->kind == VTM_TENSOR_Q6K ? 1 : 2);
+        rc = vtm_metal_graph_gemv(kind, y->f32,
+                                  kind == 2 ? (const void *)w->i8
+                                            : (const void *)w->qblocks,
+                                  kind == 2 ? w->scales : NULL, x->f32,
+                                  (int)w->dims[0], (int)w->dims[1]);
+        return rc == 0 ? 0 : -1;
+    }
+    case VTM_OP_RMSN: {
+        const vtm_tensor *x = &m->tensors[in->a];
+        const vtm_tensor *w = &m->tensors[in->b];
+        const vtm_tensor *y = &m->tensors[in->dst];
+        float eps = (float)meta_number(m, "rms_norm_eps",
+                                       (double)in->imm / 1000.0);
+        rc = vtm_metal_graph_norm(y->f32, x->f32, w->f32,
+                                  (int)x->n_elements, 1, eps);
+        return rc == 0 ? 0 : -1;
+    }
+    case VTM_OP_RMSH: {
+        const vtm_tensor *x = &m->tensors[in->a];
+        const vtm_tensor *w = &m->tensors[in->b];
+        const vtm_tensor *y = &m->tensors[in->dst];
+        uint32_t dim = x->dims[x->ndim - 1];
+        float eps = (float)meta_number(m, "rms_norm_eps",
+                                       (double)in->imm / 1000.0);
+        rc = vtm_metal_graph_norm(y->f32, x->f32, w->f32, (int)dim,
+                                  (int)(x->n_elements / dim), eps);
+        return rc == 0 ? 0 : -1;
+    }
+    case VTM_OP_ROPE: {
+        const vtm_tensor *x = &m->tensors[in->a];
+        const vtm_tensor *y = &m->tensors[in->dst];
+        int heads = (int)in->b;
+        int hd = (int)(x->n_elements / (uint32_t)heads);
+        int pos = m->position + in->imm;
+        int interleaved = ((in->flags & VTM_FLAG_ROPE_INTERLEAVED) != 0)
+            || (vtm_meta_rope_layout(m) == VTM_ROPE_LAYOUT_INTERLEAVED);
+        double theta = vtm_meta_rope_theta(m);
+        if (!(theta > 0.0) || !isfinite(theta)) theta = VTM_DEFAULT_ROPE_THETA;
+        rc = vtm_metal_graph_rope(y->f32, x->f32, heads, hd, interleaved, pos,
+                                  theta);
+        return rc == 0 ? 0 : -1;
+    }
+    case VTM_OP_SILU: {
+        const vtm_tensor *x = &m->tensors[in->a];
+        const vtm_tensor *y = &m->tensors[in->dst];
+        rc = vtm_metal_graph_silu(y->f32, x->f32, (int)x->n_elements);
+        return rc == 0 ? 0 : -1;
+    }
+    case VTM_OP_CPY: {
+        const vtm_tensor *x = &m->tensors[in->a];
+        const vtm_tensor *y = &m->tensors[in->dst];
+        rc = vtm_metal_graph_copy(y->f32, x->f32, (int)x->n_elements);
+        return rc == 0 ? 0 : -1;
+    }
+    case VTM_OP_MUL:
+    case VTM_OP_ADD: {
+        const vtm_tensor *a = &m->tensors[in->a];
+        const vtm_tensor *b = &m->tensors[in->b];
+        const vtm_tensor *y = &m->tensors[in->dst];
+        int n = (int)a->n_elements;
+        rc = in->opcode == VTM_OP_MUL
+               ? vtm_metal_graph_mul(y->f32, a->f32, b->f32, n)
+               : vtm_metal_graph_add(y->f32, a->f32, b->f32, n);
+        return rc == 0 ? 0 : -1;
+    }
+    case VTM_OP_KVW: {
+        const vtm_tensor *kc = &m->tensors[in->dst];
+        const vtm_tensor *k = &m->tensors[in->a];
+        const vtm_tensor *vc = &m->tensors[in->b];
+        const vtm_tensor *v = &m->tensors[in->c];
+        uint32_t ctx = kc->dims[0], kv_dim = kc->dims[1];
+        uint32_t win = kv_window(m, ctx);
+        long long pos = (long long)m->position + (long long)in->imm;
+        if (pos < 0 || pos > (long long)INT_MAX) return -1;
+        if (m->cache_valid
+            && ((long long)pos < (long long)m->cache_len
+                || (unsigned long long)pos >= (unsigned long long)win))
+            m->cache_valid = 0;
+        rc = vtm_metal_graph_kvw(kc->f32, k->f32, vc->f32, v->f32,
+                                 (int)kv_dim,
+                                 (int)(pos % (long long)win));
+        return rc == 0 ? 0 : -1;
+    }
+    case VTM_OP_ATTN: {
+        const vtm_tensor *q = &m->tensors[in->a];
+        const vtm_tensor *kc = &m->tensors[in->b];
+        const vtm_tensor *vc = &m->tensors[in->c];
+        const vtm_tensor *o = &m->tensors[in->dst];
+        int n_heads = (int)q->dims[0];
+        int head_dim = (int)q->dims[2];
+        int kv_dim = (int)kc->dims[1];
+        int n_kv_heads = kv_dim / head_dim;
+        uint32_t ctx = kc->dims[0];
+        int win = (int)kv_window(m, ctx);
+        long long qs = (long long)m->position + (long long)in->imm;
+        int hi, lo, n_keys, slot0;
+
+        if (qs < 0 || qs > (long long)INT_MAX) return -1;
+        hi = (int)(qs);   // q_len == 1: key_count - 1
+        lo = hi - win + 1;
+        if (lo < 0) lo = 0;
+        n_keys = hi - lo + 1;
+        if (n_keys > win) { lo = hi - win + 1; n_keys = win; }
+        slot0 = lo % win;
+        (void)t;
+        rc = vtm_metal_graph_attn(o->f32, q->f32, kc->f32, vc->f32, n_heads,
+                                  n_kv_heads, head_dim, kv_dim, win, n_keys,
+                                  slot0);
+        return rc == 0 ? 0 : -1;
+    }
+    case VTM_OP_SAMP:
+    case VTM_OP_HALT:
+        *handled = 0;
+        return 0;
+    default:
+        return -1;
+    }
+}
 #endif // VTM_WITH_METAL
 
 // --- kind 6/7 (Q4_K/Q6_K), задача 0165 -------------------------------------
@@ -3753,6 +4099,39 @@ static vtm_status op_samp(vtm_t *m, uint32_t ins, const vtm_instr *in,
     n = logits->n_elements;
     if (n == 0)
         return fail(m, ins, VTM_E_SHAPE, "SAMP: пустые логиты");
+    if (getenv("VTM_GRAPH_DUMP")) {
+        uint32_t i, best = 0;
+        float mx = logits->f32[0];
+        for (i = 1; i < n; i++)
+            if (logits->f32[i] > mx) { mx = logits->f32[i]; best = i; }
+        fprintf(stderr, "VTM: samp dump: n=%u max=%g argmax=%u первый: "
+                "%g %g %g %g %g\n", n, (double)mx, best,
+                (double)logits->f32[0], (double)logits->f32[1],
+                (double)logits->f32[2], (double)logits->f32[3],
+                (double)logits->f32[4]);
+        {
+            uint32_t ti, shown = 0;
+            for (ti = 0; ti < m->n_tensors && shown < 8; ti++) {
+                const vtm_tensor *t = &m->tensors[ti];
+                uint32_t k;
+                if (t->kind != VTM_TENSOR_F32 || !t->f32
+                    || t->n_elements == 0)
+                    continue;
+                for (k = 0; k < t->n_elements; k++) {
+                    if (isnan(t->f32[k]) || isinf(t->f32[k])) {
+                        uint32_t q;
+                        fprintf(stderr, "VTM: dump tensor %u (n=%u):",
+                                ti, (unsigned)t->n_elements);
+                        for (q = 0; q < t->n_elements && q < 4; q++)
+                            fprintf(stderr, " %g", (double)t->f32[q]);
+                        fprintf(stderr, "\n");
+                        shown++;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     if (in->dst != VTM_NO_TENSOR) {
         tok = need(m, in->dst, ins, "dst (token)", &st);
         if (!tok) return st;
@@ -6031,21 +6410,72 @@ static vtm_status run_instrs(vtm_t *m, vtm_emit_fn emit, void *user) {
     uint32_t seq = 0;
     int tracing;
     vtm_status st;
+#if VTM_WITH_METAL
+    int graph = 0;
+#endif
 
     if (!m) return VTM_E_ARG;
     if (!m->backend) m->backend = &vtm_backend_scalar_lut;
+    tracing = m->trace_cb != NULL;
+#if VTM_WITH_METAL
+    // Граф токена (0204) — только для FULL и без трассы (трасса меряет
+    // инструкции по одной, а граф их не исполняет на CPU).
+    if (g_graph_trace < 0)
+        g_graph_trace = getenv("VTM_METAL_TRACE") ? 1 : 0;
+    if (g_graph_try && !tracing && vtm_metal_graph_begin() == 0) {
+        graph = 1;
+        if (g_graph_trace) fprintf(stderr, "VTM: graph begin\n");
+    }
+#endif
+
+#if VTM_WITH_METAL
+restart:
+#endif
     m->halted = 0;
     m->error[0] = '\0';
-    tracing = m->trace_cb != NULL;
+    seq = 0;
 
     for (i = 0; i < m->n_instr; i++) {
         const vtm_instr *in = &m->instr[i];
         uint64_t trace_t0;
 #if VTM_WITH_METAL
-        // Зависимости отложенной очереди: читаем/пишем её dst — ждём GPU.
-        // Остальные инструкции (attn/RMSN/softmax/…) считаются на CPU, пока
-        // GPU ещё работает: подряд идущие GEMV уже отданы одним буфером.
-        if (g_md && g_md->active) {
+        if (graph) {
+            if (in->opcode == VTM_OP_SAMP || in->opcode == VTM_OP_HALT) {
+                // Единственная синхронизация токена: к сэмплингу логиты
+                // должны быть в арене. Ошибка — весь токен на CPU.
+                if (vtm_metal_graph_end() != 0) {
+                    graph = 0;
+                    vtm_metal_set_active(0);
+                    g_graph_try = 0;
+                    goto restart;
+                }
+            } else {
+                int handled = 0;
+
+                if (g_graph_trace) {
+                    fprintf(stderr, "VTM: graph pc=%u op=%02x a=%u b=%u c=%u "
+                            "dst=%u\n", i, (unsigned)in->opcode,
+                            (unsigned)in->a, (unsigned)in->b,
+                            (unsigned)in->c, (unsigned)in->dst);
+                }
+                if (metal_graph_op(m, in, &handled) != 0) {
+                    // Граф ещё не закоммичен — GPU ничего не записал;
+                    // перезапуск токена CPU-путём корректен.
+                    (void)vtm_metal_graph_end();
+                    graph = 0;
+                    vtm_metal_set_active(0);
+                    g_graph_try = 0;
+                    goto restart;
+                }
+                if (handled) continue;   // dispatch уже в графе
+                // handled == 0 — EMB: дешёвая распаковка строки на CPU,
+                // граф в этот момент пуст (EMB проверен преflight'ом как
+                // первая инструкция).
+            }
+        } else if (g_md && g_md->active) {
+            // Зависимости отложенной очереди: читаем/пишем её dst — ждём GPU.
+            // Остальные инструкции (attn/RMSN/softmax/…) считаются на CPU, пока
+            // GPU ещё работает: подряд идущие GEMV уже отданы одним буфером.
             if (metal_defer_conflicts(in))
                 (void)metal_defer_sync();
             else if (in->opcode != VTM_OP_TMV && in->opcode != VTM_OP_MM
@@ -6131,6 +6561,16 @@ static vtm_status run_instrs(vtm_t *m, vtm_emit_fn emit, void *user) {
         if (tracing && trace_emit(m, &seq, i, in, trace_t0) != 0) return VTM_OK;
         if (st != VTM_OK) return st;
     }
+#if VTM_WITH_METAL
+    if (graph) {
+        if (vtm_metal_graph_end() != 0) {
+            graph = 0;
+            vtm_metal_set_active(0);
+            g_graph_try = 0;
+            goto restart;
+        }
+    }
+#endif
     return VTM_OK;
 }
 
@@ -6143,9 +6583,12 @@ vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {
     metal_defer_ctx md;
     int md_on = 0;
 
+    // Фаза 3 (0204): если весь токен поддержан графом, отложенная очередь
+    // (фаза 2) не нужна — граф сам держит один командный буфер до сэмплинга.
+    g_graph_try = metal_graph_eligible(m);
     // Сессия отложенной очереди — только для полного Metal (FULL). В hybrid
     // (0198) поштучные GEMV декода идут на NEON, и очередь не нужна.
-    if (m && vtm_metal_gemv_active() && m->trace_cb == NULL) {
+    if (!g_graph_try && m && vtm_metal_gemv_active() && m->trace_cb == NULL) {
         memset(&md, 0, sizeof md);
         md.active = 1;
         g_md = &md;
@@ -6160,6 +6603,7 @@ vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {
         (void)vtm_metal_defer_end();
         g_md = NULL;
     }
+    g_graph_try = 0;
 #endif
     return st;
 }

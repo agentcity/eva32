@@ -71,7 +71,7 @@ typedef struct {
     uint64_t sc_off;    // смещение fp32-масштабов в элементах (int8)
 } vtm_metal_args;
 
-#define VTM_METAL_MAX_BIND 1024
+#define VTM_METAL_MAX_BIND 4096
 #define VTM_METAL_COPY_LIMIT (64u * 1024u * 1024u)
 
 // Фаза 2: сцены ping-pong и предел отложенных GEMV на сцену.
@@ -108,6 +108,27 @@ typedef struct {
     int submitted;
 } metal_stage;
 
+typedef struct {
+    id<MTLCommandBuffer> cb;
+    id<MTLComputeCommandEncoder> enc;
+    id<MTLBuffer> tmp;      // staging для cos/sin RoPE
+    size_t        tmpcap;
+    size_t        tmpused;
+    uint64_t      rope_pos;
+    uint32_t      rope_dim;
+    uint32_t      rope_int;
+    size_t        rope_off;
+    int           rope_valid;
+    uint64_t      ops;
+    double        t_encode0;
+} metal_graph;
+
+static metal_graph g_g;
+static int g_graph_on;
+static int g_graph_busy;
+static int g_graph_failed;
+static uintptr_t g_graph_owner;
+
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_defer_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_avail = -1;            // -1 — не проверяли, 0/1
@@ -121,9 +142,23 @@ static id<MTLLibrary> g_lib;
 static id<MTLComputePipelineState> g_ps_q4k;
 static id<MTLComputePipelineState> g_ps_q6k;
 static id<MTLComputePipelineState> g_ps_i8;
+// Фаза 3: R=4 строки на warp (см. vtm_metal.metal). Нет в старом metallib —
+// остаются nil, и GEMV идёт прежними однострочными ядрами.
+static id<MTLComputePipelineState> g_ps_q4k_r4;
+static id<MTLComputePipelineState> g_ps_q6k_r4;
+static id<MTLComputePipelineState> g_ps_q4k_g4;
 static id<MTLComputePipelineState> g_ps_q4k_gemm[3]; // 8/16/32 токенов
 static id<MTLComputePipelineState> g_ps_q6k_gemm[3];
 static id<MTLComputePipelineState> g_ps_i8_gemm[3];
+// Фаза 3: ядра графа токена (RMSNorm/RoPE/SiLU/MUL/ADD/KVW/attention).
+static id<MTLComputePipelineState> g_ps_norm;
+static id<MTLComputePipelineState> g_ps_rope;
+static id<MTLComputePipelineState> g_ps_silu;
+static id<MTLComputePipelineState> g_ps_mul;
+static id<MTLComputePipelineState> g_ps_add;
+static id<MTLComputePipelineState> g_ps_kvw;
+static id<MTLComputePipelineState> g_ps_attn;
+static id<MTLComputePipelineState> g_ps_copy;
 
 static id<MTLBuffer> g_xbuf;
 static size_t g_xcap;
@@ -162,6 +197,10 @@ static uint64_t g_alloc_after;
 static uint64_t g_gemm_calls;
 static uint64_t g_defer_ops;
 static uint64_t g_defer_waits;
+static uint64_t g_graph_tokens;
+static uint64_t g_graph_ops;
+static uint64_t g_graph_fail;
+static uint64_t g_graph_encode_ns;
 static uint64_t g_wait_ns;
 static int g_atexit_done;
 
@@ -194,7 +233,9 @@ static void metal_stats_print(void) {
             "VTM: metal stats: init %.1f ms (msl %.1f ms), вызовов %llu, "
             "отказов %llu, буферов %d, no-copy %.1f МиБ, копий %.1f МиБ, "
             "currentAllocatedSize %.1f МиБ (до init %.1f МиБ), GPU %.1f мс, "
-            "gemm %llu, отложено %llu, ожиданий %llu (%.1f мс)\n",
+            "gemm %llu, отложено %llu, ожиданий %llu (%.1f мс), "
+            "граф %llu токенов/%llu ops (отказов %llu, кодирование "
+            "%.1f мс)\n",
             (double)g_init_ms, (double)g_compile_ms,
             (unsigned long long)g_calls, (unsigned long long)g_fail, g_nbinds,
             (double)g_nocopy_bytes / (1024.0 * 1024.0),
@@ -205,7 +246,11 @@ static void metal_stats_print(void) {
             (double)g_gpu_ns / 1e6,
             (unsigned long long)g_gemm_calls,
             (unsigned long long)g_defer_ops,
-            (unsigned long long)g_defer_waits, (double)g_wait_ns / 1e6);
+            (unsigned long long)g_defer_waits, (double)g_wait_ns / 1e6,
+            (unsigned long long)g_graph_tokens,
+            (unsigned long long)g_graph_ops,
+            (unsigned long long)g_graph_fail,
+            (double)g_graph_encode_ns / 1e6);
 }
 
 // --- инициализация ----------------------------------------------------------
@@ -289,6 +334,47 @@ static id<MTLComputePipelineState> metal_pipeline(const char *name) {
     return ps;
 }
 
+// Ядро GEMV и число строк на threadgroup. Фаза 3: Q4_K/Q6_K считаются
+// вариантом R=4 (16 строк на 4-warp threadgroup, 4 независимые загрузки
+// веса на warp); если в metallib его нет — прежнее однострочное ядро.
+static int gemv_r4_env(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("VTM_METAL_GEMV_R4");
+        cached = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+static int gemv4_env(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("VTM_METAL_GEMV4");
+        cached = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+static id<MTLComputePipelineState> metal_gemv_ps(int kind, NSUInteger *rpt) {
+    // Фаза 3: Q4_K — четыре строки на warp (16 строк на threadgroup). В
+    // изолированном --qk-proj выигрыш нестабилен (машина занята), а в полном
+    // графе CLI он оказался МЕДЛЕННЕЕ однострочного: 14,6 против 16,7 ток/с
+    // (3 пары прогонов, 1,91-2,19 с на 32 токена). Поэтому по умолчанию
+    // выключен; включается VTM_METAL_GEMV4=1 для A/B.
+    if (kind == 0 && g_ps_q4k_g4 && gemv4_env()) {
+        *rpt = 16;
+        return g_ps_q4k_g4;
+    }
+    // Прежний эксперимент R=4 (массив указателей) включается только явно:
+    // на этой машине он оказался медленнее однострочного (0.95 против 0.79 мс).
+    if (gemv_r4_env()) {
+        if (kind == 0 && g_ps_q4k_r4) { *rpt = 16; return g_ps_q4k_r4; }
+        if (kind == 1 && g_ps_q6k_r4) { *rpt = 16; return g_ps_q6k_r4; }
+    }
+    *rpt = 4;
+    return kind == 0 ? g_ps_q4k : (kind == 1 ? g_ps_q6k : g_ps_i8);
+}
+
 // Вызывается под g_lock.
 static int metal_init(void) {
     double t0 = now_ms();
@@ -320,6 +406,19 @@ static int metal_init(void) {
     g_ps_q4k = metal_pipeline("vtm_q4k_gemv");
     g_ps_q6k = metal_pipeline("vtm_q6k_gemv");
     g_ps_i8 = metal_pipeline("vtm_i8_gemv");
+    g_ps_q4k_r4 = metal_pipeline("vtm_q4k_gemv_r4");
+    g_ps_q6k_r4 = metal_pipeline("vtm_q6k_gemv_r4");
+    g_ps_q4k_g4 = metal_pipeline("vtm_q4k_gemv4");
+    // Фаза 3: отсутствие этих ядер в старом metallib не ломает прогон —
+    // vtm_metal_graph_available() вернёт 0, и токен пойдёт прежним путём.
+    g_ps_norm = metal_pipeline("vtm_rmsnorm");
+    g_ps_rope = metal_pipeline("vtm_rope");
+    g_ps_silu = metal_pipeline("vtm_silu");
+    g_ps_mul = metal_pipeline("vtm_mul");
+    g_ps_add = metal_pipeline("vtm_add");
+    g_ps_kvw = metal_pipeline("vtm_kvw");
+    g_ps_attn = metal_pipeline("vtm_attn_decode");
+    g_ps_copy = metal_pipeline("vtm_copy");
     if (!g_ps_q4k || !g_ps_q6k || !g_ps_i8) {
         metal_log("%s — откат на CPU", g_err);
         g_init = -1;
@@ -489,6 +588,7 @@ static int metal_gemv_body(int kind, float *y, const void *w,
     id<MTLComputeCommandEncoder> enc;
     id<MTLComputePipelineState> ps;
     size_t wbytes, scbytes, xbytes, ybytes;
+    NSUInteger nrows_pt = 4;
     int rc = -1;
 
     if (!y || !w || !x) return -1;
@@ -548,7 +648,11 @@ static int metal_gemv_body(int kind, float *y, const void *w,
     }
     memcpy([g_xbuf contents], x, xbytes);
 
-    ps = (kind == 0) ? g_ps_q4k : (kind == 1) ? g_ps_q6k : g_ps_i8;
+    {
+        NSUInteger rpt = 4;
+        ps = metal_gemv_ps(kind, &rpt);
+        nrows_pt = rpt;
+    }
     cb = [g_queue commandBuffer];
     if (!cb) {
         metal_set_err("commandBuffer вернул nil");
@@ -563,7 +667,8 @@ static int metal_gemv_body(int kind, float *y, const void *w,
     [enc setBuffer:g_ybuf offset:0 atIndex:2];
     [enc setBytes:&a length:sizeof a atIndex:3];
     if (kind == 2) [enc setBuffer:sb offset:0 atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)rows + 3u) / 4u, 1, 1)
+    [enc dispatchThreadgroups:
+        MTLSizeMake(((NSUInteger)rows + nrows_pt - 1u) / nrows_pt, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     [enc endEncoding];
     [cb commit];
@@ -704,6 +809,16 @@ static int stage_wait(int idx) {
 static int force_fail(void) {
     static int used;
     const char *e = getenv("VTM_METAL_FORCE_FAIL");
+    if (used || !e || !*e || *e == '0') return 0;
+    used = 1;
+    return 1;
+}
+
+// Отдельная инъекция для графа токена: тест откатов в bench_backend проверяет
+// и гибрид (GEMM), и FULL (граф) в одном процессе, а force_fail() — одноразовый.
+static int force_fail_graph(void) {
+    static int used;
+    const char *e = getenv("VTM_METAL_FORCE_FAIL_GRAPH");
     if (used || !e || !*e || *e == '0') return 0;
     used = 1;
     return 1;
@@ -940,8 +1055,9 @@ int vtm_metal_defer_gemv(int kind, float *y, const void *w,
         if (!s->sem) s->sem = dispatch_semaphore_create(0);
     }
     {
-        id<MTLComputePipelineState> ps =
-            (kind == 0) ? g_ps_q4k : (kind == 1) ? g_ps_q6k : g_ps_i8;
+        NSUInteger rpt = 4;
+        id<MTLComputePipelineState> ps = metal_gemv_ps(kind, &rpt);
+
         [s->enc setComputePipelineState:ps];
         [s->enc setBuffer:wb offset:0 atIndex:0];
         [s->enc setBuffer:s->xb offset:xoff atIndex:1];
@@ -949,7 +1065,7 @@ int vtm_metal_defer_gemv(int kind, float *y, const void *w,
         [s->enc setBytes:&a length:sizeof a atIndex:3];
         if (kind == 2) [s->enc setBuffer:sb offset:0 atIndex:4];
         [s->enc dispatchThreadgroups:
-            MTLSizeMake(((NSUInteger)rows + 3u) / 4u, 1, 1)
+            MTLSizeMake(((NSUInteger)rows + rpt - 1u) / rpt, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     }
     s->res[s->nres].dst = y;
@@ -1222,6 +1338,13 @@ double vtm_metal_min_mac(void) {
 // до munmap безопасно: все командные буферы к этому моменту завершены.
 void vtm_metal_forget_all(void) {
     int i;
+
+    // Незакоммиченный граф этого потока — выбросить до освобождения буферов:
+    // после munmap/освобождения арены no-copy регистрации недействительны.
+    if (__atomic_load_n(&g_graph_on, __ATOMIC_ACQUIRE)
+        && __atomic_load_n(&g_graph_owner, __ATOMIC_RELAXED)
+           == (uintptr_t)pthread_self())
+        (void)vtm_metal_graph_end();
     pthread_mutex_lock(&g_defer_lock);
     if (__atomic_load_n(&g_defer_on, __ATOMIC_ACQUIRE)
         && __atomic_load_n(&g_defer_owner, __ATOMIC_RELAXED)
@@ -1236,8 +1359,512 @@ void vtm_metal_forget_all(void) {
         g_binds[i].buf = nil;
     }
     g_nbinds = 0;
+    [g_g.tmp release];
+    g_g.tmp = nil;
+    g_g.tmpcap = 0;
+    g_g.tmpused = 0;
+    g_g.rope_valid = 0;
     pthread_mutex_unlock(&g_lock);
     pthread_mutex_unlock(&g_defer_lock);
+}
+
+
+// --- фаза 3: граф одного токена ---------------------------------------------
+//
+// Задача 0204. Фаза 2 сократила число командных буферов до 4 на слой, но
+// декод всё равно ждал CPU на attention/RMSN/SiLU: пока они считались, GPU
+// стоял. Здесь RMSNorm/RoPE/SiLU/MUL/ADD/KVW и attention декода считаются
+// MSL-ядрами, а ВСЕ операции токена (все слои) кодируются в ОДИН
+// MTLCommandBuffer. CPU ждёт один раз — перед сэмплингом; результатом
+// командного буфера к этому моменту уже записаны в арену модели (zero-copy
+// буферы смотрят прямо в неё, staging-копий нет).
+//
+// Сессией владеет один поток; вторая одновременная попытка begin вернёт -1, и
+// прогон пойдёт прежним путём (defer/CPU). Ошибка Metal на любом шаге —
+// vtm_metal_graph_end() возвращает -1, interp.c выключает Metal и пересчитывает
+// токен CPU-ядрами (откат, ADR 0021).
+
+#define VTM_GRAPH_TMP_BYTES ((size_t)64u * 1024u)
+
+int vtm_metal_graph_available(void) {
+    int rc;
+
+    if (g_init == -1) return 0;
+    if (metal_strict_env()) return 0;
+    pthread_mutex_lock(&g_lock);
+    rc = metal_init();
+    pthread_mutex_unlock(&g_lock);
+    if (rc != 0) return 0;
+    if (getenv("VTM_METAL_TRACE"))
+        metal_log("граф: ядра norm %d rope %d silu %d mul %d add %d kvw %d "
+                  "attn %d copy %d", g_ps_norm != nil, g_ps_rope != nil,
+                  g_ps_silu != nil, g_ps_mul != nil, g_ps_add != nil,
+                  g_ps_kvw != nil, g_ps_attn != nil, g_ps_copy != nil);
+    return g_ps_norm && g_ps_rope && g_ps_silu && g_ps_mul && g_ps_add
+        && g_ps_kvw && g_ps_attn && g_ps_copy;
+}
+
+int vtm_metal_graph_active(void) {
+    return __atomic_load_n(&g_graph_on, __ATOMIC_RELAXED) != 0;
+}
+
+int vtm_metal_graph_begin(void) {
+    if (g_init == -1) return -1;
+    if (metal_strict_env()) return -1;
+    if (!vtm_metal_graph_available()) return -1;
+    if (!__sync_bool_compare_and_swap(&g_graph_busy, 0, 1)) return -1;
+    if (g_init == -1) {
+        __sync_lock_release(&g_graph_busy);
+        return -1;
+    }
+    __atomic_store_n(&g_graph_owner, (uintptr_t)pthread_self(),
+                     __ATOMIC_RELAXED);
+    g_g.ops = 0;
+    g_g.tmpused = 0;
+    g_g.rope_valid = 0;
+    g_graph_failed = 0;
+    @autoreleasepool {
+        g_g.cb = [[g_queue commandBuffer] retain];
+    }
+    if (!g_g.cb) {
+        metal_set_err("commandBuffer вернул nil (граф)");
+        __atomic_store_n(&g_graph_owner, (uintptr_t)0, __ATOMIC_RELAXED);
+        __sync_lock_release(&g_graph_busy);
+        return -1;
+    }
+    @autoreleasepool {
+        g_g.enc = [[g_g.cb computeCommandEncoder] retain];
+    }
+    if (!g_g.enc) {
+        [g_g.cb release];
+        g_g.cb = nil;
+        metal_set_err("computeCommandEncoder вернул nil (граф)");
+        __atomic_store_n(&g_graph_owner, (uintptr_t)0, __ATOMIC_RELAXED);
+        __sync_lock_release(&g_graph_busy);
+        return -1;
+    }
+    g_g.t_encode0 = now_ms();
+    __atomic_store_n(&g_graph_on, 1, __ATOMIC_RELEASE);
+    return 0;
+}
+
+// Привязать буфер арены/весов. Копия (copied) не годится: GPU пишет в неё, а
+// CPU читает арену — результаты разошлись бы молча. Поэтому копия = отказ
+// графа, и токен считается прежним путём.
+static int graph_bind(const void *ptr, size_t bytes, id<MTLBuffer> *out,
+                      uint64_t *off) {
+    uint64_t dummy = 0;
+    int copied = 1, rc;
+
+    if (!ptr || !bytes) return -1;
+    if (!off) off = &dummy;   // metal_bind пишет смещение всегда
+    pthread_mutex_lock(&g_lock);
+    rc = metal_bind(ptr, bytes, out, off, &copied);
+    pthread_mutex_unlock(&g_lock);
+    if (rc != 0 || copied) return -1;
+    return 0;
+}
+
+static int graph_fail(void) {
+    g_graph_failed = 1;
+    return -1;
+}
+
+static void graph_encode_done(void) {
+    g_g.ops++;
+}
+
+int vtm_metal_graph_gemv(int kind, float *y, const void *w,
+                         const float *scales, const float *x, int rows,
+                         int cols) {
+    id<MTLBuffer> wb = nil, sb = nil, xb = nil, yb = nil;
+    uint64_t woff = 0, scoff = 0, xoff = 0, yoff = 0;
+    vtm_metal_args a;
+    size_t wbytes, scbytes;
+    NSUInteger rpt = 4;
+    id<MTLComputePipelineState> ps;
+
+    if (!g_graph_on || g_graph_failed) return -1;
+    if (!y || !w || !x || rows <= 0 || cols <= 0) return graph_fail();
+    if (kind == 0 || kind == 1) {
+        if (cols % 256 != 0) return graph_fail();
+        wbytes = ((size_t)rows * (size_t)cols / 256u)
+               * (kind == 0 ? 144u : 210u);
+        a.nblocks = (uint32_t)(cols / 256);
+    } else if (kind == 2) {
+        uint64_t n = (uint64_t)rows * (uint64_t)cols;
+        wbytes = (size_t)n;
+        scbytes = (size_t)(n / 128u + (n % 128u ? 1u : 0u)) * sizeof(float);
+        a.nblocks = 0;
+    } else {
+        return graph_fail();
+    }
+    if (graph_bind(w, wbytes, &wb, &woff) != 0) return graph_fail();
+    if (kind == 2) {
+        if (!scales || graph_bind(scales, scbytes, &sb, &scoff) != 0)
+            return graph_fail();
+        a.sc_off = scoff / sizeof(float);
+    } else {
+        a.sc_off = 0;
+    }
+    if (graph_bind(x, (size_t)cols * sizeof(float), &xb, &xoff) != 0)
+        return graph_fail();
+    if (graph_bind(y, (size_t)rows * sizeof(float), &yb, &yoff) != 0)
+        return graph_fail();
+    a.rows = (uint32_t)rows;
+    a.cols = (uint32_t)cols;
+    a.n_tokens = 1;
+    a.w_off = woff;
+    ps = metal_gemv_ps(kind, &rpt);
+    [g_g.enc setComputePipelineState:ps];
+    [g_g.enc setBuffer:wb offset:0 atIndex:0];
+    [g_g.enc setBuffer:xb offset:(NSUInteger)xoff atIndex:1];
+    [g_g.enc setBuffer:yb offset:(NSUInteger)yoff atIndex:2];
+    [g_g.enc setBytes:&a length:sizeof a atIndex:3];
+    if (kind == 2) [g_g.enc setBuffer:sb offset:0 atIndex:4];
+    [g_g.enc dispatchThreadgroups:
+        MTLSizeMake(((NSUInteger)rows + rpt - 1u) / rpt, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    graph_encode_done();
+    return 0;
+}
+
+int vtm_metal_graph_norm(float *y, const float *x, const float *w,
+                         int dim, int rows, float eps) {
+    id<MTLBuffer> xb = nil, wb = nil, yb = nil;
+    uint64_t xoff = 0, woff = 0, yoff = 0;
+    typedef struct { uint32_t dim, rows; float eps; } Normargs;
+    Normargs a;
+
+    if (!g_graph_on || g_graph_failed) return -1;
+    if (!y || !x || !w || dim <= 0 || rows <= 0) return graph_fail();
+    if (rows > 65536 || dim > 65536) return graph_fail();
+    if (graph_bind(x, (size_t)rows * (size_t)dim * sizeof(float), &xb, &xoff)
+        != 0
+        || graph_bind(w, (size_t)dim * sizeof(float), &wb, &woff) != 0
+        || graph_bind(y, (size_t)rows * (size_t)dim * sizeof(float), &yb,
+                      &yoff) != 0)
+        return graph_fail();
+    a.dim = (uint32_t)dim;
+    a.rows = (uint32_t)rows;
+    a.eps = eps;
+    [g_g.enc setComputePipelineState:g_ps_norm];
+    [g_g.enc setBuffer:xb offset:(NSUInteger)xoff atIndex:0];
+    [g_g.enc setBuffer:wb offset:(NSUInteger)woff atIndex:1];
+    [g_g.enc setBuffer:yb offset:(NSUInteger)yoff atIndex:2];
+    [g_g.enc setBytes:&a length:sizeof a atIndex:3];
+    [g_g.enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    graph_encode_done();
+    return 0;
+}
+
+int vtm_metal_graph_rope(float *y, const float *x, int heads, int head_dim,
+                         int interleaved, int pos, double theta) {
+    id<MTLBuffer> xb = nil, yb = nil, csb = nil;
+    uint64_t xoff = 0, yoff = 0;
+    typedef struct { uint32_t heads, half, head_dim, interleaved; } Ropeargs;
+    Ropeargs a;
+    size_t off = 0;
+    int half, ok = 0;
+
+    if (!g_graph_on || g_graph_failed) return -1;
+    if (!y || !x || heads <= 0 || head_dim < 2 || (head_dim & 1))
+        return graph_fail();
+    if (head_dim > 256) return graph_fail();
+    half = head_dim / 2;
+    if (g_g.rope_valid && g_g.rope_pos == (uint64_t)(uint32_t)pos
+        && g_g.rope_dim == (uint32_t)head_dim
+        && g_g.rope_int == (uint32_t)interleaved) {
+        off = g_g.rope_off;
+        ok = 1;
+    }
+    if (!ok) {
+        size_t need = (size_t)head_dim * sizeof(float);
+        float *dst;
+
+        if (g_g.tmpused + need > VTM_GRAPH_TMP_BYTES) return graph_fail();
+        if (!g_g.tmp || g_g.tmpcap < VTM_GRAPH_TMP_BYTES) {
+            [g_g.tmp release];
+            g_g.tmp = [g_dev newBufferWithLength:VTM_GRAPH_TMP_BYTES
+                                         options:MTLResourceStorageModeShared];
+            if (!g_g.tmp) {
+                g_g.tmpcap = 0;
+                return graph_fail();
+            }
+            g_g.tmpcap = VTM_GRAPH_TMP_BYTES;
+        }
+        off = g_g.tmpused;
+        dst = (float *)((uint8_t *)[g_g.tmp contents] + off);
+        {
+            int p;
+            for (p = 0; p < half; p++) {
+                double inv = pow(theta, -2.0 * (double)p / (double)head_dim);
+                double angle = (double)pos * inv;
+                dst[p] = (float)cos(angle);
+                dst[half + p] = (float)sin(angle);
+            }
+        }
+        g_g.tmpused += need;
+        g_g.rope_pos = (uint64_t)(uint32_t)pos;
+        g_g.rope_dim = (uint32_t)head_dim;
+        g_g.rope_int = (uint32_t)interleaved;
+        g_g.rope_off = off;
+        g_g.rope_valid = 1;
+    }
+    if (graph_bind(x, (size_t)heads * (size_t)head_dim * sizeof(float), &xb,
+                   &xoff) != 0
+        || graph_bind(y, (size_t)heads * (size_t)head_dim * sizeof(float), &yb,
+                      &yoff) != 0)
+        return graph_fail();
+    csb = g_g.tmp;
+    a.heads = (uint32_t)heads;
+    a.half = (uint32_t)half;
+    a.head_dim = (uint32_t)head_dim;
+    a.interleaved = (uint32_t)(interleaved ? 1 : 0);
+    {
+        NSUInteger pairs = (NSUInteger)heads * (NSUInteger)half;
+        [g_g.enc setComputePipelineState:g_ps_rope];
+        [g_g.enc setBuffer:xb offset:(NSUInteger)xoff atIndex:0];
+        [g_g.enc setBuffer:yb offset:(NSUInteger)yoff atIndex:1];
+        [g_g.enc setBuffer:csb offset:(NSUInteger)off atIndex:2];
+        [g_g.enc setBytes:&a length:sizeof a atIndex:3];
+        [g_g.enc dispatchThreadgroups:
+            MTLSizeMake((pairs + 255u) / 256u, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+    graph_encode_done();
+    return 0;
+}
+
+static int graph_elt(int which, float *y, const float *a_, const float *b_,
+                     int n) {
+    id<MTLBuffer> ab = nil, bb = nil, yb = nil;
+    uint64_t aoff = 0, boff2 = 0, yoff = 0;
+    typedef struct { uint32_t n; } Eltargs;
+    Eltargs ea;
+    NSUInteger vec;
+
+    if (!g_graph_on || g_graph_failed) return -1;
+    if (!y || !a_ || !b_ || n <= 0) return graph_fail();
+    if (graph_bind(a_, (size_t)n * sizeof(float), &ab, &aoff) != 0
+        || graph_bind(b_, (size_t)n * sizeof(float), &bb, &boff2) != 0
+        || graph_bind(y, (size_t)n * sizeof(float), &yb, &yoff) != 0)
+        return graph_fail();
+    ea.n = (uint32_t)n;
+    vec = (NSUInteger)((n + 3) / 4);
+    [g_g.enc setComputePipelineState:
+        which == 0 ? g_ps_silu : (which == 1 ? g_ps_mul : g_ps_add)];
+    [g_g.enc setBuffer:ab offset:(NSUInteger)aoff atIndex:0];
+    if (which != 0) [g_g.enc setBuffer:bb offset:(NSUInteger)boff2 atIndex:1];
+    [g_g.enc setBuffer:yb offset:(NSUInteger)yoff atIndex:2];
+    [g_g.enc setBytes:&ea length:sizeof ea atIndex:3];
+    [g_g.enc dispatchThreadgroups:
+        MTLSizeMake((vec + 255u) / 256u, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    graph_encode_done();
+    return 0;
+}
+
+int vtm_metal_graph_silu(float *y, const float *x, int n) {
+    if (!g_graph_on || g_graph_failed) return -1;
+    if (!y || !x || n <= 0) return graph_fail();
+    {
+        id<MTLBuffer> xb = nil, yb = nil;
+        uint64_t xoff = 0, yoff = 0;
+        typedef struct { uint32_t n; } Eltargs;
+        Eltargs ea;
+        NSUInteger vec;
+
+        if (graph_bind(x, (size_t)n * sizeof(float), &xb, &xoff) != 0
+            || graph_bind(y, (size_t)n * sizeof(float), &yb, &yoff) != 0)
+            return graph_fail();
+        ea.n = (uint32_t)n;
+        vec = (NSUInteger)((n + 3) / 4);
+        [g_g.enc setComputePipelineState:g_ps_silu];
+        [g_g.enc setBuffer:xb offset:(NSUInteger)xoff atIndex:0];
+        [g_g.enc setBuffer:yb offset:(NSUInteger)yoff atIndex:1];
+        [g_g.enc setBytes:&ea length:sizeof ea atIndex:2];
+        [g_g.enc dispatchThreadgroups:
+            MTLSizeMake((vec + 255u) / 256u, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        graph_encode_done();
+    }
+    return 0;
+}
+
+int vtm_metal_graph_mul(float *y, const float *a_, const float *b_, int n) {
+    return graph_elt(1, y, a_, b_, n);
+}
+
+int vtm_metal_graph_add(float *y, const float *a_, const float *b_, int n) {
+    return graph_elt(2, y, a_, b_, n);
+}
+
+int vtm_metal_graph_kvw(float *kc, const float *k, float *vc, const float *v,
+                        int kv_dim, int slot) {
+    id<MTLBuffer> kb = nil, vb = nil, kcb = nil, vcb = nil;
+    uint64_t koff = 0, voff = 0, kcoff = 0, vcoff = 0;
+    typedef struct { uint32_t kv_dim, slot; } Kvwargs;
+    Kvwargs a;
+
+    if (!g_graph_on || g_graph_failed) return -1;
+    if (!kc || !vc || !k || !v || kv_dim <= 0 || slot < 0) return graph_fail();
+    if (graph_bind(k, (size_t)kv_dim * sizeof(float), &kb, &koff) != 0
+        || graph_bind(v, (size_t)kv_dim * sizeof(float), &vb, &voff) != 0)
+        return graph_fail();
+    if (graph_bind(kc, (size_t)(slot + 1) * (size_t)kv_dim * sizeof(float),
+                   &kcb, &kcoff) != 0
+        || graph_bind(vc, (size_t)(slot + 1) * (size_t)kv_dim * sizeof(float),
+                      &vcb, &vcoff) != 0)
+        return graph_fail();
+    a.kv_dim = (uint32_t)kv_dim;
+    a.slot = (uint32_t)slot;
+    [g_g.enc setComputePipelineState:g_ps_kvw];
+    [g_g.enc setBuffer:kb offset:(NSUInteger)koff atIndex:0];
+    [g_g.enc setBuffer:vb offset:(NSUInteger)voff atIndex:1];
+    [g_g.enc setBuffer:kcb offset:(NSUInteger)kcoff atIndex:2];
+    [g_g.enc setBuffer:vcb offset:(NSUInteger)vcoff atIndex:3];
+    [g_g.enc setBytes:&a length:sizeof a atIndex:4];
+    [g_g.enc dispatchThreadgroups:
+        MTLSizeMake((((NSUInteger)kv_dim + 255u) / 256u), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    graph_encode_done();
+    return 0;
+}
+
+int vtm_metal_graph_attn(float *out, const float *q, const float *kc,
+                         const float *vc, int n_heads, int n_kv_heads,
+                         int head_dim, int kv_dim, int win, int n_keys,
+                         int slot0) {
+    id<MTLBuffer> qb = nil, kb = nil, vb = nil, ob = nil;
+    uint64_t qoff = 0, koff = 0, voff = 0, ooff = 0;
+    typedef struct {
+        uint32_t n_heads, rep, head_dim, kv_dim, win, n_keys, slot0;
+        float    scale;
+    } Attnargs;
+    Attnargs a;
+
+    if (!g_graph_on || g_graph_failed) return -1;
+    if (!out || !q || !kc || !vc) return graph_fail();
+    if (n_heads <= 0 || n_kv_heads <= 0 || n_heads % n_kv_heads != 0
+        || head_dim <= 0 || head_dim > 256 || kv_dim != n_kv_heads * head_dim
+        || win <= 0 || n_keys < 0 || slot0 < 0)
+        return graph_fail();
+    if (graph_bind(q, (size_t)n_heads * (size_t)head_dim * sizeof(float), &qb,
+                   &qoff) != 0
+        || graph_bind(out, (size_t)n_heads * (size_t)head_dim * sizeof(float),
+                      &ob, &ooff) != 0)
+        return graph_fail();
+    /* Кэш-тензор — [ctx, kv_dim]; регистрируем ровно столько, сколько нужно
+       attention'у: win строк (кольцо всё равно не больше win). */
+    if (graph_bind(kc, (size_t)win * (size_t)kv_dim * sizeof(float), &kb,
+                   &koff) != 0
+        || graph_bind(vc, (size_t)win * (size_t)kv_dim * sizeof(float), &vb,
+                      &voff) != 0)
+        return graph_fail();
+    a.n_heads = (uint32_t)n_heads;
+    a.rep = (uint32_t)(n_heads / n_kv_heads);
+    a.head_dim = (uint32_t)head_dim;
+    a.kv_dim = (uint32_t)kv_dim;
+    a.win = (uint32_t)win;
+    a.n_keys = (uint32_t)n_keys;
+    a.slot0 = (uint32_t)slot0;
+    a.scale = (float)(1.0 / sqrt((double)head_dim));
+    [g_g.enc setComputePipelineState:g_ps_attn];
+    [g_g.enc setBuffer:qb offset:(NSUInteger)qoff atIndex:0];
+    [g_g.enc setBuffer:kb offset:(NSUInteger)koff atIndex:1];
+    [g_g.enc setBuffer:vb offset:(NSUInteger)voff atIndex:2];
+    [g_g.enc setBuffer:ob offset:(NSUInteger)ooff atIndex:3];
+    [g_g.enc setBytes:&a length:sizeof a atIndex:4];
+    [g_g.enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    graph_encode_done();
+    return 0;
+}
+
+int vtm_metal_graph_copy(float *y, const float *x, int n) {
+    id<MTLBuffer> xb = nil, yb = nil;
+    uint64_t xoff = 0, yoff = 0;
+    typedef struct { uint32_t n; } Eltargs;
+    Eltargs ea;
+    NSUInteger vec;
+
+    if (!g_graph_on || g_graph_failed) return -1;
+    if (!y || !x || n <= 0) return graph_fail();
+    if (graph_bind(x, (size_t)n * sizeof(float), &xb, &xoff) != 0
+        || graph_bind(y, (size_t)n * sizeof(float), &yb, &yoff) != 0)
+        return graph_fail();
+    ea.n = (uint32_t)n;
+    vec = (NSUInteger)((n + 3) / 4);
+    [g_g.enc setComputePipelineState:g_ps_copy];
+    [g_g.enc setBuffer:xb offset:(NSUInteger)xoff atIndex:0];
+    [g_g.enc setBuffer:yb offset:(NSUInteger)yoff atIndex:1];
+    [g_g.enc setBytes:&ea length:sizeof ea atIndex:2];
+    [g_g.enc dispatchThreadgroups:
+        MTLSizeMake((vec + 255u) / 256u, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    graph_encode_done();
+    return 0;
+}
+
+int vtm_metal_graph_end(void) {
+    int rc = 0;
+    double gpu;
+
+    if (!__atomic_load_n(&g_graph_on, __ATOMIC_ACQUIRE)) return 0;
+    __atomic_store_n(&g_graph_on, 0, __ATOMIC_RELEASE);
+    if (g_g.t_encode0 > 0.0) {
+        double dt = now_ms() - g_g.t_encode0;
+        if (dt > 0.0) g_graph_encode_ns += (uint64_t)(dt * 1e6);
+        g_g.t_encode0 = 0.0;
+    }
+    if (g_g.enc) {
+        [g_g.enc endEncoding];
+        [g_g.enc release];
+        g_g.enc = nil;
+    }
+    if (force_fail_graph()) {
+        metal_set_err("VTM_METAL_FORCE_FAIL_GRAPH: инъекция отказа Metal "
+                      "(граф)");
+        g_graph_failed = 1;
+    }
+    if (g_graph_failed || !g_g.cb) {
+        [g_g.cb release];
+        g_g.cb = nil;
+        g_graph_fail += 1;
+        g_fail++;
+        __atomic_store_n(&g_graph_owner, (uintptr_t)0, __ATOMIC_RELAXED);
+        __sync_lock_release(&g_graph_busy);
+        return -1;
+    }
+    @autoreleasepool {
+        [g_g.cb commit];
+        [g_g.cb waitUntilCompleted];
+    }
+    gpu = (g_g.cb.GPUEndTime - g_g.cb.GPUStartTime) * 1e9;
+    if (gpu > 0.0) g_gpu_ns += (uint64_t)gpu;
+    if (g_g.cb.status != MTLCommandBufferStatusCompleted || g_g.cb.error) {
+        if (g_fail == 0)
+            metal_log("граф токена: %s — дальше CPU-откат",
+                      g_g.cb.error
+                          ? [[g_g.cb.error localizedDescription] UTF8String]
+                          : "status != completed");
+        metal_set_err("граф токена не завершился");
+        g_fail++;
+        rc = -1;
+    } else {
+        g_calls += g_g.ops;
+        g_graph_tokens++;
+        g_graph_ops += g_g.ops;
+    }
+    [g_g.cb release];
+    g_g.cb = nil;
+    g_g.tmpused = 0;
+    g_g.rope_valid = 0;
+    __atomic_store_n(&g_graph_owner, (uintptr_t)0, __ATOMIC_RELAXED);
+    __sync_lock_release(&g_graph_busy);
+    return rc;
 }
 
 // --- публичный контракт -----------------------------------------------------
@@ -1337,6 +1964,10 @@ void vtm_metal_stats_get(vtm_metal_stats *out) {
     out->gemm_calls = g_gemm_calls;
     out->defer_ops = g_defer_ops;
     out->defer_waits = g_defer_waits;
+    out->graph_tokens = g_graph_tokens;
+    out->graph_ops = g_graph_ops;
+    out->graph_fail = g_graph_fail;
+    out->graph_encode_ns = g_graph_encode_ns;
     out->wait_ns = g_wait_ns;
     snprintf(out->last_error, sizeof out->last_error, "%s", g_err);
     pthread_mutex_unlock(&g_lock);

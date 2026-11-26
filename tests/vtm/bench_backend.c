@@ -3788,7 +3788,8 @@ static float *metal_bench_logits(vtm_t *m, const vtm_backend *b,
 
 static int metal_bench_decode(vtm_t *m, const vtm_backend *b,
                               const int *prompt, int np, int ngen,
-                              double *prefill_ms, double *ms_per_tok) {
+                              double *prefill_ms, double *ms_per_tok,
+                              double *steps) {
     int i, pos, tok = -1, next = -1;
     double t0, t1;
 
@@ -3803,7 +3804,9 @@ static int metal_bench_decode(vtm_t *m, const vtm_backend *b,
     pos = np;
     t0 = now_ms();
     for (i = 0; i < ngen; i++) {
+        double s0 = now_ms();
         if (metal_step(m, tok, pos, &next) != 0) return -1;
+        if (steps) steps[i] = now_ms() - s0;
         tok = next;
         pos++;
     }
@@ -3922,23 +3925,42 @@ static int run_metal_bench(const char *explicit_path, int ngen) {
     printf("декод (префикс 5, %d токенов, min из 2, порядок чередуется):\n",
            ngen);
     {
+        static const int dlens[3] = {16, 32, 64};
         double best[3] = {1e300, 1e300, 1e300};
         double pre[3] = {1e300, 1e300, 1e300};
-        int rep, k;
+        double *steps[3] = {NULL, NULL, NULL};
+        double pref_sum[3][3];
+        int have[3] = {0, 0, 0};
+        int rep, k, li2;
 
+        for (i = 0; i < 3; i++)
+            for (li2 = 0; li2 < 3; li2++) pref_sum[i][li2] = 1e300;
+        for (i = 0; i < 3; i++) steps[i] = (double *)calloc((size_t)ngen,
+                                                            sizeof(double));
         for (rep = 0; rep < 2; rep++) {
             for (k = 0; k < 3; k++) {
                 int bi = order[rep][k];
                 double prefill = 0.0, ms = 0.0;
                 if (metal_bench_decode(m, bs[bi], prompts[0], 5, ngen,
-                                       &prefill, &ms) != 0) {
+                                       &prefill, &ms, steps[bi]) != 0) {
                     fprintf(stderr, "metal: декод %s — ошибка\n",
                             bs[bi]->name);
                     rc = 1;
                     continue;
                 }
+                have[bi] = 1;
                 if (prefill < pre[bi]) pre[bi] = prefill;
                 if (ms < best[bi]) best[bi] = ms;
+                // Сумма первых L шагов — скорость на префиксе L. В одном
+                // прогоне с парным чередованием бэкендов (0204).
+                for (li2 = 0; li2 < 3; li2++) {
+                    int L = dlens[li2], jj;
+                    double sum = 0.0;
+                    if (L > ngen) continue;
+                    for (jj = 0; jj < L; jj++) sum += steps[bi][jj];
+                    if (sum > 0.0 && sum < pref_sum[bi][li2])
+                        pref_sum[bi][li2] = sum;
+                }
             }
         }
         for (i = 0; i < 3; i++) {
@@ -3953,6 +3975,27 @@ static int run_metal_bench(const char *explicit_path, int ngen) {
                     printf("  %s/simd: %.2fx\n", bs[i]->name,
                            best[0] / best[i]);
         }
+        for (li2 = 0; li2 < 3; li2++) {
+            int L = dlens[li2], j;
+
+            if (L > ngen) continue;
+            for (j = 0; j < 3; j++)
+                if (pref_sum[j][li2] < 1e299)
+                    break;
+            if (j == 3) continue;
+            printf("  декод %2d: ", L);
+            for (j = 0; j < 3; j++) {
+                if (pref_sum[j][li2] >= 1e299) continue;
+                printf(" %-6s %.1f ток/с", bs[j]->name,
+                       (double)L * 1000.0 / pref_sum[j][li2]);
+            }
+            if (pref_sum[0][li2] < 1e299 && pref_sum[1][li2] < 1e299)
+                printf(" | metal/simd %.2fx",
+                       pref_sum[0][li2] / pref_sum[1][li2]);
+            printf("\n");
+        }
+        (void)have;
+        for (i = 0; i < 3; i++) free(steps[i]);
     }
 
     // Prefill пачкой: все токены промпта за один vtm_run_batch (внутри —
@@ -4032,13 +4075,24 @@ static int run_metal_bench(const char *explicit_path, int ngen) {
 
     vtm_metal_stats_get(&st);
     printf("metal stats: init %llu мс (MSL %llu мс), вызовов %llu, отказов "
-           "%llu, gemm %llu, отложено %llu, ожиданий %llu\n",
+           "%llu, gemm %llu, отложено %llu, ожиданий %llu, "
+           "граф %llu токенов/%llu ops (отказов %llu)\n",
            (unsigned long long)st.init_ms,
            (unsigned long long)st.compile_ms,
            (unsigned long long)st.calls, (unsigned long long)st.failures,
            (unsigned long long)st.gemm_calls,
            (unsigned long long)st.defer_ops,
-           (unsigned long long)st.defer_waits);
+           (unsigned long long)st.defer_waits,
+           (unsigned long long)st.graph_tokens,
+           (unsigned long long)st.graph_ops,
+           (unsigned long long)st.graph_fail);
+    printf("  граф: кодирование CPU %.1f мс на %llu токенов = %.2f мс/токен "
+           "(GPU ждёт только кодирование)\n",
+           (double)st.graph_encode_ns / 1e6,
+           (unsigned long long)st.graph_tokens,
+           st.graph_tokens
+               ? (double)st.graph_encode_ns / 1e6 / (double)st.graph_tokens
+               : 0.0);
     printf("  zero-copy: %.1f МиБ привязано без копии, копий %.1f МиБ; "
            "currentAllocatedSize %.1f МиБ (до init %.1f, после %.1f), "
            "ожидание GPU %.1f мс\n",
@@ -4094,6 +4148,40 @@ static int run_metal_bench(const char *explicit_path, int ngen) {
         } else {
             d = max_diff(got, ref, (size_t)n_ref, &refmax);
             printf("  hybrid после ошибки: max|Δlogits|=%.3e, argmax %d/%d "
+                   "%s\n", d, tok_ref, tok_got,
+                   tok_ref == tok_got ? "(совпал)" : "(РАЗОШЁЛСЯ)");
+            if (tok_ref != tok_got || d > 1e-2) rc = 1;
+        }
+        free(ref);
+        free(got);
+    }
+
+    // Откат графа токена (0204): инъекция отказа в конец КАЖДОГО графа —
+    // первый токен теряет результаты, interp.c перезапускает его CPU-путём и
+    // выключает Metal; остальные токены обязаны совпасть с simd побитово.
+    printf("откат графа (VTM_METAL_FORCE_FAIL=1, metal FULL, 5 токенов):\n");
+    {
+        static const int ids[5] = {1, 2, 3, 4, 5};
+        int n_ref = 0, n_got = 0, tok_ref = -1, tok_got = -1;
+        float *ref, *got;
+        double d, refmax = 0.0;
+
+        ref = metal_bench_logits(m, simd, ids, 5, &n_ref, &tok_ref);
+        setenv("VTM_METAL_FORCE_FAIL_GRAPH", "1", 1);
+        got = metal_bench_logits(m, metal, ids, 5, &n_got, &tok_got);
+        unsetenv("VTM_METAL_FORCE_FAIL_GRAPH");
+        vtm_metal_stats_get(&st);
+        printf("  режим после ошибки: %s, отказов Metal %llu, графов "
+               "потеряно %llu\n",
+               vtm_metal_mode() == VTM_METAL_OFF ? "off (чистый CPU)" : "?",
+               (unsigned long long)st.failures,
+               (unsigned long long)st.graph_fail);
+        if (!ref || !got || n_ref != n_got) {
+            fprintf(stderr, "откат графа: логиты не получены\n");
+            rc = 1;
+        } else {
+            d = max_diff(got, ref, (size_t)n_ref, &refmax);
+            printf("  metal после ошибки: max|Δlogits|=%.3e, argmax %d/%d "
                    "%s\n", d, tok_ref, tok_got,
                    tok_ref == tok_got ? "(совпал)" : "(РАЗОШЁЛСЯ)");
             if (tok_ref != tok_got || d > 1e-2) rc = 1;
