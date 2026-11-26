@@ -109,11 +109,28 @@ def _fetch_through(ctx: PluginContext):
             ctx.log.warning(
                 "TLS MOEX не доверен локальному хранилищу — повтор с корнями ОС"
             )
-            return ctx.fetch(
-                str(url),
-                timeout=float(timeout),
-                ssl_context=_system_ssl_context(ctx),
-            )
+            try:
+                return ctx.fetch(
+                    str(url),
+                    timeout=float(timeout),
+                    ssl_context=_system_ssl_context(ctx),
+                )
+            except urllib.error.URLError as second:
+                if "CERTIFICATE_VERIFY_FAILED" not in str(second):
+                    raise
+                # Последняя ступень: публичные котировки MOEX читаем по http.
+                # Это осознанный компромисс ТОЛЬКО для публичных данных без
+                # авторизации: целостность ответа не защищена, поэтому факт
+                # помечается источником «MOEX ISS (http)», а в лог идёт
+                # предупреждение. Для любых данных с ключами/приватностью
+                # такой путь запрещён.
+                ctx.log.warning(
+                    "MOEX: корни ОС не помогли — читаю публичные котировки по http"
+                )
+                return ctx.fetch(
+                    "http://" + str(url)[len("https://") :],
+                    timeout=float(timeout),
+                )
 
     return fetch
 

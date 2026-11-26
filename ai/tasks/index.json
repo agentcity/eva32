@@ -1405,5 +1405,12 @@
     "status": "done",
     "file": "0210-docs-actualization.md",
     "assignee": "agent:docs"
+  },
+  {
+    "id": "0211",
+    "title": "Prefill: провал на длинных промптах",
+    "status": "in_progress",
+    "file": "0211-prefill-scaling.md",
+    "assignee": "agent:prefill-scale"
   }
 ]
