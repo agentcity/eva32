@@ -1447,5 +1447,12 @@
     "status": "done",
     "file": "0216-metal-f16-gemm.md",
     "assignee": "agent:metal-f16"
+  },
+  {
+    "id": "0217",
+    "title": "Длинный ответ не обрезается",
+    "status": "done",
+    "file": "0217-long-answers.md",
+    "assignee": "saron"
   }
 ]
