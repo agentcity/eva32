@@ -204,6 +204,10 @@ class _Library:
 
     def __init__(self, path: Path) -> None:
         self.path = str(path)
+        # Спекуляции нужен samp_hist по КАЖДОМУ токену пачки: ускорение
+        # «lm_head только для последнего» (0215) его не заполняет. Флаг
+        # ставим до загрузки библиотеки — C читает его при разметке пачки.
+        os.environ.setdefault("VTM_SAMP_HIST_ALL", "1")
         try:
             self.cdll = ctypes.CDLL(self.path)
         except OSError as exc:

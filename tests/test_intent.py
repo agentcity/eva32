@@ -25,9 +25,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from eva.skills import fresh, intent  # noqa: E402
 from eva.skills.clock import MOSCOW_TZ  # noqa: E402
 from eva.skills.intent import (  # noqa: E402
+    FACT_SECTION_HINT,
+    FACT_SECTION_TITLE,
     Intent,
     build_facts,
     detect,
+    fact_block,
+    fact_entries,
     fact_line,
     with_fact,
 )
@@ -161,23 +165,41 @@ class TestFactLine(IntentTest):
     def test_time_line(self):
         line = fact_line("Который час?", now=NOW)
         self.assertEqual(
-            line, "[Факт: 26 ноября 2026, 15:30 MSK (источник: часы сервера)]"
+            line,
+            fact_block(["26 ноября 2026, 15:30 MSK (часы сервера)"]),
         )
+        self.assertEqual(line.splitlines()[0], FACT_SECTION_HINT)
+        self.assertEqual(
+            line.splitlines()[1], "26 ноября 2026, 15:30 MSK (часы сервера)"
+        )
+
+    def test_section_has_explicit_instruction(self):
+        # Задача 0212: команда модели — в самом заголовке секции, а не в
+        # отдельном правиле промпта, которое 3B теряла.
+        line = fact_line("Который час?", now=NOW)
+        self.assertTrue(line.startswith(FACT_SECTION_TITLE + " ("))
+        self.assertIn("дословно", line)
+        self.assertIn("не говори, что данных нет", line)
+        self.assertIn("не цитируй", line)
+        self.assertNotIn("[Факт", line)
 
     def test_time_weekday_line(self):
         line = fact_line("Какой сегодня день недели?", now=NOW)
-        self.assertTrue(line.startswith("[Факт: четверг, 26 ноября 2026"))
+        self.assertTrue(line.splitlines()[1].startswith("четверг, 26 ноября 2026"))
 
     def test_currency_line(self):
         line = fact_line("Курс доллара", fetch=FetchStub(CBR_XML))
         self.assertEqual(
-            line, "[Факт: 1 USD = 82,3130 ₽ (источник: ЦБ РФ на 26.11.2026)]"
+            line,
+            fact_block(["1 USD = 82,3130 ₽ (ЦБ РФ на 26.11.2026)"]),
         )
+        self.assertNotIn("[Факт", line)
 
     def test_currency_without_param_gives_main_three(self):
         stub = FetchStub(CBR_XML)
         line = fact_line("Курс валют", fetch=stub)
-        self.assertEqual(len(line.split("\n")), 3)
+        # Заголовок секции + три строки данных.
+        self.assertEqual(len(line.split("\n")), 4)
         self.assertIn("1 USD", line)
         self.assertIn("1 EUR", line)
         self.assertIn("1 CNY", line)
@@ -186,7 +208,7 @@ class TestFactLine(IntentTest):
     def test_stock_line(self):
         line = fact_line("Цена акции Сбер", fetch=FetchStub(MOEX_JSON))
         self.assertIn("SBER (Сбербанк) = 285,10 ₽", line)
-        self.assertIn("(источник: MOEX ISS, 26.11.2026 15:14 MSK)", line)
+        self.assertIn("(MOEX ISS, 26.11.2026 15:14 MSK)", line)
 
     def test_currency_degradation_is_honest(self):
         stub = FetchStub(error=OSError("сеть недоступна"))
@@ -292,8 +314,9 @@ class TestServerWiring(IntentTest):
 
     def test_fact_reaches_both_columns(self):
         server, left, right = self.start()
+        section = fact_block(["тест (тест)"])
         with mock.patch.object(
-            chat_server, "_fresh_fact", return_value="[Факт: тест (источник: тест)]"
+            chat_server, "_fresh_fact", return_value=section
         ):
             status = self.post(server, self.payload())
         self.assertEqual(status, 200)
@@ -302,9 +325,15 @@ class TestServerWiring(IntentTest):
                 messages = adapter.calls[0]
                 self.assertEqual(messages[0]["role"], "system")
                 self.assertIn("СИСТЕМА", messages[0]["content"])
-                self.assertIn("[Факт: тест (источник: тест)]", messages[0]["content"])
-                self.assertEqual(
-                    messages[-1], {"role": "user", "content": "Который час?"}
+                # Справка идёт В ХВОСТЕ (к последнему вопросу), чтобы кэш
+                # префикса ВТМ не промахивался: она меняется от запроса
+                # к запросу (0211/0215).
+                self.assertNotIn(section, messages[0]["content"])
+                self.assertEqual(messages[-1]["role"], "user")
+                self.assertIn(section, messages[-1]["content"])
+                self.assertTrue(
+                    messages[-1]["content"].startswith("Который час?"),
+                    "вопрос остаётся первым в сообщении, справка — хвостом",
                 )
 
     def test_no_fact_when_router_silent(self):
@@ -316,7 +345,7 @@ class TestServerWiring(IntentTest):
     def test_no_fact_when_system_disabled(self):
         server, left, _right = self.start()
         with mock.patch.object(
-            chat_server, "_fresh_fact", return_value="[Факт: тест]"
+            chat_server, "_fresh_fact", return_value=fact_block(["тест"])
         ) as mocked:
             self.post(server, self.payload(use_system=False))
         self.assertEqual([m["role"] for m in left.calls[0]], ["user"])
@@ -325,7 +354,7 @@ class TestServerWiring(IntentTest):
     def test_no_fact_when_flag_disabled(self):
         server, left, _right = self.start(facts=False)
         with mock.patch.object(
-            chat_server, "_fresh_fact", return_value="[Факт: тест]"
+            chat_server, "_fresh_fact", return_value=fact_block(["тест"])
         ) as mocked:
             self.post(server, self.payload())
         self.assertEqual(left.calls[0][0]["content"], "СИСТЕМА")
@@ -333,15 +362,14 @@ class TestServerWiring(IntentTest):
 
     def test_fact_is_injected_without_system_prompt(self):
         server, left, _right = self.start(system_prompt="")
+        section = fact_block(["15:30 MSK"])
         with mock.patch.object(
-            chat_server, "_fresh_fact", return_value="[Факт: 15:30 MSK]"
+            chat_server, "_fresh_fact", return_value=section
         ):
             self.post(server, self.payload())
         messages = left.calls[0]
-        self.assertEqual(
-            messages[0], {"role": "system", "content": "[Факт: 15:30 MSK]"}
-        )
-        self.assertEqual(messages[1]["role"], "user")
+        self.assertEqual(messages[0]["role"], "user")
+        self.assertIn(section, messages[0]["content"])
 
     def test_router_crash_does_not_break_request(self):
         # Рантайм фактов (в ядре — реестр плагинов 0209) падает → пустая
@@ -358,17 +386,46 @@ class TestWithFact(IntentTest):
             {"role": "system", "content": "Ты — Ева."},
             {"role": "user", "content": "Который час?"},
         ]
-        result = with_fact(messages, "[Факт: 15:30 MSK]")
-        self.assertEqual(result[0]["role"], "system")
-        self.assertEqual(result[0]["content"], "Ты — Ева.\n\n[Факт: 15:30 MSK]")
-        self.assertEqual(result[1], {"role": "user", "content": "Который час?"})
-        self.assertEqual(len(result), 2, "системное сообщение остаётся одно")
+        section = fact_block(["15:30 MSK"])
+        result = with_fact(messages, section)
+        # Персона остаётся стабильным префиксом, справка — в хвосте.
+        self.assertEqual(result[0], {"role": "system", "content": "Ты — Ева."})
+        self.assertEqual(result[1]["role"], "user")
+        self.assertIn(section, result[1]["content"])
+        self.assertEqual(len(result), 2)
+
+    def test_single_line_is_wrapped_into_section(self):
+        # Одиночная строка данных всё равно получает команду модели: правило
+        # должно стоять рядом с данными, иначе 3B его не связывает (0212).
+        result = with_fact(
+            [
+                {"role": "system", "content": "С"},
+                {"role": "user", "content": "Курс?"},
+            ],
+            "15:30 MSK",
+        )
+        # Персона не трогается, справка идёт к вопросу (кэш префикса).
+        self.assertEqual(result[0]["content"], "С")
+        self.assertIn(fact_block(["15:30 MSK"]), result[1]["content"])
+        self.assertIn(FACT_SECTION_HINT, result[1]["content"])
 
     def test_creates_system_when_missing(self):
         messages = [{"role": "user", "content": "Который час?"}]
-        result = with_fact(messages, "[Факт: 15:30 MSK]")
-        self.assertEqual(result[0], {"role": "system", "content": "[Факт: 15:30 MSK]"})
-        self.assertEqual(result[1]["role"], "user")
+        section = fact_block(["15:30 MSK"])
+        result = with_fact(messages, section)
+        self.assertEqual(result[0]["role"], "user")
+        self.assertIn(section, result[0]["content"])
+
+    def test_section_is_parsed_back_to_data_lines(self):
+        self.assertEqual(
+            fact_entries(fact_block(["1 USD = 82,3130 ₽ (ЦБ РФ)"])),
+            ["1 USD = 82,3130 ₽ (ЦБ РФ)"],
+        )
+        self.assertEqual(fact_entries(None), [])
+        # Старый формат из чужих вызовов тоже понимаем.
+        self.assertEqual(
+            fact_entries("[Факт: 15:30 MSK]"), ["15:30 MSK"]
+        )
 
     def test_empty_line_returns_copy(self):
         messages = [{"role": "user", "content": "привет"}]
@@ -379,7 +436,7 @@ class TestWithFact(IntentTest):
     def test_input_is_not_mutated(self):
         original = {"role": "system", "content": "система"}
         messages = [original]
-        with_fact(messages, "[Факт: x]")
+        with_fact(messages, "x")
         self.assertEqual(original["content"], "система")
 
 

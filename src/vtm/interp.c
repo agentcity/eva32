@@ -4507,9 +4507,9 @@ void vtm_cache_prefix_extend(vtm_t *m, const int32_t *ids, int n) {
 // же 2,2 ГиБ весов на каждый токен промпта. Скалярный эталон ядра битово
 // равен N вызовам vtm_q4_*, NEON — доли 1e-6 (проверяет bench_backend
 // --check и --prefill-check). Отказ ядра (нет памяти) — на поштучный путь.
-// Остальные операции (EMB/ROPE/KVW/ATTN/RMSN/SAMP/...) дешёвые и считаются
-// по токену прежними функциями: это сохраняет их семантику (позиция, окно,
-// эмбеддинг) без дублирования кода.
+// Остальные операции (EMB/ROPE/KVW/ATTN/RMSN/RMSH/SAMP/...) дешёвые и
+// считаются по токену прежними функциями: это сохраняет их семантику (позиция,
+// окно, эмбеддинг) без дублирования кода.
 //
 // Если батчевых ядер 0122 в сборке нет (или бэкенд кастомный), SIMD идёт
 // прежним путём по токену: побитово то же состояние, без выигрыша. Так же
@@ -4817,6 +4817,13 @@ typedef struct {
     int       gpu_npend;  // 0214: сколько dst ждут GPU-очередь
     int       gpu_failed; // 0214: группа GEMM не досчиталась (ошибка Metal)
     uint32_t  gpu_pend[8];// их индексы (не больше восьми без сброса)
+    // 0215: lm_head только для последнего токена пачки. mm_last_only[dst] —
+    // MM с таким dst читается в программе только SAMP'ом (и ничего после
+    // SAMP'а логиты не трогает), поэтому остальные C-1 токенов посчитаны быть
+    // не обязаны: в машину всё равно попадёт слот последнего (batch_store_one).
+    uint8_t  *mm_last_only;   // [n_tensors]
+    uint32_t  samp_logits;    // тензор, посчитанный только для последнего токена
+    int       samp_skip;      // 1 — такой SAMP выполняется только на последнем
 } batch_scratch;
 
 // Прямоугольник упакованного слота: [off, off+sz) занят тензором до pc end.
@@ -4848,6 +4855,7 @@ static void batch_free(batch_scratch *b) {
     free(b->first);
     free(b->last);
     free(b->live_in);
+    free(b->mm_last_only);
 #if VTM_WITH_METAL
     // 0214: арену отпускаем до free: no-copy буфер не должен пережить память.
     if (b->mem) vtm_metal_batch_arena_drop(b->mem);
@@ -4927,13 +4935,17 @@ static int batch_classify(vtm_t *m, batch_scratch *b) {
     for (i = 0; i < m->n_instr; i++) {
         const vtm_instr *in = &m->instr[i];
         uint32_t d = in->dst;
-        // RMSH (QK-norm) батчевых ядер не имеет, но он дешёвый и считается по
-        // токену в batch_token_op. Раньше он выключал пачку целиком — вместе с
-        // MOE, из-за чего у Qwen3-MoE батчевого prefill не было вообще (0179).
-        // Для графов без MOE поведение прежнее: пачка по-прежнему только там,
-        // где её проверяли (плотные модели), — RMSH значит Qwen3, а его
-        // ARGMAX-паритет с поштучным путём на 30B не проверялся до 0179.
-        if (in->opcode == VTM_OP_RMSH && !b->has_moe) goto done;
+        // RMSH (QK-norm, Qwen3) батчевых ядер не имеет, но он дешёвый и
+        // считается по токену в batch_token_op — ровно как EMB/ROPE/ATTN.
+        // До 0215 RMSH выключал пачку целиком у плотных графов (у MoE его
+        // сняли ещё в 0179), и Qwen3-4B — единственная плотная модель с
+        // QK-norm — шла поштучным prefill'ом: 250 токенов читали 2,5 ГиБ
+        // весов 250 раз вместо одного. Отсюда 4,4× против 3B при 1,3×
+        // параметров. В пачке RMSH корректен по построению: инструкция не
+        // читает глобальную позицию и не пишет KV, а работает по последней
+        // оси своего тензора, поэтому её результат для токена не зависит от
+        // того, вместе с другими токенами её считают или по одной.
+        // Паритет с поштучным путём проверяет bench_backend --prefill-check.
         // У HALT dst — мусор из байткода (как в trace_out_elems): он ничего
         // не пишет, и «приёмником» его считать нельзя, иначе в активации
         // попадёт случайный тензор (в demo это emb.w в read-only mmap).
@@ -4974,6 +4986,75 @@ static int batch_classify(vtm_t *m, batch_scratch *b) {
         } else {
             batch_touch(i, d, 0, 1, n, first_rd, first_wr, b->first, b->last);
         }
+    }
+
+    // 0215: какие MM читаются только SAMP'ом (tied lm_head).
+    //
+    // Prefill-граф кончается CPY -> MM (lm_head) -> SAMP -> HALT, и логиты
+    // всех токенов пачки, кроме последнего, никто не читает: в машину попадает
+    // слот последнего (batch_store_one), а SAMP во время prefill'а ничего не
+    // отдаёт хосту. Считать lm_head для всех 250 токенов (у 4B это 97 ГMAC, у
+    // 3B — 78) — чистые потери; 0214 так уже делал для Metal-пути, но условие
+    // «dst больше никто не тронет» (last[dst] == pc) для этой формы не
+    // выполняется: логиты читает SAMP, и last[dst] — его pc.
+    //
+    // Здесь отмечаются MM, чей dst читают ТОЛЬКО SAMP'ы, причём сами SAMP'ы
+    // своего токена дальше по графу не отдают (токена не читает ни одна
+    // инструкция). Тогда C-1 пропущенных SAMP'ов не меняют ничего, кроме
+    // счётчика сгенерированных, — его batch_samp_last() ведёт так же. Если
+    // сэмплер не детерминированный (температура/top-p) или включён штраф за
+    // повторы, оптимизация не включается вовсе: там пропуск SAMP'а изменил бы
+    // поток ГПСЧ/историю и, значит, ответ.
+    const int hist_all = getenv("VTM_SAMP_HIST_ALL") != NULL;
+    b->mm_last_only = (uint8_t *)calloc(n ? n : 1u, 1u);
+    if (b->mm_last_only) {
+        uint8_t *rd_other = (uint8_t *)calloc(n ? n : 1u, 1u);
+        uint8_t *rd_samp = (uint8_t *)calloc(n ? n : 1u, 1u);
+        uint8_t *tok_dst = (uint8_t *)calloc(n ? n : 1u, 1u);
+
+        if (rd_other && rd_samp && tok_dst) {
+            for (i = 0; i < m->n_instr; i++) {
+                const vtm_instr *in = &m->instr[i];
+                // У HALT dst/операнды — мусор из байткода (как в
+                // trace_out_elems), «чтением» его считать нельзя.
+                if (in->opcode == VTM_OP_HALT) continue;
+                if (in->opcode == VTM_OP_SAMP) {
+                    if (in->a < n) rd_samp[in->a] = 1;
+                    if (in->dst < n) tok_dst[in->dst] = 1;
+                } else {
+                    if (in->a < n) rd_other[in->a] = 1;
+                    if (in->b < n) rd_other[in->b] = 1;
+                    if (in->c < n) rd_other[in->c] = 1;
+                }
+            }
+            for (i = 0; i < m->n_instr; i++) {
+                const vtm_instr *in = &m->instr[i];
+                uint32_t d = in->dst, tk;
+                int ok = 1;
+
+                if (in->opcode != VTM_OP_MM) continue;
+                if (d >= n || !b->local[d]) continue;
+                if (!rd_samp[d] || rd_other[d] || tok_dst[d]) continue;
+                for (k = 0; k < m->n_instr && ok; k++) {
+                    const vtm_instr *s = &m->instr[k];
+                    if (s->opcode != VTM_OP_SAMP || s->a != d) continue;
+                    // Только чистый argmax: он не трогает ГПСЧ и не зависит от
+                    // температуры/top-p, поэтому пропущенный SAMP ничего не
+                    // сдвигает. Остальные стратегии (даже когда они вырождены
+                    // в argmax настройками) оставляем полному пути.
+                    if (s->imm != VTM_SAMP_ARGMAX) ok = 0;
+                    tk = s->dst;
+                    if (tk >= n || rd_other[tk] || rd_samp[tk]) ok = 0;
+                }
+                // Спец-путь (спекулятивный декод, 0203) читает samp_hist по
+                // КАЖДОМУ токену пачки: ускорение «только последний» ломает
+                // его контракт. VTM_SAMP_HIST_ALL=1 возвращает полный путь.
+                if (ok && !hist_all) b->mm_last_only[d] = 1;
+            }
+        }
+        free(rd_other);
+        free(rd_samp);
+        free(tok_dst);
     }
 
     b->n_local = 0;
@@ -5871,16 +5952,71 @@ static vtm_status batch_attn_apply(vtm_t *m, uint32_t pc, const vtm_instr *in,
 #endif
 }
 
+// Диагностика (VTM_BATCH_TRACE=1): нужна и счётчикам 0215 ниже.
+static int batch_trace_enabled(void) {
+    const char *e = getenv("VTM_BATCH_TRACE");
+    return e && *e && *e != '0';
+}
+
+// 0215: сколько раз сработал lm_head-last / SAMP-last (диагностика в отчёте
+// VTM_BATCH_TRACE: иначе «SAMP 0,4 с» не отличить от «оптимизация не
+// включилась и логиты по-прежнему считаются для всех токенов»).
+static uint64_t g_bt_lmhead_last, g_bt_samp_last;
+
+// 0215: можно ли в этой пачке посчитать lm_head только для последнего токена.
+//
+// Пропуск SAMP'ов у C-1 токенов ничего не меняет в ответе, только если SAMP
+// детерминирован (чистый argmax — ни одного обращения к ГПСЧ; это проверяет
+// batch_classify по imm инструкции) и штраф за повторы выключен (историю
+// сэмплера тогда никто не читает).
+//
+// Параметры сэмплера ленивые — их выставляет первый SAMP; здесь зовём тот же
+// samp_state_begin(), что и он, поэтому штраф проверяется по тем же числам
+// (включая VTM_REP_PENALTY из окружения), а не по нулям.
+//
+// Почему нельзя пропускать SAMP при стохастической стратегии: каждый SAMP
+// тянет из ГПСЧ число, и C-1 пропущенных сдвинули бы поток — декод разошёлся
+// бы с поштучным путём. Поэтому там оптимизация не включается.
+static int batch_samp_skip_ok(vtm_t *m, batch_scratch *b) {
+    if (b->samp_skip < 0) {
+        const char *e = getenv("VTM_BATCH_LAST");   // A/B: 0 — как до 0215
+        int ok = 1;
+
+        if (e && *e && *e == '0') {
+            b->samp_skip = 0;
+            return 0;
+        }
+        samp_state_begin(m);
+        ok = m->samp_repetition_penalty == VTM_DEFAULT_REPETITION_PENALTY
+          || m->samp_repetition_window <= 0;
+        b->samp_skip = ok ? 1 : 0;
+    }
+    return b->samp_skip == 1;
+}
+
 static vtm_status batch_mm_apply(vtm_t *m, uint32_t pc,
                                  const vtm_instr *in,
                                  batch_scratch *b, int *handled) {
     const vtm_tensor *a;
     int mm, kk, j, r, t;
+    int C;                    // сколько токенов реально считается
+    int last_only = 0;        // 0215: считаем только последний токен пачки
     size_t bn, yn;
 
     *handled = 0;
     if (!batch_mm_ready(m, in, b, &mm, &kk)) return VTM_OK;
     a = &m->tensors[in->a];
+    C = b->C;
+    // 0215: lm_head только для последнего токена пачки. Признак (dst читают
+    // только SAMP'ы, а их токен никому дальше не нужен) посчитан в
+    // batch_classify; здесь проверяется ещё и сэмплер (см. batch_samp_skip_ok).
+    if (C > 1 && b->mm_last_only && b->mm_last_only[in->dst]
+        && batch_samp_skip_ok(m, b)) {
+        last_only = 1;
+        C = 1;
+        b->samp_logits = in->dst;
+        g_bt_lmhead_last += (batch_trace_enabled() ? 1u : 0u);
+    }
 #if VTM_WITH_METAL
     // 0214: то же для tied lm_head — Q4_K/Q6_K/int8 прямо в арену.
     if (vtm_metal_active()
@@ -5888,23 +6024,27 @@ static vtm_status batch_mm_apply(vtm_t *m, uint32_t pc,
             || a->kind == VTM_TENSOR_INT8)
         && (a->kind == VTM_TENSOR_INT8 ? (a->i8 && a->scales)
                                        : a->qblocks != NULL)) {
-        const float *x0 = batch_src(m, b, in->b, 0);
-        float *y0 = b->mem + b->off[in->dst];
-        int xs = b->local[in->b] ? (int)b->slot : 0;
-        int C = b->C;
+        const float *x0 = batch_src(m, b, in->b, last_only ? b->C - 1 : 0);
+        float *y0 = last_only
+                  ? b->mem + (size_t)(b->C - 1) * b->slot + b->off[in->dst]
+                  : b->mem + b->off[in->dst];
+        int xs = (b->local[in->b] && !last_only) ? (int)b->slot : 0;
         int kind = a->kind == VTM_TENSOR_Q4K ? 0
                  : (a->kind == VTM_TENSOR_Q6K ? 1 : 2);
         const void *wb = kind == 2 ? (const void *)a->i8 : qk_blocks(a);
 
         // 0214: если dst этой MM больше никто не тронет (в графе это tied
         // lm_head — после него только HALT/сэмплинг), в машину попадёт лишь
-        // слот ПОСЛЕДНЕГО токена пачки (batch_store_one). Значит, остальные
-        // C-1 токенов считать не нужно: 250 токенов 3B — это 77 ГMAC впустую.
-        if (b->last[in->dst] == pc && b->local[in->dst] && C > 1) {
-            x0 = batch_src(m, b, in->b, C - 1);
-            y0 = b->mem + (size_t)(C - 1) * b->slot + b->off[in->dst];
-            xs = 0;             // один вектор на все токены (их один)
+        // слот ПОСЛЕДНЕГО токена пачки (batch_store_one). 0215 добавил случай,
+        // когда логиты читает ещё и SAMP: тогда условие last[dst] == pc не
+        // выполняется, и решение принимает last_only выше.
+        if (!last_only && b->last[in->dst] == pc && b->local[in->dst]) {
+            last_only = 1;
             C = 1;
+            b->samp_logits = VTM_NO_TENSOR;   // это не lm_head, SAMP не при чём
+            x0 = batch_src(m, b, in->b, b->C - 1);
+            y0 = b->mem + (size_t)(b->C - 1) * b->slot + b->off[in->dst];
+            xs = 0;             // один вектор на все токены (их один)
         }
         if (vtm_metal_qk_gemm_arena(kind, wb,
                                     kind == 2 ? a->scales : NULL, mm, kk,
@@ -5913,26 +6053,51 @@ static vtm_status batch_mm_apply(vtm_t *m, uint32_t pc,
             *handled = 1;
             return VTM_OK;
         }
+        // Ядро отказало — дочитываем CPU-путём все C токенов: last_only
+        // сбрасываем, иначе в слотах остальных токенов не будет логитов.
+        if (last_only) {
+            last_only = 0;
+            C = b->C;
+            b->samp_logits = VTM_NO_TENSOR;
+        }
     }
 #endif
     if (batch_gpu_flush(b) != 0) return VTM_E_UNSUPPORTED;
-    bn = (size_t)kk * (size_t)b->C;
-    yn = (size_t)mm * (size_t)b->C;
-    if (!batch_buf(&b->xt, &b->xcap, bn) || !batch_buf(&b->yt, &b->ycap, yn))
-        return fail(m, pc, VTM_E_NOMEM, "батчевый MM: нет памяти");
+    // 0215: lm_head-last считает один вектор, но батчевые ядра kind 5/6/7
+    // разворачивают токены четвёрками и хвост 1-3 добивают скалярным
+    // double-циклом по всей строке — на 151 936 строках это в разы дороже
+    // самой работы (замер: C=1 — 230 мс, C=4 — 20 мс). Поэтому один нужный
+    // токен дублируется до четвёрки, а читается/пишется только его столбец.
+    {
+        int Ck = last_only ? VTM_DENSE_BATCH_MIN : C;
 
-    for (j = 0; j < b->C; j++) {
-        const float *bs = batch_src(m, b, in->b, j);
-        for (t = 0; t < kk; t++) b->xt[(size_t)t * b->C + j] = bs[t];
-    }
-    if (batch_mm_kernel(a, b->xt, b->C, mm, kk, b->yt,
-                        batch_use_simd(m)) != 0)
-        return VTM_OK;   // handled == 0: batch_token_op пойдёт по токену
+        bn = (size_t)kk * (size_t)Ck;
+        yn = (size_t)mm * (size_t)Ck;
+        if (!batch_buf(&b->xt, &b->xcap, bn)
+            || !batch_buf(&b->yt, &b->ycap, yn))
+            return fail(m, pc, VTM_E_NOMEM, "батчевый MM: нет памяти");
 
-    for (j = 0; j < b->C; j++) {
-        float *ys = b->mem + (size_t)j * b->slot + b->off[in->dst];
-        for (r = 0; r < mm; r++)
-            ys[r] = b->yt[(size_t)r * b->C + j];
+        for (j = 0; j < Ck; j++) {
+            const float *bs = batch_src(m, b, in->b, last_only ? b->C - 1 : j);
+            for (t = 0; t < kk; t++)
+                b->xt[(size_t)t * (size_t)Ck + j] = bs[t];
+        }
+        if (batch_mm_kernel(a, b->xt, Ck, mm, kk, b->yt,
+                            batch_use_simd(m)) != 0) {
+            // Ядро отказало — MM пойдёт по токену (batch_token_op), а значит
+            // логиты будут у всех токенов. Признак lm_head-last снимаем: SAMP
+            // обязан исполняться по всем токенам, как раньше.
+            b->samp_logits = VTM_NO_TENSOR;
+            return VTM_OK;   // handled == 0: batch_token_op пойдёт по токену
+        }
+        // Столбцы дубля — те же числа, поэтому годится любой; берём последний.
+        j = last_only ? Ck - 1 : 0;
+        for (; j < Ck; j++) {
+            float *ys = b->mem + (size_t)(last_only ? b->C - 1 : j) * b->slot
+                      + b->off[in->dst];
+            for (r = 0; r < mm; r++)
+                ys[r] = b->yt[(size_t)r * (size_t)Ck + j];
+        }
     }
     *handled = 1;
     return VTM_OK;
@@ -5944,11 +6109,6 @@ static vtm_status batch_mm_apply(vtm_t *m, uint32_t pc,
 // сколько из них MOE, сколько TMV и сколько ожидания I/O.
 #define VTM_BATCH_OP_MAX 32
 static uint64_t g_bt_ns[VTM_BATCH_OP_MAX], g_bt_calls[VTM_BATCH_OP_MAX];
-
-static int batch_trace_enabled(void) {
-    const char *e = getenv("VTM_BATCH_TRACE");
-    return e && *e && *e != '0';
-}
 
 static void batch_trace_report(int ntok) {
     uint64_t total = 0;
@@ -5964,6 +6124,10 @@ static void batch_trace_report(int ntok) {
                 (double)g_bt_ns[i] / 1e9,
                 total ? 100.0 * (double)g_bt_ns[i] / (double)total : 0.0);
     }
+    if (g_bt_lmhead_last || g_bt_samp_last)
+        fprintf(stderr, "  lm_head-last: %llu пачек, SAMP-last: %llu\n",
+                (unsigned long long)g_bt_lmhead_last,
+                (unsigned long long)g_bt_samp_last);
 }
 
 // Роутер пачки по токенам параллельно (по одному токену на строку). Счёт
@@ -6358,6 +6522,117 @@ done:
     return st;
 }
 
+// --- батчевый RMSH (задача 0215) --------------------------------------------
+//
+// RMSH (QK-norm Qwen3) — единственная «горячая» инструкция плотного графа, у
+// которой до 0215 не было батчевого пути: она шла через batch_token_op, то
+// есть C раз через op_rmsh. Тот на каждый токен заново разбирал инструкцию
+// (need/req_f32/same_count) и, главное, звал meta_number(), а та делает strstr
+// по всему JSON меты (у 4B — 2,4 КБ) на каждый вызов. На 250 токенах и 72
+// инструкциях RMSH это 18 000 разборов меты на пачку.
+//
+// Здесь от токена не зависит ничего, кроме указателя на его копию активаций,
+// поэтому eps читается один раз на пачку, а по токенам идёт тот же double-цикл
+// в том же порядке, что в op_rmsh: результат побитово равен поштучному пути
+// (q/k пачки обязаны совпасть с q/k поштучного прогона, иначе
+// bench_backend --prefill-check покажет Δ).
+//
+// Отказ (handled == 0) — если форма/операнды не те, что у op_rmsh: тогда
+// инструкцию посчитает batch_token_op, как раньше.
+static vtm_status batch_rmsh_apply(vtm_t *m, uint32_t pc, const vtm_instr *in,
+                                   batch_scratch *b, int *handled) {
+    const vtm_tensor *x, *w, *y;
+    uint32_t dim, rows, r, i;
+    int j;
+    float eps;
+
+    *handled = 0;
+    if (in->a == VTM_NO_TENSOR || in->b == VTM_NO_TENSOR
+        || in->dst == VTM_NO_TENSOR)
+        return VTM_OK;
+    {
+        // A/B на одном бинарнике: VTM_BATCH_RMSH=0 — прежний поштучный RMSH.
+        const char *e = getenv("VTM_BATCH_RMSH");
+
+        if (e && *e && *e == '0') return VTM_OK;
+    }
+    if (in->a >= m->n_tensors || in->b >= m->n_tensors
+        || in->dst >= m->n_tensors)
+        return VTM_OK;
+    // x и y — активации токена (у каждого своя копия), w — общий вес.
+    // Если это не так (w тоже активация), пачка не берётся: op_rmsh умеет
+    // любую форму, а здесь важно не разойтись с ним.
+    if (!b->local[in->a] || !b->local[in->dst] || b->local[in->b])
+        return VTM_OK;
+    x = &m->tensors[in->a];
+    w = &m->tensors[in->b];
+    y = &m->tensors[in->dst];
+    if (!x->f32 || !w->f32 || !y->f32) return VTM_OK;
+    if (x->n_elements != y->n_elements) return VTM_OK;
+    if (x->ndim < 1 || x->dims[x->ndim - 1] == 0) return VTM_OK;
+    dim = x->dims[x->ndim - 1];
+    if (w->n_elements != dim || in->imm < 0) return VTM_OK;
+    rows = x->n_elements / dim;
+    if (rows == 0) return VTM_OK;
+    // 0214: инструкция читает активации на хосте — дождаться GPU-очереди.
+    if (batch_gpu_flush(b) != 0) return VTM_E_UNSUPPORTED;
+    eps = (float)meta_number(m, "rms_norm_eps", (double)in->imm / 1000.0);
+    for (j = 0; j < b->C; j++) {
+        const float *xb = batch_src(m, b, in->a, j);
+        float *yb = b->mem + (size_t)j * b->slot + b->off[in->dst];
+
+        for (r = 0; r < rows; r++) {
+            const float *xr = xb + (size_t)r * dim;
+            float *yr = yb + (size_t)r * dim;
+            double sum = 0.0, mean, rms;
+
+            for (i = 0; i < dim; i++)
+                sum += (double)xr[i] * (double)xr[i];
+            mean = sum / (double)dim;
+            rms = sqrt(mean + (double)eps);
+            if (rms == 0.0) {
+                memset(yr, 0, (size_t)dim * sizeof(float));
+                continue;
+            }
+            for (i = 0; i < dim; i++)
+                yr[i] = (float)((double)xr[i] / rms * (double)w->f32[i]);
+        }
+    }
+    (void)pc;
+    *handled = 1;
+    return VTM_OK;
+}
+
+// 0215: SAMP для пачки, у которой логиты посчитаны только для последнего
+// токена (batch_mm_apply выставил b->samp_logits). Пропущенные C-1 SAMP'ов
+// при жадном сэмплере без штрафа за повторы дали бы тот же argmax, а их
+// единственный след в состоянии машины — счётчик сгенерированных (историю
+// никто не читает: это и есть условие batch_samp_skip_ok). Поэтому счётчик
+// ведём явно, а сам SAMP выполняем один раз на последнем токене — с теми же
+// побочными эффектами (dst-токен, samp_prev_generated), что у хоста.
+static vtm_status batch_samp_last(vtm_t *m, uint32_t pc, const vtm_instr *in,
+                                  batch_scratch *b, const int32_t *ids,
+                                  int pos0) {
+    int j, stop = 0;
+    vtm_status st;
+
+    if (batch_gpu_flush(b) != 0) return VTM_E_UNSUPPORTED;
+    // Как первый SAMP поштучного пути: параметры из меты/окружения и, если
+    // был vtm_reset(), пересев ГПСЧ — до того, как двигаем счётчик.
+    samp_state_begin(m);
+    for (j = 0; j + 1 < b->C; j++) {
+        m->generated++;
+        m->samp_prev_generated = m->generated;
+    }
+    m->position = pos0 + b->C - 1;
+    m->input_token = ids[b->C - 1];
+    batch_bind(m, b, b->C - 1);
+    st = op_samp(m, pc, in, NULL, NULL, &stop);
+    batch_unbind(m, b);
+    g_bt_samp_last += (batch_trace_enabled() ? 1u : 0u);
+    return st;
+}
+
 // Одна инструкция прежним путём (кроме TMV/MM — их зовёт batch_token_op).
 static vtm_status batch_op_one(vtm_t *m, uint32_t i, const vtm_instr *in) {
     switch (in->opcode) {
@@ -6469,6 +6744,8 @@ static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
     b->C = C;
     b->gpu_npend = 0;    // 0214: очередь GEMM этой пачки начинается пустой
     b->gpu_failed = 0;
+    b->samp_logits = VTM_NO_TENSOR;   // 0215: lm_head-last решается по графу
+    b->samp_skip = -1;                //      и по сэмплеру (batch_samp_skip_ok)
     m->halted = 0;
     m->error[0] = '\0';
     batch_reinit(m, b);
@@ -6506,6 +6783,23 @@ static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
             // prefill: 25% стены на 250 токенах, 40% на 500).
             st = batch_attn_apply(m, pc, in, b, pos0, &handled);
             if (st == VTM_OK && !handled)
+                st = batch_token_op(m, pc, in, b, ids, pos0);
+            break;
+        case VTM_OP_RMSH:
+            // 0215: батчевый RMSH (QK-norm) — eps и разбор инструкции один раз
+            // на пачку, а не на каждый токен (см. batch_rmsh_apply).
+            st = batch_rmsh_apply(m, pc, in, b, &handled);
+            if (st == VTM_OK && !handled)
+                st = batch_token_op(m, pc, in, b, ids, pos0);
+            break;
+        case VTM_OP_SAMP:
+            // 0215: lm_head-last — логиты есть только у последнего токена,
+            // поэтому и SAMP исполняется на нём одном (счётчик сгенерированных
+            // доводится до C, как в поштучном пути).
+            if (b->C > 1 && b->samp_skip == 1
+                && b->samp_logits == in->a)
+                st = batch_samp_last(m, pc, in, b, ids, pos0);
+            else
                 st = batch_token_op(m, pc, in, b, ids, pos0);
             break;
         case VTM_OP_HALT:

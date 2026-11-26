@@ -419,9 +419,9 @@ class TestFacts(PluginDirCase):
         facts = registry.collect_facts("вопрос", limit=2)
         self.assertEqual([fact.text for fact in facts], ["второй", "первый"])
         self.assertEqual(facts[0].plugin, "high")
-        self.assertEqual(
-            facts[0].line(), "[Факт: второй (источник: тест)]"
-        )
+        # Задача 0212: строка данных без служебной обёртки — заголовок
+        # секции «СПРАВКА» печатается один раз на весь блок.
+        self.assertEqual(facts[0].line(), "второй (тест)")
 
     def test_zero_limit(self) -> None:
         self.add_plugin("facts", SKILL_CODE)
@@ -584,7 +584,14 @@ class TestBundledPlugins(unittest.TestCase):
         ids = set(self.registry.records)
         self.assertEqual(
             ids,
-            {"time", "currency", "stocks", "ru-numbers", "ru-gender"},
+            {
+                "time",
+                "currency",
+                "stocks",
+                "ru-numbers",
+                "ru-gender",
+                "ru-facts",
+            },
         )
         self.assertTrue(all(record.loaded for record in self.registry.records.values()))
 
@@ -775,9 +782,14 @@ def run(text):
 class TestServerIntegration(PluginServerCase):
     def test_fact_goes_to_system_block(self) -> None:
         self.chat("вопрос")
-        system = self.vtm.calls[0]["messages"][0]
-        self.assertEqual(system["role"], "system")
-        self.assertIn("[Факт: тест-факт (источник: тест)]", system["content"])
+        # Справка идёт в хвост (к вопросу), персона — стабильный префикс:
+        # иначе кэш префикса ВТМ промахивается на каждом запросе (0215).
+        messages = self.vtm.calls[0]["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        tail = messages[-1]["content"]
+        self.assertIn("СПРАВКА", tail)
+        self.assertIn("тест-факт (тест)", tail)
+        self.assertNotIn("[Факт", tail)
 
     def test_plugins_api_lists_versions_and_capabilities(self) -> None:
         status, _headers, raw = self.request("GET", "/api/plugins")
@@ -802,13 +814,14 @@ class TestServerIntegration(PluginServerCase):
         events = self.chat("вопрос")
         self.assertTrue(self.deltas(events))
         system = self.vtm.calls[0]["messages"][0]
-        self.assertNotIn("[Факт:", system["content"])
+        self.assertNotIn("СПРАВКА", system["content"])
+        self.assertNotIn("тест-факт", system["content"])
 
     def test_enable_plugin_again_returns_fact(self) -> None:
         self.request("POST", "/api/plugins", {"id": "facts", "enabled": False})
         self.request("POST", "/api/plugins", {"id": "facts", "enabled": True})
         self.chat("вопрос")
-        self.assertIn("[Факт:", self.vtm.calls[0]["messages"][0]["content"])
+        self.assertIn("СПРАВКА", self.vtm.calls[0]["messages"][-1]["content"])
 
     def test_unknown_plugin_is_404(self) -> None:
         status, _headers, raw = self.request(

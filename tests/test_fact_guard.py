@@ -104,8 +104,8 @@ class TestSectionInPrompt(unittest.TestCase):
             {"role": "user", "content": "Курс доллара?"},
         ]
         result = with_fact(messages, USD_BLOCK)
-        self.assertEqual(result[0]["content"], "Ты — Ева.\n\n" + USD_BLOCK)
-        self.assertEqual(result[1], messages[1])
+        self.assertEqual(result[0]["content"], "Ты — Ева.")
+        self.assertIn(USD_BLOCK, result[1]["content"])
 
     def test_prompts_mention_section_and_forbid_refusal(self):
         for name in ("system.compact.md", "system.assistant.md"):
@@ -531,9 +531,12 @@ class TestServerWiring(unittest.TestCase):
         for adapter in (left, right):
             with self.subTest(backend=adapter is left):
                 system = adapter.calls[0]["messages"][0]["content"]
-                self.assertIn(FACT_SECTION_TITLE, system)
-                self.assertIn(USD_ENTRY, system)
-                self.assertNotIn("[Факт", system)
+                # Справка в хвосте: префикс «персона + история» стабилен.
+                tail = adapter.calls[0]["messages"][-1]["content"]
+                self.assertIn(FACT_SECTION_TITLE, tail)
+                self.assertIn(USD_ENTRY, tail)
+                self.assertNotIn("[Факт", tail)
+                self.assertNotIn(FACT_SECTION_TITLE, system)
         answer = self.deltas(events)
         self.assertIn("82,3130", answer)
         self.assertNotIn("не могу", answer)

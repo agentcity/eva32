@@ -1437,7 +1437,7 @@
   {
     "id": "0215",
     "title": "4B prefill: разобрать 4,4×",
-    "status": "in_progress",
+    "status": "done",
     "file": "0215-4b-prefill.md",
     "assignee": "agent:4b-prefill"
   },
