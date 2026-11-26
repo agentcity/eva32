@@ -1293,5 +1293,12 @@
     "status": "in_progress",
     "file": "0193-silero-tts.md",
     "assignee": "agent:silero"
+  },
+  {
+    "id": "0194",
+    "title": "Голосовая команда «Стоп, Ева»",
+    "status": "in_progress",
+    "file": "0194-stop-command.md",
+    "assignee": "agent:stop-command"
   }
 ]
