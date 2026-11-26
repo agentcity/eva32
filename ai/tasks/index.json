@@ -1412,5 +1412,12 @@
     "status": "in_progress",
     "file": "0211-prefill-scaling.md",
     "assignee": "agent:prefill-scale"
+  },
+  {
+    "id": "0212",
+    "title": "Страж факта: не отрицать и не печатать [Факт]",
+    "status": "in_progress",
+    "file": "0212-fact-answer-guard.md",
+    "assignee": "agent:fact-guard"
   }
 ]
