@@ -830,7 +830,8 @@ enum SelfTest {
 
     /// Проверяет без окна, сети и звука: разбор SSE `image`/`silent`, сборку
     /// абсолютного URL картинки, правило «silent → не озвучиваем», кэш,
-    /// поведение на битом URL и сам вид `TaleImageView` (показ/смена/очистка).
+    /// поведение на битом URL и сам вид `TaleImageView` (показ/смена/очистка),
+    /// а также темп смены картинок 15 символов/с с подменёнными часами.
     @MainActor
     private static func runImages() async -> Int32 {
         var failures = 0
@@ -921,7 +922,111 @@ enum SelfTest {
         check("без адреса сервера картинку не показываем",
               AnswerController.imageURL(setting: true, url: "/media/x.jpg", base: nil) == nil)
 
-        // 5. Кэш в памяти и распознавание формата.
+        // 5. Смена картинок по прогрессу чтения (задача 0227). Часы и темп
+        // подменяются числами: реального ожидания 20/40/60 с нет.
+        let positions = [300, 600, 900]
+        func timerPacer() -> TaleImagePacer {
+            var pace = TaleImagePacer(mode: .timer)
+            for (index, position) in positions.enumerated() {
+                pace.enqueue(TaleImagePacer.Item(
+                    order: index + 1,
+                    afterVisible: position,
+                    afterVoice: position * 7 / 10
+                ))
+            }
+            return pace
+        }
+        func dueCount(_ pace: TaleImagePacer, elapsed: Double, rate: Double = 15) -> Int {
+            var pace = pace
+            pace.updateTimer(elapsed: elapsed, rate: rate)
+            var count = 0
+            while let item = pace.next, pace.isReached(item) {
+                count += 1
+                pace.markShown()
+            }
+            return count
+        }
+        check("темп 15 симв/с: 300 символов — около 20 с",
+              dueCount(timerPacer(), elapsed: 19.9) == 0
+                && dueCount(timerPacer(), elapsed: 20.0) == 1,
+              "19,9 с → нет, 20,0 с → первая")
+        check("темп 15 симв/с: 600 символов — около 40 с",
+              dueCount(timerPacer(), elapsed: 39.9) == 1
+                && dueCount(timerPacer(), elapsed: 40.0) == 2,
+              "39,9 с → одна, 40,0 с → две")
+        check("темп 15 симв/с: 900 символов — около 60 с",
+              dueCount(timerPacer(), elapsed: 59.9) == 2
+                && dueCount(timerPacer(), elapsed: 60.0) == 3,
+              "59,9 с → две, 60,0 с → три")
+        check("новая картинка не появляется раньше своей позиции",
+              dueCount(timerPacer(), elapsed: 5) == 0
+                && dueCount(timerPacer(), elapsed: 19.999) == 0)
+        check("темп можно подменить: 30 симв/с → 10/20/30 с",
+              dueCount(timerPacer(), elapsed: 9.9, rate: 30) == 0
+                && dueCount(timerPacer(), elapsed: 10.0, rate: 30) == 1
+                && dueCount(timerPacer(), elapsed: 20.0, rate: 30) == 2
+                && dueCount(timerPacer(), elapsed: 30.0, rate: 30) == 3)
+        var resetPace = timerPacer()
+        resetPace.updateTimer(elapsed: 60)
+        resetPace.reset(mode: .speech)
+        check("сброс (стоп/новый вопрос) очищает очередь и прогресс",
+              resetPace.next == nil && resetPace.shown == 0 && resetPace.spoken == 0)
+
+        var speechPace = TaleImagePacer(mode: .speech)
+        for (index, position) in positions.enumerated() {
+            speechPace.enqueue(TaleImagePacer.Item(
+                order: index + 1,
+                afterVisible: position,
+                afterVoice: position * 7 / 10
+            ))
+        }
+        func speechDue(_ chars: Int) -> Int {
+            var pace = speechPace
+            pace.updateSpoken(Double(chars))
+            var count = 0
+            while let item = pace.next, pace.isReached(item) {
+                count += 1
+                pace.markShown()
+            }
+            return count
+        }
+        // afterVoice у позиций 300/600/900 — 210/420/630 символов.
+        check("речь: картинка ждёт прогресс озвучки, а не приход события",
+              speechDue(209) == 0 && speechDue(210) == 1,
+              "209 симв. → нет, 210 симв. → первая")
+        check("речь: следующие картинки по своим позициям",
+              speechDue(419) == 1 && speechDue(420) == 2
+                && speechDue(629) == 2 && speechDue(630) == 3)
+        check("речь: прогресс назад не откатывает картинки",
+              {
+                  var pace = speechPace
+                  pace.updateSpoken(630)
+                  pace.markShown()
+                  pace.markShown()
+                  pace.markShown()
+                  pace.updateSpoken(10)
+                  return pace.shown == 3
+              }(),
+              "три показаны, после отката всё ещё три")
+
+        check("оценка речи внутри фразы: ~15 символов/с",
+              VoicePlayer.spokenEstimate(elapsed: 0, chars: 40) == 0
+                && VoicePlayer.spokenEstimate(elapsed: 1, chars: 40) == 15
+                && VoicePlayer.spokenEstimate(elapsed: 2, chars: 40) == 30)
+        check("оценка речи не перескакивает длину фразы",
+              VoicePlayer.spokenEstimate(elapsed: 100, chars: 40) == 40)
+        check("темп речи можно подменить в проверке",
+              VoicePlayer.spokenEstimate(elapsed: 1, chars: 100, rate: 30) == 30)
+
+        // Хвост, ещё не ставший фразой, тоже учитывается в позиции картинки:
+        // иначе событие `image` посреди фразы показало бы её раньше речи.
+        var pendingSplitter = PhraseSplitter()
+        let splitPhrases = pendingSplitter.feed("Раз. Два три")
+        check("незавершённая фраза учтена в позиции картинки",
+              splitPhrases == ["Раз."] && pendingSplitter.pendingChars == 7,
+              "\(splitPhrases), хвост \(pendingSplitter.pendingChars)")
+
+        // 6. Кэш в памяти и распознавание формата.
         let cachedURL = URL(string: "http://127.0.0.1:8765/media/fairy-tales/kolobok/02.jpg")!
         let jpeg = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10])
         TaleImageCache.shared.store(jpeg, for: cachedURL)
@@ -933,7 +1038,7 @@ enum SelfTest {
         check("загрузка: две попытки, не больше",
               TaleImageLoader.attempts == 2, "\(TaleImageLoader.attempts)")
 
-        // 6. Недоступный URL: nil, без падения и без зависания ответа.
+        // 7. Недоступный URL: nil, без падения и без зависания ответа.
         let dead = URL(string: "http://127.0.0.1:1/media/fairy-tales/nope.jpg")!
         let started = Date()
         let loaded = await TaleImageLoader.load(dead)

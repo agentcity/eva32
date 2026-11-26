@@ -29,9 +29,29 @@ final class VoicePlayer {
     private var generation = 0
     private var warnedUnavailable = false
 
+    /// Оценка темпа речи baya: ~12,8 символов в секунду (живой замер). По ней считается
+    /// прогресс внутри текущей фразы (у `AVAudioPlayer` нет счётчика
+    /// произнесённых символов, а длина фразы и время известны).
+    nonisolated static let charsPerSecond = 15.0
+
+    /// Сколько символов уже сказано. Складывается из завершённых фраз и
+    /// дробной оценки текущей — по этому числу `AnswerController` показывает
+    /// очередную картинку сказки (задача 0227).
+    private var spokenChars = 0
+    /// Длина фразы, которая играет сейчас, и момент её старта.
+    private var phraseChars = 0
+    private var phraseStartedAt: Date?
+    /// Сколько символов текста ушло в озвучку за этот ответ (включая текущую
+    /// и уже сказанные фразы). Нужно как позиция картинок в «речевых»
+    /// символах: пробелы между фразами в озвучку не попадают.
+    private(set) var enqueuedChars = 0
+
     /// Куда сообщать, почему голос молчит (сервер не отвечает, `/api/tts` 503).
     var onIssue: ((String) -> Void)?
     var onSpeakingChanged: ((Bool) -> Void)?
+    /// Прогресс озвучки: (сказано символов, всего ушло в озвучку). Второй
+    /// аргумент растёт по мере прихода текста, первый — только вперёд.
+    var onProgress: ((Int, Int) -> Void)?
     /// Очередь опустела: всё сказанное доиграно и синтезировать больше нечего.
     /// Нужно follow-up (задача 0190): микрофон открывается только после того,
     /// как голос Евы смолк, иначе она услышит саму себя. Вызывается только при
@@ -74,6 +94,9 @@ final class VoicePlayer {
     func beginStream() {
         streamDone = false
         drainedNotified = false
+        // Новый ответ — новый шанс: прошлый отказ TTS не должен навсегда
+        // лишать `onIssue` (по нему картинки переходят на таймер, 0227).
+        warnedUnavailable = false
     }
 
     /// Стрим закончился: очередь доиграет и только тогда объявит дренаж.
@@ -85,8 +108,10 @@ final class VoicePlayer {
     func enqueue(_ phrases: [String]) {
         guard !phrases.isEmpty else { return }
         texts.append(contentsOf: phrases)
+        enqueuedChars += phrases.reduce(0) { $0 + $1.count }
         drainedNotified = false
         pump()
+        notifyProgress()
     }
 
     func stop() {
@@ -99,8 +124,13 @@ final class VoicePlayer {
         player?.stop()
         player = nil
         currentText = nil
+        spokenChars = 0
+        phraseChars = 0
+        phraseStartedAt = nil
+        enqueuedChars = 0
         drainedNotified = true
         onSpeakingChanged?(false)
+        onProgress?(0, 0)
     }
 
     // MARK: - Синтез
@@ -187,14 +217,19 @@ final class VoicePlayer {
             audio.prepareToPlay()
             player = audio
             currentText = pending.text
+            phraseChars = pending.text.count
+            phraseStartedAt = Date()
             let started = audio.play()
             log("озвучка: играю \(wav.count) байт, старт=\(started)")
             onSpeakingChanged?(true)
+            notifyProgress()
             startMetering()
             watchPlayback(generation: generation)
         } catch {
             player = nil
             currentText = nil
+            phraseChars = 0
+            phraseStartedAt = nil
             report("не удалось проиграть WAV: \(error.localizedDescription)")
             playNextIfIdle()
             notifyDrainedIfIdle()
@@ -233,6 +268,43 @@ final class VoicePlayer {
         player.updateMeters()
         let db = player.averagePower(forChannel: 0)
         onLevel?(min(max((db + 50) / 50, 0), 1))
+        notifyProgress()
+    }
+
+    // MARK: - Прогресс речи для картинок
+
+    /// Оценка сказанного внутри текущей фразы: по прошедшему времени и
+    /// длине фразы, ~15 символов/с. Вынесено `nonisolated static`, чтобы
+    /// правило проверялось в `--selftest-images` без звука.
+    nonisolated static func spokenEstimate(
+        elapsed: TimeInterval,
+        chars: Int,
+        rate: Double = VoicePlayer.charsPerSecond
+    ) -> Int {
+        guard chars > 0, elapsed > 0, rate > 0 else { return 0 }
+        return min(chars, Int(elapsed * rate))
+    }
+
+    /// Сказано всего = завершённые фразы + оценка текущей. Вызывается 30 Гц
+    /// во время игры и на границах фраз.
+    private func notifyProgress() {
+        let within = phraseStartedAt.map {
+            VoicePlayer.spokenEstimate(
+                elapsed: Date().timeIntervalSince($0),
+                chars: phraseChars
+            )
+        } ?? 0
+        onProgress?(spokenChars + within, enqueuedChars)
+    }
+
+    /// Фраза доиграла: её символы переходят в «сказано» целиком.
+    private func completeCurrentPhrase() {
+        if phraseChars > 0 {
+            spokenChars += phraseChars
+            phraseChars = 0
+        }
+        phraseStartedAt = nil
+        notifyProgress()
     }
 
     /// Опрос `isPlaying` вместо делегата: так `AVAudioPlayer` не пересекает
@@ -249,6 +321,7 @@ final class VoicePlayer {
                 self.stopMetering()
                 self.player = nil
                 self.currentText = nil
+                self.completeCurrentPhrase()
                 self.onSpeakingChanged?(false)
                 self.playNextIfIdle()
                 self.notifyDrainedIfIdle()

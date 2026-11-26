@@ -567,6 +567,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         answer.onImage = { [weak self] image, alt in
             self?.window.showTaleImage(image, alt: alt)
         }
+        // «Стоп» и новый вопрос гасят очередь картинок и таймеры в
+        // `AnswerController`; окно убирает последнюю иллюстрацию (0227).
+        answer.onImagesCleared = { [weak self] in
+            self?.window.clearTaleImage()
+        }
     }
 
     /// Страховка: если озвучка включена, но звук так и не начался (TTS упал),

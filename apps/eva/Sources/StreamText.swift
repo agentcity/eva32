@@ -85,6 +85,13 @@ struct PhraseSplitter {
     private(set) var maxChars = 560
     private var buffer = ""
 
+    /// Сколько символов ещё не стало фразой (лежит в буфере). Нужно позиции
+    /// картинки (задача 0227): событие `image` может прийти в середине фразы,
+    /// и до её конца речь ещё не дойдёт — картинку нельзя показывать раньше.
+    var pendingChars: Int {
+        buffer.trimmingCharacters(in: .whitespacesAndNewlines).count
+    }
+
     mutating func feed(_ text: String) -> [String] {
         buffer += text
         return takeComplete()

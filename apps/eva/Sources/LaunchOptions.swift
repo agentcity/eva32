@@ -20,7 +20,8 @@ import Foundation
 /// * `--selftest-compact` — компактный круг: геометрия, живое окно
 ///   (CGWindowList), `visibleFrame`, позиция в UserDefaults (задача 0188).
 /// * `--selftest-images` — картинки сказок: разбор SSE `image`/`silent`, сборка
-///   URL от адреса сервера, кэш, битый URL и вид окна (без сети и звука).
+///   URL от адреса сервера, кэш, битый URL, вид окна и темп смены
+///   (300/600/900 символов → 20/40/60 с, часы подменяются в проверке).
 enum Launch {
     static let arguments = CommandLine.arguments
 
