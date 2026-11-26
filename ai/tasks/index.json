@@ -1458,14 +1458,14 @@
   {
     "id": "0218",
     "title": "Плагин сказок",
-    "status": "in_progress",
+    "status": "done",
     "file": "0218-fairy-tales.md",
     "assignee": "agent:tales"
   },
   {
     "id": "0219",
     "title": "Музыка по команде",
-    "status": "in_progress",
+    "status": "done",
     "file": "0219-music-control.md",
     "assignee": "agent:music"
   }

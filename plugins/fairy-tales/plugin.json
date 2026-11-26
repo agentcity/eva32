@@ -1,0 +1,15 @@
+{
+  "id": "fairy-tales",
+  "name": "Сказки",
+  "version": "1.0.0",
+  "api": 1,
+  "entry": "plugin.py",
+  "capabilities": ["answer"],
+  "permissions": {"network": [], "filesystem": ["tales"]},
+  "settings": {},
+  "description": "Русские народные сказки из офлайн-корпуса: «расскажи сказку про лису», «сказка на ночь», «следующая сказка»",
+  "owner": "eva32",
+  "priority": 20,
+  "scope": "chat",
+  "stateful": false
+}

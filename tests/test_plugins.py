@@ -591,6 +591,8 @@ class TestBundledPlugins(unittest.TestCase):
                 "ru-numbers",
                 "ru-gender",
                 "ru-facts",
+                "music",
+                "fairy-tales",
             },
         )
         self.assertTrue(all(record.loaded for record in self.registry.records.values()))

@@ -1,0 +1,27 @@
+{
+  "id": "music",
+  "name": "Музыка",
+  "version": "1.0.0",
+  "api": 1,
+  "entry": "plugin.py",
+  "capabilities": [
+    "answer"
+  ],
+  "permissions": {
+    "network": [
+      "ep128.hostingradio.ru",
+      "dfm.hostingradio.ru",
+      "nashe1.hostingradio.ru"
+    ],
+    "filesystem": []
+  },
+  "settings": {
+    "timeout": 5.0,
+    "default_radio": "europa"
+  },
+  "description": "Управление Music.app через osascript и интернет-радио через afplay: «включи Кино», «пауза», «громче»",
+  "owner": "eva32",
+  "priority": 30,
+  "scope": "chat",
+  "stateful": false
+}
