@@ -26,6 +26,7 @@
 // по умолчанию — simd, если он доступен.
 #include "vtm.h"
 #include "vtm_backend.h"
+#include "api.h"   // 0199: паритет сгенерированных токенов через C-ABI
 // Только тесту: минимальная машина без загрузчика, чтобы проверить проводку
 // kind 5 в interp.c (op_tmv/op_mm/op_emb) без сборки контейнера.
 #include "vtm_internal.h"
@@ -1809,6 +1810,58 @@ done:
     free(yt);
 }
 
+// GPU-батч prefill против CPU-батча (задача 0199).
+//
+// Длина пачки выбирает вариант ядра (8/16/32 токенов), но последний chunk
+// может быть короче выбранного N: 11 -> gemm16, 24 -> gemm32, 44 -> 32+12.
+// Именно на таких длинах GPU-путь до 0199 читал staging с неверным шагом
+// строки (nt вместо N) и отдавал мусор всему prefill, а с ним и K/V префикса.
+// Прежние проверки --check этого не ловили: у них длины были 8/16/32 (равны
+// N) или < 8 (GEMM отказывал и работал CPU). Эталон — CPU-батчевое ядро;
+// порядок суммирования у GPU другой, поэтому допуск — контракт 0192 (1e-2).
+static void check_metal_gemm_case(int rows, int cols, int ntok, int q6) {
+    uint32_t seed = 0x1900u + (uint32_t)rows * 31u + (uint32_t)cols * 3u
+                  + (uint32_t)ntok * 7u + (uint32_t)q6;
+    int n = rows * cols;
+    uint8_t *blocks = q6 ? make_q6k(n, seed) : make_q4k(n, seed);
+    float *x = make_vec((size_t)cols * (size_t)ntok, seed ^ 0x5au);
+    float *y_ref = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    float *y = (float *)calloc((size_t)rows * (size_t)ntok, sizeof(float));
+    char label[128];
+    double ref = 0.0;
+    int rc;
+
+    if (!blocks || !x || !y_ref || !y) {
+        fprintf(stderr, "check_metal_gemm_case: нет памяти\n");
+        failures++;
+        goto done;
+    }
+    rc = q6 ? vtm_q6k_tmv_batch(y_ref, blocks, x, rows, cols, ntok)
+            : vtm_q4k_tmv_batch(y_ref, blocks, x, rows, cols, ntok);
+    if (rc != 0) {
+        fprintf(stderr, "check_metal_gemm_case: CPU-батч — ошибка\n");
+        failures++;
+        goto done;
+    }
+    rc = vtm_metal_qk_gemm(q6 ? 1 : 0, y, blocks, NULL, x, rows, cols, ntok);
+    if (rc != 0) {
+        // Устройства нет или MSL не собрался: не ошибка CPU-набора, гибрид
+        // в такой сборке всё равно ушёл бы на CPU.
+        printf("  %-34s %s\n", q6 ? "Metal GEMM Q6_K" : "Metal GEMM Q4_K",
+               "пропущен (Metal не готов)");
+        goto done;
+    }
+    snprintf(label, sizeof label, "Metal GEMM %s %dx%dx%d",
+             q6 ? "Q6_K" : "Q4_K", rows, cols, ntok);
+    report(label, max_diff(y, y_ref, (size_t)rows * (size_t)ntok, &ref), ref,
+           CHECK_TOL_I8);
+done:
+    free(blocks);
+    free(x);
+    free(y_ref);
+    free(y);
+}
+
 static int run_checks(const vtm_backend *cand) {
     static const int shapes[][2] = {
         {1, 1}, {1, 20}, {7, 37}, {5, 53}, {17, 128}, {33, 41}, {64, 160},
@@ -1983,6 +2036,18 @@ static int run_checks(const vtm_backend *cand) {
                                  qkbshapes[qi][2], 0);
             check_q4k_batch_case(qkbshapes[qi][0], qkbshapes[qi][1],
                                  qkbshapes[qi][2], 1);
+        }
+    }
+
+    // GPU-батч prefill (0199): длины chunk'а, не равные варианту ядра
+    // (11 -> gemm16, 24/31 -> gemm32, 44 -> 32+12), плюс контроли 8/16/32.
+    // Старый код давал здесь ошибку порядка самих сумм, а не допуска.
+    if (vtm_metal_available()) {
+        static const int mlens[] = {8, 11, 16, 24, 31, 32, 44};
+        size_t mi;
+        for (mi = 0; mi < sizeof(mlens) / sizeof(mlens[0]); mi++) {
+            check_metal_gemm_case(64, 256, mlens[mi], 0);
+            check_metal_gemm_case(64, 256, mlens[mi], 1);
         }
     }
 
@@ -4878,6 +4943,95 @@ static int run_prefill_ttft(const char *explicit_path) {
     return 0;
 }
 
+// --- 0199: паритет сгенерированных токенов через C-ABI ----------------------
+//
+// Путь чата/сервера, которого не было в бенчмарках 0192/0198: vtm_api_generate
+// с cache_prefix=1 и prefill_batch=256 на настоящей 3B-модели. Печатает
+// строки PROMPT/TOK, чтобы вызывающий сравнил simd и hybrid. Один бэкенд на
+// процесс намеренно: режим Metal (VTM_METAL_OFF/FULL/BATCH) — глобальный, и
+// два контекста в одном процессе делили бы его (открытие hybrid включило бы
+// GPU и для уже открытого simd; ровно это сбило первый замер 0199).
+#define API_MAX_NEW 16
+
+typedef struct {
+    int32_t ids[API_MAX_NEW];
+    size_t n;
+} api_bag;
+
+static int api_collect(const int32_t *ids, size_t n, void *user) {
+    api_bag *b = (api_bag *)user;
+    size_t i;
+
+    for (i = 0; i < n && b->n < API_MAX_NEW; i++) b->ids[b->n++] = ids[i];
+    return 0;
+}
+
+static int run_api_tokens(const char *path, const char *backend) {
+    // Промпты взяты длинами, на которых ломался старый GPU-батч (0199):
+    // prefill = len-1 -> 14 (gemm16), 23 (gemm32), 44 (32+12).
+    static const int lens[] = {15, 24, 45};
+    vtm_api_options opts;
+    vtm_api_t *ctx;
+    int p, i, rc;
+    char what[160];
+
+    // Жадный SAMP: паритет по argmax, а не по ГПСЧ. Переменные читаются при
+    // первом SAMP, то есть уже после open(), — поэтому setenv до open.
+    setenv("VTM_TEMPERATURE", "0", 1);
+    setenv("VTM_TOP_K", "0", 1);
+    setenv("VTM_TOP_P", "1", 1);
+
+    memset(&opts, 0, sizeof opts);
+    opts.struct_size = sizeof opts;
+    opts.backend_name = backend;
+    opts.max_new_tokens = 8;
+    opts.cache_prefix = 1;
+    opts.prefill_batch = 256;
+    ctx = vtm_api_open(path, &opts);
+    if (!ctx) {
+        fprintf(stderr, "api-tokens: open(%s): %s\n", backend,
+                vtm_api_last_error(NULL));
+        return 1;
+    }
+    printf("BACKEND %s\n", backend);
+
+    for (p = 0; p < (int)(sizeof lens / sizeof lens[0]); p++) {
+        int32_t prompt[128];
+        api_bag first, again;
+
+        for (i = 0; i < lens[p]; i++)
+            prompt[i] = (int32_t)(100 + (i * 37 + p * 101) % 900);
+
+        memset(&first, 0, sizeof first);
+        rc = vtm_api_generate(ctx, prompt, (size_t)lens[p], api_collect,
+                              &first);
+        snprintf(what, sizeof what, "api-tokens %s prompt %d", backend, p);
+        if (rc != 0) {
+            fprintf(stderr, "%s: generate -> %d\n", what, rc);
+            vtm_api_close(ctx);
+            return 1;
+        }
+        // Повтор того же промпта: теперь префикс берётся из кэша. Если снимок
+        // снят с незавершённого GPU-батча, второй ответ разойдётся с первым.
+        memset(&again, 0, sizeof again);
+        rc = vtm_api_generate(ctx, prompt, (size_t)lens[p], api_collect,
+                              &again);
+        if (rc != 0) {
+            fprintf(stderr, "%s: повтор -> %d\n", what, rc);
+            vtm_api_close(ctx);
+            return 1;
+        }
+        printf("PROMPT %d %d\n", p, lens[p]);
+        printf("TOK %d 0", p);
+        for (i = 0; i < (int)first.n; i++) printf(" %d", (int)first.ids[i]);
+        printf("\nTOK %d 1", p);
+        for (i = 0; i < (int)again.n; i++) printf(" %d", (int)again.ids[i]);
+        printf("\n");
+    }
+    vtm_api_close(ctx);
+    return 0;
+}
+
 // --- main ------------------------------------------------------------------
 
 static void usage(const char *prog) {
@@ -4902,6 +5056,7 @@ static void usage(const char *prog) {
            "          [--i8-gemv [--rows N] [--cols N] [--iters N]\n"
            "           [--f32-table]]\n"
            "          [--qk-proj PATH [--iters N]]\n"
+           "          [--api-tokens PATH [--backend simd|hybrid]]\n"
            "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
            "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8);\n"
            "  env VTM_Q4_I8 — int8-dot (SDOT/VNNI): 0 — выключить; 1/2/3 —\n"
@@ -4932,6 +5087,7 @@ int main(int argc, char **argv) {
     const char *emb_check_path = NULL;
     const char *metal_bench_path = NULL;
     int metal_new = 16;
+    const char *api_tokens_path = NULL;
     const char *backend_name = NULL;
     const vtm_backend *cand;
     int i;
@@ -4969,6 +5125,8 @@ int main(int argc, char **argv) {
             metal_new = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--metal-lens") == 0 && i + 1 < argc) {
             g_metal_lens = argv[++i];   // длины prefill, по умолчанию 64,128
+        } else if (strcmp(argv[i], "--api-tokens") == 0) {
+            api_tokens_path = (i + 1 < argc) ? argv[++i] : "";
         } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
             backend_name = argv[++i];
         } else if (strcmp(argv[i], "--check") == 0) {
@@ -5064,6 +5222,10 @@ int main(int argc, char **argv) {
         vtm_metal_set_mode(VTM_METAL_OFF);
     }
 
+    // 0199: C-ABI-паритет — один бэкенд на процесс (см. run_api_tokens).
+    if (api_tokens_path)
+        return run_api_tokens(*api_tokens_path ? api_tokens_path : NULL,
+                              cand->name);
     if (emb_check_path_set)
         return run_emb_check(emb_check_path, decode_prompts_path, decode_new,
                              decode_limit);

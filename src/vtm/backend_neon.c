@@ -4780,8 +4780,15 @@ const vtm_backend vtm_backend_simd = {
 // vtm run, но через C-ABI (vtm_api_generate: кэш префикса + батчевый prefill)
 // выдаёт мусор — похоже на гонку асинхронной отправки GPU. До исправления
 // гибрид доступен только явно: VTM_BACKEND=hybrid.
+//
+// 2026-11-26 (0199): причина найдена и исправлена — не гонка, а шаг строки
+// результата GPU-батча (backend_metal.m читал staging как nt, ядро писало как
+// N варианта). Проверки: bench_backend --check (Metal GEMM 11/24/31/44) и
+// tests/vtm/test_hybrid_api_parity.py (C-ABI, 3 промпта, оба повтора с кэшем).
+// Парный замер после правки: prefill 64 — 2,03x, prefill 128 — 2,31x, декод
+// 1,02x. Условие 0198 снова выполнено, auto снова hybrid.
 #ifndef VTM_AUTO_HYBRID
-#define VTM_AUTO_HYBRID 0
+#define VTM_AUTO_HYBRID 1
 #endif
 
 // Гибридный бэкенд (0198): ядра — simd, а батчевые GEMM prefill уходят на GPU

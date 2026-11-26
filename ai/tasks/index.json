@@ -1331,8 +1331,8 @@
   },
   {
     "id": "0199",
-    "title": "Баг гибрида через C-ABI (гонка GPU)",
-    "status": "in_progress",
+    "title": "Паритет гибрида через C-ABI (шаг строки GEMM)",
+    "status": "done",
     "file": "0199-hybrid-capi-bug.md",
     "assignee": "agent:hybrid-bug"
   }

@@ -797,6 +797,36 @@ int vtm_metal_defer_active(void) {
            == (uintptr_t)pthread_self();
 }
 
+// Кэш MTLBuffer (g_binds/g_nbinds/g_tick) и инициализация Metal по контракту
+// живут под g_lock: так их держат синхронный GEMV и батчевый GEMM. Очередь
+// декода держит свой g_defer_lock и до 0199 звала metal_init()/metal_bind()
+// только с ним — при двух контекстах в разных потоках (FULL-декод и BATCH-
+// prefill) это была настоящая гонка на LRU-вытеснении и на g_init. Берём
+// g_lock на время init/bind; порядок замков — defer -> g, как в
+// vtm_metal_forget_all(), обратного порядка нет.
+//
+// Это не причина мусора 0199 (там детерминированный шаг строки GEMM, см.
+// metal_gemm_body), а тот самый разрыв синхронизации, который искали по
+// гипотезе: он существует, но в одиночном прогоне не проявлялся.
+static int defer_metal_init(void) {
+    int rc;
+
+    pthread_mutex_lock(&g_lock);
+    rc = metal_init();
+    pthread_mutex_unlock(&g_lock);
+    return rc;
+}
+
+static int defer_metal_bind(const void *ptr, size_t bytes, id<MTLBuffer> *out,
+                            uint64_t *off) {
+    int rc;
+
+    pthread_mutex_lock(&g_lock);
+    rc = metal_bind(ptr, bytes, out, off, NULL);
+    pthread_mutex_unlock(&g_lock);
+    return rc;
+}
+
 int vtm_metal_defer_gemv(int kind, float *y, const void *w,
                          const float *scales, const float *x,
                          int rows, int cols) {
@@ -819,7 +849,7 @@ int vtm_metal_defer_gemv(int kind, float *y, const void *w,
     }
 
     pthread_mutex_lock(&g_defer_lock);
-    if (metal_init() != 0) {
+    if (defer_metal_init() != 0) {
         g_fail++;
         rc = -1;
         goto out;
@@ -841,7 +871,7 @@ int vtm_metal_defer_gemv(int kind, float *y, const void *w,
         wbytes = (size_t)rows * (size_t)cols;
         a.nblocks = 0;
     }
-    if (metal_bind(w, wbytes, &wb, &woff, NULL) != 0) {
+    if (defer_metal_bind(w, wbytes, &wb, &woff) != 0) {
         g_fail++;
         rc = 1;
         goto out;
@@ -849,7 +879,7 @@ int vtm_metal_defer_gemv(int kind, float *y, const void *w,
     if (kind == 2) {
         uint64_t n = (uint64_t)rows * (uint64_t)cols;
         scbytes = (size_t)(n / 128u + (n % 128u ? 1u : 0u)) * sizeof(float);
-        if (metal_bind(scales, scbytes, &sb, &scoff, NULL) != 0) {
+        if (defer_metal_bind(scales, scbytes, &sb, &scoff) != 0) {
             g_fail++;
             rc = 1;
             goto out;
@@ -1141,10 +1171,16 @@ static int metal_gemm_body(int kind, float *y, const void *w,
         }
         {
             const float *yt = (const float *)[g_gybuf contents];
+            // Строка результата ядра — ровно N = vn столбцов (вариант
+            // gemm8/16/32 выбирается по n_tokens, хвост пачки добит нулями
+            // ещё в xt). Последний chunk может быть короче vn (nt < vn), но
+            // шаг строки в g_gybuf всё равно vn. Читать его как nt нельзя:
+            // 0199 — на nt != vn строки сдвигались, и весь батч (а с ним
+            // K/V префикса) превращался в мусор.
             for (r = 0; r < rows; r++)
                 for (j = 0; j < nt; j++)
                     y[(size_t)r * (size_t)n_tokens + (size_t)(j0 + j)] =
-                        yt[(size_t)r * (size_t)nt + (size_t)j];
+                        yt[(size_t)r * (size_t)vn + (size_t)j];
         }
         g_gemm_calls++;
         g_calls++;
