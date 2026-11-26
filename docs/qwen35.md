@@ -1,6 +1,6 @@
 # Gated Delta Net в ВТМ: линейное внимание Qwen3.5
 
-> Актуально на 2026-11-25. Задача [0176](../ai/tasks/0176-gated-delta.md),
+> Актуально на 2026-11-26. Задача [0176](../ai/tasks/0176-gated-delta.md),
 > этап 1a — **только Python-эталон**. Разведка 35B — [moe-recon.md](moe-recon.md),
 > MoE — [moe.md](moe.md), контейнер и опкоды — [vtm.md](vtm.md).
 

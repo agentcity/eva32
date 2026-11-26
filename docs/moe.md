@@ -1,6 +1,6 @@
 # MoE в ВТМ: Qwen3-30B-A3B
 
-> Актуально на 2026-11-25. Задачи [0172](../ai/tasks/0172-moe-support.md),
+> Актуально на 2026-11-26. Задачи [0172](../ai/tasks/0172-moe-support.md),
 > [0173](../ai/tasks/0173-u64-container.md),
 > [0174](../ai/tasks/0174-stream-import.md),
 > [0175](../ai/tasks/0175-moe-pread-cache.md),
