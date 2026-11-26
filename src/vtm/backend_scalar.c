@@ -30,10 +30,14 @@
 int vtm_metal_available(void) { return 0; }
 int vtm_metal_compiled(void) { return 0; }
 int vtm_metal_active(void) { return 0; }
+int vtm_metal_gemv_active(void) { return 0; }
+int vtm_metal_mode(void) { return VTM_METAL_OFF; }
+void vtm_metal_set_mode(int mode) { (void)mode; }
 void vtm_metal_set_active(int on) { (void)on; }
 void vtm_metal_forget_all(void) { }
 double vtm_metal_min_mac(void) { return 0.0; }
 const vtm_backend *vtm_backend_metal(void) { return NULL; }
+const vtm_backend *vtm_backend_hybrid(void) { return NULL; }
 int vtm_metal_q4k_gemv(float *y, const uint8_t *b, const float *x, int r,
                        int c) {
     (void)y; (void)b; (void)x; (void)r; (void)c;
@@ -2202,11 +2206,13 @@ static int qk_tmv(float *y, const uint8_t *blocks, const float *x, int rows,
     job.cols = cols;
     job.kind = kind;
 #if VTM_WITH_METAL
-    // GPU-путь декода (0192): те же GEMV, но на Metal. Отказ (-1: нет
+    // GPU-путь декода (0192): те же GEMV, но на Metal. В hybrid (0198)
+    // vtm_metal_gemv_active() ложно — поштучный GEMV остаётся на NEON, а на
+    // GPU идут только батчевые GEMM prefill. Отказ (-1: нет
     // устройства/шейдера/буфера, форма не кратна блоку) — прежний CPU-путь
     // ниже, прогон не падает. VTM_Q4K_STRICT=1 — эталонное f64-накопление,
     // GPU его не повторяет, поэтому strict всегда идёт мимо Metal.
-    if (!q4k_strict_env() && vtm_metal_active()
+    if (!q4k_strict_env() && vtm_metal_gemv_active()
         && (double)rows * (double)cols >= vtm_metal_min_mac()) {
         const int rc = kind == VTM_TENSOR_Q6K
                      ? vtm_metal_q6k_gemv(y, blocks, x, rows, cols)
@@ -2574,7 +2580,8 @@ int vtm_i8_gemv(float *y, const int8_t *q, const float *scales,
 #if VTM_WITH_METAL
     // int8-таблица словаря (kind 4) на GPU (0192). GPU считает f32-аккумулятор,
     // а не int8-плоскости; точность выше, argmax/Δ укладываются в 1e-2.
-    if (!q4k_strict_env() && vtm_metal_active()
+    // В hybrid (0198) lm_head декода остаётся на NEON: gemv_active ложно.
+    if (!q4k_strict_env() && vtm_metal_gemv_active()
         && (double)rows * (double)cols >= vtm_metal_min_mac()) {
         if (vtm_metal_i8_gemv(y, q, scales, x, rows, cols) == 0)
             return 0;
@@ -2611,7 +2618,15 @@ void vtm_backend_forget_metal(void) {
 
 void vtm_backend_note_active(const vtm_backend *b) {
 #if VTM_WITH_METAL
-    vtm_metal_set_active(b && b->name && strcmp(b->name, "metal") == 0);
+    // Имя — единственный источник правды: vtm_set_backend() не получает
+    // отдельного режима, а benchmark/CLI меняют бэкенд на лету.
+    const char *n = (b && b->name) ? b->name : "";
+    if (strcmp(n, "metal") == 0)
+        vtm_metal_set_mode(VTM_METAL_FULL);
+    else if (strcmp(n, "hybrid") == 0)
+        vtm_metal_set_mode(VTM_METAL_BATCH);
+    else
+        vtm_metal_set_mode(VTM_METAL_OFF);
 #else
     (void)b;
 #endif

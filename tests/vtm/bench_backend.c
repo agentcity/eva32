@@ -1718,11 +1718,12 @@ static int q4k_batch_parity_kernel(void) {
     return 1;
 }
 
-// При metal-бэкенде эталонный поштучный путь идёт на GPU (иной порядок
+// При metal-бэкенде (FULL) эталонный поштучный путь идёт на GPU (иной порядок
 // суммирования), а батчевый пока остаётся на CPU: побитового паритета тут нет,
-// контракт 0192 — Δ ≤ 1e-2 (как у int8-пути).
+// контракт 0192 — Δ ≤ 1e-2 (как у int8-пути). В hybrid поштучный путь — CPU,
+// поэтому допуск обычный.
 static double qk_batch_tol(void) {
-    return vtm_metal_active() ? 2.0 * CHECK_TOL_I8 : CHECK_TOL;
+    return vtm_metal_gemv_active() ? 2.0 * CHECK_TOL_I8 : CHECK_TOL;
 }
 
 static void check_q4k_batch_case(int rows, int cols, int ntok, int q6) {
@@ -3685,14 +3686,22 @@ static float *copy_logits(vtm_t *m, int *n_out, int *argmax) {
     return out;
 }
 
-// --- Metal-бэкенд: точность и скорость декода (задача 0192) ----------------
+// --- Metal-бэкенд: точность и скорость simd / metal / hybrid (0192+0198) ---
 //
-// Один процесс, одна загрузка модели. Точность: три промпта по 5 токенов,
-// SIMD-эталон и metal, сравниваются сырые логиты и argmax (контракт 0192 —
-// Δlogits ≤ 1e-2). Скорость: префикс по токену и N шагов greedy-декода для
-// обоих бэкендов, берётся минимум из двух повторов. Печатается статистика
-// Metal: время инициализации/компиляции MSL, zero-copy байты, копии,
-// currentAllocatedSize и phys_footprint до/после.
+// Один процесс, одна загрузка модели; все числа — парные прогоны в одном окне,
+// порядок бэкендов чередуется между повторами (rep 0: simd,metal,hybrid;
+// rep 1: hybrid,metal,simd), берётся min из 2. hybrid (0198) — батчевые GEMM
+// prefill на GPU, поштучные GEMV декода на NEON.
+//
+// Точность: три промпта по 5 токенов и 64-токенная пачка против simd —
+// argmax и max|Δlogits| ≤ 1e-2 (контракт 0192/0198). В конце — откат:
+// VTM_METAL_FORCE_FAIL=1 теряет первый GEMM hybrid, после этого режим Metal
+// выключается, и пачка обязана дать логиты чистого CPU-пути (Δ = 0 к simd).
+//
+// Скорость: декод (мс/токен, ток/с), prefill 64 и 128 (ток/с, TTFT, CPU-время),
+// память (RSS по точкам, zero-copy/копии/currentAllocatedSize).
+static const char *g_metal_lens;  // --metal-lens L1[,L2...] (0198)
+
 static int metal_step(vtm_t *m, int token, int pos, int *out) {
     *out = -1;
     vtm_set_position(m, pos);
@@ -3744,24 +3753,49 @@ static int run_metal_bench(const char *explicit_path, int ngen) {
         {100, 200, 300, 400, 500},
         {1000, 2000, 3000, 4000, 5000}
     };
+    static const int lens_def[2] = {64, 128};
+    int lens[8];
+    int nlens = 2;
+    // Порядок повторов: чередование, чтобы дрейф загрузки машины не лег на
+    // один бэкенд (эта машина занята, см. 0196/0198).
+    static const int order[2][3] = {{0, 1, 2}, {2, 1, 0}};
     const char *path = find_model(explicit_path);
-    const vtm_backend *simd = vtm_backend_by_name("simd");
-    const vtm_backend *metal = vtm_backend_by_name("metal");
+    const vtm_backend *simd;
+    const vtm_backend *metal;
+    const vtm_backend *hybrid;
+    const vtm_backend *bs[3];
     vtm_metal_stats st;
     vtm_t *m;
-    size_t rss0, rss_load;
-    int pi, i, rc = 0;
+    size_t rss0, rss_load, rss_pref[3] = {0, 0, 0};
+    int mode_seen[3] = {VTM_METAL_OFF, VTM_METAL_OFF, VTM_METAL_OFF};
+    int pi, i, li, rc = 0;
 
     if (!path) {
         fprintf(stderr, "модель не найдена (--metal PATH)\n");
         return 2;
     }
-    if (!metal || !metal->name || strcmp(metal->name, "metal") != 0) {
-        printf("metal: бэкенд недоступен в этой сборке — откат проверен, "
-               "замер пропущен\n");
+    // Проверка до by_name: тот на сборке без Metal печатает своё
+    // предупреждение и отдаёт simd, и замер молча измерил бы CPU как metal.
+    if (!vtm_metal_compiled() || !vtm_metal_available()) {
+        printf("metal/hybrid: Metal недоступен в этой сборке/на этой машине — "
+               "откат проверен, замер пропущен\n");
+        return 0;
+    }
+    simd = vtm_backend_by_name("simd");
+    metal = vtm_backend_by_name("metal");
+    hybrid = vtm_backend_by_name("hybrid");
+    if (!simd || !metal || !metal->name
+        || strcmp(metal->name, "metal") != 0
+        || !hybrid || !hybrid->name
+        || strcmp(hybrid->name, "hybrid") != 0) {
+        printf("metal/hybrid: бэкенд недоступен в этой сборке — откат "
+               "проверен, замер пропущен\n");
         return 0;
     }
     if (ngen < 1) ngen = 1;
+    bs[0] = simd;
+    bs[1] = metal;
+    bs[2] = hybrid;
     printf("модель: %s\n", path);
     rss0 = rss_bytes();
     m = vtm_load(path);
@@ -3770,97 +3804,165 @@ static int run_metal_bench(const char *explicit_path, int ngen) {
         return 1;
     }
     rss_load = rss_bytes();
+    lens[0] = lens_def[0];
+    lens[1] = lens_def[1];
+    if (g_metal_lens && *g_metal_lens) {
+        const char *p = g_metal_lens;
+        int k = 0;
+        while (*p && k < 8) {
+            int v = atoi(p);
+            if (v > 0 && v <= 256) lens[k++] = v;
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+        if (k > 0) nlens = k;
+    }
     printf("точность (3 промпта по 5 токенов, эталон simd):\n");
     for (pi = 0; pi < 3; pi++) {
-        float *ref = NULL, *got = NULL;
-        int n_ref = 0, n_got = 0, tok_ref = -1, tok_got = -1;
-        double d, refmax = 0.0;
+        float *ref = NULL;
+        int n_ref = 0, tok_ref = -1;
 
         ref = metal_bench_logits(m, simd, prompts[pi], 5, &n_ref, &tok_ref);
-        got = metal_bench_logits(m, metal, prompts[pi], 5, &n_got, &tok_got);
-        if (!ref || !got || n_ref != n_got) {
-            fprintf(stderr, "metal: логиты не получены (промпт %d)\n", pi);
-            free(ref);
-            free(got);
+        if (!ref) {
+            fprintf(stderr, "metal: эталонные логиты не получены (промпт "
+                    "%d)\n", pi + 1);
             rc = 1;
             continue;
         }
-        d = max_diff(got, ref, (size_t)n_ref, &refmax);
-        printf("  промпт %d: max|Δlogits|=%.3e (max|ref|=%.2f), argmax "
-               "%d/%d %s\n", pi + 1, d, refmax, tok_ref, tok_got,
-               tok_ref == tok_got ? "(совпал)" : "(РАЗОШЁЛСЯ)");
-        if (tok_ref != tok_got || d > 1e-2) rc = 1;
+        for (i = 1; i < 3; i++) {
+            float *got = NULL;
+            int n_got = 0, tok_got = -1;
+            double d, refmax = 0.0;
+
+            got = metal_bench_logits(m, bs[i], prompts[pi], 5, &n_got,
+                                     &tok_got);
+            if (!got || n_got != n_ref) {
+                fprintf(stderr, "metal: логиты не получены (%s, промпт %d)\n",
+                        bs[i]->name, pi + 1);
+                free(got);
+                rc = 1;
+                continue;
+            }
+            d = max_diff(got, ref, (size_t)n_ref, &refmax);
+            printf("  промпт %d: %-9s max|Δlogits|=%.3e (max|ref|=%.2f), "
+                   "argmax %d/%d %s\n", pi + 1, bs[i]->name, d, refmax,
+                   tok_ref, tok_got,
+                   tok_ref == tok_got ? "(совпал)" : "(РАЗОШЁЛСЯ)");
+            if (tok_ref != tok_got || d > 1e-2) rc = 1;
+            free(got);
+        }
         free(ref);
-        free(got);
     }
 
-    printf("декод (префикс 5, %d токенов, min из 2):\n", ngen);
+    printf("декод (префикс 5, %d токенов, min из 2, порядок чередуется):\n",
+           ngen);
     {
-        const vtm_backend *bs[2];
-        double best[2] = {1e300, 1e300};
-        double pre[2] = {0.0, 0.0};
+        double best[3] = {1e300, 1e300, 1e300};
+        double pre[3] = {1e300, 1e300, 1e300};
+        int rep, k;
 
-        bs[0] = simd;
-        bs[1] = metal;
-        for (i = 0; i < 2; i++) {
-            int rep;
-            for (rep = 0; rep < 2; rep++) {
+        for (rep = 0; rep < 2; rep++) {
+            for (k = 0; k < 3; k++) {
+                int bi = order[rep][k];
                 double prefill = 0.0, ms = 0.0;
-                if (metal_bench_decode(m, bs[i], prompts[0], 5, ngen,
+                if (metal_bench_decode(m, bs[bi], prompts[0], 5, ngen,
                                        &prefill, &ms) != 0) {
                     fprintf(stderr, "metal: декод %s — ошибка\n",
-                            bs[i]->name);
+                            bs[bi]->name);
                     rc = 1;
                     continue;
                 }
-                if (rep == 0 || prefill < pre[i]) pre[i] = prefill;
-                if (ms < best[i]) best[i] = ms;
+                if (prefill < pre[bi]) pre[bi] = prefill;
+                if (ms < best[bi]) best[bi] = ms;
             }
         }
-        for (i = 0; i < 2; i++)
-            printf("  %-10s prefill %.1f мс, декод %.2f мс/токен = %.1f "
-                   "ток/с\n", bs[i]->name, pre[i], best[i],
-                   1000.0 / best[i]);
-        if (best[0] < 1e299 && best[1] < 1e299)
-            printf("  ускорение декода: %.2fx\n", best[0] / best[1]);
+        for (i = 0; i < 3; i++) {
+            if (best[i] < 1e299)
+                printf("  %-10s prefill %.1f мс, декод %.2f мс/токен = %.1f "
+                       "ток/с\n", bs[i]->name, pre[i], best[i],
+                       1000.0 / best[i]);
+        }
+        if (best[0] < 1e299) {
+            for (i = 1; i < 3; i++)
+                if (best[i] < 1e299)
+                    printf("  %s/simd: %.2fx\n", bs[i]->name,
+                           best[0] / best[i]);
+        }
     }
 
-    // Prefill пачкой: все токены 64-промпта за один vtm_run_batch. Парный
-    // замер в одном процессе (сначала CPU, потом metal, затем повтор) —
-    // критерий 0196 «prefill ≥100 ток/с» проверяется на тех же страницах.
-    printf("prefill 64 токена (vtm_run_batch, min из 2):\n");
-    {
-        int32_t ids[64];
-        const vtm_backend *bs[2];
-        double best[2] = {1e300, 1e300};
-        int bi, rep;
+    // Prefill пачкой: все токены промпта за один vtm_run_batch (внутри —
+    // чанки по VTM_BATCH_TOKENS=32). Парный замер в одном процессе, min из 2:
+    // simd / metal / hybrid на одних и тех же страницах весов.
+    for (li = 0; li < nlens; li++) {
+        int len = lens[li];
+        int32_t ids[256];
+        double best[3] = {1e300, 1e300, 1e300};
+        double cpu_best[3] = {-1.0, -1.0, -1.0};
+        float *lg[3] = {NULL, NULL, NULL};
+        int nlg[3] = {0, 0, 0}, arg[3] = {0, 0, 0};
+        int rep, k;
 
-        for (i = 0; i < 64; i++) ids[i] = 1000 + (i * 37) % 150000;
-        bs[0] = simd;
-        bs[1] = metal;
+        for (i = 0; i < len; i++) ids[i] = 1000 + (i * 37) % 150000;
         for (rep = 0; rep < 2; rep++) {
-            for (bi = 0; bi < 2; bi++) {
-                double t0, ms;
+            for (k = 0; k < 3; k++) {
+                int bi = order[rep][k];
+                double t0, c0, ms, cpu;
+
                 vtm_set_backend(m, bs[bi]);
                 vtm_reset(m);
                 vtm_set_position(m, 0);
+                c0 = now_cpu_ms();
                 t0 = now_ms();
-                if (vtm_run_batch(m, ids, 64) != VTM_OK) {
+                if (vtm_run_batch(m, ids, len) != VTM_OK) {
                     fprintf(stderr, "prefill: %s — ошибка\n", bs[bi]->name);
                     rc = 1;
                     continue;
                 }
                 ms = now_ms() - t0;
+                cpu = c0 >= 0.0 ? now_cpu_ms() - c0 : -1.0;
                 if (ms < best[bi]) best[bi] = ms;
+                if (cpu >= 0.0 && (cpu_best[bi] < 0.0 || cpu < cpu_best[bi]))
+                    cpu_best[bi] = cpu;
+                if (rep == 0) {
+                    // RSS/логиты — после первого прогона этого бэкенда:
+                    // порядок simd->metal->hybrid, поэтому GPU-аллокации
+                    // видны на metal и уже не растут на hybrid (zero-copy).
+                    rss_pref[bi] = rss_bytes();
+                    mode_seen[bi] = vtm_metal_mode();
+                    lg[bi] = copy_logits(m, &nlg[bi], &arg[bi]);
+                }
             }
         }
-        for (bi = 0; bi < 2; bi++) {
-            if (best[bi] < 1e299)
-                printf("  %-10s %.1f мс = %.1f ток/с (TTFT 64)\n",
-                       bs[bi]->name, best[bi], 64.0 / (best[bi] * 1e-3));
+        printf("prefill %d токенов (vtm_run_batch, min из 2, порядок "
+               "чередуется):\n", len);
+        for (i = 0; i < 3; i++) {
+            if (best[i] >= 1e299) continue;
+            printf("  %-10s %8.1f мс = %6.1f ток/с (TTFT %.2f с), CPU %.2f с, "
+                   "режим %s\n", bs[i]->name, best[i],
+                   (double)len / (best[i] * 1e-3), best[i] * 1e-3,
+                   cpu_best[i] >= 0.0 ? cpu_best[i] * 1e-3 : 0.0,
+                   mode_seen[i] == VTM_METAL_FULL ? "full"
+                       : mode_seen[i] == VTM_METAL_BATCH ? "batch" : "off");
         }
-        if (best[0] < 1e299 && best[1] < 1e299)
-            printf("  ускорение prefill: %.2fx\n", best[0] / best[1]);
+        if (best[0] < 1e299) {
+            for (i = 1; i < 3; i++)
+                if (best[i] < 1e299)
+                    printf("  ускорение prefill %d: %s/simd %.2fx\n", len,
+                           bs[i]->name, best[0] / best[i]);
+        }
+        // Точность пачки: батчевый GEMM GPU против батчевого CPU-ядра simd.
+        if (len == 64 && lg[0]) {
+            for (i = 1; i < 3; i++) {
+                double d, refmax = 0.0;
+                if (!lg[i] || nlg[i] != nlg[0]) continue;
+                d = max_diff(lg[i], lg[0], (size_t)nlg[0], &refmax);
+                printf("  точность пачки: %-9s max|Δlogits|=%.3e, argmax "
+                       "%d/%d %s\n", bs[i]->name, d, arg[0], arg[i],
+                       arg[0] == arg[i] ? "(совпал)" : "(РАЗОШЁЛСЯ)");
+                if (d > 1e-2 || arg[0] != arg[i]) rc = 1;
+            }
+        }
+        for (i = 0; i < 3; i++) free(lg[i]);
     }
 
     vtm_metal_stats_get(&st);
@@ -3881,14 +3983,60 @@ static int run_metal_bench(const char *explicit_path, int ngen) {
            (double)st.alloc_before / (1024.0 * 1024.0),
            (double)st.alloc_after / (1024.0 * 1024.0),
            (double)st.wait_ns / 1e6);
-    printf("  phys_footprint: до загрузки %.1f МиБ, после загрузки %.1f МиБ, "
-           "сейчас %.1f МиБ (Δ после GPU %.1f МиБ)\n",
+    printf("память (RSS = phys_footprint): до загрузки %.1f МиБ, после "
+           "загрузки %.1f МиБ\n",
            (double)rss0 / (1024.0 * 1024.0),
-           (double)rss_load / (1024.0 * 1024.0),
-           (double)rss_bytes() / (1024.0 * 1024.0),
-           ((double)rss_bytes() - (double)rss_load) / (1024.0 * 1024.0));
+           (double)rss_load / (1024.0 * 1024.0));
+    for (i = 0; i < 3; i++) {
+        if (!rss_pref[i]) continue;
+        printf("  после prefill %d (%s): %.1f МиБ\n", lens[0], bs[i]->name,
+               (double)rss_pref[i] / (1024.0 * 1024.0));
+    }
     if (st.last_error[0])
         printf("  последняя ошибка Metal: %s\n", st.last_error);
+
+    // Откат (0198): первая же операция Metal теряет результат — hybrid обязан
+    // уйти на чистый CPU. Мы намеренно ставим ошибку перед прогоном пачки:
+    // ни один GEMM не считается, значит логиты обязаны совпасть с simd
+    // побитово (Δ = 0), а режим Metal — выключиться.
+    printf("откат (VTM_METAL_FORCE_FAIL=1, hybrid, пачка 16):\n");
+    {
+        int32_t ids[16];
+        float *ref = NULL, *got = NULL;
+        int n_ref = 0, n_got = 0, tok_ref = -1, tok_got = -1;
+        double d, refmax = 0.0;
+
+        for (i = 0; i < 16; i++) ids[i] = 7000 + i * 11;
+        vtm_set_backend(m, simd);
+        vtm_reset(m);
+        vtm_set_position(m, 0);
+        if (vtm_run_batch(m, ids, 16) == VTM_OK)
+            ref = copy_logits(m, &n_ref, &tok_ref);
+        setenv("VTM_METAL_FORCE_FAIL", "1", 1);
+        vtm_set_backend(m, hybrid);
+        vtm_reset(m);
+        vtm_set_position(m, 0);
+        if (vtm_run_batch(m, ids, 16) == VTM_OK)
+            got = copy_logits(m, &n_got, &tok_got);
+        unsetenv("VTM_METAL_FORCE_FAIL");
+        vtm_metal_stats_get(&st);
+        printf("  режим после ошибки: %s, отказов Metal %llu\n",
+               vtm_metal_mode() == VTM_METAL_OFF ? "off (чистый CPU)" : "?",
+               (unsigned long long)st.failures);
+        if (!ref || !got || n_ref != n_got) {
+            fprintf(stderr, "откат: логиты не получены\n");
+            rc = 1;
+        } else {
+            d = max_diff(got, ref, (size_t)n_ref, &refmax);
+            printf("  hybrid после ошибки: max|Δlogits|=%.3e, argmax %d/%d "
+                   "%s\n", d, tok_ref, tok_got,
+                   tok_ref == tok_got ? "(совпал)" : "(РАЗОШЁЛСЯ)");
+            if (tok_ref != tok_got || d > 1e-2) rc = 1;
+        }
+        free(ref);
+        free(got);
+    }
+
     vtm_free(m);
     return rc;
 }
@@ -4744,6 +4892,7 @@ static void usage(const char *prog) {
            "[--q4-batch]]\n"
            "          [--prefill-check PATH] [--prefill-ttft PATH]\n"
            "          [--prefill-lens 64,256,512] [--prefill-reps N]\n"
+           "          [--metal PATH] [--metal-new N] [--metal-lens 64,128]\n"
            "          [--decode-bench PATH --prompts FILE [--decode-new N]\n"
            "           [--decode-reps N]]\n"
            "          [--decode-check PATH --prompts FILE [--decode-new N]\n"
@@ -4818,6 +4967,8 @@ int main(int argc, char **argv) {
             metal_bench_path = (i + 1 < argc) ? argv[++i] : "";
         } else if (strcmp(argv[i], "--metal-new") == 0 && i + 1 < argc) {
             metal_new = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--metal-lens") == 0 && i + 1 < argc) {
+            g_metal_lens = argv[++i];   // длины prefill, по умолчанию 64,128
         } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
             backend_name = argv[++i];
         } else if (strcmp(argv[i], "--check") == 0) {
@@ -4906,8 +5057,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "неизвестный бэкенд: %s\n", backend_name);
         return 2;
     }
-    if (!backend_name && (!getenv("VTM_BACKEND") || !*getenv("VTM_BACKEND")))
+    if (!backend_name && (!getenv("VTM_BACKEND") || !*getenv("VTM_BACKEND"))) {
         cand = &vtm_backend_simd;  // бенчмарк по умолчанию меряет SIMD
+        // auto (0198) мог выставить BATCH/устройством — вернуть явный simd,
+        // иначе синтетические замеры пойдут с включённым режимом Metal.
+        vtm_metal_set_mode(VTM_METAL_OFF);
+    }
 
     if (emb_check_path_set)
         return run_emb_check(emb_check_path, decode_prompts_path, decode_new,

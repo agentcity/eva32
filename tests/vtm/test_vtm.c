@@ -848,10 +848,12 @@ static void test_load_and_tmv(void) {
     if (!m) { free(img); model_free(&md); return; }
     CHECK(vtm_tensor_count(m) == 3);
     CHECK(vtm_instr_count(m) == 2);
-    // По умолчанию теперь auto: metal (0192), иначе simd-*, иначе
-    // scalar-lut243. Проверяем именно это, а не конкретное имя.
+    // По умолчанию теперь auto: hybrid (0198: GPU только на батчевый prefill),
+    // metal (0192), иначе simd-*, иначе scalar-lut243. Проверяем именно это,
+    // а не конкретное имя.
     CHECK(strcmp(vtm_backend_name(m), "scalar-lut243") == 0 ||
           strcmp(vtm_backend_name(m), "metal") == 0 ||
+          strcmp(vtm_backend_name(m), "hybrid") == 0 ||
           strncmp(vtm_backend_name(m), "simd", 4) == 0);
     t = vtm_tensor_by_name(m, "W");
     CHECK(t != NULL);

@@ -4737,7 +4737,8 @@ static int batch_backend_enabled(const vtm_t *m) {
         return 1;
     if (be->name && strncmp(be->name, "scalar", 6) == 0) return 1;
     if (be->name && (strncmp(be->name, "simd", 4) == 0
-                     || strcmp(be->name, "metal") == 0))
+                     || strcmp(be->name, "metal") == 0
+                     || strcmp(be->name, "hybrid") == 0))
         return vtm_simd_available();
     return 0;
 }
@@ -4751,9 +4752,11 @@ static int batch_backend_enabled(const vtm_t *m) {
 static int batch_use_simd(const vtm_t *m) {
     const vtm_backend *be = m->backend;
     const char *n = (be && be->name) ? be->name : NULL;
-    // metal (0192) для батча — те же SIMD-ядра: на GPU в фазе 1 уходит только
-    // одноколоночный GEMV, пачка остаётся CPU-путём.
-    return n && (strncmp(n, "simd", 4) == 0 || strcmp(n, "metal") == 0)
+    // metal (0192) и hybrid (0198) для батча — те же SIMD-ядра: в hybrid на
+    // GPU уходят только батчевые GEMM kind 6/7 и int8-таблица (см.
+    // batch_tmv_kernel/batch_mm_kernel), остальное остаётся на CPU.
+    return n && (strncmp(n, "simd", 4) == 0 || strcmp(n, "metal") == 0
+                 || strcmp(n, "hybrid") == 0)
         && vtm_simd_available();
 }
 
@@ -6140,7 +6143,9 @@ vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {
     metal_defer_ctx md;
     int md_on = 0;
 
-    if (m && vtm_metal_active() && m->trace_cb == NULL) {
+    // Сессия отложенной очереди — только для полного Metal (FULL). В hybrid
+    // (0198) поштучные GEMV декода идут на NEON, и очередь не нужна.
+    if (m && vtm_metal_gemv_active() && m->trace_cb == NULL) {
         memset(&md, 0, sizeof md);
         md.active = 1;
         g_md = &md;

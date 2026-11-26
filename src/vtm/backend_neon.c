@@ -4769,21 +4769,54 @@ const vtm_backend vtm_backend_simd = {
     .copy = NULL
 };
 
+// auto = hybrid? Решение по парному замеру 0198 (bench_backend --metal на
+// 3B Q4_K, одна машина, min из 2, два прогона): prefill 64 токена 19,6 -> 38,4
+// ток/с (1,96x, TTFT 3,28 -> 1,67 с), prefill 128 — 1,86x, декод 20,2 -> 19,9
+// ток/с (0,98x, шум: в hybrid те же NEON-ядра). Условие задачи выполнено
+// (prefill >= 1,3x, декод не хуже simd), поэтому auto выбирает hybrid, когда
+// Metal собран и устройство есть. Одна константа, чтобы вернуть simd без
+// правок логики: 0 — auto=simd.
+#ifndef VTM_AUTO_HYBRID
+#define VTM_AUTO_HYBRID 1
+#endif
+
+// Гибридный бэкенд (0198): ядра — simd, а батчевые GEMM prefill уходят на GPU
+// по vtm_metal_active(). Доступен только в сборке с Metal.
+static const vtm_backend *backend_hybrid_or_simd(const char *why) {
+#if VTM_WITH_METAL
+    if (vtm_metal_compiled() && vtm_metal_available()) {
+        vtm_metal_set_mode(VTM_METAL_BATCH);
+        return vtm_backend_hybrid();
+    }
+    fprintf(stderr, "VTM: %s: Metal недоступен — бэкенд simd (откат)\n", why);
+#else
+    fprintf(stderr, "VTM: %s: сборка без Metal — бэкенд simd (откат)\n", why);
+#endif
+    vtm_metal_set_active(0);
+    return vtm_simd_available() ? &vtm_backend_simd : &vtm_backend_scalar_lut;
+}
+
 const vtm_backend *vtm_backend_by_name(const char *name) {
     if (!name || !*name) return vtm_backend_from_env();
     if (strcmp(name, "auto") == 0) {
-#if VTM_WITH_METAL
-        // ADR 0021, фаза 1: auto = simd. Замеры 0192 на M1 Pro показали, что
-        // Metal на СИНХРОННЫХ GEMV медленнее CPU (7,8 против 20,8 ток/с):
-        // 181 командный буфер на токен — накладные больше выигрыша. GPU
-        // включится по умолчанию только после фазы 2 (батч/persistent pipeline);
-        // до тех пор метал доступен явно: VTM_BACKEND=metal.
-        vtm_metal_set_active(0);
-#else
-        vtm_metal_set_active(0);
+        // 0198: hybrid (GPU только на prefill GEMM), иначе simd. Устройство
+        // проверяется здесь, а шейдеры компилируются лениво при первом GEMM.
+        if (!vtm_simd_available()) {
+            vtm_metal_set_active(0);
+            return &vtm_backend_scalar_lut;
+        }
+#if VTM_WITH_METAL && VTM_AUTO_HYBRID
+        // Устройство, а не только сборка: на машине без GPU auto остаётся simd.
+        if (vtm_metal_compiled() && vtm_metal_available()) {
+            vtm_metal_set_mode(VTM_METAL_BATCH);
+            return vtm_backend_hybrid();
+        }
 #endif
-        return vtm_simd_available() ? &vtm_backend_simd
-                                    : &vtm_backend_scalar_lut;
+        vtm_metal_set_active(0);
+        return &vtm_backend_simd;
+    }
+    if (strcmp(name, "hybrid") == 0) {
+        return backend_hybrid_or_simd("hybrid");
     }
     if (strcmp(name, "metal") == 0) {
 #if VTM_WITH_METAL
@@ -4828,7 +4861,8 @@ const vtm_backend *vtm_backend_from_env(void) {
     backend = vtm_backend_by_name(env);
     if (backend) return backend;
     fprintf(stderr, "vtm: неизвестный VTM_BACKEND='%s' "
-                    "(auto|metal|scalar|simd|direct), беру scalar\n", env);
+                    "(auto|hybrid|metal|scalar|simd|direct), беру scalar\n",
+            env);
     vtm_metal_set_active(0);
     return &vtm_backend_scalar_lut;
 }

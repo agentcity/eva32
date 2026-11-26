@@ -112,7 +112,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_defer_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_avail = -1;            // -1 — не проверяли, 0/1
 static int g_init = 0;              // 0 — нет, 1 — готов, -1 — отказ
-static int g_active = 0;            // выбран ли metal-бэкенд
+static int g_mode = VTM_METAL_OFF;  // OFF / FULL / BATCH (задача 0198)
 static int g_warned_tsan = 0;
 
 static id<MTLDevice> g_dev;
@@ -999,6 +999,15 @@ static int metal_gemm_body(int kind, float *y, const void *w,
     // равно считает 8 (минимум из вариантов), а накладные те же.
     if (n_tokens < 8) return -1;
     if (metal_strict_env()) return -1;
+    // Инъекция отказа (VTM_METAL_FORCE_FAIL) для проверки откала гибрида:
+    // первый GEMM «теряет» результат, режим выключается — весь остаток
+    // пачки/прогона считается CPU-ядрами, как при любой ошибке Metal.
+    if (force_fail()) {
+        metal_set_err("VTM_METAL_FORCE_FAIL: инъекция отказа Metal (GEMM)");
+        g_fail++;
+        vtm_metal_set_mode(VTM_METAL_OFF);
+        return -1;
+    }
 
     pthread_mutex_lock(&g_lock);
     if (metal_init() != 0) {
@@ -1124,6 +1133,10 @@ static int metal_gemm_body(int kind, float *y, const void *w,
                               : "status != completed");
             metal_set_err("GEMM-буфер не завершился");
             g_fail++;
+            // Ошибка командного буфера — не «форма не та», а сбой GPU: чтобы
+            // не повторять её на каждой матрице, режим выключается, и
+            // остаток прогона идёт чистым CPU-путём (0198, откат).
+            vtm_metal_set_mode(VTM_METAL_OFF);
             goto out;
         }
         {
@@ -1205,27 +1218,52 @@ int vtm_metal_compiled(void) {
 }
 
 int vtm_metal_active(void) {
-    return __atomic_load_n(&g_active, __ATOMIC_RELAXED);
+    // FULL и BATCH: батчевые GEMM prefill работают в обоих режимах.
+    return __atomic_load_n(&g_mode, __ATOMIC_RELAXED) != VTM_METAL_OFF;
+}
+
+int vtm_metal_gemv_active(void) {
+    // Одиночные GEMV — только FULL; в hybrid (BATCH) их считает NEON.
+    return __atomic_load_n(&g_mode, __ATOMIC_RELAXED) == VTM_METAL_FULL;
+}
+
+int vtm_metal_mode(void) {
+    return __atomic_load_n(&g_mode, __ATOMIC_RELAXED);
+}
+
+void vtm_metal_set_mode(int mode) {
+    if (mode < VTM_METAL_OFF || mode > VTM_METAL_BATCH) mode = VTM_METAL_OFF;
+    // GEMV-путь читает флаг из рабочих потоков пула, поэтому запись/чтение
+    // атомарны (замок здесь только сериализует выбор бэкенда с инициализацией).
+    __atomic_store_n(&g_mode, mode, __ATOMIC_RELAXED);
 }
 
 void vtm_metal_set_active(int on) {
-    // GEMV-путь читает флаг из рабочих потоков пула, поэтому запись/чтение
-    // атомарны (замок здесь только сериализует выбор бэкенда с инициализацией).
-    __atomic_store_n(&g_active, on ? 1 : 0, __ATOMIC_RELAXED);
+    vtm_metal_set_mode(on ? VTM_METAL_FULL : VTM_METAL_OFF);
+}
+
+// Оба описателя — копия simd-бэкенда (триты/нормы не трогаем), отличается
+// только имя: по нему interp.c/call-сайты понимают, что батч можно отдать GPU.
+static const vtm_backend *metal_backend_named(int hybrid) {
+    static vtm_backend b[2];
+    static int ready[2];
+
+    pthread_mutex_lock(&g_lock);
+    if (!ready[hybrid]) {
+        b[hybrid] = vtm_backend_simd;
+        b[hybrid].name = hybrid ? "hybrid" : "metal";
+        ready[hybrid] = 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return &b[hybrid];
 }
 
 const vtm_backend *vtm_backend_metal(void) {
-    static vtm_backend b;
-    static int ready = 0;
+    return metal_backend_named(0);
+}
 
-    pthread_mutex_lock(&g_lock);
-    if (!ready) {
-        b = vtm_backend_simd;   // те же ядра для тритов/норм: их не трогаем
-        b.name = "metal";
-        ready = 1;
-    }
-    pthread_mutex_unlock(&g_lock);
-    return &b;
+const vtm_backend *vtm_backend_hybrid(void) {
+    return metal_backend_named(1);
 }
 
 int vtm_metal_q4k_gemv(float *y, const uint8_t *blocks, const float *x,
@@ -1247,7 +1285,8 @@ void vtm_metal_stats_get(vtm_metal_stats *out) {
     if (!out) return;
     pthread_mutex_lock(&g_lock);
     out->available = g_avail > 0;
-    out->active = __atomic_load_n(&g_active, __ATOMIC_RELAXED);
+    out->active = vtm_metal_active();
+    out->mode = vtm_metal_mode();
     out->init_ms = g_init_ms;
     out->compile_ms = g_compile_ms;
     out->calls = g_calls;

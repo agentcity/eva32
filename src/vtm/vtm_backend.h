@@ -29,9 +29,11 @@ extern const vtm_backend vtm_backend_simd;
 // подменяет только перечисленные GEMV. Веса не копируются: MTLBuffer
 // создаётся на выровненный срез mmap-региона контейнера (zero-copy).
 //
-// Включение: VTM_BACKEND=metal (см. vtm_backend_by_name). auto выбирает metal,
-// если сборка с Metal; устройство проверяется лениво при первом ядре (чтобы
-// выбор бэкенда не инициализировал GPU), и при отказе прогон уходит на CPU.
+// Включение: VTM_BACKEND=metal (всё на GPU) или hybrid (0196/0198: GPU только
+// на батчевые GEMM prefill); см. vtm_backend_by_name. auto с 0198 — hybrid,
+// если устройство есть и парный замер подтвердил выигрыш (см. docs/vtm.md);
+// иначе auto — simd. Одиночные ядра инициализируют GPU лениво, при первом
+// вызове, и при отказе прогон уходит на CPU.
 // Любая ошибка Metal (нет устройства, не собрался MSL, ошибка командного
 // буфера) — лог в stderr и откат на NEON/scalar: ядра возвращают -1,
 // вызывающий идёт прежним путём. Побитового паритета с CPU нет (GPU меняет
@@ -39,11 +41,35 @@ extern const vtm_backend vtm_backend_simd;
 //
 // Сборка без Metal (не Darwin или VTM_WITH_METAL=0): backend_metal.m не
 // компилируется, а backend_scalar.c даёт заглушки Metal-API (ядра → -1).
+//
+// Режим (задача 0198). GPU выигрывает только на батчевом GEMM (prefill), а на
+// одиночных GEMV декода проигрывает CPU в 2,3 раза (замер 0196). Поэтому у
+// Metal три режима:
+//   VTM_METAL_OFF   — Metal выключен (simd/scalar);
+//   VTM_METAL_FULL  — все GEMV kind 4/6/7 и батчевые GEMM на GPU
+//                     (VTM_BACKEND=metal);
+//   VTM_METAL_BATCH — только батчевые GEMM prefill на GPU, одиночные GEMV
+//                     декода — NEON (VTM_BACKEND=hybrid).
+// Развилка живёт в диспетчере, а не в ядре: vtm_metal_active() истинно для
+// FULL и BATCH (его спрашивают батчевые пути interp.c), а
+// vtm_metal_gemv_active() — только для FULL (поштучные GEMV в
+// vtm_q4k_tmv/vtm_q6k_tmv/vtm_i8_gemv и сессия отложенной очереди). Так
+// «не умею» не нужно возвращать из ядра: Metal просто не вызывается.
+#define VTM_METAL_OFF   0
+#define VTM_METAL_FULL  1
+#define VTM_METAL_BATCH 2
 int vtm_metal_available(void);       // 1 — устройство есть (шейдеры ещё нет)
 int vtm_metal_compiled(void);        // 1 — сборка с Metal (без проверки устройства)
-int vtm_metal_active(void);          // 1 — metal выбран диспетчером
-void vtm_metal_set_active(int on);   // выбрать/снять; выключен — no-op
+int vtm_metal_active(void);          // 1 — режим FULL или BATCH
+int vtm_metal_gemv_active(void);     // 1 — только FULL: поштучные GEMV на GPU
+int vtm_metal_mode(void);            // VTM_METAL_OFF/FULL/BATCH
+void vtm_metal_set_mode(int mode);   // выбрать режим (см. выше)
+void vtm_metal_set_active(int on);   // on — FULL, 0 — OFF (прежний контракт)
 const vtm_backend *vtm_backend_metal(void); // .name == "metal" + ядра simd
+// Гибрид: .name == "hybrid", ядра — simd (поштучные операции на CPU), а
+// батчевые GEMM interp.c уходят на GPU по vtm_metal_active(). Тот же ввод,
+// что у vtm_backend_metal(), но режим BATCH; без Metal — NULL/откат.
+const vtm_backend *vtm_backend_hybrid(void);
 
 // GEMV-ядра. 0 — успех, -1 — отказ (сборка/устройство/форма/память): тогда
 // диспетчер backend_scalar.c зовёт CPU-ядро, прогон не падает.
@@ -96,6 +122,7 @@ int vtm_metal_defer_end(void);
 typedef struct vtm_metal_stats {
     int      available;
     int      active;
+    int      mode;          // VTM_METAL_OFF/FULL/BATCH на момент опроса
     uint64_t init_ms;       // вся инициализация (устройство + MSL + pipeline)
     uint64_t compile_ms;    // только загрузка/компиляция библиотеки шейдеров
     uint64_t calls;         // успешных GEMV
@@ -130,8 +157,9 @@ int vtm_simd_available(void);
 // "neon" | "avx2" | "none" — что реально используется (для логов/бенчмарка).
 const char *vtm_simd_isa(void);
 
-// Выбор бэкенда по имени: "auto" | "metal" | "simd" | "scalar" | "direct" | "lut"
-// (NULL/"" — то же, что VTM_BACKEND из окружения). Неизвестное имя — NULL.
+// Выбор бэкенда по имени: "auto" | "metal" | "hybrid" | "simd" | "scalar" |
+// "direct" | "lut" (NULL/"" — то же, что VTM_BACKEND из окружения).
+// Неизвестное имя — NULL.
 const vtm_backend *vtm_backend_by_name(const char *name);
 
 // Внутренний хук диспетчера: запомнить фактически выбранный бэкенд машины.
@@ -140,8 +168,14 @@ const vtm_backend *vtm_backend_by_name(const char *name);
 void vtm_backend_note_active(const vtm_backend *backend);
 
 // Бэкенд из env VTM_BACKEND:
-//   не задан        -> auto: simd, если доступен, иначе scalar-lut243;
-//   auto            -> simd, если доступен, иначе scalar;
+//   не задан        -> auto (ниже);
+//   auto            -> hybrid, если Metal собран и устройство есть, иначе
+//                      simd, если доступен, иначе scalar. Решение по замеру
+//                      0198: prefill 64 токена 19,6 -> 34,1 ток/с (1,74x),
+//                      декод 20,4 -> 20,4 (шум), TTFT 3,27 -> 1,88 с;
+//   metal           -> всё на GPU (GEMV+GEMM); без Metal — simd;
+//   hybrid          -> батчевые GEMM на GPU, одиночные GEMV на NEON; без
+//                      Metal — simd с предупреждением;
 //   simd            -> simd (с внутренним откатом на scalar, если недоступен);
 //   scalar | lut    -> scalar-lut243;
 //   direct          -> scalar-direct.

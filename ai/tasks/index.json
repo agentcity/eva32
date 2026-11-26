@@ -1325,7 +1325,7 @@
   {
     "id": "0198",
     "title": "Гибрид: GPU prefill + CPU декод",
-    "status": "in_progress",
+    "status": "done",
     "file": "0198-hybrid-gpu-prefill.md",
     "assignee": "agent:hybrid"
   }
