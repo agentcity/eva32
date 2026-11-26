@@ -1349,5 +1349,12 @@
     "status": "in_progress",
     "file": "0201-decode-memory-parallelism.md",
     "assignee": "agent:decode-mlp"
+  },
+  {
+    "id": "0203",
+    "title": "Спекулятивный декод (черновик 0.5B)",
+    "status": "in_progress",
+    "file": "0203-speculative-decode.md",
+    "assignee": "agent:speculative"
   }
 ]
