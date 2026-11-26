@@ -1165,7 +1165,7 @@ class SileroWorker:
     ) -> None:
         self._python = Path(python)
         self._script = Path(script)
-        self._speaker = speaker
+        self._speaker = _silero_safe_speaker(speaker)
         self._sample_rate = int(sample_rate)
         self._env = dict(env) if env is not None else None
         self.timeout = float(timeout)
@@ -1227,7 +1227,7 @@ class SileroWorker:
             str(self._python),
             str(self._script),
             "--speaker",
-            self._speaker,
+            _silero_safe_speaker(self._speaker),
             "--sample-rate",
             str(self._sample_rate),
         ]
@@ -1389,7 +1389,7 @@ class SileroWorker:
     ) -> dict[str, Any]:
         """Синтезировать фразу в ``out_path``; вернуть ответ worker'а."""
         reply = self.request(
-            {"text": text, "speaker": speaker, "out": str(out_path)},
+            {"text": text, "speaker": _silero_safe_speaker(speaker), "out": str(out_path)},
             timeout=timeout,
         )
         if not reply.get("ok"):
@@ -1559,6 +1559,19 @@ def prewarm_silero_worker(
     thread = threading.Thread(target=_warm, name="silero-prewarm", daemon=True)
     thread.start()
     return thread
+
+
+def _silero_safe_speaker(speaker: str | None) -> str:
+    """Вернуть допустимый голос Silero: неизвестный → baya.
+
+    Клиент (приложение) мог сохранить старое значение из эпохи Piper
+    (`young`, `soft`, `irina`). Раньше это давало ValueError «доступные голоса…»
+    и откат на системный `say` — то есть Ева замолкала голосом Евы.
+    Лучше сказать голосом по умолчанию, чем не сказать вовсе.
+    """
+    known = {"aidar", "baya", "kseniya", "xenia", "eugene", "random"}
+    value = (speaker or "").strip().lower()
+    return value if value in known else "baya"
 
 
 class SileroTTS(TTSAdapter):
