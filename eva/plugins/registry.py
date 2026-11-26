@@ -175,6 +175,15 @@ class TtsBinding:
 
 
 @dataclass(frozen=True)
+class AnswerBinding:
+    """Способность ``answer``: плагин отвечает сам, модель не нужна."""
+
+    plugin_id: str
+    run: Callable[..., Any]
+    ctx: PluginContext
+
+
+@dataclass(frozen=True)
 class CommandBinding:
     """Способность ``command`` одного плагина (каркас)."""
 
@@ -829,6 +838,40 @@ class PluginRegistry:
                 CommandBinding(plugin_id=record.id, run=run, ctx=record.ctx)
             )
         return bindings
+
+    def answers(self) -> list[AnswerBinding]:
+        """Включённые плагины со способностью ``answer`` в порядке приоритета."""
+        bindings: list[AnswerBinding] = []
+        for record in self.enabled():
+            if not record.loaded or "answer" not in record.manifest.capabilities:
+                continue
+            run = getattr(record.entry, "answer", None)
+            if not callable(run):
+                logger.warning(
+                    "плагин %s: capability answer без функции answer()", record.id
+                )
+                continue
+            bindings.append(AnswerBinding(plugin_id=record.id, run=run, ctx=record.ctx))
+        return bindings
+
+    def run_answer(self, question: str) -> str | None:
+        """Первый плагин, который ответил сам; ``None`` — пусть отвечает модель.
+
+        Ошибка плагина не ломает чат: пишем в лог и пробуем следующий.
+        """
+        text = str(question or "").strip()
+        if not text:
+            return None
+        for binding in self.answers():
+            try:
+                result = binding.run(binding.ctx, text)
+            except Exception as exc:  # noqa: BLE001
+                self._note_error(binding.plugin_id, f"{type(exc).__name__}: {exc}")
+                logger.warning("плагин %s: answer упал: %s", binding.plugin_id, exc)
+                continue
+            if isinstance(result, str) and result.strip():
+                return result.strip()
+        return None
 
     def run_command(self, line: str) -> str | None:
         """Первый плагин, который взял слэш-команду; ``None`` — никто."""

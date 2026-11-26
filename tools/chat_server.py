@@ -2311,6 +2311,41 @@ def _run_side(
     # он прозрачен и обычное «не знаю» остаётся как есть.
     guard = FactGuardStream(facts)
     gender = GenderStreamer()
+    # Плагины со способностью ``answer`` (сказки, музыка) отвечают сами:
+    # сервер не зовёт модель вовсе. Это и быстрее, и надёжнее — 4B не
+    # перепишет сказку своими словами и не «потеряет» музыкальную команду.
+    plugin_answer: str | None = None
+    if server is not None:
+        try:
+            plugin_answer = server.plugins.run_answer(messages[-1].get("content", ""))
+        except Exception:  # noqa: BLE001 — плагин не должен ронять чат
+            logger.exception("плагины: answer упал")
+            plugin_answer = None
+    if plugin_answer:
+        filtered = filters.feed(plugin_answer) if filters is not None else plugin_answer
+        filtered = gender.feed(filtered) + gender.flush()
+        if filtered:
+            events.put(
+                {
+                    "type": "delta",
+                    "side": index,
+                    "text": filtered,
+                }
+            )
+        events.put(
+            {
+                "type": "done",
+                "side": index,
+                "backend": side["backend"],
+                "model": side["model"],
+                "finish_reason": "plugin",
+                "answer": filtered,
+                "source": "plugin",
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+            }
+        )
+        completed = True
+        return
     try:
         iterator = iter(adapter.stream(messages, max_tokens=max_tokens))
         try:
