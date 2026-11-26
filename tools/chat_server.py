@@ -136,7 +136,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 try:  # ru_maxrss — пиковый RSS; на Windows модуля нет, там честное «—»
     import resource
@@ -226,6 +226,17 @@ HISTORY_CHARS_PER_TOKEN = 3
 MAX_BODY_BYTES = 64 * 1024
 #: Потолок вопроса в символах; защита от случайной вставки книги.
 MAX_QUESTION_CHARS = 8000
+#: Иллюстрации плагинов (задача 0221): отдаём только из ``images/`` плагина.
+MEDIA_URL_PREFIX = "/media/"
+MEDIA_CACHE_CONTROL = "max-age=86400"
+#: Content-Type по расширению: всё, что не картинка, ``/media`` не отдаёт.
+MEDIA_CONTENT_TYPES: dict[str, str] = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
 #: Модели Ollama по умолчанию. Имена можно заменить ``--ollama-model``.
 DEFAULT_OLLAMA_MODELS: tuple[tuple[str, str], ...] = (
     ("qwen2.5:7b", "Qwen2.5 7B"),
@@ -2233,6 +2244,141 @@ class _SideDone:
         self.answer = answer
 
 
+def _plugin_image_rel(path: object) -> str | None:
+    """Относительный путь картинки плагина или ``None``, если он небезопасен.
+
+    Контракт ``answer``: ``path`` — ``images/<slug>/NN.jpg`` относительно
+    каталога плагина. Абсолютные пути, ``..`` и чужие каталоги отбрасываем
+    здесь, до SSE: клиент не должен получить ссылку за пределы ``images/``.
+    """
+    if not isinstance(path, str):
+        return None
+    value = path.strip().replace("\\", "/")
+    if not value or value.startswith("/"):
+        return None
+    parts = [part for part in value.split("/") if part not in ("", ".")]
+    if len(parts) < 3 or parts[0] != "images":
+        return None
+    if any(part == ".." for part in parts):
+        return None
+    relative = "/".join(parts[1:])
+    suffix = pathlib.PurePosixPath(relative).suffix.lower()
+    if suffix not in MEDIA_CONTENT_TYPES:
+        return None
+    return relative
+
+
+def _coerce_plugin_reply(
+    result: Any, plugin_id: str
+) -> dict[str, Any] | None:
+    """Привести ответ плагина к ``{"plugin", "text", "images", "silent"}``.
+
+    Строка — прежний контракт (задачи 0218/0220); словарь ``{"text",
+    "images"}`` — расширение 0221, ``silent`` — 0223 (запись сказки играет
+    сама, голос Евы поверх неё не нужен). Пустой/битый ответ = плагин не
+    ответил.
+    """
+    if isinstance(result, Mapping):
+        body = result.get("text")
+        if not isinstance(body, str) or not body.strip():
+            return None
+        images: list[dict[str, Any]] = []
+        raw_images = result.get("images")
+        if isinstance(raw_images, (list, tuple)):
+            for item in raw_images:
+                if not isinstance(item, Mapping):
+                    continue
+                relative = _plugin_image_rel(item.get("path"))
+                if relative is None:
+                    continue
+                after = item.get("after_chars", 0)
+                if isinstance(after, bool) or not isinstance(
+                    after, (int, float)
+                ):
+                    after = 0
+                alt = item.get("alt")
+                images.append(
+                    {
+                        "relative": relative,
+                        "alt": alt if isinstance(alt, str) else "",
+                        "after_chars": max(0, int(after)),
+                    }
+                )
+        images.sort(key=lambda image: image["after_chars"])
+        return {
+            "plugin": plugin_id,
+            "text": body.strip(),
+            "images": images,
+            "silent": bool(result.get("silent")),
+        }
+    if isinstance(result, str) and result.strip():
+        return {
+            "plugin": plugin_id,
+            "text": result.strip(),
+            "images": [],
+            "silent": False,
+        }
+    return None
+
+
+def _plugin_reply(server: Any, question: str) -> dict[str, Any] | None:
+    """Спросить плагины ``answer``; первый ответивший — победитель.
+
+    Это тот же порядок и те же ошибки, что у ``PluginRegistry.run_answer``,
+    но с поддержкой словаря ``{"text", "images"}`` (задача 0221). Если у
+    рантайма нет ``answers()`` (тестовая заглушка), откатываемся на
+    прежний ``run_answer``.
+    """
+    text = str(question or "").strip()
+    if not text:
+        return None
+    plugins = getattr(server, "plugins", None)
+    if plugins is None:
+        return None
+    answers = getattr(plugins, "answers", None)
+    if callable(answers):
+        try:
+            bindings = answers()
+        except Exception:  # noqa: BLE001 - реестр не должен ронять чат
+            logger.exception("плагины: answers() упал")
+            bindings = []
+        for binding in bindings:
+            plugin_id = str(getattr(binding, "plugin_id", "?"))
+            try:
+                result = binding.run(binding.ctx, text)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "плагин %s: answer упал: %s", plugin_id, exc
+                )
+                continue
+            reply = _coerce_plugin_reply(result, plugin_id)
+            if reply is not None:
+                return reply
+        return None
+    run = getattr(plugins, "run_answer", None)
+    if callable(run):
+        try:
+            result = run(text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("плагины: answer упал: %s", exc)
+            return None
+        return _coerce_plugin_reply(result, "plugin")
+    return None
+
+
+def _image_event(plugin_id: str, image: Mapping[str, Any], side: int) -> dict[str, Any]:
+    """SSE-событие картинки: URL строится только из проверенного пути."""
+    relative = str(image["relative"])
+    return {
+        "type": "image",
+        "side": side,
+        "url": "{}{}/{}".format(
+            MEDIA_URL_PREFIX, quote(plugin_id, safe=""), quote(relative, safe="/")
+        ),
+        "alt": str(image.get("alt", "")),
+    }
+
+
 def _run_side(
     index: int,
     side: Mapping[str, Any],
@@ -2314,24 +2460,59 @@ def _run_side(
     # Плагины со способностью ``answer`` (сказки, музыка) отвечают сами:
     # сервер не зовёт модель вовсе. Это и быстрее, и надёжнее — 4B не
     # перепишет сказку своими словами и не «потеряет» музыкальную команду.
-    plugin_answer: str | None = None
-    if server is not None:
-        try:
-            plugin_answer = server.plugins.run_answer(messages[-1].get("content", ""))
-        except Exception:  # noqa: BLE001 — плагин не должен ронять чат
-            logger.exception("плагины: answer упал")
-            plugin_answer = None
-    if plugin_answer:
-        filtered = filters.feed(plugin_answer) if filters is not None else plugin_answer
+    # Словарь с ``images`` (задача 0221) идёт сюда же: картинки вставляются
+    # между delta-кусками по ``after_chars``.
+    plugin_reply = (
+        _plugin_reply(server, messages[-1].get("content", ""))
+        if server is not None
+        else None
+    )
+    if plugin_reply is not None:
+        original = plugin_reply["text"]
+        filtered = filters.feed(original) if filters is not None else original
         filtered = gender.feed(filtered) + gender.flush()
+        images = plugin_reply.get("images") or []
+        silent = bool(plugin_reply.get("silent"))
         if filtered:
-            events.put(
-                {
-                    "type": "delta",
-                    "side": index,
-                    "text": filtered,
-                }
-            )
+            if images:
+                # Фильтры могли изменить длину текста (род/числа): сохраняем
+                # пропорцию, чтобы картинка осталась у того же абзаца.
+                scale = len(filtered) / max(1, len(original))
+                cursor = 0
+                for image in images:
+                    position = round(int(image["after_chars"]) * scale)
+                    position = min(len(filtered), max(cursor, position))
+                    if position > cursor:
+                        events.put(
+                            {
+                                "type": "delta",
+                                "side": index,
+                                "text": filtered[cursor:position],
+                                "silent": silent,
+                            }
+                        )
+                        cursor = position
+                    events.put(
+                        _image_event(plugin_reply["plugin"], image, index)
+                    )
+                if cursor < len(filtered):
+                    events.put(
+                        {
+                            "type": "delta",
+                            "side": index,
+                            "text": filtered[cursor:],
+                            "silent": silent,
+                        }
+                    )
+            else:
+                events.put(
+                    {
+                        "type": "delta",
+                        "side": index,
+                        "text": filtered,
+                        "silent": silent,
+                    }
+                )
         events.put(
             {
                 "type": "done",
@@ -2341,10 +2522,15 @@ def _run_side(
                 "finish_reason": "plugin",
                 "answer": filtered,
                 "source": "plugin",
+                "silent": silent,
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
             }
         )
         completed = True
+        # Маркер обязателен и на пути плагина: HTTP-поток закрывает стрим,
+        # только получив _SideDone. Ранний return обходит общий finally ниже,
+        # поэтому ставим его здесь явно (без этого плагинный ответ висел).
+        events.put(_SideDone(index, filtered))
         return
     try:
         iterator = iter(adapter.stream(messages, max_tokens=max_tokens))
@@ -2808,6 +2994,18 @@ PAGE_HTML = """<!doctype html>
   }
   .answer .error-text {
     color: var(--danger); font-style: normal; white-space: pre-wrap;
+  }
+  /* Иллюстрации к сказке (задача 0221): блок в потоке текста. */
+  .answer .tale-image {
+    margin: 14px 0; padding: 0; white-space: normal;
+  }
+  .answer .tale-image img {
+    display: block; width: min(100%, 640px); height: auto;
+    border: 1px solid var(--border); border-radius: 12px;
+    background: var(--code-bg);
+  }
+  .answer .tale-image figcaption {
+    margin-top: 6px; color: var(--muted); font-size: 12px;
   }
   .foot { padding: 0 14px 12px; color: var(--muted); font-size: 12px; }
   .metrics {
@@ -3902,7 +4100,31 @@ PAGE_HTML = """<!doctype html>
     // Текст печатается независимо от звука: сплиттер только копит фразы и
     // отдаёт их в очередь, если «озвучивать» включено.
     var state = streams[side];
-    if (state && state.tts) { state.tts.feed(text); }
+    // silent: ответ уже озвучен записью (afplay) — текст показываем, но в
+    // /api/tts его не отправляем, иначе Ева говорит поверх сказки.
+    if (state && state.tts && !state.silent) { state.tts.feed(text); }
+  }
+
+  // Иллюстрация приходит отдельным SSE-событием между delta: вставляем её
+  // в ответ в том месте, где сейчас печатается текст (задача 0221).
+  function appendImage(side, event) {
+    var answer = byId("answer-" + side);
+    if (!event.url) { return; }
+    var figure = document.createElement("figure");
+    figure.className = "tale-image";
+    var image = document.createElement("img");
+    image.src = event.url;
+    image.alt = event.alt || "Иллюстрация к сказке";
+    image.loading = "lazy";
+    image.decoding = "async";
+    figure.appendChild(image);
+    if (event.alt) {
+      var caption = document.createElement("figcaption");
+      caption.textContent = event.alt;
+      figure.appendChild(caption);
+    }
+    answer.appendChild(figure);
+    followStream(side);
   }
 
   function appendThink(side, text) {
@@ -3933,6 +4155,7 @@ PAGE_HTML = """<!doctype html>
     streams[side] = {
       thinkChars: 0,
       flushed: false,
+      silent: false,
       tts: createPhraseSplitter(function (phrase) { enqueueSpeech(side, phrase); }),
       parser: createThinkParser({
         answer: function (text) { appendText(side, text); },
@@ -3955,7 +4178,7 @@ PAGE_HTML = """<!doctype html>
     state.parser.flush();
     // Конец ответа: недопетая последняя фраза уходит в очередь, уже
     // поставленные фразы доигрываются — очередь не чистим.
-    if (state.tts) { state.tts.flush(); }
+    if (state.tts && !state.silent) { state.tts.flush(); }
     updateCollapseButton(side);
   }
 
@@ -4035,9 +4258,19 @@ PAGE_HTML = """<!doctype html>
         (event.model_label || event.model);
     } else if (event.type === "delta") {
       if (statusPhase === "думает") { switchStatusPhase("отвечает"); }
+      if (event.silent) {
+        if (!streams[side]) { resetAnswer(side); }
+        streams[side].silent = true;
+      }
       deltaAnswer(side, event.text || "");
+    } else if (event.type === "image") {
+      appendImage(side, event);
     } else if (event.type === "done") {
       stopStatusTimer();
+      if (event.silent) {
+        if (!streams[side]) { resetAnswer(side); }
+        streams[side].silent = true;
+      }
       flushAnswer(side);
       panel.classList.remove("streaming");
       byId("time-" + side).textContent = formatSeconds(event.elapsed_ms);
@@ -4343,7 +4576,7 @@ CSP = (
     "style-src 'unsafe-inline'; "
     "script-src 'unsafe-inline'; "
     "connect-src 'self'; "
-    "img-src data:; "
+    "img-src 'self' data:; "
     "base-uri 'none'; "
     "form-action 'none'; "
     "frame-ancestors 'none'"
@@ -4722,6 +4955,8 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 self.send_response(204)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+            elif path.startswith(MEDIA_URL_PREFIX):
+                self._send_media(path)
             elif path.startswith("/api/"):
                 self._send_json(
                     404,
@@ -4911,6 +5146,97 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         self._send_bytes(
             status, text.encode("utf-8"), "text/plain; charset=utf-8"
         )
+
+    # -- иллюстрации плагинов (задача 0221) ----------------------------------
+
+    def _media_base(self, plugin_id: str) -> Path | None:
+        """``plugins/<id>/images/`` для известного плагина, иначе ``None``.
+
+        Чужой/неизвестный плагин не отдаётся: id должен быть в реестре,
+        а каталог — существовать. Путь канонизируем, чтобы ``..`` и симлинки
+        не вывели за пределы ``images/``.
+        """
+        records = getattr(self.server.plugins, "records", None)
+        if not isinstance(records, Mapping):
+            return None
+        record = records.get(plugin_id)
+        if record is None:
+            return None
+        plugin_dir = getattr(record, "path", None)
+        if plugin_dir is None:
+            return None
+        try:
+            base = (Path(plugin_dir) / "images").resolve(strict=False)
+        except OSError:
+            return None
+        return base if base.is_dir() else None
+
+    def _send_media(self, raw_path: str) -> None:
+        """``GET /media/<plugin>/<path>`` — только картинки из ``images/``.
+
+        Отказы (404, без деталей наружу): выход за каталог (``..``,
+        абсолютный путь), неизвестный/чужой плагин, не-картинка.
+        """
+        target_path = unquote(raw_path[len(MEDIA_URL_PREFIX) :])
+        parts = target_path.split("/")
+        if len(parts) < 3 or "\\" in target_path:
+            self._send_json(
+                404,
+                {"error": {"code": "not_found", "message": "Файл не найден."}},
+            )
+            return
+        plugin_id = parts[0]
+        relative = parts[1:]
+        if (
+            not plugin_id
+            or plugin_id in (".", "..")
+            or any(part in ("", ".", "..") for part in relative)
+        ):
+            self._send_json(
+                404,
+                {"error": {"code": "not_found", "message": "Файл не найден."}},
+            )
+            return
+        content_type = MEDIA_CONTENT_TYPES.get(
+            pathlib.PurePosixPath(relative[-1]).suffix.lower()
+        )
+        base = self._media_base(plugin_id)
+        if content_type is None or base is None:
+            self._send_json(
+                404,
+                {"error": {"code": "not_found", "message": "Файл не найден."}},
+            )
+            return
+        try:
+            target = (base.joinpath(*relative)).resolve(strict=False)
+            inside = target.is_relative_to(base)
+        except (OSError, ValueError):
+            inside = False
+            target = base
+        if not inside or not target.is_file():
+            self._send_json(
+                404,
+                {"error": {"code": "not_found", "message": "Файл не найден."}},
+            )
+            return
+        try:
+            data = target.read_bytes()
+        except OSError:
+            self._send_json(
+                404,
+                {"error": {"code": "not_found", "message": "Файл не найден."}},
+            )
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", MEDIA_CACHE_CONTROL)
+        self.end_headers()
+        if data:
+            self.wfile.write(data)
+            self.wfile.flush()
 
     # -- память модели (задача 0166) -----------------------------------------
 

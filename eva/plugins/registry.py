@@ -24,6 +24,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+from collections.abc import Mapping
 import os
 import re
 import sys
@@ -862,7 +863,7 @@ class PluginRegistry:
             bindings.append(AnswerBinding(plugin_id=record.id, run=run, ctx=record.ctx))
         return bindings
 
-    def run_answer(self, question: str) -> str | None:
+    def run_answer(self, question: str) -> str | dict[str, Any] | None:
         """Первый плагин, который ответил сам; ``None`` — пусть отвечает модель.
 
         Ошибка плагина не ломает чат: пишем в лог и пробуем следующий.
@@ -879,6 +880,15 @@ class PluginRegistry:
                 continue
             if isinstance(result, str) and result.strip():
                 return result.strip()
+            # Ответ может быть словарём: {"text", "images", "silent"} —
+            # сказки с картинками (0221) и готовая озвучка (0223). Раньше
+            # такой ответ молча отбрасывался, и плагин «не срабатывал».
+            if isinstance(result, Mapping):
+                text = str(result.get("text") or "").strip()
+                if text:
+                    payload = dict(result)
+                    payload["text"] = text
+                    return payload
         return None
 
     def run_command(self, line: str) -> str | None:
