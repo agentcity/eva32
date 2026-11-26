@@ -1374,7 +1374,7 @@
   {
     "id": "0206",
     "title": "Знаки, сокращения и телефоны в озвучке",
-    "status": "in_progress",
+    "status": "done",
     "file": "0206-tts-symbols.md",
     "assignee": "agent:tts-symbols"
   },
@@ -1384,5 +1384,12 @@
     "status": "in_progress",
     "file": "0207-feminine-speech.md",
     "assignee": "agent:feminine"
+  },
+  {
+    "id": "0208",
+    "title": "Скиллы: время, курсы, котировки",
+    "status": "in_progress",
+    "file": "0208-eva-tools.md",
+    "assignee": "agent:tools"
   }
 ]
