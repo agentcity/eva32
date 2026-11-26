@@ -39,11 +39,14 @@ Qwen одновременно, с временем и скоростью. Скр
 * ``POST /api/reset`` — новый диалог: сброс истории колонки
   (``{"side": 0}``) или обеих (``{}``); в шапке колонки — «история: N реплик ·
   ~M токенов», счётчик приходит в ``history`` у ``GET /api/models``;
-* ``POST /api/tts`` — озвучка (задача 0183): ``{"text", "voice"}`` →
-  ``audio/wav`` (``Cache-Control: no-store``). Текст чистится от
-  ``<think>…</think>``, markdown и URL, длиннее 600 символов — 400. Синтез —
-  ``eva/tts.py``: Piper → системный ``say``/``espeak`` → null; нет движка или
-  он упал — 503 «голос недоступен», чат при этом работает как раньше;
+* ``POST /api/tts`` — озвучка (задачи 0183/0191): ``{"text", "voice"}`` →
+  аудио (``Cache-Control: no-store``). Content-Type — по сигнатуре:
+  ``audio/mpeg`` для MP3 ElevenLabs, ``audio/wav`` для Piper/say/espeak.
+  Текст чистится от ``<think>…</think>``, markdown и URL, длиннее 600
+  символов — 400. Синтез — ``eva/tts.py``: ElevenLabs → Piper → системный
+  ``say``/``espeak`` → null; сбой облака откатывается на Piper, а 503 «голос
+  недоступен» — только если запасного движка тоже нет; чат при этом работает
+  как раньше;
 * ``POST /api/load`` / ``POST /api/unload`` — явная загрузка/выгрузка
   ВТМ-модели (задача 0166). Тело — ``{"backend": "vtm", "model": "<id>"}``,
   неизвестная модель — 400, чужой бэкенд (Ollama) — 400: её памятью
@@ -154,6 +157,7 @@ __all__ = [
     "estimate_tokens",
     "default_tts_speech",
     "inspect_vtm",
+    "looks_like_audio",
     "looks_like_wav",
     "main",
     "system_snapshot",
@@ -4166,7 +4170,9 @@ CSP = (
 #: Потолок одной фразы: клиент режет ответ на фразы сам, но прислать может
 #: что угодно — длинный кусок отвергается с понятным текстом, а не синтезируется.
 TTS_MAX_CHARS = 600
-#: Формат ответа: ``say`` и Piper пишут RIFF/WAVE, браузер играет его напрямую.
+#: Формат ответа по умолчанию. Историческое имя оставлено для совместимости:
+#: с задачей 0191 ответ бывает и MP3, поэтому MIME определяется по сигнатуре
+#: аудио (:func:`looks_like_audio`), а не этим значением.
 TTS_CONTENT_TYPE = "audio/wav"
 
 #: ``<think>…</think>`` (и ``<thinking>``) — рассуждение моделью, не для ушей.
@@ -4208,10 +4214,32 @@ def clean_tts_text(text: object) -> str:
 
 
 def looks_like_wav(data: bytes | bytearray | None) -> bool:
-    """Настоящий ли это RIFF/WAVE: браузер играет только такой файл."""
-    if not isinstance(data, (bytes, bytearray)) or len(data) < 12:
-        return False
-    return bytes(data[:4]) == b"RIFF" and bytes(data[8:12]) == b"WAVE"
+    """Настоящий ли это RIFF/WAVE."""
+    return looks_like_audio(data) == "audio/wav"
+
+
+def looks_like_audio(data: bytes | bytearray | None) -> str | None:
+    """Content-Type по сигнатуре аудио: ``audio/wav``, ``audio/mpeg`` или None.
+
+    Проверяем именно содержимое, а не заявленный клиентом/адаптером тип:
+
+    * WAV — ``RIFF`` + ``WAVE`` в заголовке;
+    * MP3 — тег ``ID3`` или кадр с синхрословом ``0xFF 0xFB/0xF3/0xF2/0xFA``
+      (старшие 11 бит ``0x7FF``).
+
+    Так ответ ElevenLabs (MP3) и локальных движков (WAV) различается без
+    доверия внешнему заголовку и без лишних зависимостей.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    raw = bytes(data[:12])
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
+        return "audio/wav"
+    if len(raw) >= 3 and raw[:3] == b"ID3":
+        return "audio/mpeg"
+    if len(raw) >= 2 and raw[0] == 0xFF and (raw[1] & 0xE0) == 0xE0:
+        return "audio/mpeg"
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -4327,28 +4355,37 @@ def _pitch_shift_wav(wav: bytes, factor: float) -> bytes:
     return buf.getvalue()
 
 
-def default_tts_speech(text: str, voice: str | None = None) -> bytes:
-    """Синтез через ``eva/tts.py``: Piper → say → espeak, иначе пустые байты.
+def default_tts_speech(
+    text: str, voice: str | None = None
+) -> tuple[bytes, str]:
+    """Синтез через ``eva/tts.py``: ElevenLabs → Piper → say/espeak → null.
 
-    Импорт ленивый: страница и метрики не должны тянуть ``eva`` без нужды.
+    Возвращает ``(аудиобайты, content_type)``: ElevenLabs — MP3
+    (``audio/mpeg``), локальные движки — WAV (``audio/wav``). Импорт ленивый:
+    страница и метрики не должны тянуть ``eva`` без нужды.
+
     ``NullTTS`` (нет ни одного движка) возвращает ``b""`` — это «голоса нет»,
     а не сбой процесса; HTTP-слой превращает пустой ответ в понятный 503.
-    Исключения адаптера (``TTSUnavailable``/``TTSError``) не глотаются: их
-    текст уходит клиенту как «голос недоступен».
+    Сбой ElevenLabs обрабатывает ``eva.tts``: логирует причину без ключа и
+    откатывается на Piper/system, поэтому сюда обычно приходит уже аудио.
+    Исключения адаптера не глотаются: их текст уходит клиенту как «голос
+    недоступен» (только если запасной движок тоже не настроен).
+
+    Пресеты (``irina``/``soft``/``young``) — параметры WAV-Piper; к MP3 они
+    неприменимы, поэтому для облачного голоса возвращаем его как есть.
     """
     try:
-        from eva.tts import synthesize
+        from eva.tts import synthesize_audio
     except ImportError as exc:  # pragma: no cover - eva лежит в репозитории
         raise RuntimeError("нет адаптера синтеза eva/tts.py") from exc
     preset = VOICE_PRESETS.get((voice or "").strip().lower())
     if preset is None:
-        result = synthesize(text, voice=voice)
-    else:
-        result = synthesize(text, rate=preset["rate"])
-        if isinstance(result, (bytes, bytearray)):
-            shifted = _pitch_shift_wav(bytes(result), preset["pitch"])
-            result = _smooth_wav(shifted, preset.get("smooth", 0.0))
-    return bytes(result) if isinstance(result, (bytes, bytearray)) else b""
+        return synthesize_audio(text, voice=voice)
+    data, content_type = synthesize_audio(text, rate=preset["rate"])
+    if content_type == "audio/wav":
+        shifted = _pitch_shift_wav(data, preset["pitch"])
+        data = _smooth_wav(shifted, preset.get("smooth", 0.0))
+    return data, content_type
 
 
 # --------------------------------------------------------------------------- #
@@ -4375,7 +4412,9 @@ class ChatHTTPServer(ThreadingHTTPServer):
         keep_alive: float | None = None,
         history_tokens: int = DEFAULT_HISTORY_TOKENS,
         history_turns: int = DEFAULT_HISTORY_TURNS,
-        tts: Callable[[str, str | None], bytes] | None = None,
+        tts: Callable[
+            [str, str | None], bytes | tuple[bytes, str]
+        ] | None = None,
     ) -> None:
         self.registry = tuple(registry)
         # Озвучка (задача 0183): чем синтезировать фразу. Тесты подставляют
@@ -4868,14 +4907,19 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
     # -- озвучка (задача 0183) -----------------------------------------------
 
     def _handle_tts(self) -> None:
-        """``POST /api/tts``: фраза → WAV для ``<audio>``.
+        """``POST /api/tts``: фраза → аудио (WAV или MP3) для ``<audio>``.
 
         Тело — ``{"text": "...", "voice": "..."}``; ``voice`` необязателен и
         уходит в адаптер (у Piper голос задаёт модель, у ``say`` — имя вроде
-        Milena). Ответ — ``audio/wav`` без кэша: фраза уникальна, хранить её
-        в кэше браузера незачем. Всё, что не синтезировалось (нет движка,
-        процесс упал, не WAV), — 503 с текстом «голос недоступен»: страница
-        покажет это, а чат продолжит работать.
+        Milena, у ElevenLabs — ID голоса). Адаптер может вернуть как голые
+        байты, так и пару ``(bytes, content_type)``; MIME в ответе берём по
+        сигнатуре (:func:`looks_like_audio`): MP3 → ``audio/mpeg``, WAV →
+        ``audio/wav``. ``Cache-Control: no-store`` остаётся: фраза одноразовая.
+
+        Всё, что не синтезировалось (нет движка, процесс упал, не аудио), —
+        503 с текстом «голос недоступен»: страница покажет это, а чат
+        продолжит работать. Откат ElevenLabs → Piper делает ``eva/tts.py``,
+        поэтому сюда ошибка приходит только если запасного голоса тоже нет.
         """
         payload = self._read_json_body()
         if not isinstance(payload, Mapping):
@@ -4906,7 +4950,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 code="text_too_long",
             )
         try:
-            wav = self.server.tts(text, voice)
+            result = self.server.tts(text, voice)
         except Exception as exc:  # noqa: BLE001 - любой сбой синтеза = 503
             logger.warning("озвучка: %s", exc)
             raise ClientError(
@@ -4914,14 +4958,36 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 status=503,
                 code="voice_unavailable",
             ) from exc
-        if not looks_like_wav(wav):
+        declared_type = ""
+        if (
+            isinstance(result, tuple)
+            and len(result) == 2
+            and isinstance(result[0], (bytes, bytearray))
+        ):
+            data = bytes(result[0])
+            declared_type = str(result[1] or "")
+        elif isinstance(result, (bytes, bytearray)):
+            data = bytes(result)
+        else:
+            data = b""
+        content_type = looks_like_audio(data)
+        if content_type is None:
             raise ClientError(
-                "голос недоступен: движок синтеза не вернул WAV.",
+                "голос недоступен: движок синтеза не вернул аудио "
+                "(WAV/MP3).",
                 status=503,
                 code="voice_unavailable",
             )
+        if declared_type and declared_type != content_type:
+            # Заявленный тип может врать (или быть с параметрами): доверяем
+            # сигнатуре, но оставляем след для диагностики.
+            logger.debug(
+                "озвучка: адаптер заявил %s, по сигнатуре %s",
+                declared_type,
+                content_type,
+            )
         # ``_send_bytes`` выставляет Cache-Control: no-store и прочую защиту.
-        self._send_bytes(200, bytes(wav), TTS_CONTENT_TYPE)
+        self._send_bytes(200, data, content_type)
 
     # -- SSE ------------------------------------------------------------------
 

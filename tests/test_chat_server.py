@@ -2413,6 +2413,11 @@ def make_wav(payload=2048):
     return b"RIFF" + struct.pack("<I", len(body)) + body
 
 
+def make_mp3():
+    """MP3 с ID3-тегом: содержимое важно только сигнатурой, не звуком."""
+    return b"ID3\x04\x00\x00\x00\x00\x00\x00" + b"\0" * 512
+
+
 def tts_split_source(page):
     """Вырезать из страницы самодостаточный блок разбиения на фразы."""
     script = page_script(page)
@@ -2510,6 +2515,46 @@ class TestTtsEndpoint(TtsServerCase):
         self.assertEqual(body[:4], b"RIFF")
         self.assertEqual(body[8:12], b"WAVE")
         self.assertEqual(self.calls, [{"text": "Привет, мир.", "voice": None}])
+
+    def test_returns_mp3_with_audio_mpeg_for_tuple_result(self):
+        self.server.tts = lambda text, voice=None: (make_mp3(), "audio/mpeg")
+        status, headers, body = self.post_tts({"text": "Привет"})
+        self.assertEqual(status, 200, body[:300])
+        self.assertEqual(headers.get("Content-Type"), "audio/mpeg")
+        self.assertEqual(headers.get("Cache-Control"), "no-store")
+        self.assertEqual(body, make_mp3())
+
+    def test_mp3_id3_signature_sets_audio_mpeg_without_hint(self):
+        self.server.tts = lambda text, voice=None: make_mp3()
+        status, headers, body = self.post_tts({"text": "Привет"})
+        self.assertEqual(status, 200, body[:300])
+        self.assertEqual(headers.get("Content-Type"), "audio/mpeg")
+
+    def test_mp3_frame_sync_signature_sets_audio_mpeg(self):
+        frame = b"\xff\xfb\x90\x64" + b"\0" * 256
+        self.server.tts = lambda text, voice=None: frame
+        status, headers, body = self.post_tts({"text": "Привет"})
+        self.assertEqual(status, 200, body[:300])
+        self.assertEqual(headers.get("Content-Type"), "audio/mpeg")
+
+    def test_signature_wins_over_wrong_declared_type(self):
+        self.server.tts = lambda text, voice=None: (make_wav(), "audio/mpeg")
+        status, headers, body = self.post_tts({"text": "Привет"})
+        self.assertEqual(status, 200, body[:300])
+        self.assertEqual(headers.get("Content-Type"), "audio/wav")
+        self.assertEqual(body[:4], b"RIFF")
+
+    def test_empty_tuple_is_503(self):
+        self.server.tts = lambda text, voice=None: (b"", "audio/mpeg")
+        status, _, body = self.post_tts({"text": "Привет"})
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["error"]["code"], "voice_unavailable")
+
+    def test_tuple_with_non_audio_bytes_is_503(self):
+        self.server.tts = lambda text, voice=None: (b"not audio", "audio/mpeg")
+        status, _, body = self.post_tts({"text": "Привет"})
+        self.assertEqual(status, 503)
+        self.assertIn("WAV/MP3", json.loads(body)["error"]["message"])
 
     def test_cleans_think_markdown_and_urls(self):
         raw = (
