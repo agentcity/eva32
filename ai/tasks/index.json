@@ -1398,5 +1398,12 @@
     "status": "in_progress",
     "file": "0209-plugin-runtime.md",
     "assignee": "agent:plugins"
+  },
+  {
+    "id": "0210",
+    "title": "Актуализация документации",
+    "status": "in_progress",
+    "file": "0210-docs-actualization.md",
+    "assignee": "agent:docs"
   }
 ]
