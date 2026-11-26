@@ -1335,5 +1335,12 @@
     "status": "done",
     "file": "0199-hybrid-capi-bug.md",
     "assignee": "agent:hybrid-bug"
+  },
+  {
+    "id": "0200",
+    "title": "Qwen-шаблон и бюджет размышлений",
+    "status": "in_progress",
+    "file": "0200-qwen-template-thinking.md",
+    "assignee": "agent:qwen-template"
   }
 ]
