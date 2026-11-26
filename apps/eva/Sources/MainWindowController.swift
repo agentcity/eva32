@@ -13,6 +13,13 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     private var thinkBox: NSView!
     private var thinkButton: NSButton!
     private var thinkHeight: NSLayoutConstraint!
+    /// Иллюстрация сказки (задача 0224) справа от текста ответа. Ширина 0,
+    /// пока картинки нет: текст занимает всё место.
+    private var taleImage: TaleImageView!
+    private var taleImageWidth: NSLayoutConstraint!
+    private var taleImageGap: NSLayoutConstraint!
+    /// Ряд «текст ответа + картинка».
+    private var answerRow: NSView!
     private var statusLabel: NSTextField!
     private var transcriptLabel: NSTextField!
     private var speakCheck: NSButton!
@@ -28,6 +35,12 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     var onSettings: (() -> Void)?
     /// Свернуть в компактный круг (задача 0188).
     var onCollapse: (() -> Void)?
+
+    /// Ширина колонки с картинкой: портретные иллюстрации 1024×~1400
+    /// помещаются целиком и не отбирают у текста больше половины ширины.
+    static let taleImageWidth: CGFloat = 190
+    /// Зазор между текстом и картинкой (0, когда картинки нет).
+    static let taleImageSpacing: CGFloat = 10
 
     init(circles: CircleHub) {
         self.circles = circles
@@ -74,6 +87,37 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         expandedThinking = false
         thinkView?.string = ""
         updateThinkVisibility()
+        // Новый вопрос — чистая страница: прошлая иллюстрация не должна
+        // висеть над новым ответом.
+        clearTaleImage()
+    }
+
+    /// Показать картинку сказки рядом с текстом. Картинки не трогают круг:
+    /// это не озвучка, состояние `speaking`/`idle` остаётся прежним.
+    func showTaleImage(_ image: NSImage, alt: String = "") {
+        if panel == nil { build() }
+        guard let taleImage else { return }
+        taleImage.isHidden = false
+        taleImageWidth?.constant = MainWindowController.taleImageWidth
+        taleImageGap?.constant = MainWindowController.taleImageSpacing
+        // Проявление и кроссфейд — внутри TaleImageView; колонка при этом
+        // занимает свою ширину сразу, чтобы текст не «дышал» вёрсткой.
+        taleImage.show(image, alt: alt)
+    }
+
+    /// Убрать иллюстрацию: текст снова занимает всю ширину.
+    func clearTaleImage() {
+        taleImageWidth?.constant = 0
+        taleImageGap?.constant = 0
+        taleImage?.isHidden = true
+        taleImage?.clear()
+    }
+
+    /// Для самопроверки: картинка действительно в окне ответа, а не только
+    /// загружена. Ширина 0 — колонка скрыта (только текст).
+    var taleImageState: (visible: Bool, width: CGFloat) {
+        let visible = taleImage?.hasImage == true && taleImage?.isHidden == false
+        return (visible, taleImageWidth?.constant ?? 0)
     }
 
     func showQuestion(_ text: String) {
@@ -175,6 +219,38 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         answerScroll.hasHorizontalScroller = false
         answerScroll.autohidesScrollers = true
         answerScroll.borderType = .bezelBorder
+
+        // Иллюстрация сказки — отдельная колонка справа от текста: вертикаль
+        // окна не тратится, а картинка видна по ходу рассказа. Ряд собран
+        // вручную, без `NSStackView`: у стека виды появляются в иерархии не
+        // сразу, и констрейнт «высота картинки = высота текста» падал бы с
+        // «no common ancestor». Колонка скрыта шириной 0 и зазором 0.
+        taleImage = TaleImageView(frame: .zero)
+        taleImage.translatesAutoresizingMaskIntoConstraints = false
+        taleImage.isHidden = true
+
+        let row = NSView(frame: .zero)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        answerScroll.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(answerScroll)
+        row.addSubview(taleImage)
+
+        taleImageWidth = taleImage.widthAnchor.constraint(equalToConstant: 0)
+        taleImageGap = taleImage.leadingAnchor.constraint(
+            equalTo: answerScroll.trailingAnchor,
+            constant: 0
+        )
+        NSLayoutConstraint.activate([
+            answerScroll.topAnchor.constraint(equalTo: row.topAnchor),
+            answerScroll.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            answerScroll.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            taleImage.topAnchor.constraint(equalTo: row.topAnchor),
+            taleImage.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            taleImage.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            taleImageWidth,
+            taleImageGap,
+        ])
+        answerRow = row
 
         thinkButton = NSButton(title: "размышления", target: self, action: #selector(toggleThinking))
         thinkButton.isBordered = false
@@ -284,7 +360,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         inputRow.distribution = .fill
 
         let stack = NSStackView(views: [
-            header, circle, transcriptLabel, answerScroll, thinkBox, controls, inputRow,
+            header, circle, transcriptLabel, answerRow, thinkBox, controls, inputRow,
         ])
         stack.orientation = .vertical
         stack.alignment = .width
@@ -366,6 +442,11 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     func reloadFromSettings() {
         speakCheck?.state = Settings.shared.speakReplies ? .on : .off
         selectVoice(Settings.shared.voice)
+        // Сняли галочку «Показывать картинки сказок» — убираем и ту, что уже
+        // на экране: текст остаётся один.
+        if !Settings.shared.showTaleImages {
+            clearTaleImage()
+        }
     }
 
     private func selectVoice(_ id: String) {

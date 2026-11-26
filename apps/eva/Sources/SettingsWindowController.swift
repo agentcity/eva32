@@ -9,6 +9,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var modelPopup: NSPopUpButton!
     private var voicePopup: NSPopUpButton!
     private var speakCheck: NSButton!
+    private var imagesCheck: NSButton!
     private var animateCheck: NSButton!
     private var startCompactCheck: NSButton!
     private var wakeCheck: NSButton!
@@ -84,6 +85,23 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             action: #selector(speakChanged)
         )
         speakCheck.controlSize = .small
+
+        // «Показывать картинки сказок» (задача 0224): рядом с озвучкой, потому
+        // что это вторая половина одного и того же ответа — текст, голос и
+        // иллюстрации. По умолчанию включено.
+        imagesCheck = NSButton(
+            checkboxWithTitle: "Показывать картинки сказок",
+            target: self,
+            action: #selector(imagesChanged)
+        )
+        imagesCheck.controlSize = .small
+
+        let imagesHint = NSTextField(
+            wrappingLabelWithString: "иллюстрации появляются в окне ответа по ходу "
+                + "сказки; на озвучку и состояние круга не влияют"
+        )
+        imagesHint.font = .systemFont(ofSize: 11)
+        imagesHint.textColor = .secondaryLabelColor
 
         animateCheck = NSButton(
             checkboxWithTitle: "Анимация круга (меньше CPU)",
@@ -207,6 +225,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             row("Модель", modelRow),
             row("Голос", voicePopup),
             row("", speakCheck),
+            row("", imagesCheck),
+            row("", imagesHint),
             row("", animateCheck),
             row("", startCompactCheck),
             row("", startCompactHint),
@@ -259,6 +279,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         guard serverField != nil else { return }
         serverField.stringValue = Settings.shared.serverText
         speakCheck.state = Settings.shared.speakReplies ? .on : .off
+        imagesCheck.state = Settings.shared.showTaleImages ? .on : .off
         animateCheck.state = Settings.shared.animateCircle ? .on : .off
         startCompactCheck.state = Settings.shared.startCompact ? .on : .off
         wakeCheck.state = Settings.shared.wakeWord ? .on : .off
@@ -384,6 +405,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             Settings.shared.voice = SileroVoices.all[voiceIndex].id
         }
         Settings.shared.speakReplies = speakCheck.state == .on
+        Settings.shared.showTaleImages = imagesCheck.state == .on
         Settings.shared.animateCircle = animateCheck.state == .on
         Settings.shared.startCompact = startCompactCheck.state == .on
         Settings.shared.wakeWord = wakeCheck.state == .on
@@ -397,6 +419,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         statusLabel.textColor = .secondaryLabelColor
         log("настройки: сервер=\(base.absoluteString) модель=\(Settings.shared.model.storageValue) "
             + "голос=\(Settings.shared.voice) озвучка=\(Settings.shared.speakReplies) "
+            + "картинки=\(Settings.shared.showTaleImages) "
             + "анимация=\(Settings.shared.animateCircle) "
             + "старт-свёрнутым=\(Settings.shared.startCompact) "
             + "ожидание=\(Settings.shared.wakeWord) "
@@ -447,6 +470,15 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     @objc private func speakChanged() {
         Settings.shared.speakReplies = speakCheck.state == .on
+    }
+
+    /// «Показывать картинки сказок» применяется сразу: `AppDelegate` слушает
+    /// `Settings.didChange`, и снятая галочка убирает картинку из окна, а
+    /// следующие `image`-события игнорируются.
+    @objc private func imagesChanged() {
+        Settings.shared.showTaleImages = imagesCheck.state == .on
+        log("настройки: картинки сказок="
+            + "\(Settings.shared.showTaleImages ? "включены" : "выключены")")
     }
 
     /// Галочка применяется сразу: круг в главном окне перестаёт анимироваться

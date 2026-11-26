@@ -19,6 +19,8 @@ import Foundation
 ///   без распознавания: замер CPU и проверка остановки `AVAudioEngine`.
 /// * `--selftest-compact` — компактный круг: геометрия, живое окно
 ///   (CGWindowList), `visibleFrame`, позиция в UserDefaults (задача 0188).
+/// * `--selftest-images` — картинки сказок: разбор SSE `image`/`silent`, сборка
+///   URL от адреса сервера, кэш, битый URL и вид окна (без сети и звука).
 enum Launch {
     static let arguments = CommandLine.arguments
 
@@ -46,6 +48,7 @@ enum Launch {
         if arguments.contains("--selftest-followup") { return .followUp }
         if arguments.contains("--selftest-stop") { return .stop }
         if arguments.contains("--selftest-compact") { return .compact }
+        if arguments.contains("--selftest-images") { return .images }
         if let raw = value("--selftest-wake-audio") {
             return .wakeAudio(Double(raw) ?? 10)
         }

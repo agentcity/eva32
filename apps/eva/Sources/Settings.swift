@@ -69,6 +69,10 @@ final class Settings {
     static let modelKey = "eva.modelSpec"
     static let voiceKey = "eva.voice"
     static let speakKey = "eva.speakReplies"
+    /// «Показывать картинки сказок» (задача 0224): иллюстрации из SSE-события
+    /// `image` в окне ответа. По умолчанию включено; на озвучку и круг не
+    /// влияет — только на показ.
+    static let showTaleImagesKey = "eva.showTaleImages"
     static let maxTokensKey = "eva.maxTokens"
     /// Галочка «Анимация»: без неё большой круг статичен (слабые машины).
     static let animateCircleKey = "eva.animateCircle"
@@ -107,6 +111,9 @@ final class Settings {
     /// «Запускаться свёрнутым» по умолчанию выключено: обычный запуск
     /// показывает главное окно (задача 0188).
     static let defaultStartCompact = false
+    /// Картинки сказок по умолчанию включены: сказка с иллюстрациями — то,
+    /// ради чего плагин их готовит (задача 0224). Выключение оставляет текст.
+    static let defaultShowTaleImages = true
 
     private let defaults: UserDefaults
 
@@ -120,6 +127,7 @@ final class Settings {
             Settings.modelKey: ModelSpec.fallback.storageValue,
             Settings.voiceKey: SileroVoices.defaultID,
             Settings.speakKey: true,
+            Settings.showTaleImagesKey: Settings.defaultShowTaleImages,
             Settings.maxTokensKey: Settings.defaultMaxTokens,
             Settings.animateCircleKey: true,
             Settings.wakeWordKey: false,
@@ -163,6 +171,13 @@ final class Settings {
     var speakReplies: Bool {
         get { defaults.bool(forKey: Settings.speakKey) }
         set { store(Settings.speakKey, newValue) }
+    }
+
+    /// «Показывать картинки сказок» (задача 0224). При выключенной галочке
+    /// SSE-события `image` игнорируются: в окне остаётся только текст.
+    var showTaleImages: Bool {
+        get { defaults.bool(forKey: Settings.showTaleImagesKey) }
+        set { store(Settings.showTaleImagesKey, newValue) }
     }
 
     var maxTokens: Int {

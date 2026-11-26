@@ -5,6 +5,15 @@ import Foundation
 enum ChatEvent: Sendable, Equatable {
     case started(modelLabel: String, cold: Bool?)
     case delta(String)
+    /// Иллюстрация сказки (задача 0224): URL как его отдал сервер
+    /// (`/media/fairy-tales/<slug>/NN.jpg`) и подпись. Приходит между
+    /// `delta`, поэтому картинка показывается по ходу текста.
+    case image(url: String, alt: String)
+    /// Ответ уже озвучен записью на сервере (задача 0223, `afplay`): текст
+    /// показываем как обычно, а в `/api/tts` его отправлять нельзя — иначе
+    /// сказка звучит двумя голосами. Сервер ставит `silent: true` в `delta`
+    /// и `done`; событие приходит раньше первого `delta`.
+    case silent(Bool)
     /// Короткая строка метрик из `done` (время, ток/с) для статуса.
     case stats(String)
     case failed(String)
@@ -98,11 +107,12 @@ final class ChatSession {
                 onEvent(.failed(describeHTTP(status: http.statusCode, body: raw)))
                 return
             }
-            for try await line in bytes.lines {
+            lines: for try await line in bytes.lines {
                 try Task.checkCancellation()
-                guard let event = parse(line: line) else { continue }
-                if event == .finished { break }  // это может дать только [DONE]
-                onEvent(event)
+                for event in parse(line: line) {
+                    if event == .finished { break lines }  // это может дать только [DONE]
+                    onEvent(event)
+                }
             }
         } catch is CancellationError {
             // Отмена «Стоп» — не ошибка.
@@ -116,31 +126,49 @@ final class ChatSession {
     }
 
     /// Разбор одной строки SSE: `data: {...}`, пустые строки и `[DONE]`.
-    private nonisolated static func parse(line: String) -> ChatEvent? {
-        guard line.hasPrefix("data:") else { return nil }
+    ///
+    /// Возвращает массив, потому что одно событие сервера может дать два:
+    /// `silent` (признак «уже озвучено записью», задача 0223) должен попасть
+    /// в `AnswerController` раньше текста, иначе озвучка успеет начаться.
+    /// Функция не `private`, чтобы её проверял `--selftest-images`.
+    nonisolated static func parse(line: String) -> [ChatEvent] {
+        guard line.hasPrefix("data:") else { return [] }
         var payload = line.dropFirst("data:".count)
         if payload.hasPrefix(" ") { payload = payload.dropFirst() }
-        if payload == "[DONE]" { return .finished }
+        if payload == "[DONE]" { return [.finished] }
         guard let data = payload.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = object["type"] as? String
         else {
-            return nil
+            return []
         }
         // Колонка 1 в приложении выключена («нет»), её события не показываем.
         if let side = object["side"] as? Int, side != 0, type != "end" {
-            return nil
+            return []
         }
         switch type {
         case "start":
             let label = (object["model_label"] as? String)
                 ?? (object["model"] as? String)
                 ?? "модель"
-            return .started(modelLabel: label, cold: object["cold"] as? Bool)
+            return [.started(modelLabel: label, cold: object["cold"] as? Bool)]
         case "delta":
-            guard let text = object["text"] as? String, !text.isEmpty else { return nil }
-            return .delta(text)
+            var events = silentEvent(in: object)
+            guard let text = object["text"] as? String, !text.isEmpty else { return events }
+            events.append(.delta(text))
+            return events
+        case "image":
+            // Битая картинка не должна ломать ответ: нет URL — просто нет
+            // события, текст сказки продолжает идти.
+            guard let url = object["url"] as? String,
+                  !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else {
+                return []
+            }
+            let alt = (object["alt"] as? String) ?? ""
+            return [.image(url: url, alt: alt)]
         case "done":
+            var events = silentEvent(in: object)
             var parts: [String] = []
             if let milliseconds = object["elapsed_ms"] as? Int, milliseconds > 0 {
                 parts.append(String(format: "%.1f с", Double(milliseconds) / 1000.0))
@@ -154,13 +182,21 @@ final class ChatSession {
             if object["estimated"] as? Bool == true {
                 parts.append("токены — оценка")
             }
-            return .stats(parts.joined(separator: " · "))
+            events.append(.stats(parts.joined(separator: " · ")))
+            return events
         case "error":
             let message = (object["message"] as? String) ?? "модель вернула ошибку"
-            return .failed(message)
+            return [.failed(message)]
         default:
-            return nil
+            return []
         }
+    }
+
+    /// `"silent": true` в `delta`/`done` — ответ уже озвучен записью на
+    /// сервере; отдаём отдельным событием, чтобы признак нельзя было потерять.
+    private nonisolated static func silentEvent(in object: [String: Any]) -> [ChatEvent] {
+        guard object["silent"] as? Bool == true else { return [] }
+        return [.silent(true)]
     }
 
     /// Человеческий текст ошибки HTTP: у сервера `{"error": {"message": ...}}`.

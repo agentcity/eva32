@@ -22,6 +22,7 @@ enum SelfTest {
         case stop
         case wakeAudio(Double)
         case compact
+        case images
         case version
     }
 
@@ -48,6 +49,8 @@ enum SelfTest {
             return await runWakeAudio(seconds: seconds)
         case .compact:
             return runCompact()
+        case .images:
+            return await runImages()
         case .version:
             print("EVA voice app 0.1.0 (Swift 6.2, AppKit/SwiftUI-free)")
             return 0
@@ -63,6 +66,8 @@ enum SelfTest {
         var deltas = 0
         var firstDelta: Double?
         var hadError = false
+        var images = 0
+        var silent = false
         var resumed = false
         var continuation: CheckedContinuation<Int32, Never>?
         let session = ChatSession()
@@ -85,6 +90,18 @@ enum SelfTest {
                         elapsed, visible.debugDescription
                     ))
                 }
+            case .image(let url, let alt):
+                images += 1
+                print(String(
+                    format: "[%6.2f с] image #%d: %@ alt=%@",
+                    elapsed, images, url, alt
+                ))
+            case .silent(let flag):
+                silent = silent || flag
+                print(String(
+                    format: "[%6.2f с] silent: ответ озвучен записью — в /api/tts не отправляем",
+                    elapsed
+                ))
             case .stats(let line):
                 print(String(format: "[%6.2f с] done: %@", elapsed, line))
             case .failed(let message):
@@ -95,6 +112,10 @@ enum SelfTest {
                 print("---")
                 let first = firstDelta.map { String(format: "%.2f", $0) } ?? "—"
                 print("кусков: \(deltas), первый delta через \(first) с")
+                print("image-событий: \(images)")
+                print(silent
+                    ? "озвучка: пропущена (silent)"
+                    : "озвучка: не проверялась (в ответе нет признака silent)")
                 print("ответ: \(filter.visible)")
                 print("размышления: \(filter.thinking.count) символов (скрыты от глаз и уха)")
                 guard !resumed, let continuation else { return }
@@ -758,6 +779,169 @@ enum SelfTest {
         getrusage(RUSAGE_SELF, &usage)
         return Double(usage.ru_utime.tv_sec) + Double(usage.ru_utime.tv_usec) / 1_000_000
             + Double(usage.ru_stime.tv_sec) + Double(usage.ru_stime.tv_usec) / 1_000_000
+    }
+
+    // MARK: - Картинки сказки и silent (задача 0224)
+
+    /// AppKit-часть проверки картинок: сам вид и окно ответа. Синхронная, без
+    /// `await` — так её тело гарантированно исполняется на главном потоке.
+    @MainActor
+    private static func runImagesUI() -> Int {
+        var failures = 0
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            print((ok ? "OK   " : "FAIL ") + name + (detail.isEmpty ? "" : " — " + detail))
+            fflush(stdout)
+            if !ok { failures += 1 }
+        }
+
+        // Вид: показ, смена (кроссфейд) и очистка без окна.
+        let view = TaleImageView(frame: NSRect(x: 0, y: 0, width: 190, height: 240))
+        let image = NSImage(size: NSSize(width: 20, height: 30))
+        view.show(image, alt: "Колобок", animated: false)
+        check("картинка показана, подпись на месте",
+              view.hasImage && view.currentImage != nil && view.toolTip == "Колобок")
+        view.show(image, alt: "Лиса", animated: false)
+        check("смена картинки обновляет подпись", view.altText == "Лиса")
+        view.clear()
+        check("очистка убирает картинку", !view.hasImage && view.currentImage == nil)
+        print("вид: \(MainWindowController.taleImageWidth) pt ширина колонки, "
+            + "кроссфейд \(TaleImageView.fadeDuration) с")
+
+        // Окно ответа: картинка рядом с текстом, новый вопрос её убирает.
+        // Окно не показываем — вёрстку видно и без WindowServer; речь не
+        // трогаем вовсе, поэтому TCC-запросов нет.
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        if !app.isRunning { app.finishLaunching() }
+        let windowController = MainWindowController(circles: CircleHub())
+        windowController.showTaleImage(image, alt: "Колобок")
+        let shown = windowController.taleImageState
+        check("окно ответа: картинка видна, колонка заняла ширину",
+              shown.visible && shown.width == MainWindowController.taleImageWidth,
+              "visible=\(shown.visible), width=\(shown.width)")
+        windowController.beginAnswer()
+        let cleared = windowController.taleImageState
+        check("окно ответа: новый вопрос убирает картинку",
+              !cleared.visible && cleared.width == 0,
+              "visible=\(cleared.visible), width=\(cleared.width)")
+        return failures
+    }
+
+    /// Проверяет без окна, сети и звука: разбор SSE `image`/`silent`, сборку
+    /// абсолютного URL картинки, правило «silent → не озвучиваем», кэш,
+    /// поведение на битом URL и сам вид `TaleImageView` (показ/смена/очистка).
+    @MainActor
+    private static func runImages() async -> Int32 {
+        var failures = 0
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            print((ok ? "OK   " : "FAIL ") + name + (detail.isEmpty ? "" : " — " + detail))
+            fflush(stdout)
+            if !ok { failures += 1 }
+        }
+
+        // 0. AppKit-часть — первой и без `await`: окно можно создавать только
+        // на настоящем главном потоке, а в процессе с `dispatchMain()`
+        // продолжение после await приходит на потоке пула.
+        failures += runImagesUI()
+
+        // 1. Настройка «Показывать картинки сказок».
+        check("ключ настройки — eva.showTaleImages",
+              Settings.showTaleImagesKey == "eva.showTaleImages",
+              Settings.showTaleImagesKey)
+        check("картинки сказок по умолчанию включены", Settings.defaultShowTaleImages)
+
+        // 2. Разбор SSE-события image.
+        let imageLine = #"data: {"type":"image","side":0,"url":"/media/fairy-tales/kolobok/01.jpg","alt":"Колобок"}"#
+        let imageEvents = ChatSession.parse(line: imageLine)
+        check("image-событие разобрано",
+              imageEvents == [.image(url: "/media/fairy-tales/kolobok/01.jpg", alt: "Колобок")],
+              "\(imageEvents)")
+        check("image без side относится к колонке 0",
+              ChatSession.parse(line: #"data: {"type":"image","url":"/media/x.jpg"}"#)
+                == [.image(url: "/media/x.jpg", alt: "")])
+        check("image второй колонки игнорируется",
+              ChatSession.parse(line: #"data: {"type":"image","side":1,"url":"/media/x.jpg"}"#).isEmpty)
+        check("image без url — просто нет события",
+              ChatSession.parse(line: #"data: {"type":"image","side":0,"alt":"без адреса"}"#).isEmpty)
+        check("image с пустым url — нет события",
+              ChatSession.parse(line: #"data: {"type":"image","side":0,"url":"   "}"#).isEmpty)
+        check("битый JSON не роняет парсер",
+              ChatSession.parse(line: #"data: {"type":"image", "url": "#).isEmpty)
+        check("не-SSE строка игнорируется",
+              ChatSession.parse(line: ": keep-alive").isEmpty)
+        check("[DONE] закрывает поток",
+              ChatSession.parse(line: "data: [DONE]") == [.finished])
+
+        // 3. silent: признак приходит раньше текста (задача 0223/0224).
+        let silentDelta = ChatSession.parse(
+            line: #"data: {"type":"delta","side":0,"text":"Слушай","silent":true}"#
+        )
+        check("silent из delta приходит раньше текста",
+              silentDelta == [.silent(true), .delta("Слушай")],
+              "\(silentDelta)")
+        check("silent из done тоже виден",
+              ChatSession.parse(line: #"data: {"type":"done","side":0,"silent":true}"#).first
+                == .silent(true))
+        check("delta без silent не поднимает признак",
+              ChatSession.parse(line: #"data: {"type":"delta","side":0,"text":"Привет"}"#)
+                == [.delta("Привет")])
+        check("правило: silent → в /api/tts не отправляем",
+              !AnswerController.shouldSpeak(voiceOn: true, silent: true))
+        check("правило: обычный ответ озвучивается",
+              AnswerController.shouldSpeak(voiceOn: true, silent: false))
+        check("правило: выключенная озвучка молчит",
+              !AnswerController.shouldSpeak(voiceOn: false, silent: false))
+
+        // 4. URL картинки относительно адреса сервера.
+        let base = URL(string: "http://127.0.0.1:8765")!
+        check("относительный URL картинки — от сервера",
+              AnswerController.imageURL(
+                  setting: true,
+                  url: "/media/fairy-tales/kolobok/01.jpg",
+                  base: base
+              )?.absoluteString == "http://127.0.0.1:8765/media/fairy-tales/kolobok/01.jpg")
+        check("абсолютный URL не переписывается",
+              AnswerController.imageURL(
+                  setting: true,
+                  url: "https://example.com/a.jpg",
+                  base: base
+              )?.absoluteString == "https://example.com/a.jpg")
+        check("выключенная настройка — картинки нет",
+              AnswerController.imageURL(setting: false, url: "/media/x.jpg", base: base) == nil)
+        check("битый URL без хоста не роняет показ",
+              AnswerController.imageURL(setting: true, url: "http://", base: base) == nil
+                && AnswerController.imageURL(setting: true, url: "://", base: base) == nil
+                && AnswerController.imageURL(setting: true, url: "", base: base) == nil)
+        check("чужой протокол отброшен",
+              AnswerController.imageURL(setting: true, url: "file:///etc/passwd", base: base) == nil
+                && AnswerController.imageURL(
+                    setting: true, url: "javascript:alert(1)", base: base
+                ) == nil)
+        check("без адреса сервера картинку не показываем",
+              AnswerController.imageURL(setting: true, url: "/media/x.jpg", base: nil) == nil)
+
+        // 5. Кэш в памяти и распознавание формата.
+        let cachedURL = URL(string: "http://127.0.0.1:8765/media/fairy-tales/kolobok/02.jpg")!
+        let jpeg = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10])
+        TaleImageCache.shared.store(jpeg, for: cachedURL)
+        check("кэш по url отдаёт те же данные",
+              TaleImageCache.shared.data(for: cachedURL) == jpeg)
+        check("JPEG распознан по заголовку", TaleImageLoader.looksLikeImage(jpeg))
+        check("HTML не считается картинкой",
+              !TaleImageLoader.looksLikeImage(Data("<html>404</html>".utf8)))
+        check("загрузка: две попытки, не больше",
+              TaleImageLoader.attempts == 2, "\(TaleImageLoader.attempts)")
+
+        // 6. Недоступный URL: nil, без падения и без зависания ответа.
+        let dead = URL(string: "http://127.0.0.1:1/media/fairy-tales/nope.jpg")!
+        let started = Date()
+        let loaded = await TaleImageLoader.load(dead)
+        check("недоступный URL — nil без падения",
+              loaded == nil,
+              String(format: "%.2f с", Date().timeIntervalSince(started)))
+
+        print(failures == 0 ? "все проверки картинок прошли" : "провалено: \(failures)")
+        return failures == 0 ? 0 : 1
     }
 
     // MARK: - Компактный круг (задача 0188)

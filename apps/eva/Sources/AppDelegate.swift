@@ -114,6 +114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let wakeWord = Settings.shared.wakeWord
         let stopCommand = Settings.shared.stopCommand
         log("настройки: сервер=\(server) модель=\(model) голос=\(voice) озвучка=\(speak) "
+            + "картинки=\(Settings.shared.showTaleImages) "
             + "анимация=\(animate) ожидание=\(wakeWord) "
             + "стоп-команда=\(stopCommand) "
             + "follow-up=\(Settings.shared.followUpListen)/\(Settings.shared.followUpSilence) с "
@@ -495,7 +496,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // озвучка — до первого звука (TTS может думать ещё пару сотен мс).
             if self.awaitingFirstToken, !visible.isEmpty {
                 self.awaitingFirstToken = false
+                // silent-ответ (запись сказки уже играет) звука не даст:
+                // ждать его — значит держать круг в «думаю» впустую.
                 self.awaitingAudio = self.expectsVoice && !self.isSpeaking
+                    && !self.answer.isSilentAnswer
                 self.refreshVisualState("первый видимый текст")
                 // Голос ещё синтезируется — стоп-слушатель остаётся; если
                 // озвучки нет, уступаем место wake-ожиданию (задача 0194).
@@ -505,7 +509,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         answer.onFinished = { [weak self] in
             guard let self else { return }
             self.awaitingFirstToken = false
-            if self.isSpeaking || !self.expectsVoice {
+            if self.isSpeaking || !self.expectsVoice || self.answer.isSilentAnswer {
                 self.awaitingAudio = false
             }
             self.answerEnded = true
@@ -544,6 +548,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         answer.onLevel = { [weak self] level in
             self?.circles.setLevel(CGFloat(level))
+        }
+        // Иллюстрация сказки (задача 0224): только окно. Круг не трогаем —
+        // картинка не озвучка, состояние speaking/idle от неё не зависит.
+        answer.onImage = { [weak self] image, alt in
+            self?.window.showTaleImage(image, alt: alt)
         }
     }
 
