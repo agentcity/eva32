@@ -1521,7 +1521,7 @@
   {
     "id": "0230",
     "title": "Паузы при чтении сказки",
-    "status": "in_progress",
+    "status": "done",
     "file": "0230-reading-pauses.md",
     "assignee": "agent:pauses"
   },

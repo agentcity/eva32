@@ -17,17 +17,27 @@ final class VoicePlayer {
     private struct PendingVoice {
         let wav: Data
         let text: String
+        /// Фраза закрывала абзац: после неё пауза длиннее (задача 0230).
+        let paragraph: Bool
     }
 
     private var server: URL?
     private var voice = SileroVoices.defaultID
-    private var texts: [String] = []
+    private var texts: [SpokenPhrase] = []
     private var pendingWav: [PendingVoice] = []
     private var synthesis: Task<Void, Never>?
     private var player: AVAudioPlayer?
     private var meterTimer: Timer?
     private var generation = 0
     private var warnedUnavailable = false
+    /// Тишина после доигравшей фразы. Пока она идёт, очередь не считается
+    /// опустевшей: `onDrained` и открытие микрофона — только после неё.
+    private let pauses = PauseGate()
+    /// Ответ читается как сказка: паузы длиннее (задача 0230). Ставится
+    /// `AnswerController`, сбрасывается на новом ответе и «Стоп».
+    private var taleMode = false
+    /// Абзац только что доигравшей фразы — для выбора длины паузы.
+    private var currentParagraph = false
 
     /// Оценка темпа речи baya: ~12,8 символов в секунду (живой замер). По ней считается
     /// прогресс внутри текущей фразы (у `AVAudioPlayer` нет счётчика
@@ -60,15 +70,22 @@ final class VoicePlayer {
     /// Громкость текущей фразы 0…1 для большого круга (30 Гц, metering плеера).
     var onLevel: ((Float) -> Void)?
 
-    /// Очередь пуста: ничего не играет, не ждёт и не синтезируется.
+    /// Очередь пуста: ничего не играет, не ждёт и не синтезируется. Пауза
+    /// между фразами — тоже «не пусто»: микрофон откроется после неё.
     var isDrained: Bool {
         streamDone && player == nil && pendingWav.isEmpty && texts.isEmpty
-            && synthesis == nil
+            && synthesis == nil && !pauses.isWaiting
     }
 
-    /// Текст фразы, которая звучит прямо сейчас; `nil` — тишина. Эхо-защита
+    /// Идёт пауза между фразами. Нужна `--selftest-pauses`: при выключенной
+    /// озвучке фраз в очереди нет, и пауза не запускается.
+    var isPausing: Bool { pauses.isWaiting }
+
+    /// Текст фразы, которая звучит прямо сейчас; на паузе между фразами —
+    /// текст только что сказанной; `nil` — чтение кончилось. Эхо-защита
     /// стоп-команды смотрит сюда: если Ева сама говорит «…и стоп.», совпадение
-    /// с микрофона — это её же голос, а не команда (задача 0194).
+    /// с микрофона — это её же голос, а не команда (задача 0194). На паузе
+    /// фразу не стираем: хвост её звука ещё может попасть в микрофон.
     private(set) var currentText: String?
 
     /// Уже сообщили, что очередь опустела: не повторяем на каждый чих.
@@ -94,9 +111,18 @@ final class VoicePlayer {
     func beginStream() {
         streamDone = false
         drainedNotified = false
+        taleMode = false
         // Новый ответ — новый шанс: прошлый отказ TTS не должен навсегда
         // лишать `onIssue` (по нему картинки переходят на таймер, 0227).
         warnedUnavailable = false
+    }
+
+    /// Ответ плагина сказок: паузы чтения длиннее (задача 0230). Вызывается,
+    /// как только признак стал известен, — картинки, длина или `plugin` в
+    /// `done`; настройка «медленная/обычная» читается в момент паузы, поэтому
+    /// смена применяется без перезапуска.
+    func setTaleMode(_ enabled: Bool) {
+        taleMode = enabled
     }
 
     /// Стрим закончился: очередь доиграет и только тогда объявит дренаж.
@@ -105,10 +131,10 @@ final class VoicePlayer {
         notifyDrainedIfIdle()
     }
 
-    func enqueue(_ phrases: [String]) {
+    func enqueue(_ phrases: [SpokenPhrase]) {
         guard !phrases.isEmpty else { return }
         texts.append(contentsOf: phrases)
-        enqueuedChars += phrases.reduce(0) { $0 + $1.count }
+        enqueuedChars += phrases.reduce(0) { $0 + $1.text.count }
         drainedNotified = false
         pump()
         notifyProgress()
@@ -116,6 +142,10 @@ final class VoicePlayer {
 
     func stop() {
         generation += 1
+        // «Стоп» и новый вопрос прерывают паузу мгновенно: засыпающая задача
+        // отменяется, её `onDone` не сработает и микрофон не откроется.
+        pauses.cancel()
+        taleMode = false
         synthesis?.cancel()
         synthesis = nil
         texts.removeAll()
@@ -124,6 +154,7 @@ final class VoicePlayer {
         player?.stop()
         player = nil
         currentText = nil
+        currentParagraph = false
         spokenChars = 0
         phraseChars = 0
         phraseStartedAt = nil
@@ -144,7 +175,8 @@ final class VoicePlayer {
             notifyDrainedIfIdle()
             return
         }
-        let text = texts.removeFirst()
+        let phrase = texts.removeFirst()
+        let text = phrase.text
         let preset = voice
         log("озвучка: синтез \(text.count) симв., голос \(preset)")
         let generation = self.generation
@@ -154,7 +186,11 @@ final class VoicePlayer {
             self.synthesis = nil
             switch result {
             case .success(let wav):
-                self.pendingWav.append(PendingVoice(wav: wav, text: text))
+                self.pendingWav.append(PendingVoice(
+                    wav: wav,
+                    text: text,
+                    paragraph: phrase.paragraph
+                ))
                 self.playNextIfIdle()
             case .failure(let error):
                 self.report(error.message)
@@ -208,7 +244,10 @@ final class VoicePlayer {
     // MARK: - Воспроизведение
 
     private func playNextIfIdle() {
-        guard player == nil, !pendingWav.isEmpty else { return }
+        // Пока идёт пауза, следующая фраза ждёт её конца: синтез может
+        // закончиться раньше, и без этого условия пауза была бы слышна
+        // только между уже готовыми WAV.
+        guard !pauses.isWaiting, player == nil, !pendingWav.isEmpty else { return }
         let pending = pendingWav.removeFirst()
         let wav = pending.wav
         do {
@@ -217,6 +256,7 @@ final class VoicePlayer {
             audio.prepareToPlay()
             player = audio
             currentText = pending.text
+            currentParagraph = pending.paragraph
             phraseChars = pending.text.count
             phraseStartedAt = Date()
             let started = audio.play()
@@ -228,6 +268,7 @@ final class VoicePlayer {
         } catch {
             player = nil
             currentText = nil
+            currentParagraph = false
             phraseChars = 0
             phraseStartedAt = nil
             report("не удалось проиграть WAV: \(error.localizedDescription)")
@@ -318,14 +359,42 @@ final class VoicePlayer {
                 return
             }
             if self.player != nil {
+                let paragraph = self.currentParagraph
                 self.stopMetering()
                 self.player = nil
-                self.currentText = nil
+                // `currentText` оставляем до конца паузы: эхо последней фразы
+                // ещё может попасть в микрофон (стоп-слушатель активен).
+                self.currentParagraph = false
                 self.completeCurrentPhrase()
-                self.onSpeakingChanged?(false)
-                self.playNextIfIdle()
-                self.notifyDrainedIfIdle()
+                self.startPause(paragraph: paragraph)
             }
+        }
+    }
+
+    // MARK: - Паузы между фразами (задача 0230)
+
+    /// Фраза доиграла: держим тишину до следующей. Круг всё это время
+    /// остаётся в `speaking` (микрофон не переключается между фразами), а
+    /// `onSpeakingChanged(false)` и `onDrained` приходят только после
+    /// последней паузы — иначе follow-up открыл бы микрофон раньше времени.
+    private func startPause(paragraph: Bool) {
+        let seconds = ReadingPause.duration(
+            paragraph: paragraph,
+            tale: taleMode,
+            slowTale: Settings.shared.talePace == .slow
+        )
+        log("озвучка: пауза \(Int((seconds * 1000).rounded())) мс"
+            + (paragraph ? " — абзац" : "")
+            + (taleMode ? " (сказка)" : ""))
+        pauses.schedule(seconds: seconds) { [weak self] in
+            guard let self else { return }
+            self.playNextIfIdle()
+            if self.player == nil {
+                // Дальше звука нет: только теперь голос действительно смолк.
+                self.currentText = nil
+                self.onSpeakingChanged?(false)
+            }
+            self.notifyDrainedIfIdle()
         }
     }
 

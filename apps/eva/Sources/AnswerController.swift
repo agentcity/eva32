@@ -23,6 +23,9 @@ final class AnswerController {
     private var startedAt = Date()
     private var deltaCount = 0
     private var imageCount = 0
+    /// Ответ читается как сказка: паузы длиннее (задача 0230). Признаки —
+    /// картинки плагина, длина ответа или `finish_reason=plugin`.
+    private var tale = false
     /// Базовый адрес сервера этого ответа: по нему собираются URL картинок.
     private var baseURL: URL?
 
@@ -121,6 +124,19 @@ final class AnswerController {
         return TaleImageRef(url: url, alt: "").resolved(base: base)
     }
 
+    /// Ответ считать сказкой (задача 0230): длинная проза плагина или его
+    /// явные признаки — картинки и `finish_reason=plugin`. Порог 400 символов
+    /// выбран между обычным ответом (десятки–сотни символов) и сказкой
+    /// (900+), чтобы короткий чат читался с короткими паузами. Вынесено
+    /// `nonisolated`, чтобы правило проверял `--selftest-pauses`.
+    nonisolated static func isTaleAnswer(
+        images: Int,
+        chars: Int,
+        plugin: Bool
+    ) -> Bool {
+        plugin || images > 0 || chars >= 400
+    }
+
     func ask(_ question: String, config: ChatConfig, speak enabled: Bool, voiceID: String) {
         runID += 1
         let run = runID
@@ -135,6 +151,7 @@ final class AnswerController {
         splitter = PhraseSplitter()
         speak = enabled
         silent = false
+        tale = false
         baseURL = config.serverURL
         startedAt = Date()
         if enabled {
@@ -178,13 +195,25 @@ final class AnswerController {
                 }
                 let visible = self.filter.feed(chunk)
                 self.publish(visible: self.filter.visible, thinking: self.filter.thinking)
+                if !self.tale,
+                   Self.isTaleAnswer(
+                       images: self.imageCount,
+                       chars: self.filter.visible.count,
+                       plugin: false
+                   )
+                {
+                    self.enableTaleMode("длинный ответ")
+                }
                 if Self.shouldSpeak(voiceOn: self.speak, silent: self.silent),
                    !visible.isEmpty
                 {
-                    self.voice.enqueue(self.splitter.feed(visible))
+                    self.voice.enqueue(self.splitter.feedPhrases(visible))
                 }
             case .image(let url, let alt):
                 self.imageCount += 1
+                // Картинки присылает плагин сказок — это самый ранний и
+                // надёжный признак, что ответ читается медленнее (0230).
+                self.enableTaleMode("картинки сказки")
                 let order = self.imageCount
                 // Позиция в ответе: сколько символов уже показано к этому
                 // событию (для таймера) и сколько символов реально ушло в
@@ -216,6 +245,10 @@ final class AnswerController {
                     break
                 }
                 self.loadImage(target, alt: alt, run: run, order: order)
+            case .pluginAnswer:
+                // Сервер пометил источник в `done`: ответ собрал плагин,
+                // даже если картинок в нём нет (0230).
+                self.enableTaleMode("источник plugin")
             case .stats(let line):
                 self.stats = line
                 log("sse done: \(line)")
@@ -232,7 +265,7 @@ final class AnswerController {
                         log("озвучка: пропущена (silent) — в /api/tts не отправлено "
                             + "ни одной фразы")
                     } else {
-                        self.voice.enqueue(self.splitter.flush())
+                        self.voice.enqueue(self.splitter.flushPhrases())
                     }
                     // Только теперь очередь может объявить «досказали»:
                     // иначе follow-up открывал микрофон посреди длинной
@@ -262,8 +295,19 @@ final class AnswerController {
         chat.cancel()
         resetImagePacing(mode: .timer)
         onImagesCleared?()
+        tale = false
         voice.stop()
         onStatus?("остановлено", false)
+    }
+
+    /// Включить медленное чтение сказки: `VoicePlayer` будет ставить длинные
+    /// паузы. Настройка «обычная/медленная» читается им в момент паузы,
+    /// поэтому применяется без перезапуска.
+    private func enableTaleMode(_ reason: String) {
+        guard !tale else { return }
+        tale = true
+        voice.setTaleMode(true)
+        log("озвучка: режим сказки — паузы длиннее (\(reason))")
     }
 
     /// Только звук: выключили галочку «Озвучивать» — генерацию не трогаем.

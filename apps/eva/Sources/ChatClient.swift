@@ -9,6 +9,10 @@ enum ChatEvent: Sendable, Equatable {
     /// (`/media/fairy-tales/<slug>/NN.jpg`) и подпись. Приходит между
     /// `delta`, поэтому картинка показывается по ходу текста.
     case image(url: String, alt: String)
+    /// Ответ собрал плагин (сказка): в `done` пришло
+    /// `finish_reason: "plugin"` или `source: "plugin"`. Приложение читает
+    /// такой ответ с длинными паузами (задача 0230).
+    case pluginAnswer
     /// Ответ уже озвучен записью на сервере (задача 0223, `afplay`): текст
     /// показываем как обычно, а в `/api/tts` его отправлять нельзя — иначе
     /// сказка звучит двумя голосами. Сервер ставит `silent: true` в `delta`
@@ -169,6 +173,7 @@ final class ChatSession {
             return [.image(url: url, alt: alt)]
         case "done":
             var events = silentEvent(in: object)
+            if isPluginDone(object) { events.append(.pluginAnswer) }
             var parts: [String] = []
             if let milliseconds = object["elapsed_ms"] as? Int, milliseconds > 0 {
                 parts.append(String(format: "%.1f с", Double(milliseconds) / 1000.0))
@@ -197,6 +202,14 @@ final class ChatSession {
     private nonisolated static func silentEvent(in object: [String: Any]) -> [ChatEvent] {
         guard object["silent"] as? Bool == true else { return [] }
         return [.silent(true)]
+    }
+
+    /// `done` от плагина: сервер ставит `finish_reason: "plugin"` и
+    /// `source: "plugin"` (задача 0230). Достаточно любого из двух — версии
+    /// сервера могут присылать только одно.
+    private nonisolated static func isPluginDone(_ object: [String: Any]) -> Bool {
+        object["finish_reason"] as? String == "plugin"
+            || object["source"] as? String == "plugin"
     }
 
     /// Человеческий текст ошибки HTTP: у сервера `{"error": {"message": ...}}`.

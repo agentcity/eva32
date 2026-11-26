@@ -22,6 +22,9 @@ import Foundation
 /// * `--selftest-images` — картинки сказок: разбор SSE `image`/`silent`, сборка
 ///   URL от адреса сервера, кэш, битый URL, вид окна и темп смены
 ///   (300/600/900 символов → 20/40/60 с, часы подменяются в проверке).
+/// * `--selftest-pauses` — паузы чтения (задача 0230): расчёт по тексту
+///   (обычная фраза/абзац/сказка), настройка `eva.talePace`, флаг абзаца в
+///   нарезке, мгновенное прерывание стопом и отсутствие пауз без озвучки.
 enum Launch {
     static let arguments = CommandLine.arguments
 
@@ -50,6 +53,7 @@ enum Launch {
         if arguments.contains("--selftest-stop") { return .stop }
         if arguments.contains("--selftest-compact") { return .compact }
         if arguments.contains("--selftest-images") { return .images }
+        if arguments.contains("--selftest-pauses") { return .pauses }
         if let raw = value("--selftest-wake-audio") {
             return .wakeAudio(Double(raw) ?? 10)
         }

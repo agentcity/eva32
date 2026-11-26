@@ -23,6 +23,7 @@ enum SelfTest {
         case wakeAudio(Double)
         case compact
         case images
+        case pauses
         case version
     }
 
@@ -51,6 +52,8 @@ enum SelfTest {
             return runCompact()
         case .images:
             return await runImages()
+        case .pauses:
+            return await runPauses()
         case .version:
             print("EVA voice app 0.1.0 (Swift 6.2, AppKit/SwiftUI-free)")
             return 0
@@ -68,6 +71,7 @@ enum SelfTest {
         var hadError = false
         var images = 0
         var silent = false
+        var plugin = false
         var resumed = false
         var continuation: CheckedContinuation<Int32, Never>?
         let session = ChatSession()
@@ -96,6 +100,12 @@ enum SelfTest {
                     format: "[%6.2f с] image #%d: %@ alt=%@",
                     elapsed, images, url, alt
                 ))
+            case .pluginAnswer:
+                plugin = true
+                print(String(
+                    format: "[%6.2f с] plugin: ответ плагина — паузы сказки (0230)",
+                    elapsed
+                ))
             case .silent(let flag):
                 silent = silent || flag
                 print(String(
@@ -113,6 +123,7 @@ enum SelfTest {
                 let first = firstDelta.map { String(format: "%.2f", $0) } ?? "—"
                 print("кусков: \(deltas), первый delta через \(first) с")
                 print("image-событий: \(images)")
+                print("источник: " + (plugin ? "plugin (сказка — паузы длиннее)" : "модель"))
                 print(silent
                     ? "озвучка: пропущена (silent)"
                     : "озвучка: не проверялась (в ответе нет признака silent)")
@@ -1047,6 +1058,188 @@ enum SelfTest {
               String(format: "%.2f с", Date().timeIntervalSince(started)))
 
         print(failures == 0 ? "все проверки картинок прошли" : "провалено: \(failures)")
+        return failures == 0 ? 0 : 1
+    }
+
+    // MARK: - Паузы чтения (задача 0230)
+
+    /// Проверяет без звука, сети и реального ожидания: расчёт паузы по тексту
+    /// (обычная фраза, абзац, режим сказки), настройку «скорость чтения
+    /// сказок», флаг абзаца в нарезке, разбор `finish_reason=plugin`,
+    /// мгновенное прерывание паузы стопом и отсутствие пауз без озвучки.
+    @MainActor
+    private static func runPauses() async -> Int32 {
+        var failures = 0
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            print((ok ? "OK   " : "FAIL ") + name + (detail.isEmpty ? "" : " — " + detail))
+            fflush(stdout)
+            if !ok { failures += 1 }
+        }
+        func approx(_ value: TimeInterval, _ expected: TimeInterval) -> Bool {
+            abs(value - expected) < 0.001
+        }
+
+        // 1. База обычного чата: 350 мс после фразы, 900 мс после абзаца.
+        let phrase = ReadingPause.duration(text: "Колобок покатился.", tale: false, slowTale: true)
+        let paragraph = ReadingPause.duration(text: "Колобок покатился.\n\n", tale: false, slowTale: true)
+        check("обычная фраза — 350 мс", approx(phrase, 0.35),
+              String(format: "%.0f мс", phrase * 1000))
+        check("конец абзаца — 900 мс", approx(paragraph, 0.9),
+              String(format: "%.0f мс", paragraph * 1000))
+        check("абзац распознан по пустой строке",
+              ReadingPause.isParagraph("Фраза.\n\n")
+                && ReadingPause.isParagraph("Фраза.\r\n\r\n")
+                && !ReadingPause.isParagraph("Фраза.")
+                && !ReadingPause.isParagraph("Фраза.\nСледующая строка."))
+        check("вид паузы по тексту",
+              ReadingPause.kind(for: "Фраза.") == .phrase
+                && ReadingPause.kind(for: "Фраза.\n\n") == .paragraph)
+        check("флаг абзаца важнее текста (текст уже обрезан нарезкой)",
+              approx(
+                  ReadingPause.duration(paragraph: true, tale: false, slowTale: true),
+                  0.9
+              )
+                && approx(
+                    ReadingPause.duration(paragraph: false, tale: false, slowTale: true),
+                    0.35
+                ))
+
+        // 2. Сказка: на «медленной» настройке паузы ×1,8 (≈630/1620 мс).
+        let talePhrase = ReadingPause.duration(text: "Колобок покатился.", tale: true, slowTale: true)
+        let taleParagraph = ReadingPause.duration(text: "Колобок покатился.\n\n", tale: true, slowTale: true)
+        check("сказка, медленная: фраза ≈630 мс", approx(talePhrase, 0.63),
+              String(format: "%.0f мс", talePhrase * 1000))
+        check("сказка, медленная: абзац ≈1620 мс", approx(taleParagraph, 1.62),
+              String(format: "%.0f мс", taleParagraph * 1000))
+        check("множитель сказки — 1,8", ReadingPause.taleFactor == 1.8)
+        check("сказка, обычная скорость — паузы как в чате",
+              approx(
+                  ReadingPause.duration(text: "Фраза.", tale: true, slowTale: false),
+                  0.35
+              )
+                && approx(
+                    ReadingPause.duration(text: "Фраза.\n\n", tale: true, slowTale: false),
+                    0.9
+                ))
+        check("обычный чат не зависит от настройки сказок",
+              approx(
+                  ReadingPause.duration(text: "Фраза.", tale: false, slowTale: true),
+                  0.35
+              )
+                && approx(
+                    ReadingPause.duration(text: "Фраза.", tale: false, slowTale: false),
+                    0.35
+                ))
+
+        // 3. Настройка «Скорость чтения сказок».
+        check("ключ настройки — eva.talePace", Settings.talePaceKey == "eva.talePace",
+              Settings.talePaceKey)
+        check("по умолчанию сказки читаются медленно", Settings.defaultTalePace == .slow)
+        check("значения настройки: обычная/медленная",
+              TalePace.normalize("normal") == .normal
+                && TalePace.normalize("slow") == .slow)
+        check("пустое/чужое значение — медленная (детский режим)",
+              TalePace.normalize(nil) == .slow && TalePace.normalize("быстро") == .slow)
+
+        // 4. Нарезка: фраза перед пустой строкой получает флаг абзаца.
+        var twoParagraphs = PhraseSplitter()
+        let paragraphPhrases = twoParagraphs.feedPhrases(
+            "Колобок покатился.\n\nЛиса идёт. Хвост."
+        ) + twoParagraphs.flushPhrases()
+        check("нарезка: абзац — у фразы перед пустой строкой",
+              paragraphPhrases.map(\.text) == ["Колобок покатился.", "Лиса идёт.", "Хвост."]
+                && paragraphPhrases.map(\.paragraph) == [true, false, false],
+              "\(paragraphPhrases)")
+        var oneLine = PhraseSplitter()
+        let linePhrases = oneLine.feedPhrases("Раз.\nДва.") + oneLine.flushPhrases()
+        check("нарезка: один перевод строки — не абзац",
+              linePhrases.map(\.text) == ["Раз.", "Два."]
+                && linePhrases.allSatisfy { !$0.paragraph },
+              "\(linePhrases)")
+
+        // Абзац может прийти разрезанным между двумя SSE-кусками: первый
+        // кончается одним переводом строки, второй начинается со второго.
+        var splitParagraph = PhraseSplitter()
+        let firstChunk = splitParagraph.feedPhrases("Колобок покатился.\n")
+        check("фраза на границе куска придержана и учтена в позиции картинки",
+              firstChunk.isEmpty && splitParagraph.pendingChars == 18,
+              "фраз: \(firstChunk.count), хвост \(splitParagraph.pendingChars)")
+        let splitPhrases = firstChunk
+            + splitParagraph.feedPhrases("\nЛиса идёт.")
+            + splitParagraph.flushPhrases()
+        check("абзац, разрезанный между кусками SSE, не потерян",
+              splitPhrases.map(\.text) == ["Колобок покатился.", "Лиса идёт."]
+                && splitPhrases.map(\.paragraph) == [true, false],
+              "\(splitPhrases)")
+        check("после нарезки хвост пуст", splitParagraph.pendingChars == 0)
+
+        var splitLine = PhraseSplitter()
+        _ = splitLine.feedPhrases("Раз.\n")
+        let splitLinePhrases = splitLine.feedPhrases("Два.") + splitLine.flushPhrases()
+        check("один перевод строки между кусками — не абзац",
+              splitLinePhrases.map(\.text) == ["Раз.", "Два."]
+                && splitLinePhrases.allSatisfy { !$0.paragraph },
+              "\(splitLinePhrases)")
+
+        // 5. Какие ответы считаются сказкой: длинные, с картинками, plugin.
+        check("сказка: длинный ответ (400+ символов)",
+              AnswerController.isTaleAnswer(images: 0, chars: 400, plugin: false))
+        check("обычный чат короче порога — не сказка",
+              !AnswerController.isTaleAnswer(images: 0, chars: 399, plugin: false))
+        check("сказка: картинки или finish_reason=plugin",
+              AnswerController.isTaleAnswer(images: 1, chars: 0, plugin: false)
+                && AnswerController.isTaleAnswer(images: 0, chars: 0, plugin: true))
+
+        // 6. Разбор `done` плагина: признак сказки не теряется в SSE.
+        let pluginDone = ChatSession.parse(
+            line: #"data: {"type":"done","side":0,"finish_reason":"plugin","source":"plugin","silent":true}"#
+        )
+        check("done плагина: silent, сказка и метрики",
+              pluginDone.first == .silent(true) && pluginDone.contains(.pluginAnswer),
+              "\(pluginDone)")
+        check("done модели: сказки нет",
+              !ChatSession.parse(
+                  line: #"data: {"type":"done","side":0,"finish_reason":"stop"}"#
+              ).contains(.pluginAnswer))
+        check("source=plugin без finish_reason — тоже сказка",
+              ChatSession.parse(
+                  line: #"data: {"type":"done","side":0,"source":"plugin"}"#
+              ).contains(.pluginAnswer))
+
+        // 7. Пауза живёт и отменяется мгновенно. Реальные 5 с не ждём:
+        // отменённая задача просыпается сразу.
+        let stopGate = PauseGate()
+        var stopFired = 0
+        stopGate.schedule(seconds: 5) { stopFired += 1 }
+        check("пауза идёт — очередь не опустела", stopGate.isWaiting)
+        stopGate.cancel()
+        check("стоп гасит паузу немедленно", !stopGate.isWaiting)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        check("после стопа пауза не срабатывает", stopFired == 0,
+              "срабатываний: \(stopFired)")
+
+        let shortGate = PauseGate()
+        var shortFired = 0
+        shortGate.schedule(seconds: 0.05) { shortFired += 1 }
+        check("короткая пауза ждёт своего срока", shortGate.isWaiting)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        check("после паузы очередь освобождается (дренаж — только теперь)",
+              shortFired == 1 && !shortGate.isWaiting,
+              "срабатываний: \(shortFired)")
+
+        // 8. Выключенная озвучка и silent: фраза не уходит в /api/tts, значит
+        // и пауз нет. Пустая очередь паузу не запускает.
+        check("выключенная озвучка — фраз нет, пауз нет",
+              !AnswerController.shouldSpeak(voiceOn: false, silent: false))
+        check("silent (запись afplay) — фраз нет, пауз нет",
+              !AnswerController.shouldSpeak(voiceOn: true, silent: true))
+        check("обычный ответ — фразы уходят, паузы будут",
+              AnswerController.shouldSpeak(voiceOn: true, silent: false))
+        let idleVoice = VoicePlayer()
+        check("пустая очередь не на паузе и сразу дренирована",
+              !idleVoice.isPausing && idleVoice.isDrained)
+
+        print(failures == 0 ? "все проверки пауз прошли" : "провалено: \(failures)")
         return failures == 0 ? 0 : 1
     }
 

@@ -55,6 +55,30 @@ enum SileroVoices {
     }
 }
 
+/// Скорость чтения сказок (задача 0230). «Медленная» растягивает паузы между
+/// фразами и абзацами в `ReadingPause.taleFactor` раз; обычный чат настройка
+/// не трогает — там паузы всегда короткие.
+enum TalePace: String, CaseIterable, Sendable {
+    case normal
+    case slow
+
+    var title: String {
+        switch self {
+        case .normal: return "обычная"
+        case .slow: return "медленная"
+        }
+    }
+
+    /// Разбор значения из `UserDefaults`: пусто/чужое — «медленная», детский
+    /// режим по умолчанию.
+    static func normalize(_ raw: String?) -> TalePace {
+        guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let pace = TalePace(rawValue: value)
+        else { return .slow }
+        return pace
+    }
+}
+
 /// Настройки в `UserDefaults`: адрес сервера, модель, голос, озвучка.
 ///
 /// Домен — идентификатор бандла (`com.eva32.eva`), поэтому `defaults write`
@@ -73,6 +97,9 @@ final class Settings {
     /// `image` в окне ответа. По умолчанию включено; на озвучку и круг не
     /// влияет — только на показ.
     static let showTaleImagesKey = "eva.showTaleImages"
+    /// «Скорость чтения сказок» (задача 0230): `normal`/`slow`. Читается в
+    /// момент паузы, поэтому смена действует без перезапуска.
+    static let talePaceKey = "eva.talePace"
     static let maxTokensKey = "eva.maxTokens"
     /// Галочка «Анимация»: без неё большой круг статичен (слабые машины).
     static let animateCircleKey = "eva.animateCircle"
@@ -114,6 +141,9 @@ final class Settings {
     /// Картинки сказок по умолчанию включены: сказка с иллюстрациями — то,
     /// ради чего плагин их готовит (задача 0224). Выключение оставляет текст.
     static let defaultShowTaleImages = true
+    /// Сказки по умолчанию читаются медленно: ребёнок не успевает за обычным
+    /// темпом ответа (задача 0230).
+    static let defaultTalePace = TalePace.slow
 
     private let defaults: UserDefaults
 
@@ -128,6 +158,7 @@ final class Settings {
             Settings.voiceKey: SileroVoices.defaultID,
             Settings.speakKey: true,
             Settings.showTaleImagesKey: Settings.defaultShowTaleImages,
+            Settings.talePaceKey: Settings.defaultTalePace.rawValue,
             Settings.maxTokensKey: Settings.defaultMaxTokens,
             Settings.animateCircleKey: true,
             Settings.wakeWordKey: false,
@@ -178,6 +209,13 @@ final class Settings {
     var showTaleImages: Bool {
         get { defaults.bool(forKey: Settings.showTaleImagesKey) }
         set { store(Settings.showTaleImagesKey, newValue) }
+    }
+
+    /// «Скорость чтения сказок» (задача 0230). По умолчанию «медленная»:
+    /// паузы между фразами и абзацами длиннее. Обычный чат не затрагивается.
+    var talePace: TalePace {
+        get { TalePace.normalize(defaults.string(forKey: Settings.talePaceKey)) }
+        set { store(Settings.talePaceKey, newValue.rawValue) }
     }
 
     var maxTokens: Int {

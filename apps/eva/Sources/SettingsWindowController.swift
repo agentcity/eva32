@@ -10,6 +10,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var voicePopup: NSPopUpButton!
     private var speakCheck: NSButton!
     private var imagesCheck: NSButton!
+    private var talePacePopup: NSPopUpButton!
     private var animateCheck: NSButton!
     private var startCompactCheck: NSButton!
     private var wakeCheck: NSButton!
@@ -41,7 +42,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private func build() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 600),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 660),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -102,6 +103,31 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         )
         imagesHint.font = .systemFont(ofSize: 11)
         imagesHint.textColor = .secondaryLabelColor
+
+        // «Скорость чтения сказок» (задача 0230): «медленная» растягивает
+        // паузы между фразами и абзацами, обычный чат читается как раньше.
+        talePacePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        talePacePopup.controlSize = .small
+        talePacePopup.font = .systemFont(ofSize: 11)
+        talePacePopup.addItems(withTitles: TalePace.allCases.map(\.title))
+        talePacePopup.target = self
+        talePacePopup.action = #selector(talePaceChanged)
+
+        let talePaceLabel = NSTextField(labelWithString: "скорость чтения сказок")
+        talePaceLabel.font = .systemFont(ofSize: 11)
+        talePaceLabel.textColor = .secondaryLabelColor
+        let talePaceRow = NSStackView(views: [talePacePopup, talePaceLabel])
+        talePaceRow.orientation = .horizontal
+        talePaceRow.spacing = 8
+        talePaceRow.distribution = .fill
+
+        let talePaceHint = NSTextField(
+            wrappingLabelWithString: "медленная — пауза 0,63 с между фразами и "
+                + "1,6 с между абзацами; обычная — как в чате (0,35/0,9 с); "
+                + "на короткий чат настройка не влияет и применяется сразу"
+        )
+        talePaceHint.font = .systemFont(ofSize: 11)
+        talePaceHint.textColor = .secondaryLabelColor
 
         animateCheck = NSButton(
             checkboxWithTitle: "Анимация круга (меньше CPU)",
@@ -227,6 +253,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             row("", speakCheck),
             row("", imagesCheck),
             row("", imagesHint),
+            row("Сказки", talePaceRow),
+            row("", talePaceHint),
             row("", animateCheck),
             row("", startCompactCheck),
             row("", startCompactHint),
@@ -280,6 +308,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         serverField.stringValue = Settings.shared.serverText
         speakCheck.state = Settings.shared.speakReplies ? .on : .off
         imagesCheck.state = Settings.shared.showTaleImages ? .on : .off
+        if let index = TalePace.allCases.firstIndex(of: Settings.shared.talePace) {
+            talePacePopup.selectItem(at: index)
+        }
         animateCheck.state = Settings.shared.animateCircle ? .on : .off
         startCompactCheck.state = Settings.shared.startCompact ? .on : .off
         wakeCheck.state = Settings.shared.wakeWord ? .on : .off
@@ -406,6 +437,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         Settings.shared.speakReplies = speakCheck.state == .on
         Settings.shared.showTaleImages = imagesCheck.state == .on
+        let taleIndex = talePacePopup.indexOfSelectedItem
+        if TalePace.allCases.indices.contains(taleIndex) {
+            Settings.shared.talePace = TalePace.allCases[taleIndex]
+        }
         Settings.shared.animateCircle = animateCheck.state == .on
         Settings.shared.startCompact = startCompactCheck.state == .on
         Settings.shared.wakeWord = wakeCheck.state == .on
@@ -420,6 +455,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         log("настройки: сервер=\(base.absoluteString) модель=\(Settings.shared.model.storageValue) "
             + "голос=\(Settings.shared.voice) озвучка=\(Settings.shared.speakReplies) "
             + "картинки=\(Settings.shared.showTaleImages) "
+            + "сказки=\(Settings.shared.talePace.rawValue) "
             + "анимация=\(Settings.shared.animateCircle) "
             + "старт-свёрнутым=\(Settings.shared.startCompact) "
             + "ожидание=\(Settings.shared.wakeWord) "
@@ -479,6 +515,16 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         Settings.shared.showTaleImages = imagesCheck.state == .on
         log("настройки: картинки сказок="
             + "\(Settings.shared.showTaleImages ? "включены" : "выключены")")
+    }
+
+    /// «Скорость чтения сказок» применяется сразу: `VoicePlayer` читает
+    /// настройку в момент каждой паузы, поэтому даже идущая сказка продолжит
+    /// чтение с новыми паузами (задача 0230).
+    @objc private func talePaceChanged() {
+        let index = talePacePopup.indexOfSelectedItem
+        guard TalePace.allCases.indices.contains(index) else { return }
+        Settings.shared.talePace = TalePace.allCases[index]
+        log("настройки: скорость чтения сказок=\(Settings.shared.talePace.rawValue)")
     }
 
     /// Галочка применяется сразу: круг в главном окне перестаёт анимироваться
