@@ -1391,5 +1391,12 @@
     "status": "in_progress",
     "file": "0208-eva-tools.md",
     "assignee": "agent:tools"
+  },
+  {
+    "id": "0209",
+    "title": "Рантайм плагинов Евы",
+    "status": "in_progress",
+    "file": "0209-plugin-runtime.md",
+    "assignee": "agent:plugins"
   }
 ]
