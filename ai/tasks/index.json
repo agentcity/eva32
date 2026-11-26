@@ -1279,5 +1279,12 @@
     "status": "in_progress",
     "file": "0191-elevenlabs-tts.md",
     "assignee": "agent:elevenlabs"
+  },
+  {
+    "id": "0192",
+    "title": "Metal-бэкенд: GEMV и lm_head на GPU",
+    "status": "in_progress",
+    "file": "0192-metal-gemv.md",
+    "assignee": "agent:metal"
   }
 ]
