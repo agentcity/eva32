@@ -1290,7 +1290,7 @@
   {
     "id": "0193",
     "title": "Silero TTS — локальный русский нейроголос",
-    "status": "in_progress",
+    "status": "done",
     "file": "0193-silero-tts.md",
     "assignee": "agent:silero"
   },

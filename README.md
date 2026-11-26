@@ -175,30 +175,34 @@ python3 tools/chat.py --backend vtm --model runs/q4/3b-q4k.vtm \
 (в `tokenizer_config.json` лежит EOS — без него генерация не останавливалась).
 Путь можно задать `EVA_VTM_TOKENIZER`.
 
-### Голос: как включить озвучку (Piper)
+### Голос: как включить озвучку (Silero / Piper)
 
 По умолчанию чат молчит. Чтобы модель говорила вслух, поставьте локальный
-нейро-TTS (один раз, нужна сеть):
+нейро-TTS (один раз, нужна сеть). Лучший голос — Silero (русская нейросеть,
+локально, без облака):
 
 ```bash
+sh tools/install_silero.sh         # torch в vendor/torch-py + модель v4_ru (baya)
+# или, если нужен лёгкий Piper:
 sh tools/install_piper.sh          # piper-tts в vendor/piper-py + голос irina
 ```
 
-Скрипт кладёт в `vendor/` (в git не попадает) бинарь-обёртку и русский голос
-`ru_RU-irina-medium` (~60 МБ), затем сам проверяет синтез на фразе «Проверка голоса».
-После установки запускайте сервер с путями к ним:
+`install_silero.sh` ставит torch для python3.13 (~780 МБ), качает модель
+v4_ru (~40 МБ) в `vendor/silero`, затем сам синтезирует «Проверка голоса» и
+печатает время/размеры. `install_piper.sh` кладёт в `vendor/` (в git не
+попадает) бинарь-обёртку и русский голос `ru_RU-irina-medium` (~60 МБ).
+После любого из них сервер подхватывает голос сам:
 
 ```bash
-PIPER_BIN=vendor/piper/bin/piper \
-PIPER_MODEL=vendor/piper/voices/ru_RU-irina-medium.onnx \
-python3 tools/chat_server.py --port 8765
+python3 tools/chat_server.py --port 8765          # авто: Silero → Piper → say
+# принудительно: EVA_TTS=silero|piper|system|null, голос Silero: SILERO_SPEAKER=kseniya
 ```
 
 В интерфейсе появится галочка «озвучивать»: ответ режется на фразы, первая звучит,
-пока генерируются остальные. Без Piper и без `say` галочка покажет «голос недоступен»,
-и чат продолжит работать текстом. Почему обёртка: `piper-tts` ставится как
-Python-модуль (колёса есть для python3.13, для 3.14 их нет), а `eva/tts.py` ждёт
-исполняемый `piper`.
+пока генерируются остальные. Без Silero, Piper и `say` галочка покажет «голос
+недоступен», и чат продолжит работать текстом. Почему обёртки: и `piper-tts`, и
+`torch` ставятся Python-модулями (колёса есть для python3.13, для 3.14 их нет), а
+`eva/tts.py` запускает отдельный процесс и не тащит torch в память сервера.
 
 ### Если что-то не так
 
@@ -209,7 +213,7 @@ Python-модуль (колёса есть для python3.13, для 3.14 их �
 | Ответ длинный и «не по делу» | модель не удержала 6 правил — используйте `system.compact.md` |
 | `ollama не отвечает` | `ollama serve` в отдельном терминале |
 | Первый ответ 20 с, дальше 1 с | так и должно быть: загрузка + кэш префикса |
-| «голос недоступен» | не заданы `PIPER_BIN`/`PIPER_MODEL`; запустите `sh tools/install_piper.sh` |
+| «голос недоступен» | не установлены Silero/Piper; запустите `sh tools/install_silero.sh` (или `sh tools/install_piper.sh`) |
 
 ## Гибрид
 

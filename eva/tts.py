@@ -1,7 +1,9 @@
-"""TTS-адаптер EVA32: ElevenLabs → Piper → системный say/espeak → null.
+"""TTS-адаптер EVA32: ElevenLabs → Silero → Piper → системный say/espeak → null.
 
-Задача — [`ai/tasks/0191-elevenlabs-tts.md`](../ai/tasks/0191-elevenlabs-tts.md)
-(провайдер), [`ai/tasks/0093-eva-tts-piper.md`](../ai/tasks/0093-eva-tts-piper.md)
+Задачи — [`ai/tasks/0191-elevenlabs-tts.md`](../ai/tasks/0191-elevenlabs-tts.md)
+(провайдер), [`ai/tasks/0193-silero-tts.md`](../ai/tasks/0193-silero-tts.md)
+(локальный русский нейроголос Silero),
+[`ai/tasks/0093-eva-tts-piper.md`](../ai/tasks/0093-eva-tts-piper.md)
 (локальный Piper). Весь синтез идёт через один интерфейс, а движок выбирается
 по доступности:
 
@@ -9,6 +11,10 @@
 ``elevenlabs`` облачный нейро-TTS: ``POST /v1/text-to-speech/{voice_id}``,
                ключ ``ELEVENLABS_API_KEY``. Возвращает MP3 (по умолчанию
                ``mp3_44100_128``). Текст уходит в облако ElevenLabs.
+``silero``     локальный нейро-TTS: отдельный процесс ``python3.13`` с
+               ``vendor/torch-py`` (torch) и моделью v4_ru в
+               ``vendor/silero``; WAV 48 кГц. Ставится
+               ``tools/install_silero.sh``. Голос — ``SILERO_SPEAKER``.
 ``piper``      локальный нейро-TTS: ``piper --model MODEL --output_file OUT``,
                текст — в stdin. Пути из ``PIPER_BIN``/``PIPER_MODEL``
                (или ``--piper-bin``/``--piper-model`` в ``voice_loop.py``).
@@ -16,14 +22,22 @@
 ``null``       заглушка: синтеза нет, ничего не пишет, ничего не играет.
 ============== ==========================================================
 
-Автовыбор: **ElevenLabs, если задан ключ**, иначе **Piper, если доступен**
+Автовыбор: **ElevenLabs, если задан ключ**, иначе **Silero, если установлен**
+(есть python3.13, vendor/torch-py и модель), иначе **Piper, если доступен**
 (есть бинарь и модель), иначе **SystemTTS**, иначе **NullTTS**. Явный выбор
-(``EVA_TTS=elevenlabs|piper|system|null`` / ``prefer=``) перекрывает
+(``EVA_TTS=elevenlabs|silero|piper|system|null`` / ``prefer=``) перекрывает
 автовыбор — даже если движок недоступен: тогда при синтезе будет понятная
-:class:`TTSUnavailable`, а не молчаливая подмена. Исключение — ElevenLabs:
-если облако ответило ошибкой (401/429/сеть/пусто), модуль логирует причину
-(без ключа!) и **сам откатывается на Piper/system**, чтобы пользователь не
-остался без голоса.
+:class:`TTSUnavailable`, а не молчаливая подмена. Исключение — облачный
+ElevenLabs и локальный Silero: если движок не сработал (401/429/сеть/пусто
+или упал процесс/нет torch), модуль логирует причину (без ключа!) и **сам
+откатывается на следующий локальный движок** (Silero → Piper → system),
+чтобы пользователь не остался без голоса.
+
+Silero запускается отдельным процессом (как Piper): torch импортируется
+только внутри него, поэтому память чат-сервера не растёт на ~300 МБ. Цена —
+холодный старт процесса (импорт torch + загрузка модели) на каждую новую
+фразу; повторные одинаковые фразы отдаются из LRU-кэша адаптера. Первый
+замер печатается в лог и в :meth:`SileroTTS.describe`.
 
 Контракт синтеза — ``synthesize(text) -> bytes | Path | (bytes, content_type)``::
 
@@ -40,8 +54,9 @@
 Адаптеры умеют также :meth:`TTSAdapter.synthesize_timed` — с замерами
 ``synth_ms`` и ``first_fragment_ms`` для голосового цикла.
 
-Только стандартная библиотека. Сеть используется только ElevenLabs (и только
-при заданном ключе); модели не скачиваются, реальный звук не воспроизводится
+Сеть используется только ElevenLabs (и только при заданном ключе); ничего не
+скачивается во время синтеза. Сам модуль — только стандартная библиотека:
+torch живёт в отдельном процессе Silero, реальный звук не воспроизводится
 (это делает ``voice_loop.py`` через afplay).
 """
 
@@ -73,6 +88,7 @@ __all__ = [
     "DEFAULT_ELEVENLABS_TIMEOUT",
     "DEFAULT_ELEVENLABS_VOICE_ID",
     "DEFAULT_SAY_VOICE",
+    "DEFAULT_SILERO_SPEAKER",
     "DEFAULT_TIMEOUT",
     "DEFAULT_TTS_LANG",
     "ELEVENLABS_API_URL",
@@ -81,6 +97,7 @@ __all__ = [
     "ENGINE_CHOICES",
     "NullTTS",
     "PiperTTS",
+    "SileroTTS",
     "SystemTTS",
     "SynthesisResult",
     "TTSAdapter",
@@ -88,14 +105,20 @@ __all__ = [
     "TTSUnavailable",
     "build_say_command",
     "clear_elevenlabs_cache",
+    "clear_silero_cache",
     "describe_engine",
     "elevenlabs_cache_info",
     "find_espeak_binary",
     "find_piper_binary",
     "find_piper_model",
     "find_say_binary",
+    "find_silero_model_dir",
+    "find_silero_python",
+    "find_silero_torch_dir",
     "piper_help",
     "select_engine",
+    "silero_cache_info",
+    "silero_help",
     "synthesize",
     "synthesize_audio",
     "system_help",
@@ -117,7 +140,7 @@ DEFAULT_TTS_LANG = os.environ.get("EVA_TTS_LANG", "ru").strip() or "ru"
 
 #: Допустимые значения ``--tts``/``EVA_TTS``. Порядок — приоритет автовыбора
 #: (``auto`` не движок, а «выбери сам»).
-ENGINE_CHOICES = ("auto", "elevenlabs", "piper", "system", "null")
+ENGINE_CHOICES = ("auto", "elevenlabs", "silero", "piper", "system", "null")
 
 # --------------------------------------------------------------------------- #
 # ElevenLabs (задача 0191)
@@ -202,6 +225,40 @@ PIPER_MODEL_DIRS = (
 
 #: Имена бинарника espeak (Linux).
 ESPEAK_BINARY_NAMES = ("espeak-ng", "espeak")
+
+# --------------------------------------------------------------------------- #
+# Silero (задача 0193)
+# --------------------------------------------------------------------------- #
+#: Голос Silero v4_ru по умолчанию: женский, ближе всего к EVA. Другие —
+#: ``kseniya``, ``xenia``, ``aidar`` (мужской), ``eugene``, ``random``.
+DEFAULT_SILERO_SPEAKER = os.environ.get("SILERO_SPEAKER", "baya").strip() or "baya"
+
+#: Голоса v4_ru, которые понимает модель. Пресеты страницы чата
+#: (``irina``/``soft``/``young``) — от Piper и сюда не относятся.
+SILERO_SPEAKERS = ("aidar", "baya", "eugene", "kseniya", "xenia", "random")
+
+#: Частота Silero v4_ru: 48 кГц — лучшее качество модели; Web Audio и AVPlayer
+#: играют такой WAV без пересэмплинга.
+SILERO_SAMPLE_RATE = 48000
+
+#: Каталог вендорного torch (``tools/install_silero.sh``). В ``.pylibs``
+#: лежит сломанный source-checkout, поэтому подставляем только этот путь.
+SILERO_TORCH_DIR = "vendor/torch-py"
+
+#: Кэш модели и репозитория torch.hub: ``TORCH_HOME=vendor/silero``.
+SILERO_MODEL_DIR = "vendor/silero"
+
+#: Скрипт-синтезатор: читает текст из stdin, пишет WAV в argv[1].
+SILERO_SCRIPT = "tools/silero_speak.py"
+
+#: Python для Silero. 3.13 — единственный с колёсами torch на arm64 macOS;
+#: python3.14 их пока не имеет.
+SILERO_PYTHON_NAMES = ("python3.13", "/opt/homebrew/bin/python3.13")
+
+#: Сколько последних фраз держать в LRU-кэше адаптера. Одна фраза — WAV
+#: 48 кГц/16 бит (~190 КБ/с); 16 записей — несколько мегабайт, зато повторные
+#: «стоп»/«повтори» не платят за холодный процесс.
+SILERO_CACHE_SIZE = 16
 
 
 # --------------------------------------------------------------------------- #
@@ -348,6 +405,7 @@ def _run_to_file(
     timeout: float,
     label: str,
     fragment_threshold: int,
+    env: Mapping[str, str] | None = None,
 ) -> tuple[float, float | None]:
     """Запустить TTS-процесс, который пишет WAV в ``out_path``.
 
@@ -373,6 +431,7 @@ def _run_to_file(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=dict(env) if env is not None else None,
             )
         except OSError as exc:
             raise TTSUnavailable(f"{label} не запустился: {exc}") from exc
@@ -452,6 +511,14 @@ class TTSAdapter:
         """Собрать argv и текст для stdin (``None`` — текст в аргументах)."""
         raise NotImplementedError
 
+    def subprocess_env(self) -> dict[str, str] | None:
+        """Окружение дочернего процесса (``None`` — унаследовать текущее).
+
+        Нужно Silero: torch и модель должны искаться в ``vendor/``, а не в
+        случайном ``.pylibs``/site-packages.
+        """
+        return None
+
     def synthesize(
         self,
         text: str,
@@ -498,6 +565,7 @@ class TTSAdapter:
             timeout=timeout,
             label=self.name,
             fragment_threshold=self.fragment_threshold,
+            env=self.subprocess_env(),
         )
         return SynthesisResult(
             path=target,
@@ -724,6 +792,497 @@ class PiperTTS(TTSAdapter):
         if length_scale is not None:
             command.extend(["--length_scale", f"{float(length_scale):.3f}"])
         return command, text + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# Silero (локальный русский нейро-TTS)
+# --------------------------------------------------------------------------- #
+def _silero_autodiscovery_allowed(env: Mapping[str, str] | None) -> bool:
+    """Искать ли вендорный Silero, если окружение передано явно.
+
+    ``env=None``/``os.environ`` — боевой путь: ``vendor/torch-py`` и
+    ``vendor/silero`` подхватываются сами. Изолированный словарь без
+    ``SILERO_*`` (тесты, встраивание) считается явной конфигурацией: чужой
+    установленный Silero в неё не подмешивается.
+    """
+    if env is None or env is os.environ:
+        return True
+    if not isinstance(env, dict):
+        return True
+    return any(str(key).upper().startswith("SILERO_") for key in env)
+
+
+def find_silero_python(
+    explicit: str | Path | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path | None:
+    """Найти python3.13 для Silero: аргумент → ``SILERO_PYTHON`` → PATH.
+
+    Явный путь обязан существовать: опечатка в конфиге не должна молча
+    менять движок. Если автопоиск не разрешён (изолированный ``env``),
+    возвращается ``None``.
+    """
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not _is_executable(path):
+            raise TTSUnavailable(
+                f"Silero: python не найден или не исполняемый: {path}. "
+                "Укажите SILERO_PYTHON=/opt/homebrew/bin/python3.13."
+            )
+        return path
+
+    raw = _env(env, "SILERO_PYTHON")
+    if raw:
+        path = Path(raw).expanduser()
+        if _is_executable(path):
+            return path
+        raise TTSUnavailable(
+            f"SILERO_PYTHON={path}: файл не найден или не исполняемый. "
+            "Нужен python3.13 (у python3.14 нет колёс torch)."
+        )
+
+    if not _silero_autodiscovery_allowed(env):
+        return None
+    for name in SILERO_PYTHON_NAMES:
+        if os.sep in name:
+            path = Path(name).expanduser()
+            if _is_executable(path):
+                return path
+        else:
+            found = shutil.which(name)
+            if found:
+                return Path(found)
+    return None
+
+
+def _has_vendored_torch(path: Path) -> bool:
+    """Есть ли по пути рабочий (распакованный) пакет torch."""
+    return (path / "torch" / "__init__.py").is_file()
+
+
+def find_silero_torch_dir(
+    explicit: str | Path | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path | None:
+    """Найти вендорный torch: аргумент → ``SILERO_TORCH_DIR`` → vendor/torch-py."""
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not _has_vendored_torch(path):
+            raise TTSUnavailable(
+                f"Silero: в {path} нет пакета torch. Запустите "
+                "sh tools/install_silero.sh."
+            )
+        return path
+
+    raw = _env(env, "SILERO_TORCH_DIR")
+    if raw:
+        path = Path(raw).expanduser()
+        if _has_vendored_torch(path):
+            return path
+        raise TTSUnavailable(
+            f"SILERO_TORCH_DIR={path}: torch не найден. Запустите "
+            "sh tools/install_silero.sh."
+        )
+
+    if not _silero_autodiscovery_allowed(env):
+        return None
+    path = ROOT / SILERO_TORCH_DIR
+    return path if _has_vendored_torch(path) else None
+
+
+def _silero_weights(model_dir: Path) -> Path | None:
+    """Файл весов v4_ru в кэше torch.hub (или ``None``).
+
+    ``torch.hub`` кладёт пакет модели в
+    ``$TORCH_HOME/hub/snakers4_silero-models_master/src/silero/model``;
+    старые версии — в ``hub/checkpoints``. Проверяем оба места, чтобы
+    «папка есть, а модели нет» не считалась установкой.
+    """
+    candidates: list[Path] = []
+    package = (
+        model_dir
+        / "hub"
+        / "snakers4_silero-models_master"
+        / "src"
+        / "silero"
+        / "model"
+    )
+    try:
+        candidates.extend(sorted(package.glob("v4_ru*.pt")))
+        candidates.extend(sorted((model_dir / "hub" / "checkpoints").glob("*.pt")))
+    except OSError:
+        return None
+    for path in candidates:
+        try:
+            if path.is_file() and path.stat().st_size > 1_000_000:
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def find_silero_model_dir(
+    explicit: str | Path | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path | None:
+    """Найти кэш модели: аргумент → ``SILERO_MODEL_DIR`` → vendor/silero.
+
+    Каталог считается готовым, только если в нём есть веса v4_ru: пустой
+    ``vendor/silero`` — это «не установлено», а не рабочий движок.
+    """
+    if explicit:
+        path = Path(explicit).expanduser()
+        if _silero_weights(path) is None:
+            raise TTSUnavailable(
+                f"Silero: модель v4_ru не найдена в {path}. Запустите "
+                "sh tools/install_silero.sh (первый раз нужна сеть)."
+            )
+        return path
+
+    raw = _env(env, "SILERO_MODEL_DIR")
+    if raw:
+        path = Path(raw).expanduser()
+        if _silero_weights(path) is not None:
+            return path
+        raise TTSUnavailable(
+            f"SILERO_MODEL_DIR={path}: модель v4_ru не найдена. Запустите "
+            "sh tools/install_silero.sh."
+        )
+
+    if not _silero_autodiscovery_allowed(env):
+        return None
+    path = ROOT / SILERO_MODEL_DIR
+    return path if _silero_weights(path) is not None else None
+
+
+def silero_help(
+    python: Path | None = None,
+    torch_dir: Path | None = None,
+    model_dir: Path | None = None,
+) -> str:
+    """Человеческое сообщение: чего не хватает и как поставить Silero."""
+    missing: list[str] = []
+    if python is None:
+        missing.append("python3.13")
+    if torch_dir is None:
+        missing.append("torch в vendor/torch-py")
+    if model_dir is None:
+        missing.append("модель v4_ru в vendor/silero")
+    lines = [
+        "Silero недоступен: нет " + ", ".join(missing) + ".",
+        "Установите (один раз, нужна сеть):",
+        "  sh tools/install_silero.sh",
+        "Без Silero работает Piper/system; принудительно: EVA_TTS=piper.",
+    ]
+    if python is not None:
+        lines.append(f"python: {python}")
+    if torch_dir is not None:
+        lines.append(f"torch: {torch_dir}")
+    if model_dir is not None:
+        lines.append(f"модель: {model_dir}")
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class _SileroRuntime:
+    """Разрешённые пути и голос для запуска синтезатора."""
+
+    python: Path
+    torch_dir: Path
+    model_dir: Path
+    script: Path
+    speaker: str
+    weights: Path
+
+
+#: LRU-кэш WAV по ``(текст, голос, частота)``: повторная фраза не платит за
+#: новый процесс torch. Живёт на уровне модуля, потому что ``select_engine``
+#: создаёт адаптер на каждый запрос.
+_SILERO_CACHE: "OrderedDict[tuple[str, str, int], bytes]" = OrderedDict()
+_SILERO_CACHE_LOCK = threading.Lock()
+_SILERO_CACHE_HITS = 0
+_SILERO_CACHE_MISSES = 0
+
+#: Время первого реального синтеза (torch + модель), мс. Показывается в
+#: ``describe()`` как честная цена холодного старта.
+_SILERO_WARMUP_MS: float | None = None
+
+#: Один раз сообщить в лог, что автовыбор ушёл с Silero на Piper (иначе на
+#: машине без установки это сообщение повторялось бы на каждый запрос).
+_SILERO_FALLBACK_LOGGED = False
+
+
+def _log_silero_fallback_once() -> None:
+    global _SILERO_FALLBACK_LOGGED
+    if _SILERO_FALLBACK_LOGGED:
+        return
+    _SILERO_FALLBACK_LOGGED = True
+    logger.info(
+        "озвучка: Silero недоступен (нет python3.13/torch/модели), "
+        "использую Piper; установка: sh tools/install_silero.sh"
+    )
+
+
+def clear_silero_cache() -> None:
+    """Очистить LRU-кэш Silero (тесты и смена голоса)."""
+    global _SILERO_CACHE_HITS, _SILERO_CACHE_MISSES
+    with _SILERO_CACHE_LOCK:
+        _SILERO_CACHE.clear()
+        _SILERO_CACHE_HITS = 0
+        _SILERO_CACHE_MISSES = 0
+
+
+def silero_cache_info() -> dict[str, int]:
+    """Состояние кэша Silero: размер, попадания/промахи (диагностика)."""
+    with _SILERO_CACHE_LOCK:
+        return {
+            "size": len(_SILERO_CACHE),
+            "hits": _SILERO_CACHE_HITS,
+            "misses": _SILERO_CACHE_MISSES,
+            "max_size": SILERO_CACHE_SIZE,
+        }
+
+
+def _silero_cache_get(key: tuple[str, str, int]) -> bytes | None:
+    global _SILERO_CACHE_HITS, _SILERO_CACHE_MISSES
+    with _SILERO_CACHE_LOCK:
+        value = _SILERO_CACHE.get(key)
+        if value is None:
+            _SILERO_CACHE_MISSES += 1
+            return None
+        _SILERO_CACHE.move_to_end(key)
+        _SILERO_CACHE_HITS += 1
+        return value
+
+
+def _silero_cache_put(key: tuple[str, str, int], value: bytes) -> None:
+    with _SILERO_CACHE_LOCK:
+        _SILERO_CACHE[key] = value
+        _SILERO_CACHE.move_to_end(key)
+        while len(_SILERO_CACHE) > SILERO_CACHE_SIZE:
+            _SILERO_CACHE.popitem(last=False)
+
+
+class SileroTTS(TTSAdapter):
+    """Локальный Silero v4_ru в отдельном процессе python3.13.
+
+    Команда::
+
+        python3.13 tools/silero_speak.py OUT.wav --speaker baya \
+            --sample-rate 48000
+
+    Текст — в stdin, WAV — в ``OUT.wav``. ``torch`` импортируется только
+    внутри дочернего процесса; ``PYTHONPATH=vendor/torch-py``,
+    ``TORCH_HOME=vendor/silero``. Пути/голос:
+
+    ====================== ================================================
+    ``SILERO_PYTHON``      python3.13 (по умолчанию из PATH или Homebrew)
+    ``SILERO_TORCH_DIR``   каталог вендорного torch (``vendor/torch-py``)
+    ``SILERO_MODEL_DIR``   кэш модели (``vendor/silero``)
+    ``SILERO_SCRIPT``      скрипт-синтезатор (``tools/silero_speak.py``)
+    ``SILERO_SPEAKER``     голос: ``baya``/``kseniya``/``xenia``/``aidar``/…
+    ``SILERO_CACHE``       ``0`` отключает LRU-кэш повторных фраз
+    ====================== ================================================
+
+    Пресеты Piper (``irina``/``soft``/``young``) отбрасываются: у Silero
+    свой тембр и никакого питч-шифта. ``voice``, совпавший с именем голоса
+    Silero, уважается — так страница чата сможет выбрать голос явно.
+    """
+
+    name = "silero"
+    fragment_threshold = MIN_WAV_BYTES
+
+    def __init__(
+        self,
+        python: str | Path | None = None,
+        *,
+        torch_dir: str | Path | None = None,
+        model_dir: str | Path | None = None,
+        script: str | Path | None = None,
+        speaker: str | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> None:
+        self._python = python
+        self._torch_dir = torch_dir
+        self._model_dir = model_dir
+        self._script = script
+        self._speaker = speaker
+        self._env = env
+        self._resolved: _SileroRuntime | None = None
+
+    def _configured_speaker(self) -> str:
+        raw = (
+            self._speaker
+            or _env(self._env, "SILERO_SPEAKER")
+            or DEFAULT_SILERO_SPEAKER
+        )
+        return (raw or DEFAULT_SILERO_SPEAKER).strip().lower()
+
+    def resolve(self) -> _SileroRuntime:
+        """Найти python/torch/модель/скрипт или поднять :class:`TTSUnavailable`."""
+        if self._resolved is not None:
+            return self._resolved
+        python = find_silero_python(self._python, env=self._env)
+        torch_dir = find_silero_torch_dir(self._torch_dir, env=self._env)
+        model_dir = find_silero_model_dir(self._model_dir, env=self._env)
+        raw_script = self._script or _env(self._env, "SILERO_SCRIPT")
+        script = (
+            Path(raw_script).expanduser()
+            if raw_script
+            else ROOT / SILERO_SCRIPT
+        )
+        if not script.is_file():
+            raise TTSUnavailable(
+                f"Silero: скрипт-синтезатор не найден: {script}. "
+                "Ожидается tools/silero_speak.py в репозитории."
+            )
+        speaker = self._configured_speaker()
+        if speaker not in SILERO_SPEAKERS:
+            raise TTSUnavailable(
+                f"SILERO_SPEAKER={speaker!r}: неизвестный голос. Допустимо: "
+                + ", ".join(SILERO_SPEAKERS)
+            )
+        if python is None or torch_dir is None or model_dir is None:
+            raise TTSUnavailable(silero_help(python, torch_dir, model_dir))
+        weights = _silero_weights(model_dir)
+        if weights is None:  # защита от гонки: каталог опустел
+            raise TTSUnavailable(silero_help(python, torch_dir, model_dir))
+        self._resolved = _SileroRuntime(
+            python=python,
+            torch_dir=torch_dir,
+            model_dir=model_dir,
+            script=script,
+            speaker=speaker,
+            weights=weights,
+        )
+        return self._resolved
+
+    def available(self) -> bool:
+        try:
+            self.resolve()
+        except TTSUnavailable:
+            return False
+        return True
+
+    def describe(self) -> str:
+        try:
+            runtime = self.resolve()
+        except TTSUnavailable:
+            return (
+                "silero (недоступен: не установлен — sh tools/install_silero.sh)"
+            )
+        text = (
+            f"silero (голос {runtime.speaker}, {SILERO_SAMPLE_RATE} Гц, "
+            f"{runtime.python.name}, модель {runtime.weights.name}"
+        )
+        if _SILERO_WARMUP_MS is not None:
+            text += f", первый синтез {_SILERO_WARMUP_MS:.0f} мс"
+        return text + ")"
+
+    def _speaker_for(self, requested: str | None) -> str:
+        """Голос запроса, если это голос Silero, иначе настроенный.
+
+        Страница чата присылает пресеты Piper (``irina``/``soft``/``young``);
+        для Silero они бессмысленны и игнорируются.
+        """
+        candidate = (requested or "").strip().lower()
+        if candidate in SILERO_SPEAKERS:
+            return candidate
+        return self._configured_speaker()
+
+    def build_command(
+        self,
+        text: str,
+        out_path: str | Path,
+        *,
+        rate: int | None = None,
+        voice: str | None = None,
+    ) -> tuple[list[str], str | None]:
+        runtime = self.resolve()
+        speaker = self._speaker_for(voice)
+        command = [
+            str(runtime.python),
+            str(runtime.script),
+            str(Path(out_path).expanduser()),
+            "--speaker",
+            speaker,
+            "--sample-rate",
+            str(SILERO_SAMPLE_RATE),
+        ]
+        return command, text + "\n"
+
+    def subprocess_env(self) -> dict[str, str] | None:
+        """Окружение дочернего процесса: только вендорный torch и кэш модели."""
+        runtime = self.resolve()
+        env = dict(os.environ)
+        # Ровно vendor/torch-py: иначе сломанный source-checkout из .pylibs
+        # (или чужой torch из site-packages) может оказаться первым в sys.path.
+        env["PYTHONPATH"] = str(runtime.torch_dir)
+        env["TORCH_HOME"] = str(runtime.model_dir)
+        env["PYTHONNOUSERSITE"] = "1"
+        threads = str(env.get("SILERO_THREADS", "4")).strip() or "4"
+        env["SILERO_THREADS"] = threads
+        env.setdefault("OMP_NUM_THREADS", threads)
+        env["SILERO_SPEAKER"] = runtime.speaker
+        return env
+
+    def synthesize_timed(
+        self,
+        text: str,
+        out_path: str | Path,
+        *,
+        rate: int | None = None,
+        voice: str | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+    ) -> SynthesisResult:
+        """Синтез с LRU-кэшем повторных фраз и замером холодного старта."""
+        global _SILERO_WARMUP_MS
+        clean = _clean_text(text)
+        target = Path(out_path).expanduser()
+        runtime = self.resolve()
+        speaker = self._speaker_for(voice)
+        key = (clean, speaker, SILERO_SAMPLE_RATE)
+        use_cache = _env_flag(self._env, "SILERO_CACHE", True)
+        if use_cache:
+            cached = _silero_cache_get(key)
+            if cached is not None:
+                target = _prepare_target(target)
+                started = time.perf_counter()
+                try:
+                    target.write_bytes(cached)
+                except OSError as exc:
+                    raise TTSError(
+                        f"не удалось записать аудио в {target}: {exc}"
+                    ) from exc
+                synth_ms = (time.perf_counter() - started) * 1000.0
+                return SynthesisResult(
+                    path=target,
+                    synth_ms=synth_ms,
+                    first_fragment_ms=synth_ms,
+                    engine=self.name,
+                )
+
+        result = super().synthesize_timed(
+            clean, target, rate=rate, voice=voice, timeout=timeout
+        )
+        if use_cache:
+            try:
+                data = target.read_bytes()
+            except OSError:
+                data = b""
+            if data:
+                _silero_cache_put(key, data)
+        if _SILERO_WARMUP_MS is None:
+            _SILERO_WARMUP_MS = result.synth_ms
+            logger.info(
+                "silero: первый синтез %.0f мс (torch + модель v4_ru в "
+                "отдельном процессе; повторные одинаковые фразы — из кэша)",
+                result.synth_ms,
+            )
+        return result
 
 
 # --------------------------------------------------------------------------- #
@@ -1390,6 +1949,9 @@ def select_engine(
     *,
     piper_bin: str | Path | None = None,
     piper_model: str | Path | None = None,
+    silero_python: str | Path | None = None,
+    silero_model_dir: str | Path | None = None,
+    silero_speaker: str | None = None,
     say_bin: str | Path | None = None,
     voice: str | None = None,
     lang: str = DEFAULT_TTS_LANG,
@@ -1398,14 +1960,16 @@ def select_engine(
     """Выбрать TTS-движок.
 
     ``prefer``/``EVA_TTS``: ``auto`` (по умолчанию), ``elevenlabs``,
-    ``piper``, ``system``, ``null``. Явный выбор перекрывает автовыбор и не
-    подменяется: если выбранный движок не настроен,
+    ``silero``, ``piper``, ``system``, ``null``. Явный выбор перекрывает
+    автовыбор и не подменяется: если выбранный движок не настроен,
     :meth:`TTSAdapter.available` вернёт False, а синтез поднимет
     :class:`TTSUnavailable` с подсказкой.
 
-    Авто: ElevenLabs (если задан ``ELEVENLABS_API_KEY``), иначе Piper (если
-    есть бинарь **и** модель), иначе SystemTTS, иначе NullTTS. Отсутствие
-    ключа или Piper — не ошибка, а причина фолбэка.
+    Авто: ElevenLabs (если задан ``ELEVENLABS_API_KEY``), иначе Silero (если
+    установлен ``tools/install_silero.sh``: python3.13 + vendor/torch-py +
+    модель), иначе Piper (если есть бинарь **и** модель), иначе SystemTTS,
+    иначе NullTTS. Отсутствие ключа, Silero или Piper — не ошибка, а причина
+    фолбэка: локальное по умолчанию лучше облака.
     """
     env_source = os.environ if env is None else env
     choice = _env(env_source, "EVA_TTS", "EVA_TTS_ENGINE")
@@ -1419,9 +1983,17 @@ def select_engine(
         )
 
     elevenlabs = ElevenLabsTTS(env=env)
+    silero = SileroTTS(
+        silero_python,
+        model_dir=silero_model_dir,
+        speaker=silero_speaker,
+        env=env,
+    )
     piper = PiperTTS(piper_bin, piper_model, env=env)
     if choice == "elevenlabs":
         return elevenlabs
+    if choice == "silero":
+        return silero
     if choice == "piper":
         return piper
     if choice == "system":
@@ -1431,7 +2003,10 @@ def select_engine(
 
     if elevenlabs.available():
         return elevenlabs
+    if silero.available():
+        return silero
     if piper.available():
+        _log_silero_fallback_once()
         return piper
     system = SystemTTS(say_bin, voice=voice, lang=lang, env=env)
     if system.available():
@@ -1449,27 +2024,36 @@ def describe_engine(engine: TTSAdapter | None) -> str:
         return engine.name
 
 
-def _fallback_engine(
+def _fallback_engines(
     *,
+    skip: Sequence[str] = (),
     piper_bin: str | Path | None = None,
     piper_model: str | Path | None = None,
     say_bin: str | Path | None = None,
     voice: str | None = None,
     lang: str = DEFAULT_TTS_LANG,
     env: Mapping[str, str] | None = None,
-) -> TTSAdapter | None:
-    """Локальный запасной движок после сбоя ElevenLabs: Piper, затем system.
+) -> list[TTSAdapter]:
+    """Локальные запасные движки в порядке предпочтения: Silero → Piper → system.
 
-    Возвращает ``None``, если ни Piper, ни say/espeak недоступны: тогда
-    вызывающий поднимает исходную ошибку ElevenLabs — молчаливой тишины нет.
+    Движки из ``skip`` не предлагаются (например, Silero, который только что
+    упал). Возвращается список доступных прямо сейчас; пустой список означает
+    «локального голоса нет» — вызывающий поднимает исходную ошибку.
     """
-    piper = PiperTTS(piper_bin, piper_model, env=env)
-    if piper.available():
-        return piper
-    system = SystemTTS(say_bin, voice=voice, lang=lang, env=env)
-    if system.available():
-        return system
-    return None
+    engines: list[TTSAdapter] = []
+    if "silero" not in skip:
+        silero = SileroTTS(env=env)
+        if silero.available():
+            engines.append(silero)
+    if "piper" not in skip:
+        piper = PiperTTS(piper_bin, piper_model, env=env)
+        if piper.available():
+            engines.append(piper)
+    if "system" not in skip:
+        system = SystemTTS(say_bin, voice=voice, lang=lang, env=env)
+        if system.available():
+            engines.append(system)
+    return engines
 
 
 def _synthesize_with_fallback(
@@ -1487,7 +2071,13 @@ def _synthesize_with_fallback(
     timeout: float,
     env: Mapping[str, str] | None,
 ) -> tuple[object, TTSAdapter]:
-    """Синтез с откатом ElevenLabs → Piper/system; возвращает результат и движок."""
+    """Синтез с откатом ElevenLabs/Silero → локальные движки.
+
+    Облако может ответить 401/429/сетью, а Silero — упасть из-за
+    отсутствующего/битого torch. В обоих случаях пробуем следующие локальные
+    движки (Silero, затем Piper, затем system), логируя причину. Если не
+    осталось ни одного — поднимаем исходную ошибку, а не отдаём тишину.
+    """
     env_source = os.environ if env is None else env
     chosen = engine or select_engine(
         prefer,
@@ -1506,10 +2096,11 @@ def _synthesize_with_fallback(
             chosen,
         )
     except TTSError as exc:
-        if chosen.name != "elevenlabs":
+        if chosen.name not in ("elevenlabs", "silero"):
             raise
         api_key = _env(env_source, "ELEVENLABS_API_KEY")
-        fallback = _fallback_engine(
+        fallbacks = _fallback_engines(
+            skip=(chosen.name,),
             piper_bin=piper_bin,
             piper_model=piper_model,
             say_bin=say_bin,
@@ -1517,24 +2108,40 @@ def _synthesize_with_fallback(
             lang=lang,
             env=env,
         )
-        if fallback is None:
-            # Нечего озвучивать локально: показываем исходную причину, а не
-            # «тишину». Ключ в текст не попадает (redact на всякий случай).
+        last_error: TTSError = exc
+        for fallback in fallbacks:
+            try:
+                result = fallback.synthesize(
+                    text, out_path, rate=rate, voice=voice, timeout=timeout
+                )
+            except TTSError as fallback_exc:
+                # Запасной тоже упал (например, битый Silero): пробуем
+                # следующий, а не сдаёмся после первого.
+                last_error = fallback_exc
+                logger.warning(
+                    "озвучка: %s не сработал (%s), пробую следующий движок",
+                    fallback.name,
+                    fallback_exc,
+                )
+                continue
+            logger.warning(
+                "озвучка: %s не сработал (%s), откат на %s",
+                chosen.name,
+                _redact(exc, api_key),
+                fallback.name,
+            )
+            return result, fallback
+
+        # Нечего озвучивать локально: показываем исходную причину, а не
+        # «тишину». Ключ в текст не попадает (redact на всякий случай).
+        if chosen.name == "elevenlabs":
             raise TTSError(
                 f"ElevenLabs: {_redact(exc, api_key)}; запасной Piper/system "
                 "тоже недоступен."
             ) from None
-        logger.warning(
-            "озвучка: ElevenLabs не сработал (%s), откат на %s",
-            _redact(exc, api_key),
-            fallback.name,
-        )
-        return (
-            fallback.synthesize(
-                text, out_path, rate=rate, voice=voice, timeout=timeout
-            ),
-            fallback,
-        )
+        raise TTSError(
+            f"Silero: {last_error}; запасной Piper/system тоже недоступен."
+        ) from None
 
 
 def synthesize(
@@ -1554,11 +2161,12 @@ def synthesize(
 ) -> bytes | Path | tuple[bytes, str]:
     """Синтезировать текст выбранным (или переданным) движком.
 
-    Без ``out_path`` — аудиобайты (Piper/system — WAV, ElevenLabs — пара
-    ``(mp3, "audio/mpeg")``); с ``out_path`` — путь. Если Piper нет,
-    автовыбор уходит на системный TTS, а при полном отсутствии TTS вернёт
-    пустые байты (NullTTS), не падая. Сбой ElevenLabs (401/429/сеть/пусто)
-    логируется без ключа и откатывается на Piper/system.
+    Без ``out_path`` — аудиобайты (Silero/Piper/system — WAV, ElevenLabs —
+    пара ``(mp3, "audio/mpeg")``); с ``out_path`` — путь. Если Silero и
+    Piper нет, автовыбор уходит на системный TTS, а при полном отсутствии TTS
+    вернёт пустые байты (NullTTS), не падая. Сбой ElevenLabs
+    (401/429/сеть/пусто) или Silero логируется без ключа и откатывается на
+    локальный движок (Piper/system).
     """
     result, _ = _synthesize_with_fallback(
         text,
@@ -1594,8 +2202,9 @@ def synthesize_audio(
     """Синтезировать в память и вернуть ``(bytes, content_type)``.
 
     Обёртка над :func:`synthesize` для HTTP-слоя: ElevenLabs отдаёт MP3 и
-    ``audio/mpeg``, локальные движки — WAV и ``audio/wav``. Тот же откат:
-    при сбое ElevenLabs возвращается аудио Piper, а не ошибка.
+    ``audio/mpeg``, локальные движки (Silero/Piper/system) — WAV и
+    ``audio/wav``. Тот же откат: при сбое ElevenLabs или Silero возвращается
+    аудио локального движка, а не ошибка.
     """
     result, chosen = _synthesize_with_fallback(
         text,
@@ -1615,6 +2224,13 @@ def synthesize_audio(
         data, content_type = result
         return bytes(data), str(content_type)
     if isinstance(result, (bytes, bytearray)):
-        return bytes(result), "audio/wav"
+        data = bytes(result)
+        if chosen.name == "silero":
+            # Страница чата шлёт пресеты Piper (irina/soft/young) и для WAV
+            # применяет питч-шифт/сглаживание. У Silero свой тембр: помечаем
+            # WAV параметром MIME, чтобы ``default_tts_speech`` не трогал
+            # звук. HTTP-слой всё равно определяет тип по сигнатуре RIFF.
+            return data, "audio/wav; engine=silero"
+        return data, "audio/wav"
     # Path без out_path не возвращается, но контракт защищаем.
     return b"", "audio/wav"
