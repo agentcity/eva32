@@ -82,6 +82,18 @@ logger = logging.getLogger("eva.skills.fresh")
 
 #: Курс ЦБ РФ: XML, windows-1251, без ключа. Один запрос — все валюты.
 CBR_URL = "https://www.cbr.ru/scripts/XML_daily.asp"
+#: Индексы MOEX ISS (IMOEX/RTSI): другая доска и другое поле цены.
+MOEX_INDEX_URL = (
+    "https://iss.moex.com/iss/engines/stock/markets/index/boards/SNDX/"
+    "securities/{ticker}.json?iss.meta=off"
+)
+#: Имена индексов для человека.
+INDEX_TITLES = {
+    "IMOEX": "Индекс Мосбиржи",
+    "RTSI": "Индекс РТС",
+    "RTS": "Индекс РТС",  # MOEX отдаёт SECID=RTS на доске SNDX
+}
+
 #: Котировки MOEX ISS: без ключа, одна бумага на запрос.
 MOEX_URL = (
     "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/"
@@ -499,6 +511,48 @@ class Quote:
     board: str = "TQBR"
 
 
+def parse_moex_index(raw: bytes | str | Mapping[str, Any]) -> Quote | None:
+    """Разобрать ответ ISS по ИНДЕКСУ (доска SNDX, поле ``CURRENTVALUE``).
+
+    Отдельная функция, потому что у индекса нет ``LAST``/``PREVPRICE``:
+    цена — ``CURRENTVALUE``, изменение — ``LASTCHANGEPRC`` (в пунктах и
+    процентах). Свалить это в :func:`parse_moex_json` нельзя: перепутанные
+    поля дают правдоподобно неверную цифру (живой случай: «индекс 2915,68»
+    при фактических 2333,84).
+    """
+    payload = raw
+    if isinstance(raw, (bytes, str)):
+        text = _decode_json(raw)
+        if not text:
+            return None
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            return None
+    if not isinstance(payload, Mapping):
+        return None
+    marketdata = _moex_table(payload.get("marketdata"))
+    if not marketdata or not marketdata.get("rows"):
+        return None
+    row = marketdata["rows"][0]
+    price = _first_number(row, ("CURRENTVALUE", "MARKETPRICE", "LASTVALUE"))
+    if price is None:
+        return None
+    change_pct = _first_number(row, ("LASTCHANGEPRC",), allow_zero=True)
+    change_abs = _first_number(row, ("LASTCHANGE",), allow_zero=True)
+    ticker = str(row.get("SECID") or "").upper()
+    return Quote(
+        ticker=ticker or "IMOEX",
+        name=INDEX_TITLES.get(ticker or "IMOEX", ticker or "индекс"),
+        price=price,
+        change=change_abs,
+        change_pct=change_pct,
+        prev_price=None,
+        updated=_updated(row),
+        board="SNDX",
+    )
+
+
 def parse_moex_json(raw: bytes | str | Mapping[str, Any]) -> Quote | None:
     """Разобрать ответ ISS по бумаге; нет цены → ``None``.
 
@@ -550,6 +604,48 @@ def parse_moex_json(raw: bytes | str | Mapping[str, Any]) -> Quote | None:
         updated=_updated(row),
         board=str(row.get("BOARDID") or "TQBR"),
     )
+
+
+def index_quote(
+    ticker: str = "IMOEX",
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    fetch: Callable[[str, float], bytes] | None = None,
+    use_cache: bool = True,
+) -> Fact | None:
+    """Факт по индексу MOEX: «Индекс Мосбиржи (IMOEX) = 2 333,84 п. (-0,52 %)».
+
+    Отдельно от :func:`stock_quote`: у индекса другая доска (``SNDX``) и
+    другое поле цены (``CURRENTVALUE``). Перепутать их означает показать
+    правдоподобно неверную цифру — именно так случилось с «индексом 2915,68»
+    при фактических 2333,84.
+    """
+    code = str(ticker or "IMOEX").strip().upper() or "IMOEX"
+    quote: Quote | None = None
+    if use_cache:
+        cached = _MOEX_CACHE.get("index:" + code)
+        if isinstance(cached, Quote):
+            quote = cached
+    if quote is None:
+        url = MOEX_INDEX_URL.format(ticker=urllib.parse.quote(code))
+        try:
+            raw = _fetch(url, timeout, fetch)
+            quote = parse_moex_index(raw)
+        except Exception as exc:  # noqa: BLE001 — сеть/парсинг не роняют чат
+            logger.info("индекс %s не получен: %s", code, exc)
+            return None
+        if quote is None:
+            logger.info("индекс %s: ответ не разобран", code)
+            return None
+        if use_cache:
+            _MOEX_CACHE.put("index:" + code, quote)
+    title = INDEX_TITLES.get(quote.ticker or code, quote.name or code)
+    data = f"{title} ({quote.ticker or code}) = {format_number(quote.price, 2)} п."
+    if quote.change_pct is not None:
+        data += f", за день {format_number(quote.change_pct, 2)} %"
+    if quote.updated:
+        data += f", обновлено {quote.updated}"
+    return Fact(kind="index", data=data, source="MOEX ISS")
 
 
 def _moex_table(block: Any) -> dict[str, Any] | None:

@@ -38,6 +38,22 @@ _STOCK_INTENT_RE = re.compile(
 )
 
 
+def _index_fact(ctx: PluginContext, ticker: str) -> Fact | None:
+    """Факт по индексу MOEX (IMOEX/RTSI) — своя доска и своё поле цены."""
+    ctx.check_url(_fresh.MOEX_INDEX_URL.format(ticker=str(ticker).upper()))
+    try:
+        fact = _fresh.index_quote(ticker, fetch=_fetch_through(ctx))
+    except PluginPermissionError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - сеть/парсинг деградируют
+        ctx.log.warning("индекс %s не получен: %s", ticker, exc)
+        return Fact(
+            text=f"не удалось получить индекс {ticker} — нет ответа от MOEX",
+            source="MOEX ISS",
+        )
+    return fact
+
+
 class StocksPlugin:
     """Одна котировка одним фактом; сеть упала — честное «не удалось»."""
 
@@ -52,8 +68,10 @@ class StocksPlugin:
         # Намерение — из роутера 0208 (он уже отличил бумагу от товара).
         if _intent is not None:
             detected = _intent.detect(text)
-            if detected is None or detected.kind != "stock":
+            if detected is None or detected.kind not in ("stock", "index"):
                 return None
+            if detected.kind == "index":
+                return _index_fact(ctx, detected.params[0] if detected.params else "IMOEX")
             tickers = list(detected.params)
         else:  # pragma: no cover - только без 0208
             if not _STOCK_INTENT_RE.search(text):

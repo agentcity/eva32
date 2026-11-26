@@ -156,6 +156,19 @@ _STOCK_WORD_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Индекс MOEX: «индекс мосбиржи», «IMOEX», «индекс РТС». Проверяется ДО
+#: бумаг: иначе «индекс мосбиржи» уходил в тикер MOEX и отдавал не ту цифру.
+_INDEX_RE = re.compile(
+    r"(?:"
+    r"индекс\w*\s+(?:мосбирж\w*|московск\w+\s+бирж\w*|ртс)"
+    r"|\bimoex\b|\brtsi\b|индекс\s+мосбирж\w*"
+    r")",
+    re.IGNORECASE,
+)
+#: Имя индекса в вопросе → тикер MOEX.
+_INDEX_TICKERS = (("ртс", "RTSI"), ("rtsi", "RTSI"), ("imoex", "IMOEX"),
+                  ("мосбирж", "IMOEX"))
+
 #: Общий вопрос о курсе без конкретной валюты: «курс валют», «курс ЦБ».
 _ANY_CURRENCY_RE = re.compile(
     r"(?:валют\w*|\bцб\b|центробанк\w*|центральн\w+\s+банк)", re.IGNORECASE
@@ -215,6 +228,15 @@ def detect(text: str) -> Intent | None:
     #    цене — не наша зона (модель ответит сама).
     if _CATALOG_GUARD_RE.search(value):
         return None
+    index_hit = _INDEX_RE.search(raw)
+    if index_hit:
+        lowered = index_hit.group(0).lower()
+        ticker = next(
+            (code for marker, code in _INDEX_TICKERS if marker in lowered),
+            "IMOEX",
+        )
+        return Intent("index", (ticker,), phrase=index_hit.group(0).strip())
+
     tickers = ticker_mentions(raw)
     if tickers and (_STOCK_WORD_RE.search(value) or _RATE_WORD_RE.search(value)):
         phrase = (_STOCK_WORD_RE.search(value) or _RATE_WORD_RE.search(value))
