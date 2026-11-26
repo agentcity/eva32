@@ -1482,5 +1482,19 @@
     "status": "in_progress",
     "file": "0221-tale-pictures.md",
     "assignee": "agent:tale-images"
+  },
+  {
+    "id": "0222",
+    "title": "Ударения для Silero",
+    "status": "in_progress",
+    "file": "0222-silero-stress.md",
+    "assignee": "agent:stress"
+  },
+  {
+    "id": "0223",
+    "title": "Готовая озвучка сказок",
+    "status": "in_progress",
+    "file": "0223-tale-audio.md",
+    "assignee": "agent:tale-audio"
   }
 ]
