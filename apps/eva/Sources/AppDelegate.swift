@@ -15,16 +15,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyRef: EventHotKeyRef?
     private var hotKeyHandler: EventHandlerRef?
 
-    private let window = MainWindowController()
+    private let circles: CircleHub
+    private let window: MainWindowController
+    private let compact: CompactWindowController
     private let settingsWindow = SettingsWindowController()
     private let recorder = SpeechRecorder()
     private let answer = AnswerController()
     /// Фоновое ожидание «Привет, Ева» (задача 0187): живёт только в idle.
     private let wake = WakeWordListener()
 
+    /// Компактный режим: главное окно спрятано, на экране только круг.
+    private var isCompact = false
+
     private var isRecording = false
     private var isSpeaking = false
     private var isTerminating = false
+
+    override init() {
+        // Оба окна смотрят в один хаб: состояние круга не дублируется.
+        let hub = CircleHub()
+        circles = hub
+        window = MainWindowController(circles: hub)
+        compact = CompactWindowController(circles: hub)
+        super.init()
+    }
 
     // Follow-up (задача 0190): после ответа микрофон открывается сам, без
     // «Привет, Ева». Автоматика включается только когда ожидание фразы
@@ -67,7 +81,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wireAnswer()
         wireWake()
         wireWindow()
+        wireCompact()
         observeSettings()
+        // Хаб мог быть создан до `registerDefaults`: значение галочки берём
+        // из настроек уже после регистрации значений по умолчанию.
+        circles.setAnimationEnabled(Settings.shared.animateCircle)
 
         let argv = CommandLine.arguments.dropFirst().joined(separator: " ")
         let bundleID = Bundle.main.bundleIdentifier ?? "?"
@@ -81,7 +99,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let wakeWord = Settings.shared.wakeWord
         log("настройки: сервер=\(server) модель=\(model) голос=\(voice) озвучка=\(speak) "
             + "анимация=\(animate) ожидание=\(wakeWord) "
-            + "follow-up=\(Settings.shared.followUpListen)/\(Settings.shared.followUpSilence) с")
+            + "follow-up=\(Settings.shared.followUpListen)/\(Settings.shared.followUpSilence) с "
+            + "старт-свёрнутым=\(Settings.shared.startCompact)")
 
         if Launch.ask == nil {
             // При `--ask` вопрос уйдёт через 0,4 с: поднимать ожидание на этот
@@ -91,8 +110,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startRequestedQuestionIfAny()
         // Показываем окно при обычном запуске: без иконки в доке (accessory)
         // пользователь иначе не понимает, что приложение вообще открылось.
-        // Флаг --background оставляет только статус-бар (автозапуск/агент).
-        if !CommandLine.arguments.contains("--background") {
+        // Флаг --background оставляет только статус-бар (автозапуск/агент),
+        // галочка «Запускаться свёрнутым» — только круг (задача 0188).
+        if CommandLine.arguments.contains("--background") {
+            log("вид: запуск в фоне — только статус-бар")
+        } else if Settings.shared.startCompact, Launch.ask == nil {
+            collapseToCompact(reason: "запуск свёрнутым (настройка)")
+        } else {
             window.showAndFocusInput()
         }
     }
@@ -105,8 +129,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wakeSync?.cancel()
         wakeSync = nil
         wake.stop()
-        window.setWakeWaiting(false)
-        window.stopCircleAnimation()
+        circles.setWakeWaiting(false)
+        circles.stopAnimation()
+        compact.hide()
         recorder.stop()
         answer.stop()
         if let hotKeyRef {
@@ -237,6 +262,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(NSText.selectAll(_:)),
             keyEquivalent: "a"
         )
+
+        // «Вид» (задача 0188): ⌘M — свернуть в круг, как стандартное «Свернуть»,
+        // но окно не улетает в Dock, а прячется и оставляет круг на экране.
+        let viewItem = NSMenuItem()
+        mainMenu.addItem(viewItem)
+        let viewMenu = NSMenu(title: "Вид")
+        viewItem.submenu = viewMenu
+        let collapse = NSMenuItem(
+            title: "Свернуть в круг",
+            action: #selector(collapseToCompactAction),
+            keyEquivalent: "m"
+        )
+        collapse.target = self
+        viewMenu.addItem(collapse)
+        let expand = NSMenuItem(
+            title: "Показать главное окно",
+            action: #selector(expandAction),
+            keyEquivalent: "M"
+        )
+        expand.target = self
+        viewMenu.addItem(expand)
+
         NSApp.mainMenu = mainMenu
     }
 
@@ -306,10 +353,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.awaitingFirstToken = false
                 self.awaitingAudio = false
             } else {
-                self.window.setCircleLevel(0)
+                self.circles.setLevel(0)
                 // Круг возвращается к обычному виду: приглушение — только
                 // пока идёт follow-up-запись.
-                self.window.setFollowUp(false)
+                self.circles.setFollowUp(false)
             }
             self.listenItem?.title = recording
                 ? "Остановить (⌥Space)"
@@ -326,7 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
         recorder.onLevel = { [weak self] level in
-            self?.window.setCircleLevel(CGFloat(level))
+            self?.circles.setLevel(CGFloat(level))
         }
         recorder.onPartial = { [weak self] text in
             self?.window.showPartial(text)
@@ -336,7 +383,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if self.isFollowUp {
                 log("follow-up: услышала вопрос, отправляю")
                 self.isFollowUp = false
-                self.window.setFollowUp(false)
+                self.circles.setFollowUp(false)
             }
             self.window.showQuestion(text)
             self.ask(text)
@@ -373,21 +420,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if recorder.isRecording {
             recorder.stop()
         } else {
-            startListening()
+            // В компактном режиме ⌥Space не разворачивает главное окно:
+            // человек свернул Еву именно ради круга.
+            startListening(present: !isCompact)
         }
     }
 
     /// `followUp: true` — автоматическое включение после ответа (задача 0190).
     /// Отличие от ⌥Space: окно не поднимаем и не перехватываем фокус, а
     /// тишина до первого слова считается по настройке, а не 6 с.
-    private func startListening(followUp: Bool = false) {
+    ///
+    /// `present: false` — не показывать главное окно (компактный режим:
+    /// запись включена двойным кликом по кругу).
+    private func startListening(followUp: Bool = false, present: Bool = true) {
         // Двух захватов одновременно быть не должно: ожидание отпускает
         // микрофон до того, как запись его займёт.
         wakeSync?.cancel()
         if wake.isRunning {
             wake.stop()
         }
-        window.setWakeWaiting(false)
+        circles.setWakeWaiting(false)
         if followUp {
             // Ответ только что показан; активировать приложение после каждого
             // ответа — навязчиво.
@@ -397,11 +449,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             // Ручное прослушивание отменяет отложенный follow-up.
             followUpArmed = false
-            window.show()
+            if present {
+                window.show()
+            }
             window.showPartial("")
         }
         isFollowUp = followUp
-        window.setFollowUp(followUp)
+        circles.setFollowUp(followUp)
         recorder.start(followUp: followUp)
     }
 
@@ -460,7 +514,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.syncWake(speaking ? "озвучка пошла" : "озвучка кончилась")
         }
         answer.onLevel = { [weak self] level in
-            self?.window.setCircleLevel(CGFloat(level))
+            self?.circles.setLevel(CGFloat(level))
         }
     }
 
@@ -491,7 +545,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.answerEnded = false
             self.followUpArmed = false
             self.isFollowUp = false
-            self.window.setFollowUp(false)
+            self.circles.setFollowUp(false)
             // Серверу — явный POST /api/cancel (задача 0185): обрыв SSE тоже
             // отменяет, но флаг в C-рантайме надёжнее и виден в метриках.
             self.cancelServerGeneration()
@@ -501,7 +555,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.awaitingFirstToken = false
             self.awaitingAudio = false
             self.clearVisualError()
-            self.window.setCircleLevel(0)
+            self.circles.setLevel(0)
             self.refreshVisualState("стоп по кнопке")
             self.updateStatusIcon()
             self.syncWake("стоп по кнопке", after: 0.2)
@@ -512,6 +566,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         window.onStopVoice = { [weak self] in
             self?.answer.stopVoice()
+        }
+        window.onCollapse = { [weak self] in
+            self?.collapseToCompact(reason: "кнопка «Свернуть»")
+        }
+    }
+
+    /// Компактный режим (задача 0188). Обратные вызовы ведут в те же методы,
+    /// что и обычные действия: второго «слушать» или второго «развернуть» нет.
+    private func wireCompact() {
+        compact.onExpand = { [weak self] in
+            self?.expandFromCompact(reason: "клик по кругу")
+        }
+        compact.onToggleListening = { [weak self] in
+            self?.toggleListeningInCompact()
+        }
+        compact.onSettings = { [weak self] in
+            self?.settingsWindow.show()
+        }
+        compact.onQuit = { [weak self] in
+            self?.quit()
+        }
+    }
+
+    // MARK: - Компактный режим
+
+    @objc private func collapseToCompactAction() {
+        collapseToCompact(reason: "⌘M")
+    }
+
+    @objc private func expandAction() {
+        if isCompact {
+            expandFromCompact(reason: "меню «Вид»")
+        } else {
+            window.show()
+        }
+    }
+
+    /// Спрятать главное окно и показать маленький круг. Приложение не
+    /// активируется: компактное окно — nonactivatingPanel.
+    private func collapseToCompact(reason: String) {
+        guard !isTerminating else { return }
+        guard !isCompact else {
+            log("вид: уже свёрнут — \(reason) игнорирую")
+            return
+        }
+        isCompact = true
+        // Окно не показываем, но собираем: ответ и статус копятся в нём, и
+        // после разворота человек видит тот же разговор, а не пустое окно.
+        window.prepare()
+        window.hide()
+        compact.show()
+        let frame = compact.frame.map(CompactLayout.description) ?? "?"
+        log("вид: свёрнут — \(reason); круг \(frame), главное окно скрыто")
+    }
+
+    /// Вернуть главное окно, спрятав круг. Это единственный путь разворота,
+    /// поэтому окно и круг не могут оказаться видимыми одновременно.
+    private func expandFromCompact(reason: String) {
+        guard isCompact else {
+            log("вид: уже развёрнут — \(reason) игнорирую")
+            return
+        }
+        isCompact = false
+        compact.hide()
+        window.show()
+        log("вид: развёрнут — \(reason); круг скрыт")
+    }
+
+    /// Двойной клик по кругу — то же, что ⌥Space, но без разворота окна:
+    /// человек свернул Еву именно для того, чтобы она не занимала место.
+    private func toggleListeningInCompact() {
+        if recorder.isRecording {
+            recorder.stop()
+        } else {
+            startListening(present: false)
         }
     }
 
@@ -526,6 +655,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func settingsChanged() {
         window.reloadFromSettings()
+        // Галочка «Анимация круга» действует и на компактный круг.
+        circles.setAnimationEnabled(Settings.shared.animateCircle)
         // Человек мог включить галочку уже после отказа в правах — даём
         // ожиданию ещё один шанс.
         wakeSuppressed = false
@@ -548,7 +679,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard let server = effectiveServerURL else {
-            window.show()
+            if !isCompact { window.show() }
             let message = "адрес сервера непонятен: \(Settings.shared.serverText) — откройте настройки"
             window.setStatus(message, isError: true)
             showVisualError(message)
@@ -559,7 +690,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             model: effectiveModel,
             maxTokens: Settings.shared.maxTokens
         )
-        window.show()
+        // В компактном режиме окно не всплывает на каждый ответ: вопрос и
+        // ответ обновляют скрытое окно, а на экране остаётся круг.
+        if !isCompact { window.show() }
         window.showQuestion(trimmed)
         window.beginAnswer()
         log("вопрос (\"\(trimmed.prefix(120))\"): модель=\(config.model.storageValue) "
@@ -574,7 +707,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         answerEnded = false
         followUpArmed = false
         isFollowUp = false
-        window.setFollowUp(false)
+        circles.setFollowUp(false)
         clearVisualError()
         refreshVisualState("вопрос ушёл")
         syncWake("вопрос ушёл")
@@ -625,14 +758,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wake.onIssue = { [weak self] message in
             guard let self else { return }
             self.wakeSuppressed = true
-            self.window.setWakeWaiting(false)
+            self.circles.setWakeWaiting(false)
             guard Settings.shared.wakeWord else { return }
             self.window.setStatus("ожидание: \(message)", isError: true)
         }
         // Подъём слушателя асинхронный (сначала права и офлайн-модель),
         // поэтому пульсацию круга включает именно это событие.
         wake.onState = { [weak self] running in
-            self?.window.setWakeWaiting(running)
+            self?.circles.setWakeWaiting(running)
         }
     }
 
@@ -642,9 +775,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isTerminating, Settings.shared.wakeWord else { return }
         guard !isRecording, !isSpeaking else { return }
         wake.stop()
-        window.setWakeWaiting(false)
+        circles.setWakeWaiting(false)
         log("wake: перехожу к записи (\(text.prefix(80)))")
-        startListening()
+        startListening(present: !isCompact)
     }
 
     /// Единая точка решения «должно ли сейчас работать ожидание». Причина
@@ -680,7 +813,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             log("wake: ожидание выключается — \(reason)")
             wake.stop()
         }
-        window.setWakeWaiting(wake.isRunning)
+        circles.setWakeWaiting(wake.isRunning)
     }
 
     // MARK: - Follow-up: слушаю после ответа (задача 0190)
@@ -771,7 +904,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard next != visualState else { return }
         log("круг: \(visualState.rawValue) → \(next.rawValue) — \(reason)")
         visualState = next
-        window.setVisualState(next)
+        circles.setState(next)
     }
 
     /// Красная вспышка ~1,2 с, потом круг возвращается к настоящему состоянию.
@@ -782,7 +915,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let token = errorToken
         awaitingFirstToken = false
         awaitingAudio = false
-        window.setVisualError(message)
+        circles.showError(message)
         // В статусе ошибка уже с префиксом «ошибка:», в журнале префикс не
         // дублируем — состояние и так названо.
         let prefix = "ошибка: "

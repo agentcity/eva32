@@ -10,6 +10,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var voicePopup: NSPopUpButton!
     private var speakCheck: NSButton!
     private var animateCheck: NSButton!
+    private var startCompactCheck: NSButton!
     private var wakeCheck: NSButton!
     private var followUpCheck: NSButton!
     private var followUpPopup: NSPopUpButton!
@@ -89,6 +90,22 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             action: #selector(animateChanged)
         )
         animateCheck.controlSize = .small
+
+        // Запуск сразу в компактном режиме (задача 0188): по умолчанию
+        // выключено, обычный запуск по-прежнему показывает главное окно.
+        startCompactCheck = NSButton(
+            checkboxWithTitle: "Запускаться свёрнутым (только круг)",
+            target: self,
+            action: #selector(startCompactChanged)
+        )
+        startCompactCheck.controlSize = .small
+
+        let startCompactHint = NSTextField(
+            wrappingLabelWithString: "при следующем запуске — без главного окна, "
+                + "круг в правом нижнем углу; ⌘M сворачивает и сейчас"
+        )
+        startCompactHint.font = .systemFont(ofSize: 11)
+        startCompactHint.textColor = .secondaryLabelColor
 
         wakeCheck = NSButton(
             checkboxWithTitle: "Слушать „Привет, Ева“",
@@ -173,6 +190,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             row("Голос", voicePopup),
             row("", speakCheck),
             row("", animateCheck),
+            row("", startCompactCheck),
+            row("", startCompactHint),
             row("", wakeCheck),
             row("", wakeHint),
             row("", followUpCheck),
@@ -221,6 +240,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         serverField.stringValue = Settings.shared.serverText
         speakCheck.state = Settings.shared.speakReplies ? .on : .off
         animateCheck.state = Settings.shared.animateCircle ? .on : .off
+        startCompactCheck.state = Settings.shared.startCompact ? .on : .off
         wakeCheck.state = Settings.shared.wakeWord ? .on : .off
         followUpCheck.state = Settings.shared.followUpListen ? .on : .off
         // Пауза может быть выставлена и вручную (`defaults write`) — тогда
@@ -344,6 +364,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         Settings.shared.speakReplies = speakCheck.state == .on
         Settings.shared.animateCircle = animateCheck.state == .on
+        Settings.shared.startCompact = startCompactCheck.state == .on
         Settings.shared.wakeWord = wakeCheck.state == .on
         Settings.shared.followUpListen = followUpCheck.state == .on
         let pauseIndex = followUpPopup.indexOfSelectedItem
@@ -355,6 +376,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         log("настройки: сервер=\(base.absoluteString) модель=\(Settings.shared.model.storageValue) "
             + "голос=\(Settings.shared.voice) озвучка=\(Settings.shared.speakReplies) "
             + "анимация=\(Settings.shared.animateCircle) "
+            + "старт-свёрнутым=\(Settings.shared.startCompact) "
             + "ожидание=\(Settings.shared.wakeWord) "
             + "follow-up=\(Settings.shared.followUpListen)/\(Settings.shared.followUpSilence) с")
     }
@@ -409,6 +431,14 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     @objc private func animateChanged() {
         Settings.shared.animateCircle = animateCheck.state == .on
         log("настройки: анимация круга=\(Settings.shared.animateCircle ? "включена" : "выключена")")
+    }
+
+    /// «Запускаться свёрнутым» (задача 0188): действует при следующем запуске,
+    /// текущий вид не меняем — иначе окно закрывалось бы под курсором.
+    @objc private func startCompactChanged() {
+        Settings.shared.startCompact = startCompactCheck.state == .on
+        log("настройки: запускаться свёрнутым="
+            + "\(Settings.shared.startCompact ? "включено" : "выключено")")
     }
 
     /// Ожидание «Привет, Ева» применяется сразу: `AppDelegate` слушает

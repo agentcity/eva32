@@ -15,6 +15,8 @@ import Foundation
 ///   ожиданием „Привет, Ева“» (без микрофона);
 /// * `--selftest-wake-audio N` — N секунд держать микрофон и кольцевой буфер
 ///   без распознавания: замер CPU и проверка остановки `AVAudioEngine`.
+/// * `--selftest-compact` — компактный круг: геометрия, живое окно
+///   (CGWindowList), `visibleFrame`, позиция в UserDefaults (задача 0188).
 enum Launch {
     static let arguments = CommandLine.arguments
 
@@ -40,6 +42,7 @@ enum Launch {
         if arguments.contains("--selftest-text") { return .text }
         if arguments.contains("--selftest-wake") { return .wake }
         if arguments.contains("--selftest-followup") { return .followUp }
+        if arguments.contains("--selftest-compact") { return .compact }
         if let raw = value("--selftest-wake-audio") {
             return .wakeAudio(Double(raw) ?? 10)
         }

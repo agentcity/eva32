@@ -1,4 +1,6 @@
 import AVFoundation
+import AppKit
+import CoreGraphics
 import Foundation
 import Speech
 
@@ -18,6 +20,7 @@ enum SelfTest {
         case wake
         case followUp
         case wakeAudio(Double)
+        case compact
         case version
     }
 
@@ -40,6 +43,8 @@ enum SelfTest {
             return runFollowUp()
         case .wakeAudio(let seconds):
             return await runWakeAudio(seconds: seconds)
+        case .compact:
+            return runCompact()
         case .version:
             print("EVA voice app 0.1.0 (Swift 6.2, AppKit/SwiftUI-free)")
             return 0
@@ -510,7 +515,308 @@ enum SelfTest {
             + Double(usage.ru_stime.tv_sec) + Double(usage.ru_stime.tv_usec) / 1_000_000
     }
 
+    // MARK: - Компактный круг (задача 0188)
+
+    /// Проверяет компактный режим без мышки: геометрию (правый нижний угол,
+    /// зажатие в `visibleFrame` в т.ч. после смены монитора), живое окно
+    /// (CGWindowList: размер, уровень floating, прозрачность), отсутствие
+    /// перехвата фокуса, клики/меню и запоминание позиции в UserDefaults.
+    ///
+    /// Окна создаются в отдельном домене UserDefaults
+    /// (`com.eva32.eva.selftest.compact`), чтобы не трогать позицию настоящего
+    /// круга; домен удаляется в конце. Настоящие жесты мыши проверяются
+    /// человеком, но те же обработчики кликов вызываются здесь напрямую.
+    ///
+    /// Функция намеренно синхронная: AppKit-транзакции WindowServer требуют
+    /// витка главного run loop, а в процессе с `dispatchMain()` (см.
+    /// `runSelfTest`) `await` может вернуть продолжение не на главном потоке.
+    @MainActor
+    private static func runCompact() -> Int32 {
+        var failures = 0
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            print((ok ? "OK   " : "FAIL ") + name + (detail.isEmpty ? "" : " — " + detail))
+            // Сброс буфера: иначе падение ниже по коду съело бы напечатанное
+            // (stdout — файл/пайп).
+            fflush(stdout)
+            if !ok { failures += 1 }
+        }
+
+        let size = CompactLayout.size
+        check("размер круга в пределах 120–160 pt",
+              size >= 120 && size <= 160, "\(size) pt")
+        check("«Запускаться свёрнутым» по умолчанию выключено",
+              !Settings.defaultStartCompact)
+
+        let visible = NSScreen.main?.visibleFrame
+            ?? NSScreen.screens.first?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        print("видимая область: \(CompactLayout.description(visible))")
+
+        // 1. По умолчанию — правый нижний угол с отступом 24 pt.
+        let defaultOrigin = CompactLayout.defaultOrigin(in: visible)
+        check("позиция по умолчанию — правый нижний угол, отступ 24 pt",
+              defaultOrigin.x == visible.maxX - size - CompactLayout.inset
+                && defaultOrigin.y == visible.minY + CompactLayout.inset,
+              "\(defaultOrigin.x),\(defaultOrigin.y)")
+
+        // 2. Улетевшее за край окно зажимается целиком.
+        let clamped = CompactLayout.clampedOrigin(
+            NSPoint(x: -500, y: -500),
+            size: size,
+            in: visible
+        )
+        check("окно за левым/нижним краем зажато в visibleFrame",
+              clamped == NSPoint(x: visible.minX, y: visible.minY),
+              "\(clamped.x),\(clamped.y)")
+
+        let pushed = CompactLayout.clampedOrigin(
+            NSPoint(x: visible.maxX + 500, y: visible.maxY + 500),
+            size: size,
+            in: visible
+        )
+        check("окно за правым/верхним краем зажато (строка меню не перекрыта)",
+              pushed.x == visible.maxX - size && pushed.y == visible.maxY - size,
+              "\(pushed.x),\(pushed.y)")
+
+        // 3. Смена монитора: позиция принадлежит второму экрану — остаётся
+        // внутри него, а не прыгает на основной.
+        let second = NSRect(
+            x: visible.maxX,
+            y: visible.minY,
+            width: 1280,
+            height: 800
+        )
+        let onSecond = CompactLayout.clampedOrigin(
+            NSPoint(x: second.midX, y: second.midY),
+            size: size,
+            visibleFrames: [visible, second],
+            fallback: visible
+        )
+        check("окно на втором экране остаётся в его visibleFrame",
+              second.contains(NSRect(
+                  x: onSecond.x, y: onSecond.y,
+                  width: size, height: size
+              )),
+              "\(onSecond.x),\(onSecond.y)")
+
+        // 4. Второй экран отключили — окно возвращается на основной.
+        let detached = CompactLayout.clampedOrigin(
+            NSPoint(x: second.midX, y: second.midY),
+            size: size,
+            visibleFrames: [visible],
+            fallback: visible
+        )
+        check("после отключения монитора окно зажато в основной экран",
+              visible.contains(NSRect(
+                  x: detached.x, y: detached.y,
+                  width: size, height: size
+              )),
+              "\(detached.x),\(detached.y)")
+
+        // 5. Живое окно. Отдельный домен UserDefaults — настоящая позиция
+        // компактного круга не меняется.
+        let frontBefore = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        // Без finishLaunching у процесса нет связи с WindowServer: окно
+        // считается видимым, но CGWindowList его не видит, а первая же смена
+        // frame падает в AppKit. `application.run()` в самопроверке не нужен.
+        if !app.isRunning {
+            app.finishLaunching()
+        }
+        // 4b. Один источник состояния: два круга (большой и маленький) видят
+        // одно и то же без второй копии логики. Окна не нужны — проверяем
+        // сам хаб и зарегистрированные в нём CircleView.
+        let sharedHub = CircleHub()
+        sharedHub.setAnimationEnabled(false)
+        let bigCircle = CircleView(frame: NSRect(x: 0, y: 0, width: 162, height: 162))
+        let smallCircle = CircleView(frame: NSRect(x: 0, y: 0, width: 140, height: 140))
+        sharedHub.register(bigCircle)
+        sharedHub.register(smallCircle)
+        sharedHub.setState(.thinking)
+        sharedHub.setWakeWaiting(true)
+        sharedHub.setFollowUp(true)
+        check("оба круга получают одно состояние из хаба",
+              bigCircle.visualState == .thinking && smallCircle.visualState == .thinking
+                && bigCircle.wakeWaiting && smallCircle.wakeWaiting
+                && bigCircle.followUpListening && smallCircle.followUpListening,
+              "большой=\(bigCircle.visualState.rawValue), "
+                + "маленький=\(smallCircle.visualState.rawValue)")
+        sharedHub.showError("сеть: проверка")
+        check("ошибка из хаба видна на обоих кругах",
+              bigCircle.visualState == .error && smallCircle.visualState == .error)
+        sharedHub.setState(.listening)
+        check("выход из ошибки — на обоих кругах",
+              bigCircle.visualState == .listening && smallCircle.visualState == .listening)
+
+        let suite = "com.eva32.eva.selftest.compact"
+        guard let testDefaults = UserDefaults(suiteName: suite) else {
+            print("FAIL не создался домен UserDefaults для проверки")
+            return 1
+        }
+        testDefaults.removePersistentDomain(forName: suite)
+
+        let hub = CircleHub()
+        let controller = CompactWindowController(circles: hub, defaults: testDefaults)
+        controller.show()
+        pumpRunLoop(0.5)
+
+        let frame = controller.frame ?? .zero
+        print("живое окно: \(CompactLayout.description(frame)), "
+            + "level=\(controller.windowLevel?.rawValue ?? -1), "
+            + "visible=\(controller.isVisible)")
+        check("компактное окно создано и показано", controller.isVisible)
+        check("размер окна \(Int(size))×\(Int(size)) pt",
+              frame.width == size && frame.height == size,
+              "\(frame.width)×\(frame.height)")
+        check("окно без рамки и nonactivatingPanel",
+              controller.styleMask?.contains(.borderless) == true
+                && controller.styleMask?.contains(.nonactivatingPanel) == true,
+              "\(controller.styleMask?.rawValue ?? 0)")
+        check("уровень floating",
+              controller.windowLevel == .floating,
+              "\(controller.windowLevel?.rawValue ?? -1)")
+        check("фон прозрачный",
+              controller.isOpaque == false
+                && (controller.backgroundColor?.alphaComponent ?? 1) == 0)
+
+        // 6. CGWindowList: окно действительно есть на экране, на уровне
+        // floating. Имена окон без разрешения Screen Recording не читаются,
+        // поэтому ищем по pid, слою и размеру.
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let allWindows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly],
+            kCGNullWindowID
+        ) as? [[String: Any]] ?? []
+        let ours = allWindows.filter { info in
+            guard let owner = info[kCGWindowOwnerPID as String] as? Int else { return false }
+            return Int32(owner) == pid
+        }
+        let compactWindows = ours.filter { info in
+            guard let layer = info[kCGWindowLayer as String] as? Int,
+                  let raw = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: raw as CFDictionary)
+            else { return false }
+            return layer == NSWindow.Level.floating.rawValue
+                && abs(bounds.width - size) < 1
+                && abs(bounds.height - size) < 1
+        }
+        check("CGWindowList: компактное окно на экране (pid \(pid), слой floating)",
+              compactWindows.count == 1,
+              "окон нашего pid: \(ours.count), подходящих: \(compactWindows.count)")
+        if let info = compactWindows.first,
+           let raw = info[kCGWindowBounds as String] as? NSDictionary,
+           let bounds = CGRect(dictionaryRepresentation: raw as CFDictionary) {
+            // CGWindowList отдаёт глобальные координаты с началом в левом
+            // верхнем углу основного экрана (ось Y вниз), AppKit — в левом
+            // нижнем (Y вверх). Переводим, чтобы сравнивать с visibleFrame
+            // честно, а не «похоже на правду».
+            let primaryHeight = NSScreen.screens.first?.frame.maxY ?? 0
+            let appKitFrame = NSRect(
+                x: bounds.minX,
+                y: primaryHeight - bounds.maxY,
+                width: bounds.width,
+                height: bounds.height
+            )
+            print("CGWindowList: \(CompactLayout.description(appKitFrame)) (в координатах AppKit)")
+            let frames = NSScreen.screens.map(\.visibleFrame)
+            check("frame окна не выходит за visibleFrame",
+                  frames.contains { $0.contains(appKitFrame) },
+                  "frame=\(CompactLayout.description(appKitFrame))")
+            check("окно не перекрывает строку меню",
+                  frames.contains { appKitFrame.maxY <= $0.maxY },
+                  "maxY=\(appKitFrame.maxY)")
+            check("CGWindowList и NSWindow согласны про frame",
+                  appKitFrame == frame,
+                  "cg=\(CompactLayout.description(appKitFrame)), ns=\(CompactLayout.description(frame))")
+        }
+
+        let frontAfter = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        check("показ круга не забирает фокус",
+              frontBefore == frontAfter && !app.isActive,
+              "до=\(frontBefore ?? -1), после=\(frontAfter ?? -1), active=\(app.isActive)")
+        check("приложение без иконки в Dock (accessory)",
+              app.activationPolicy() == .accessory)
+
+        // 6b. Клики и контекстное меню: та же разводка, что и у настоящей мыши.
+        var expansions = 0
+        var toggles = 0
+        controller.onExpand = { expansions += 1 }
+        controller.onToggleListening = { toggles += 1 }
+
+        let menuTitles = controller.makeMenu().items
+            .filter { !$0.isSeparatorItem }
+            .map(\.title)
+        check("правое меню: «Развернуть», «Настройки…», «Выход»",
+              menuTitles == ["Развернуть", "Настройки…", "Выход"],
+              "\(menuTitles)")
+
+        // Двойной клик: первый клик отложил разворот, второй его отменил.
+        controller.simulateClickForTest(clickCount: 1)
+        controller.simulateClickForTest(clickCount: 2)
+        pumpRunLoop(NSEvent.doubleClickInterval + 0.2)
+        check("двойной клик — слушать, отложенный разворот отменён",
+              toggles == 1 && expansions == 0,
+              "слушать=\(toggles), развернуть=\(expansions)")
+
+        // Одиночный клик разворачивает (с задержкой doubleClickInterval).
+        controller.simulateClickForTest(clickCount: 1)
+        pumpRunLoop(NSEvent.doubleClickInterval + 0.2)
+        check("одиночный клик разворачивает",
+              expansions == 1 && toggles == 1,
+              "развернуть=\(expansions), слушать=\(toggles)")
+
+        // 7. Позиция запоминается и восстанавливается.
+        let moved = NSPoint(x: visible.minX + 80, y: visible.minY + 120)
+        controller.setFrameOriginForTest(moved)
+        pumpRunLoop(0.15)
+        let savedX = testDefaults.object(forKey: Settings.compactXKey) as? Double
+        let savedY = testDefaults.object(forKey: Settings.compactYKey) as? Double
+        check("позиция перетаскивания записана в UserDefaults",
+              savedX == Double(moved.x) && savedY == Double(moved.y),
+              "\(savedX ?? .nan),\(savedY ?? .nan)")
+
+        let restored = CompactWindowController(circles: hub, defaults: testDefaults)
+        restored.show()
+        pumpRunLoop(0.3)
+        check("позиция восстановлена при новом показе",
+              restored.frame?.origin == moved,
+              "\(restored.frame.map(CompactLayout.description) ?? "?")")
+        restored.hide()
+
+        // 8. Сохранённая позиция с исчезнувшего монитора зажимается.
+        testDefaults.set(9000.0, forKey: Settings.compactXKey)
+        testDefaults.set(9000.0, forKey: Settings.compactYKey)
+        let offscreen = CompactWindowController(circles: hub, defaults: testDefaults)
+        offscreen.show()
+        pumpRunLoop(0.3)
+        let offscreenFrame = offscreen.frame ?? .zero
+        check("сохранённая позиция вне экрана зажата в visibleFrame",
+              NSScreen.screens.contains { $0.visibleFrame.contains(offscreenFrame) },
+              CompactLayout.description(offscreenFrame))
+        offscreen.hide()
+        pumpRunLoop(0.2)
+        check("после скрытия окно не на экране", !offscreen.isVisible)
+
+        controller.hide()
+        testDefaults.removePersistentDomain(forName: suite)
+        print(failures == 0 ? "все проверки компактного круга прошли" : "провалено: \(failures)")
+        return failures == 0 ? 0 : 1
+    }
+
     // MARK: - Значения
+
+    /// Прокрутить главный run loop: WindowServer-транзакции (показ окна, смена
+    /// frame) выполняются только на его витке, а `Task.sleep` в CLI-процессе
+    /// без `NSApp.run()` витков не даёт. Для самопроверки это допустимо:
+    /// других задач на главном акторе в этот момент нет.
+    @MainActor
+    private static func pumpRunLoop(_ seconds: TimeInterval) {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+    }
 
     @MainActor
     private static func serverURL() -> URL? {

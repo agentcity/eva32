@@ -5,7 +5,7 @@ import AppKit
 @MainActor
 final class MainWindowController: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
-    private var circleView: CircleView?
+    private let circles: CircleHub
     private var answerView: NSTextView!
     private var answerScroll: NSScrollView!
     private var thinkView: NSTextView!
@@ -21,14 +21,18 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     private var thinking = ""
     private var expandedThinking = false
-    /// Запоминаем ожидание «Привет, Ева» до сборки окна: слушатель может
-    /// подняться раньше, чем пользователь откроет окно из статус-бара.
-    private var wakeWaiting = false
 
     /// Отправить текст (голосом или с клавиатуры) в чат.
     var onAsk: ((String) -> Void)?
     var onStop: (() -> Void)?
     var onSettings: (() -> Void)?
+    /// Свернуть в компактный круг (задача 0188).
+    var onCollapse: (() -> Void)?
+
+    init(circles: CircleHub) {
+        self.circles = circles
+        super.init()
+    }
 
     // MARK: - Показ
 
@@ -37,6 +41,19 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         guard let panel else { return }
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Спрятать главное окно, не закрывая его: компактный режим оставляет
+    /// только круг, а окно с ответом возвращается по клику.
+    func hide() {
+        panel?.orderOut(nil)
+    }
+
+    /// Собрать окно, не показывая его. Нужно компактному режиму: вопрос и
+    /// ответ копятся в скрытом окне, чтобы при развороте всё было на месте
+    /// (задача 0188).
+    func prepare() {
+        if panel == nil { build() }
     }
 
     func showAndFocusInput() {
@@ -84,40 +101,6 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         statusLabel?.textColor = isError ? .systemRed : .secondaryLabelColor
     }
 
-    // MARK: - Большой круг
-
-    /// Смена визуального состояния (AppDelegate уже залогировал переход).
-    func setVisualState(_ state: EvaCircleState) {
-        circleView?.visualState = state
-    }
-
-    /// Уровень микрофона или озвучки, 0…1.
-    func setCircleLevel(_ level: CGFloat) {
-        circleView?.setLevel(level)
-    }
-
-    /// Красная вспышка с текстом ошибки (полный текст — в статусе шапки).
-    func setVisualError(_ message: String) {
-        circleView?.showError(message)
-    }
-
-    /// Включено фоновое ожидание «Привет, Ева»: круг в `idle` пульсирует.
-    func setWakeWaiting(_ waiting: Bool) {
-        wakeWaiting = waiting
-        circleView?.wakeWaiting = waiting
-    }
-
-    /// Идёт follow-up (задача 0190): микрофон открыт после ответа, круг
-    /// остаётся «слушаю», но чуть приглушён.
-    func setFollowUp(_ active: Bool) {
-        circleView?.followUpListening = active
-    }
-
-    /// При закрытии приложения/окна не оставляем тикающий таймер.
-    func stopCircleAnimation() {
-        circleView?.stopAnimation()
-    }
-
     // MARK: - Сборка окна
 
     private func build() {
@@ -155,10 +138,10 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
         // Новый верхний блок: большой круг состояния. Высота — доля ширины
         // окна (круг масштабируется), но не больше 240 pt и не меньше 110 pt.
+        // Круг регистрируется в общем хабе: компактное окно получает то же
+        // состояние, уровень и ошибки без второй копии логики (задача 0188).
         let circle = CircleView(frame: .zero)
-        circle.animationEnabled = Settings.shared.animateCircle
-        circle.wakeWaiting = wakeWaiting
-        circleView = circle
+        circles.register(circle)
 
         transcriptLabel = NSTextField(wrappingLabelWithString: "")
         transcriptLabel.font = .systemFont(ofSize: 14)
@@ -260,6 +243,16 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         stopButton.bezelStyle = .rounded
         stopButton.controlSize = .small
 
+        // «Свернуть» (задача 0188): главное окно прячется, остаётся круг.
+        let collapseButton = NSButton(
+            title: "Свернуть",
+            target: self,
+            action: #selector(collapseTapped)
+        )
+        collapseButton.bezelStyle = .rounded
+        collapseButton.controlSize = .small
+        collapseButton.toolTip = "Оставить только круг поверх окон (⌘M)"
+
         let settingsButton = NSButton(
             title: "Настройки…",
             target: self,
@@ -268,7 +261,9 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         settingsButton.bezelStyle = .rounded
         settingsButton.controlSize = .small
 
-        let controls = NSStackView(views: [speakCheck, voicePopup, spacer, stopButton, settingsButton])
+        let controls = NSStackView(
+            views: [speakCheck, voicePopup, spacer, stopButton, collapseButton, settingsButton]
+        )
         controls.orientation = .horizontal
         controls.spacing = 8
         controls.distribution = .fill
@@ -348,6 +343,10 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         onStop?()
     }
 
+    @objc private func collapseTapped() {
+        onCollapse?()
+    }
+
     @objc private func settingsTapped() {
         onSettings?()
     }
@@ -366,7 +365,6 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     func reloadFromSettings() {
         speakCheck?.state = Settings.shared.speakReplies ? .on : .off
-        circleView?.animationEnabled = Settings.shared.animateCircle
         selectVoice(Settings.shared.voice)
     }
 

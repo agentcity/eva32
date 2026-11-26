@@ -68,6 +68,13 @@ final class Settings {
     static let followUpKey = "eva.followUpListen"
     /// Сколько секунд тишины терпит follow-up, пока не сказано ни слова.
     static let followUpSilenceKey = "eva.followUpSilence"
+    /// «Запускаться свёрнутым» (задача 0188): на экране сразу только круг.
+    static let startCompactKey = "eva.startCompact"
+    /// Позиция компактного круга (задача 0188) — левый нижний угол окна.
+    /// Хранится не ради настроек в UI, а чтобы круг оставался там, где его
+    /// оставили; при показе зажимается в `visibleFrame`.
+    static let compactXKey = "eva.compactX"
+    static let compactYKey = "eva.compactY"
 
     static let defaultServer = "http://127.0.0.1:8765"
     static let defaultMaxTokens = 256
@@ -77,6 +84,9 @@ final class Settings {
     /// «не успел собраться с мыслью» и «микрофон висит впустую».
     static let followUpSilenceOptions = [8, 12, 20]
     static let defaultFollowUpSilence = 12
+    /// «Запускаться свёрнутым» по умолчанию выключено: обычный запуск
+    /// показывает главное окно (задача 0188).
+    static let defaultStartCompact = false
 
     private let defaults: UserDefaults
 
@@ -95,6 +105,7 @@ final class Settings {
             Settings.wakeWordKey: false,
             Settings.followUpKey: Settings.defaultFollowUpListen,
             Settings.followUpSilenceKey: Settings.defaultFollowUpSilence,
+            Settings.startCompactKey: Settings.defaultStartCompact,
         ])
     }
 
@@ -160,6 +171,15 @@ final class Settings {
 
     /// Та же пауза в секундах — для таймеров `SpeechRecorder`.
     var followUpSilenceValue: Double { Double(followUpSilence) }
+
+    /// «Запускаться свёрнутым» (задача 0188): при старте главное окно не
+    /// показывается, остаётся только круг в правом нижнем углу. По умолчанию
+    /// выключено — флаг `--background` и ручной запуск сохраняют прежнее
+    /// поведение.
+    var startCompact: Bool {
+        get { defaults.bool(forKey: Settings.startCompactKey) }
+        set { store(Settings.startCompactKey, newValue) }
+    }
 
     /// Нормализованный базовый URL сервера без хвостового слэша.
     /// `127.0.0.1:8765` превращается в `http://127.0.0.1:8765`.

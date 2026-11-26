@@ -1255,7 +1255,7 @@
   {
     "id": "0188",
     "title": "Свернуть в круг — мини-окно поверх окон",
-    "status": "pending",
+    "status": "done",
     "file": "0188-compact-floating-circle.md",
     "assignee": "agent:compact-circle"
   },
