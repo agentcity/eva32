@@ -16,7 +16,8 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     /// Иллюстрация сказки (задача 0224) справа от текста ответа. Ширина 0,
     /// пока картинки нет: текст занимает всё место.
     private var taleImage: TaleImageView!
-    private var taleImageWidth: NSLayoutConstraint!
+    private var taleImageExpanded: NSLayoutConstraint!
+    private var taleImageCollapsed: NSLayoutConstraint!
     private var taleImageGap: NSLayoutConstraint!
     /// Ряд «текст ответа + картинка».
     private var answerRow: NSView!
@@ -36,9 +37,9 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     /// Свернуть в компактный круг (задача 0188).
     var onCollapse: (() -> Void)?
 
-    /// Ширина колонки с картинкой: портретные иллюстрации 1024×~1400
-    /// помещаются целиком и не отбирают у текста больше половины ширины.
-    static let taleImageWidth: CGFloat = 190
+    /// Картинка занимает большую часть поля ответа (жалоба: в колонке 190 pt
+    /// иллюстрации были крошечными). Доля высоты поля, не больше этого.
+    static let taleImageHeightRatio: CGFloat = 0.62
     /// Зазор между текстом и картинкой (0, когда картинки нет).
     static let taleImageSpacing: CGFloat = 10
 
@@ -98,7 +99,10 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         if panel == nil { build() }
         guard let taleImage else { return }
         taleImage.isHidden = false
-        taleImageWidth?.constant = MainWindowController.taleImageWidth
+        // Большая картинка НАД текстом: поле не делится на узкую колонку,
+        // иллюстрация занимает широкую область, текст идёт под ней.
+        taleImageCollapsed?.isActive = false
+        taleImageExpanded?.isActive = true
         taleImageGap?.constant = MainWindowController.taleImageSpacing
         // Проявление и кроссфейд — внутри TaleImageView; колонка при этом
         // занимает свою ширину сразу, чтобы текст не «дышал» вёрсткой.
@@ -107,7 +111,8 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     /// Убрать иллюстрацию: текст снова занимает всю ширину.
     func clearTaleImage() {
-        taleImageWidth?.constant = 0
+        taleImageExpanded?.isActive = false
+        taleImageCollapsed?.isActive = true
         taleImageGap?.constant = 0
         taleImage?.isHidden = true
         taleImage?.clear()
@@ -117,7 +122,11 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     /// загружена. Ширина 0 — колонка скрыта (только текст).
     var taleImageState: (visible: Bool, width: CGFloat) {
         let visible = taleImage?.hasImage == true && taleImage?.isHidden == false
-        return (visible, taleImageWidth?.constant ?? 0)
+        // Высоту кадра до первого layout не измерить (окно не показано),
+        // поэтому сообщаем состояние активного констрейнта: он и задаёт
+        // «большая картинка / картинки нет».
+        let expanded = taleImageExpanded?.isActive == true
+        return (visible, expanded ? 1 : 0)
     }
 
     func showQuestion(_ text: String) {
@@ -235,19 +244,26 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         row.addSubview(answerScroll)
         row.addSubview(taleImage)
 
-        taleImageWidth = taleImage.widthAnchor.constraint(equalToConstant: 0)
-        taleImageGap = taleImage.leadingAnchor.constraint(
-            equalTo: answerScroll.trailingAnchor,
+        // Картинка — сверху на всю ширину поля; текст занимает остаток.
+        // Высота: доля высоты ряда (большая иллюстрация) либо 0, когда
+        // картинки нет. Зазор между ними — taleImageGap.
+        taleImageExpanded = taleImage.heightAnchor.constraint(
+            equalTo: row.heightAnchor,
+            multiplier: MainWindowController.taleImageHeightRatio
+        )
+        taleImageCollapsed = taleImage.heightAnchor.constraint(equalToConstant: 0)
+        taleImageCollapsed.isActive = true
+        taleImageGap = answerScroll.topAnchor.constraint(
+            equalTo: taleImage.bottomAnchor,
             constant: 0
         )
         NSLayoutConstraint.activate([
-            answerScroll.topAnchor.constraint(equalTo: row.topAnchor),
             answerScroll.bottomAnchor.constraint(equalTo: row.bottomAnchor),
             answerScroll.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            answerScroll.trailingAnchor.constraint(equalTo: row.trailingAnchor),
             taleImage.topAnchor.constraint(equalTo: row.topAnchor),
-            taleImage.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            taleImage.leadingAnchor.constraint(equalTo: row.leadingAnchor),
             taleImage.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-            taleImageWidth,
             taleImageGap,
         ])
         answerRow = row

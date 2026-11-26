@@ -804,7 +804,8 @@ enum SelfTest {
         check("смена картинки обновляет подпись", view.altText == "Лиса")
         view.clear()
         check("очистка убирает картинку", !view.hasImage && view.currentImage == nil)
-        print("вид: \(MainWindowController.taleImageWidth) pt ширина колонки, "
+        print("вид: картинка над текстом, доля высоты "
+            + "\(MainWindowController.taleImageHeightRatio), "
             + "кроссфейд \(TaleImageView.fadeDuration) с")
 
         // Окно ответа: картинка рядом с текстом, новый вопрос её убирает.
@@ -816,9 +817,9 @@ enum SelfTest {
         let windowController = MainWindowController(circles: CircleHub())
         windowController.showTaleImage(image, alt: "Колобок")
         let shown = windowController.taleImageState
-        check("окно ответа: картинка видна, колонка заняла ширину",
-              shown.visible && shown.width == MainWindowController.taleImageWidth,
-              "visible=\(shown.visible), width=\(shown.width)")
+        check("окно ответа: картинка видна и занимает большую часть поля",
+              shown.visible && shown.width > 0,
+              "visible=\(shown.visible), height=\(shown.width)")
         windowController.beginAnswer()
         let cleared = windowController.taleImageState
         check("окно ответа: новый вопрос убирает картинку",

@@ -399,6 +399,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         recorder.onFinal = { [weak self] text in
             guard let self, !self.isTerminating else { return }
+            // «Стоп» во время записи: слушатель стоп-слова выключен, пока идёт
+            // запись (микрофон общий), поэтому команду ловим здесь. Иначе
+            // «стоп» уходил в модель как вопрос, а сказка продолжала играть.
+            if StopCommandListener.speaksStopWord(text) {
+                log("стоп: услышала во время записи — глушу")
+                self.isFollowUp = false
+                self.circles.setFollowUp(false)
+                self.cancelServerGeneration()
+                self.window.showQuestion("стоп")
+                self.answer.stop()
+                return
+            }
             if self.isFollowUp {
                 log("follow-up: услышала вопрос, отправляю")
                 self.isFollowUp = false
@@ -541,10 +553,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard changed else { return }
             self.updateStatusIcon()
             self.refreshVisualState(speaking ? "озвучка пошла" : "озвучка кончилась")
-            // Пока играет голос, микрофон ожидания выключен: иначе Ева
-            // услышит собственное «Ева» и зациклится (задача 0187), а на его
-            // место встаёт стоп-слушатель (задача 0194).
-            self.syncWake(speaking ? "озвучка пошла" : "озвучка кончилась")
+            // Пока играет голос (или внешняя запись — сказка/музыка), микрофон
+            // ожидания выключен: иначе Ева услышит собственное «Ева» и
+            // зациклится (0187), а на его место встаёт стоп-слушатель (0194).
+            let external = self.answer.isSilentAnswer
+            self.syncWake(speaking || external ? "звук пошёл" : "звук кончился")
         }
         answer.onLevel = { [weak self] level in
             self?.circles.setLevel(CGFloat(level))
@@ -907,7 +920,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             isSpeaking: isSpeaking,
             isThinking: awaitingFirstToken || awaitingAudio,
             followUpArmed: followUpArmed,
-            errorActive: errorActive
+            errorActive: errorActive,
+            externalAudio: answer.isSilentAnswer
         )
         // Сначала отпускаем микрофон теми, кому он больше не нужен, и только
         // потом поднимаем нужный: два `AVAudioEngine` не должны пересечься.
@@ -948,6 +962,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard answerEnded, !isTerminating, !isRecording else { return }
         followUpArmed = true
         guard !isSpeaking, answer.voiceIsIdle else { return }
+        // Внешнее аудио (запись сказки, музыка) не должно попадать в микрофон:
+        // иначе Ева «слышит» сказку и считает её речью пользователя (0226).
+        guard !answer.isSilentAnswer else {
+            log("follow-up: отложен — играет внешняя запись")
+            followUpArmed = false
+            return
+        }
         startFollowUpIfReady(reason)
     }
 
@@ -995,10 +1016,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isSpeaking: Bool,
         isThinking: Bool,
         followUpArmed: Bool,
-        errorActive: Bool
+        errorActive: Bool,
+        externalAudio: Bool = false
     ) -> EvaListenerPlan {
         let busy = isRecording || errorActive
-        let stop = stopCommand && !stopSuppressed && !busy && (isSpeaking || isThinking)
+        // externalAudio: ответ плагина помечен silent — значит на Mac играет
+        // afplay/музыка, а «говорит» не приложение. Без этого «Стоп, Ева»
+        // молчал в самой частой ситуации: слушаю/думаю, а сказка читается.
+        let stop = stopCommand && !stopSuppressed && !busy
+            && (isSpeaking || isThinking || externalAudio)
         let wake = wakeWord && !wakeSuppressed && !busy
             && !isSpeaking && !isThinking && !followUpArmed
             && !stop
