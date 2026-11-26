@@ -103,6 +103,31 @@ class MockAdapter:
         )
 
 
+class PassThroughPlugins:
+    """Рантайм плагинов без фильтров (``plugins/`` не найден или выключен).
+
+    Задача 0207: женский род не должен зависеть от discovery плагинов — ядро
+    применяет ``eva.ru_gender`` само. Дактилотипия повторяет минимум
+    ``PluginRegistry``: ``stream_filter``/``filter_text``.
+    """
+
+    class _Pipeline:
+        def feed(self, text):
+            return text
+
+        def flush(self):
+            return ""
+
+        def __bool__(self):
+            return False
+
+    def stream_filter(self, *, scope="chat"):
+        return self._Pipeline()
+
+    def filter_text(self, text, *, scope="chat"):
+        return text
+
+
 def make_stream_payload(question="Что нового?", use_system=True, sides=None):
     if sides is None:
         sides = [
@@ -748,6 +773,59 @@ class TestChatStream(ServerTestCase):
         elapsed = time.monotonic() - started
         # Последовательно было бы ~2 с (8 кусков по 0.25), параллельно — ~1 с.
         self.assertLess(elapsed, 1.8)
+
+
+class TestFeminineSpeech(ServerTestCase):
+    """Женский род Евы в потоке ответа (задача 0207).
+
+    Модель 3B пишет «я понял», «готов»; сервер обязан отдать странице и
+    истории женские формы, а чужой род (он/ты) и цитаты не трогать.
+    """
+
+    def deltas(self, events, side=0):
+        return "".join(
+            event["text"]
+            for event in events
+            if event["type"] == "delta" and event["side"] == side
+        )
+
+    def test_stream_and_history_are_feminized(self):
+        # Куски нарочно рвут слова: стример держит недописанное слово.
+        self.vtm.pieces = ("Я всё сдел", "ал, я ", "готов", " помочь.")
+        self.ollama.pieces = ("Я пон", "ял.")
+        events, _, _ = self.post_chat_ok()
+        self.assertEqual(self.deltas(events, 0), "Я всё сделала, я готова помочь.")
+        self.assertEqual(self.deltas(events, 1), "Я поняла.")
+
+        # История получает тот же текст, что видел пользователь: следующий
+        # вопрос уходит в модель с женскими формами, а не с «сделал».
+        self.post_chat_ok(make_stream_payload(question="второй вопрос"))
+        second = self.vtm.calls[1]["messages"]
+        self.assertIn(
+            {"role": "assistant", "content": "Я всё сделала, я готова помочь."},
+            second,
+        )
+
+    def test_other_person_and_quotes_are_untouched(self):
+        self.vtm.pieces = ("Он понял, ты готов. «Я не уверен».",)
+        events, _, _ = self.post_chat_ok()
+        self.assertEqual(
+            self.deltas(events, 0), "Он понял, ты готов. «Я не уверен»."
+        )
+
+    def test_plain_answer_is_unchanged(self):
+        # Ответ без первого лица не должен даже переставиться по кускам.
+        self.vtm.pieces = ("При", "вет")
+        events, _, _ = self.post_chat_ok()
+        self.assertEqual(self.deltas(events, 0), "Привет")
+
+    def test_core_feminizes_without_plugins(self):
+        # Плагины не найдены/выключены: включается страховка ядра (0207).
+        self.server.plugins = PassThroughPlugins()
+        self.vtm.pieces = ("Я пон", "ял, ", "готов", ".")
+        events, _, _ = self.post_chat_ok()
+        self.assertEqual(self.deltas(events, 0), "Я поняла, готов.")
+        self.assertNotRegex(self.deltas(events, 0), r"понял(?!а)")
 
 
 class TestChatHistory(ServerTestCase):
@@ -2564,6 +2642,26 @@ class TestTtsEndpoint(TtsServerCase):
         status, _, body = self.post_tts({"text": raw})
         self.assertEqual(status, 200, body[:300])
         self.assertEqual(self.calls[-1]["text"], "Привет заголовок код и ссылка мир")
+
+    def test_feminizes_first_person_before_voice(self):
+        # Silero получает уже женские формы: «я понял» → «я поняла».
+        status, _, body = self.post_tts({"text": "Я понял, я не готов."})
+        self.assertEqual(status, 200, body[:300])
+        self.assertEqual(self.calls[-1]["text"], "Я поняла, я не готова.")
+
+    def test_tts_feminizes_without_plugins(self):
+        # Прямой /api/tts без плагина рода: ядро применяет feminize само.
+        self.server.plugins = PassThroughPlugins()
+        status, _, body = self.post_tts({"text": "Я понял."})
+        self.assertEqual(status, 200, body[:300])
+        self.assertEqual(self.calls[-1]["text"], "Я поняла.")
+
+    def test_tts_keeps_other_person_and_code(self):
+        status, _, body = self.post_tts({"text": "Он понял, ты готов: `я понял`"})
+        self.assertEqual(status, 200, body[:300])
+        # Чужой род не трогаем; код в бэктиках не переписываем,
+        # а из озвучки бэктики убирает чистка разметки.
+        self.assertEqual(self.calls[-1]["text"], "Он понял, ты готов: я понял")
 
     def test_unclosed_think_is_not_spoken(self):
         status, _, _ = self.post_tts({"text": "Ответ.<think>долгое рассуждение"})
