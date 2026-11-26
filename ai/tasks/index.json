@@ -1363,5 +1363,12 @@
     "status": "done",
     "file": "0204-metal-phase3.md",
     "assignee": "agent:metal3"
+  },
+  {
+    "id": "0205",
+    "title": "Числа в слова перед озвучкой",
+    "status": "in_progress",
+    "file": "0205-tts-numbers.md",
+    "assignee": "agent:tts-numbers"
   }
 ]
