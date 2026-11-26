@@ -4811,6 +4811,12 @@ typedef struct {
     float    *yt;         // [rows * C] транспонированный выход
     size_t    xcap, ycap; // ёмкости xt/yt, float
     batch_moe_ws moe_ws;  // рабочие буферы MOE, переживают пачки (0181)
+    // 0214: арена — mmap, а не calloc: Metal берёт её zero-copy буфером только
+    // со страничного выравнивания, и тогда батчевые GEMM пишут прямо сюда.
+    size_t    mem_bytes;  // байт арены (с запасом на хвост пачки)
+    int       gpu_npend;  // 0214: сколько dst ждут GPU-очередь
+    int       gpu_failed; // 0214: группа GEMM не досчиталась (ошибка Metal)
+    uint32_t  gpu_pend[8];// их индексы (не больше восьми без сброса)
 } batch_scratch;
 
 // Прямоугольник упакованного слота: [off, off+sz) занят тензором до pc end.
@@ -4842,6 +4848,10 @@ static void batch_free(batch_scratch *b) {
     free(b->first);
     free(b->last);
     free(b->live_in);
+#if VTM_WITH_METAL
+    // 0214: арену отпускаем до free: no-copy буфер не должен пережить память.
+    if (b->mem) vtm_metal_batch_arena_drop(b->mem);
+#endif
     free(b->mem);
     free(b->real);
     free(b->xt);
@@ -5079,15 +5089,51 @@ done:
     return ok;
 }
 
+// 0214: память пачки — странично-выровненная. Только так Metal берёт её
+// zero-copy буфером, а значит батчевый GEMM может писать результат прямо в
+// активации пачки. До 0214 хост транспонировал вход в b->xt и разносил выход
+// по слотам токенов — это была примерно половина «хостового» времени prefill
+// (3,62 с из 8,65 на 250 токенах). calloc для этого не годится: выравнивание
+// у него только 16 байт.
+static float *batch_arena_alloc(size_t bytes) {
+    void *p = NULL;
+    long page = sysconf(_SC_PAGESIZE);
+    size_t rounded;
+
+    if (page <= 0) page = 4096;
+    rounded = (bytes + (size_t)page - 1u) & ~((size_t)page - 1u);
+    if (rounded == 0) rounded = (size_t)page;
+    if (posix_memalign(&p, (size_t)page, rounded) != 0 || !p)
+        return (float *)calloc(bytes ? bytes : sizeof(float), 1);
+    // Арена обязана быть нулевой, как был calloc: на «непрочитанных до записи»
+    // тензорах это не важно, но так поведение пачки не зависит от классификации
+    // (и запасные токены хвоста читаются ядром как нули).
+    memset(p, 0, rounded);
+    return (float *)p;
+}
+
 // Выделить память пачки и разложить по копиям текущее состояние активаций
 // (каждый токен начинает проход с того, чем закончил предыдущий).
 static int batch_scratch_alloc(vtm_t *m, batch_scratch *b, int C) {
-    size_t total = (size_t)C * b->slot;
+    size_t n_tok = (size_t)C;
+    size_t bytes;
     uint32_t k;
 
     b->C = C;
-    b->mem = (float *)calloc(total ? total : 1u, sizeof(float));
+#if VTM_WITH_METAL
+    n_tok += (size_t)vtm_metal_gemm_pad();
+#endif
+    if (b->slot > SIZE_MAX / sizeof(float) / (n_tok ? n_tok : 1u)) return 0;
+    bytes = n_tok * b->slot * sizeof(float);
+    b->mem_bytes = bytes;
+    b->mem = batch_arena_alloc(bytes);
     if (!b->mem) return 0;
+#if VTM_WITH_METAL
+    // 0214: одна zero-copy привязка арены на пачку — дальше батчевые GEMM
+    // передают только смещения тензоров в ней. Отказ не смертелен: матрицы
+    // уйдут CPU-путём (vtm_metal_qk_gemm_arena вернёт 1).
+    (void)vtm_metal_batch_arena(b->mem, bytes);
+#endif
     for (k = 0; k < b->n_local; k++) {
         uint32_t t = b->idx[k];
         b->real[t] = m->tensors[t].f32;
@@ -5570,6 +5616,60 @@ static int batch_tmv_ready(vtm_t *m, const vtm_instr *in,
     return 1;
 }
 
+// --- 0214: очередь GPU-матриц пачки ----------------------------------------
+//
+// Подряд идущие матрицы слоя (q/k/v, gate/up) кодируются в ОДИН командный
+// буфер: CPU ставит dispatch'и и ждёт GPU только когда числа правда нужны —
+// перед первой не-GEMM инструкцией (она читает активации на хосте), перед
+// копированием «умершего» тензора в машину и в конце пачки. До 0214 каждая
+// матрица была отдельным командным буфером с ожиданием.
+//
+// Диагностика: сколько времени ушло на ожидание — vtm_metal_stats.wait_ns;
+// сколько суммарно занял GPU — там же gpu_ns (см. bench_backend --metal).
+#if VTM_WITH_METAL
+static int batch_gpu_flush(batch_scratch *b) {
+    int rc;
+
+    if (b->gpu_failed) return -1;
+    if (b->gpu_npend == 0) return 0;
+    b->gpu_npend = 0;
+    rc = vtm_metal_gemm_flush();
+    if (rc != 0) b->gpu_failed = 1;
+    return rc;
+}
+
+static void batch_gpu_track(batch_scratch *b, uint32_t t) {
+    if (b->gpu_npend >= (int)(sizeof b->gpu_pend / sizeof b->gpu_pend[0]))
+        (void)batch_gpu_flush(b);
+    if (b->gpu_npend < (int)(sizeof b->gpu_pend / sizeof b->gpu_pend[0]))
+        b->gpu_pend[b->gpu_npend++] = t;
+}
+
+// Правда ли, что на этом pc в машину копируется тензор, который ещё пишет GPU:
+// только тогда ждать обязательно (у «умер на чтении» тензора значение уже
+// готово — его писал кто-то раньше).
+static int batch_gpu_store_hazard(const batch_scratch *b, uint32_t pc) {
+    int q;
+    uint32_t k;
+
+    if (b->gpu_npend == 0) return 0;
+    for (k = 0; k < b->n_local; k++) {
+        uint32_t t = b->idx[k];
+
+        if (b->last[t] != pc) continue;
+        for (q = 0; q < b->gpu_npend; q++)
+            if (b->gpu_pend[q] == t) return 1;
+    }
+    return 0;
+}
+#else
+// Сборка без Metal (в т.ч. харнессы в тестах): макросы-заглушки, чтобы
+// -Werror не ругался на неиспользуемые функции.
+#define batch_gpu_flush(b)           ((void)(b), 0)
+#define batch_gpu_store_hazard(b, pc) ((void)(b), (void)(pc), 0)
+#define batch_gpu_track(b, t)        ((void)(b), (void)(t))
+#endif
+
 static vtm_status batch_tmv_apply(vtm_t *m, uint32_t pc,
                                   const vtm_instr *in,
                                   batch_scratch *b, int *handled) {
@@ -5580,6 +5680,32 @@ static vtm_status batch_tmv_apply(vtm_t *m, uint32_t pc,
     *handled = 0;
     if (!batch_tmv_ready(m, in, b, &rows, &cols, &tr)) return VTM_OK;
     w = &m->tensors[in->a];
+#if VTM_WITH_METAL
+    // 0214: нулевые копии. Ядро само читает вход пачки по шагу слота и пишет
+    // выход туда же — ни транспонирования входа, ни разноски выхода на хосте
+    // (до 0214 это была примерно половина «хостового» времени prefill).
+    if (vtm_metal_active() && !tr
+        && (w->kind == VTM_TENSOR_Q4K || w->kind == VTM_TENSOR_Q6K)
+        && w->qblocks) {
+        const float *x0 = batch_src(m, b, in->b, 0);
+        float *y0 = b->mem + b->off[in->dst];
+        int xs = b->local[in->b] ? (int)b->slot : 0;
+
+        if (vtm_metal_qk_gemm_arena(w->kind == VTM_TENSOR_Q4K ? 0 : 1,
+                                    qk_blocks(w), NULL, rows, cols, b->C, x0,
+                                    xs, y0, (int)b->slot) == 0) {
+            batch_gpu_track(b, in->dst);
+            *handled = 1;
+            return VTM_OK;
+        }
+        // Не взялось (старый metallib, выравнивание, буфер не zero-copy):
+        // ниже — прежний путь с копиями. Ошибка Metal тоже здесь: он уже
+        // выключил режим, а vtm_metal_active() выше это отсечёт на следующей.
+    }
+#endif
+    // CPU-путь читает и пишет активации пачки: незакрытая группа обязана быть
+    // посчитана, иначе она затрёт те же места арены из-под CPU.
+    if (batch_gpu_flush(b) != 0) return VTM_E_UNSUPPORTED;
     xn = (size_t)cols * (size_t)b->C;
     yn = (size_t)rows * (size_t)b->C;
     if (!batch_buf(&b->xt, &b->xcap, xn) || !batch_buf(&b->yt, &b->ycap, yn))
@@ -5681,6 +5807,70 @@ static int batch_mm_ready(vtm_t *m, const vtm_instr *in,
     return 1;
 }
 
+// 0214: attention пачки на GPU. Граф модели — декодный (q_len == 1 на токен),
+// поэтому пачка = C независимых «декодных» вниманий: у токена i видимы ключи
+// [max(0, pos+imm+1-win), pos+imm], что ядро vtm_attn_prefill и считает.
+// K/V всех токенов пачки уже в кольце (KVW идёт раньше по графу).
+static vtm_status batch_attn_apply(vtm_t *m, uint32_t pc, const vtm_instr *in,
+                                   batch_scratch *b, int pos0, int *handled) {
+#if VTM_WITH_METAL
+    const vtm_tensor *q, *k, *v, *out;
+    int heads, hd, kv_dim, n_kv, ctx, win;
+    long long first;
+
+    *handled = 0;
+    if (!vtm_metal_active()) return VTM_OK;
+    if (in->a == VTM_NO_TENSOR || in->b == VTM_NO_TENSOR
+        || in->c == VTM_NO_TENSOR || in->dst == VTM_NO_TENSOR)
+        return VTM_OK;
+    if (in->a >= m->n_tensors || in->b >= m->n_tensors
+        || in->c >= m->n_tensors || in->dst >= m->n_tensors)
+        return VTM_OK;
+    if (!b->local[in->dst] || !b->local[in->a] || b->local[in->b]
+        || b->local[in->c])
+        return VTM_OK;
+    q = &m->tensors[in->a];
+    k = &m->tensors[in->b];
+    v = &m->tensors[in->c];
+    out = &m->tensors[in->dst];
+    if (q->ndim != 3 || out->ndim != 3 || k->ndim != 2 || v->ndim != 2)
+        return VTM_OK;
+    // Только декодная форма: одна строка Q на токен (иначе длина Q — пачка).
+    if (q->dims[1] != 1 || out->dims[1] != 1) return VTM_OK;
+    if (out->dims[0] != q->dims[0] || out->dims[2] != q->dims[2])
+        return VTM_OK;
+    heads = (int)q->dims[0];
+    hd = (int)q->dims[2];
+    ctx = (int)k->dims[0];
+    kv_dim = (int)k->dims[1];
+    if (!q->f32 || !out->f32 || !k->f32 || !v->f32) return VTM_OK;
+    if ((int)v->dims[0] != ctx || (int)v->dims[1] != kv_dim) return VTM_OK;
+    if (hd <= 0 || hd > 256 || kv_dim <= 0 || kv_dim % hd != 0) return VTM_OK;
+    n_kv = kv_dim / hd;
+    if (n_kv <= 0 || heads % n_kv != 0) return VTM_OK;
+    win = (int)kv_window(m, (uint32_t)ctx);
+    if (win <= 0) return VTM_OK;
+    first = (long long)pos0 + (long long)in->imm;
+    if (first < 0) return VTM_OK;
+    {
+        float *o0 = b->mem + b->off[in->dst];
+        const float *q0 = b->mem + b->off[in->a];
+
+        if (vtm_metal_attn_prefill(o0, q0, k->f32, v->f32, heads, n_kv, hd,
+                                   kv_dim, win, b->C, (int)first,
+                                   (int)b->slot, (int)b->slot) == 0) {
+            batch_gpu_track(b, in->dst);
+            *handled = 1;
+        }
+    }
+    (void)pc;
+    return VTM_OK;
+#else
+    (void)m; (void)pc; (void)in; (void)b; (void)pos0; (void)handled;
+    return VTM_OK;
+#endif
+}
+
 static vtm_status batch_mm_apply(vtm_t *m, uint32_t pc,
                                  const vtm_instr *in,
                                  batch_scratch *b, int *handled) {
@@ -5691,6 +5881,41 @@ static vtm_status batch_mm_apply(vtm_t *m, uint32_t pc,
     *handled = 0;
     if (!batch_mm_ready(m, in, b, &mm, &kk)) return VTM_OK;
     a = &m->tensors[in->a];
+#if VTM_WITH_METAL
+    // 0214: то же для tied lm_head — Q4_K/Q6_K/int8 прямо в арену.
+    if (vtm_metal_active()
+        && (a->kind == VTM_TENSOR_Q4K || a->kind == VTM_TENSOR_Q6K
+            || a->kind == VTM_TENSOR_INT8)
+        && (a->kind == VTM_TENSOR_INT8 ? (a->i8 && a->scales)
+                                       : a->qblocks != NULL)) {
+        const float *x0 = batch_src(m, b, in->b, 0);
+        float *y0 = b->mem + b->off[in->dst];
+        int xs = b->local[in->b] ? (int)b->slot : 0;
+        int C = b->C;
+        int kind = a->kind == VTM_TENSOR_Q4K ? 0
+                 : (a->kind == VTM_TENSOR_Q6K ? 1 : 2);
+        const void *wb = kind == 2 ? (const void *)a->i8 : qk_blocks(a);
+
+        // 0214: если dst этой MM больше никто не тронет (в графе это tied
+        // lm_head — после него только HALT/сэмплинг), в машину попадёт лишь
+        // слот ПОСЛЕДНЕГО токена пачки (batch_store_one). Значит, остальные
+        // C-1 токенов считать не нужно: 250 токенов 3B — это 77 ГMAC впустую.
+        if (b->last[in->dst] == pc && b->local[in->dst] && C > 1) {
+            x0 = batch_src(m, b, in->b, C - 1);
+            y0 = b->mem + (size_t)(C - 1) * b->slot + b->off[in->dst];
+            xs = 0;             // один вектор на все токены (их один)
+            C = 1;
+        }
+        if (vtm_metal_qk_gemm_arena(kind, wb,
+                                    kind == 2 ? a->scales : NULL, mm, kk,
+                                    C, x0, xs, y0, (int)b->slot) == 0) {
+            batch_gpu_track(b, in->dst);
+            *handled = 1;
+            return VTM_OK;
+        }
+    }
+#endif
+    if (batch_gpu_flush(b) != 0) return VTM_E_UNSUPPORTED;
     bn = (size_t)kk * (size_t)b->C;
     yn = (size_t)mm * (size_t)b->C;
     if (!batch_buf(&b->xt, &b->xcap, bn) || !batch_buf(&b->yt, &b->ycap, yn))
@@ -5874,6 +6099,8 @@ static vtm_status batch_moe_apply(vtm_t *m, uint32_t pc, const vtm_instr *in,
 
     *handled = 0;
     if (C < 1 || !moe_batch_enabled()) return VTM_OK;
+    // 0214: MOE-пачка считает на CPU и читает активации — дождаться GPU.
+    if (batch_gpu_flush(b) != 0) return VTM_E_UNSUPPORTED;
     // dst — активация токена: писать в общий тензор «всей пачкой» нельзя
     // (поштучный путь делает y += acc на каждый токен, то есть копит сумму).
     if (in->dst == VTM_NO_TENSOR || in->dst >= b->n_tensors
@@ -6186,6 +6413,9 @@ static vtm_status batch_token_op(vtm_t *m, uint32_t pc, const vtm_instr *in,
     int j;
     vtm_status st = VTM_OK;
 
+    // 0214: любая поштучная инструкция читает/пишет активации на хосте —
+    // сначала дожидаемся незакрытой GPU-группы.
+    if (batch_gpu_flush(b) != 0) return VTM_E_UNSUPPORTED;
     for (j = 0; j < b->C; j++) {
         m->position = pos0 + j;
         m->input_token = ids[j];
@@ -6237,6 +6467,8 @@ static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
     int bt_trace = batch_trace_enabled();
 
     b->C = C;
+    b->gpu_npend = 0;    // 0214: очередь GEMM этой пачки начинается пустой
+    b->gpu_failed = 0;
     m->halted = 0;
     m->error[0] = '\0';
     batch_reinit(m, b);
@@ -6269,6 +6501,13 @@ static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
             if (st == VTM_OK && !handled)
                 st = batch_token_op(m, pc, in, b, ids, pos0);
             break;
+        case VTM_OP_ATTN:
+            // 0214: attention пачки на GPU (был самый дорогой CPU-опкод
+            // prefill: 25% стены на 250 токенах, 40% на 500).
+            st = batch_attn_apply(m, pc, in, b, pos0, &handled);
+            if (st == VTM_OK && !handled)
+                st = batch_token_op(m, pc, in, b, ids, pos0);
+            break;
         case VTM_OP_HALT:
             m->halted = 1;
             halted = 1;
@@ -6282,10 +6521,19 @@ static vtm_status batch_chunk(vtm_t *m, batch_scratch *b, const int32_t *ids,
             g_bt_calls[in->opcode]++;
         }
         if (st != VTM_OK) break;
+        // 0214: если на этом pc «умирает» тензор, который ещё пишет GPU, —
+        // сначала ждём, иначе копирование в машину прочитает недописанное.
+        if (batch_gpu_store_hazard(b, pc) && batch_gpu_flush(b) != 0) {
+            st = VTM_E_UNSUPPORTED;
+            break;
+        }
         // Тензоры, для которых это последнее касание, надо вернуть в машину
         // сейчас: дальше их область в слоте переиспользует следующий тензор.
         batch_store_ended(m, b, pc);
     }
+    // Хвост группы: последняя матрица слоя должна быть посчитана до возврата
+    // управления (после пачки машина читает логиты и K/V).
+    if (st == VTM_OK && batch_gpu_flush(b) != 0) st = VTM_E_UNSUPPORTED;
     batch_unbind(m, b);
     // Всё остальное уже отдано машине в момент последнего касания
     // (batch_store_ended); отдельных «живых на конце» тензоров нет: последнее

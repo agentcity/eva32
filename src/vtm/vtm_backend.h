@@ -93,6 +93,46 @@ int vtm_metal_i8_gemv(float *y, const int8_t *q, const float *scales,
 int vtm_metal_qk_gemm(int kind, float *y, const void *w, const float *scales,
                       const float *x, int rows, int cols, int n_tokens);
 
+// --- 0214: батчевый GEMM в арену пачки --------------------------------------
+//
+// Тот же GEMM, но вход и выход — со шагом на токен (x_stride/y_stride в
+// float), а не упакованные: interp.c держит активации пачки в одной mmap-арене,
+// Metal берёт её zero-copy буфером, поэтому ни транспонирования входа, ни
+// разноски выхода на хосте нет. x_stride = 0 — один вектор на все токены.
+//
+// dispatch'и копятся в ОДНОМ командном буфере (vtm_metal_gemm_flush): подряд
+// идущие матрицы слоя (q/k/v, gate/up) считаются без ожидания между ними.
+// 0 — поставлено в очередь (числа готовы после flush); 1 — не взялся (старый
+// metallib, форма, выравнивание, буфер не zero-copy) — считать CPU-путём;
+// -1 — Metal отказал (тоже CPU-путь). Пока очередь не закрыта, арену читать
+// нельзя: её пишет GPU.
+int vtm_metal_qk_gemm_arena(int kind, const void *w, const float *scales,
+                            int rows, int cols, int n_tokens,
+                            const float *x, int x_stride,
+                            float *y, int y_stride);
+// Закрыть группу и дождаться. 0 — всё посчитано (или очередь пуста),
+// -1 — командный буфер не завершился (результаты пачки недостоверны).
+int vtm_metal_gemm_flush(void);
+// 0214: attention пачки — C независимых «декодных» вниманий (у токена i
+// видимы ключи до pos0+i включительно). q/out — по слоту на токен (stride),
+// K/V — кольцевой кэш модели. 0 — dispatch в той же очереди, что GEMM
+// (один командный буфер на группу), 1 — не взялся, -1 — Metal отказал.
+int vtm_metal_attn_prefill(float *out, const float *q, const float *kc,
+                           const float *vc, int n_heads, int n_kv_heads,
+                           int head_dim, int kv_dim, int win, int n_tokens,
+                           int pos0, int q_stride, int out_stride);
+// Сколько токенов-«пустышек» нужно арене в хвосте: тайловое ядро варианта NT
+// читает/пишет ровно NT токенов, даже если в хвосте пачки их меньше.
+int vtm_metal_gemm_pad(void);
+// Привязать арену пачки к Metal один раз на прогон (zero-copy MTLBuffer поверх
+// странично-выровненной памяти). Пока арена привязана, vtm_metal_qk_gemm_arena
+// передаёт в ядро только смещение тензора — иначе пришлось бы создавать
+// no-copy буфер на каждую матрицу (драйвер отображает тысячи страниц, это
+// дороже самого GEMM). 0 — привязана, -1 — не вышло (пачка пойдёт CPU-путём).
+int vtm_metal_batch_arena(const void *ptr, size_t bytes);
+// Отпустить арену перед free()/munmap её памяти (ptr == NULL — все).
+void vtm_metal_batch_arena_drop(const void *ptr);
+
 // Отложенная очередь декода (фаза 2): interp.c собирает подряд идущие GEMV в
 // один MTLCommandBuffer и ждёт результат только когда он нужен CPU. Между
 // begin/end сессией владеет один поток; вторая попытка begin вернёт -1 и
@@ -170,6 +210,7 @@ typedef struct vtm_metal_stats {
     uint64_t defer_ops;     // GEMV, отложенных в общий командный буфер
     uint64_t defer_waits;   // ожиданий отданных буферов
     uint64_t wait_ns;       // суммарное время ожидания GPU
+    uint64_t gpu_ns;        // 0214: суммарное GPU-время командных буферов
     uint64_t graph_tokens;  // токенов, посчитанных одним графом (0204)
     uint64_t graph_ops;     // dispatches в графах
     uint64_t graph_fail;    // неудачных графов (откат на CPU)

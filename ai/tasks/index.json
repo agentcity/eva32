@@ -1430,7 +1430,7 @@
   {
     "id": "0214",
     "title": "Быстрый Metal-GEMM (prefill 100+ ток/с)",
-    "status": "pending",
+    "status": "done",
     "file": "0214-metal-fast-gemm.md",
     "assignee": "agent:metal-gemm"
   }

@@ -206,218 +206,6 @@ kernel void vtm_i8_gemv(device const char *q [[buffer(0)]],
 }
 
 // ===========================================================================
-// Батчевый GEMM (задача 0196, фаза 2): N токенов против одной матрицы.
-//
-// Вход — token-major: xt[j * cols + t] (хост транспонирует пачку в staging и
-// добивает нулями до N). Выход — token-minor, как у батчевых ядер interp.c:
-// y[r * N + j].
-//
-// Схема: threadgroup = 8 строк (8 simdgroups), дорожка берёт 4 подряд идущих
-// колонки. Активации половины блока (128 колонок × N токенов) сначала
-// коллективно грузятся в threadgroup-память: 256 потоков делают 4 независимые
-// float4-загрузки — это даёт нужную параллельность памяти. Без этого каждая
-// дорожка тянула float4 из глобальной памяти последовательно, и ядро
-// упиралось в задержку (замер 0196: x-трафик — 70 ГБ/с и 140 GMAC/s против
-// 1,7 TMAC/s, когда x целиком в кэше).
-//
-// N — параметр сборки (8/16/32): цикл токенов развёрнут, аккумуляторы в
-// регистрах.
-// ===========================================================================
-
-#define VTM_GEMM_TG 256u   /* потоков: 8 simdgroup по 32 */
-
-// Общая загрузка половины блока: xs[j*128 + i] = xt[j*cols + colbase + i].
-// tid — thread_index_in_threadgroup, NT — токенов, M — загрузок на поток
-// (128*NT/1024 = NT/8).
-#define VTM_GEMM_LOAD_HALF(NT, COLBASE)                                      \
-    do {                                                                     \
-        uint m;                                                              \
-        _Pragma("unroll")                                                    \
-        for (m = 0; m < (NT) / rpt; m++) {                                   \
-            uint flat = (tid + rpt * 32u * m) * 4u;                          \
-            uint lj = flat >> 7;                                             \
-            uint li = flat & 127u;                                           \
-            *(threadgroup float4 *)(xs + lj * 128u + li) =                   \
-                *(device const float4 *)(xt + (ulong)lj * a.cols            \
-                                         + (COLBASE) + li);                  \
-        }                                                                    \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                     \
-    } while (0)
-
-#define VTM_GEMM_KERNEL(NAME, NT, DECODE_RP, DECODE_HALF)              \
-kernel void NAME(device const uchar *w [[buffer(0)]],                        \
-                 device const float *xt [[buffer(1)]],                       \
-                 device float *y [[buffer(2)]],                              \
-                 constant GemvArgs &a [[buffer(3)]],                         \
-                 uint tg [[threadgroup_position_in_grid]],                   \
-                 uint sg [[simdgroup_index_in_threadgroup]],                 \
-                 uint lane [[thread_index_in_simdgroup]],                    \
-                 uint tid [[thread_index_in_threadgroup]]) {                 \
-    const uint N = NT;                                                       \
-    threadgroup float xs[128u * NT];                                         \
-    uint rpt = a.n_tokens;                                                   \
-    uint row = tg * rpt + sg;                                                \
-    float acc[NT];                                                           \
-    device const uchar *rp;                                                  \
-    uint active = row < a.rows;                                              \
-    for (uint z = 0; z < NT; z++) acc[z] = 0.0f;                             \
-    DECODE_RP;                                                               \
-    for (uint b = 0; b < a.nblocks; b++) {                                   \
-        VTM_GEMM_LOAD_HALF(NT, b * 256u);                                    \
-        if (active) { DECODE_HALF(0); }                                      \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                     \
-        VTM_GEMM_LOAD_HALF(NT, b * 256u + 128u);                             \
-        if (active) { DECODE_HALF(1); }                                      \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                     \
-    }                                                                        \
-    if (active) {                                                            \
-        for (uint j = 0; j < NT; j++) {                                      \
-            float total = simd_sum(acc[j]);                                  \
-            if (lane == 0u) y[(uint)row * N + j] = total;                    \
-        }                                                                    \
-    }                                                                        \
-}
-
-// Q4_K: половина k — под-блоки 4k..4k+3, дорожка li=lane>>3, четвёрка l8.
-#define VTM_Q4K_RP                                                           \
-    rp = w + a.w_off + (uint)row * a.nblocks * 144u;
-
-#define VTM_Q4K_HALF(K)                                                      \
-    do {                                                                     \
-        device const uchar *bp = rp + b * 144u;                              \
-        float d = vtm_f16_to_f32(bp);                                        \
-        float dmin = vtm_f16_to_f32(bp + 2u);                                \
-        device const uchar *scp = bp + 4u;                                   \
-        device const uchar *qs = bp + 16u;                                   \
-        uint l8 = lane & 7u;                                                 \
-        uint li = lane >> 3;                                                 \
-        uint sb = 4u * (K) + li;                                             \
-        uint g = sb >> 1;                                                    \
-        uint h = sb & 1u;                                                    \
-        uint scv, mnv;                                                       \
-        vtm_q4k_sc_mn(scp, sb, scv, mnv);                                    \
-        uchar4 bytes = *(device const uchar4 *)(qs + g * 32u + l8 * 4u);    \
-        float w0 = d * (float)scv * (float)(h ? (bytes.x >> 4)              \
-                                                : (bytes.x & 0x0fu))         \
-                 - dmin * (float)mnv;                                        \
-        float w1 = d * (float)scv * (float)(h ? (bytes.y >> 4)              \
-                                                : (bytes.y & 0x0fu))         \
-                 - dmin * (float)mnv;                                        \
-        float w2 = d * (float)scv * (float)(h ? (bytes.z >> 4)              \
-                                                : (bytes.z & 0x0fu))         \
-                 - dmin * (float)mnv;                                        \
-        float w3 = d * (float)scv * (float)(h ? (bytes.w >> 4)              \
-                                                : (bytes.w & 0x0fu))         \
-                 - dmin * (float)mnv;                                        \
-        for (uint j = 0; j < N; j++) {                                       \
-            float4 xv = *(threadgroup const float4 *)(xs + j * 128u         \
-                                                     + li * 32u + l8 * 4u); \
-            acc[j] += w0 * xv.x + w1 * xv.y + w2 * xv.z + w3 * xv.w;        \
-        }                                                                    \
-    } while (0)
-
-// Q6_K: половина k — под-блоки 8k..8k+7, liq=lane>>2, четвёрка l4.
-#define VTM_Q6K_RP                                                           \
-    rp = w + a.w_off + (uint)row * a.nblocks * 210u;
-
-#define VTM_Q6K_HALF(K)                                                      \
-    do {                                                                     \
-        device const uchar *bp = rp + b * 210u;                              \
-        float d = vtm_f16_to_f32(bp + 208u);                                 \
-        device const uchar *ql = bp;                                         \
-        device const uchar *qh = bp + 128u;                                  \
-        device const char *sc = (device const char *)(bp + 192u);            \
-        uint l4 = lane & 3u;                                                 \
-        uint liq = lane >> 2;                                                \
-        uint sb = 8u * (K) + liq;                                            \
-        uint jj = l4 * 4u;                                                   \
-        uint chunk = sb >> 3;                                                \
-        uint in = sb & 7u;                                                   \
-        uint quad = in >> 1;                                                 \
-        uint hs = in & 1u;                                                   \
-        uchar4 qlb = *(device const uchar4 *)(ql + chunk * 64u              \
-                      + (quad & 1u) * 32u + hs * 16u + jj);                 \
-        uchar4 qhb = *(device const uchar4 *)(qh + chunk * 32u + hs * 16u   \
-                      + jj);                                                 \
-        float s = d * (float)sc[sb];                                         \
-        float w0 = s * (float)((int)((quad >= 2u ? (qlb.x >> 4)             \
-                                                  : (qlb.x & 0x0fu))        \
-                        | (((qhb.x >> (quad * 2u)) & 3u) << 4)) - 32);       \
-        float w1 = s * (float)((int)((quad >= 2u ? (qlb.y >> 4)             \
-                                                  : (qlb.y & 0x0fu))        \
-                        | (((qhb.y >> (quad * 2u)) & 3u) << 4)) - 32);       \
-        float w2 = s * (float)((int)((quad >= 2u ? (qlb.z >> 4)             \
-                                                  : (qlb.z & 0x0fu))        \
-                        | (((qhb.z >> (quad * 2u)) & 3u) << 4)) - 32);       \
-        float w3 = s * (float)((int)((quad >= 2u ? (qlb.w >> 4)             \
-                                                  : (qlb.w & 0x0fu))        \
-                        | (((qhb.w >> (quad * 2u)) & 3u) << 4)) - 32);       \
-        for (uint j = 0; j < N; j++) {                                       \
-            float4 xv = *(threadgroup const float4 *)(xs + j * 128u         \
-                                                     + liq * 16u + l4 * 4u);\
-            acc[j] += w0 * xv.x + w1 * xv.y + w2 * xv.z + w3 * xv.w;        \
-        }                                                                    \
-    } while (0)
-
-VTM_GEMM_KERNEL(vtm_q4k_gemm8, 8u, VTM_Q4K_RP, VTM_Q4K_HALF)
-VTM_GEMM_KERNEL(vtm_q4k_gemm16, 16u, VTM_Q4K_RP, VTM_Q4K_HALF)
-VTM_GEMM_KERNEL(vtm_q4k_gemm32, 32u, VTM_Q4K_RP, VTM_Q4K_HALF)
-VTM_GEMM_KERNEL(vtm_q6k_gemm8, 8u, VTM_Q6K_RP, VTM_Q6K_HALF)
-VTM_GEMM_KERNEL(vtm_q6k_gemm16, 16u, VTM_Q6K_RP, VTM_Q6K_HALF)
-VTM_GEMM_KERNEL(vtm_q6k_gemm32, 32u, VTM_Q6K_RP, VTM_Q6K_HALF)
-
-// int8-таблица словаря (kind 4): дорожка — 4 подряд идущих колонки, масштаб
-// общий на блок 128 (четвёрка не пересекает границу).
-#define VTM_I8_GEMM_KERNEL(NAME, NT)                                         \
-kernel void NAME(device const char *q [[buffer(0)]],                        \
-                 device const float *xt [[buffer(1)]],                       \
-                 device float *y [[buffer(2)]],                              \
-                 constant GemvArgs &a [[buffer(3)]],                         \
-                 device const float *scales [[buffer(4)]],                   \
-                 uint tg [[threadgroup_position_in_grid]],                   \
-                 uint sg [[simdgroup_index_in_threadgroup]],                 \
-                 uint lane [[thread_index_in_simdgroup]],                    \
-                 uint tid [[thread_index_in_threadgroup]]) {                 \
-    const uint N = NT;                                                       \
-    threadgroup float xs[128u * NT];                                         \
-    uint rpt = a.n_tokens;                                                   \
-    uint row = tg * rpt + sg;                                                \
-    uint active = row < a.rows;                                              \
-    uint base;                                                               \
-    float acc[NT];                                                           \
-    for (uint z = 0; z < NT; z++) acc[z] = 0.0f;                             \
-    base = row * a.cols;                                                     \
-    for (uint blk = 0; blk < a.cols; blk += 128u) {                          \
-        VTM_GEMM_LOAD_HALF(NT, blk);                                         \
-        if (active) {                                                        \
-            uint col = blk + lane * 4u;                                      \
-            uchar4 qb = *(device const uchar4 *)(q + a.w_off + base + col);  \
-            float sc = scales[a.sc_off + ((base + col) >> 7)];               \
-            float w0 = sc * (float)(char)qb.x;                               \
-            float w1 = sc * (float)(char)qb.y;                               \
-            float w2 = sc * (float)(char)qb.z;                               \
-            float w3 = sc * (float)(char)qb.w;                               \
-            for (uint j = 0; j < N; j++) {                                   \
-                float4 xv = *(threadgroup const float4 *)(xs + j * 128u     \
-                                                         + lane * 4u);       \
-                acc[j] += w0 * xv.x + w1 * xv.y + w2 * xv.z + w3 * xv.w;    \
-            }                                                                \
-        }                                                                    \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                     \
-    }                                                                        \
-    if (active) {                                                            \
-        for (uint j = 0; j < N; j++) {                                       \
-            float total = simd_sum(acc[j]);                                  \
-            if (lane == 0u) y[(uint)row * N + j] = total;                    \
-        }                                                                    \
-    }                                                                        \
-}
-
-VTM_I8_GEMM_KERNEL(vtm_i8_gemm8, 8u)
-VTM_I8_GEMM_KERNEL(vtm_i8_gemm16, 16u)
-VTM_I8_GEMM_KERNEL(vtm_i8_gemm32, 32u)
-
-// ===========================================================================
 // GEMV декода с несколькими строками на дорожку-группу (фаза 3, 0204).
 //
 // Диагноз: однострочные ядра выше читают 4 байта веса на дорожку за итерацию
@@ -938,6 +726,364 @@ kernel void vtm_q4k_gemv4(device const uchar *w [[buffer(0)]],
             if (grow + 1u < a.rows) y[grow + 1u] = t1;
             if (grow + 2u < a.rows) y[grow + 2u] = t2;
             if (grow + 3u < a.rows) y[grow + 3u] = t3;
+        }
+    }
+}
+
+// ===========================================================================
+// 0214: тайловый батчевый GEMM — переиспользование фрагмента B.
+//
+// Что не так с ядром выше (VTM_GEMM_KERNEL, замер 0211/0214): threadgroup —
+// 8–16 строк, по одной строке на warp; на каждую итерацию токена поток читает
+// float4 активаций из threadgroup-памяти и делает 4 MAC, то есть 16 Б
+// threadgroup-трафика на 4 MAC (4 Б/MAC). Веса при этом читаются один раз на
+// строку-блок — узкое место не полоса весов, а LDS: на один FFMA приходится
+// 0.25 LDS.128, а LDS.128 на Apple GPU вчетверо дороже FFMA по слотам выдачи.
+//
+// Здесь каждый warp считает ДВЕ строки (по два аккумулятора на токен), и один
+// float4 активаций идёт в 8 MAC вместо 4: 2 Б/MAC. Вес по-прежнему читается
+// один раз (строка-блок принадлежит ровно одному threadgroup), декодирование
+// Q4_K/Q6_K не удваивается: на 2 строки × 4 колонки — две uchar4-загрузки.
+//
+// Аргументы (GemmArgs) несут смещения и шаги, поэтому ядро читает вход и
+// пишет выход прямо в памяти хоста/арене пачки (interp.c) — без
+// транспонирования на хосте. Раскладка входа:
+//   x[a.x_off + j*a.x_stride + t]   (j — токен, t — колонка)
+//   y[a.y_off + j*a.y_stride + r*a.y_rstride]
+// x_stride = 0 — один вектор на все токены (общая активация); y_rstride = 1 —
+// токен-мажорный выход арены, y_rstride = n_tokens и y_stride = 1 — прежняя
+// раскладка батчевых ядер (y[r*n_tokens + j]).
+// ===========================================================================
+
+typedef struct {
+    uint rows;
+    uint cols;
+    uint nblocks;   // cols / 256 для kind 6/7
+    uint n_tokens;  // токенов в chunk'е (NT варианта)
+    uint x_off;     // смещение входа в x, float
+    uint y_off;     // смещение выхода в y, float
+    uint x_stride;  // шаг токена во входе, float
+    uint y_stride;  // шаг токена в выходе, float
+    uint y_rstride; // шаг строки весов в выходе, float
+    uint pad0;      // выравнивание до ulong (sizeof == 56)
+    ulong w_off;    // смещение блоков веса в базовом MTLBuffer
+    ulong sc_off;   // смещение fp32-масштабов (int8), float
+} GemmArgs;
+
+#define VTM_TILE_TG    256u   // потоков: 8 warp по 32
+#define VTM_TILE_RPT   2u     // строк на warp (== строк на поток)
+#define VTM_TILE_ROWS  16u    // строк на threadgroup
+
+// Коллективная загрузка половины блока (128 колонок × NT токенов) в
+// threadgroup-память: 256 потоков делают NT/8 float4-загрузок.
+#define VTM_TILE_LOAD(NT, COLBASE)                                           \
+    do {                                                                     \
+        uint m;                                                              \
+        _Pragma("unroll")                                                    \
+        for (m = 0; m < (NT) / 8u; m++) {                                    \
+            uint flat = (tid + VTM_TILE_TG * m) * 4u;                        \
+            uint lj = flat >> 7;                                             \
+            uint li0 = flat & 127u;                                          \
+            *(threadgroup float4 *)(xs + lj * 128u + li0) =                  \
+                *(device const float4 *)(xt + (ulong)lj * a.x_stride         \
+                                         + a.x_off + (COLBASE) + li0);       \
+        }                                                                    \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                     \
+    } while (0)
+
+// Четыре подряд идущих веса строки — одна uchar4-загрузка.
+static inline float4 vtm_q4k_quad(device const uchar *bp, uint sb, uint l8) {
+    float d = vtm_f16_to_f32(bp);
+    float dmin = vtm_f16_to_f32(bp + 2u);
+    uint g = sb >> 1;
+    uint h = sb & 1u;
+    uint scv, mnv;
+    float A, B;
+    uchar4 b;
+
+    vtm_q4k_sc_mn(bp + 4u, sb, scv, mnv);
+    b = *(device const uchar4 *)(bp + 16u + g * 32u + l8 * 4u);
+    A = d * (float)scv;
+    B = dmin * (float)mnv;
+    return float4(A * (float)(h ? (b.x >> 4) : (b.x & 0x0fu)) - B,
+                  A * (float)(h ? (b.y >> 4) : (b.y & 0x0fu)) - B,
+                  A * (float)(h ? (b.z >> 4) : (b.z & 0x0fu)) - B,
+                  A * (float)(h ? (b.w >> 4) : (b.w & 0x0fu)) - B);
+}
+
+static inline float4 vtm_q6k_quad(device const uchar *bp, uint sb, uint l4) {
+    device const uchar *ql = bp;
+    device const uchar *qh = bp + 128u;
+    device const char *sc = (device const char *)(bp + 192u);
+    float d = vtm_f16_to_f32(bp + 208u);
+    uint jj = l4 * 4u;
+    uint chunk = sb >> 3;
+    uint in = sb & 7u;
+    uint quad = in >> 1;
+    uint hs = in & 1u;
+    uchar4 qlb = *(device const uchar4 *)(ql + chunk * 64u
+                  + (quad & 1u) * 32u + hs * 16u + jj);
+    uchar4 qhb = *(device const uchar4 *)(qh + chunk * 32u + hs * 16u + jj);
+    float s = d * (float)sc[sb];
+
+    return float4(
+        s * (float)((int)((quad >= 2u ? (qlb.x >> 4) : (qlb.x & 0x0fu))
+                          | (((qhb.x >> (quad * 2u)) & 3u) << 4)) - 32),
+        s * (float)((int)((quad >= 2u ? (qlb.y >> 4) : (qlb.y & 0x0fu))
+                          | (((qhb.y >> (quad * 2u)) & 3u) << 4)) - 32),
+        s * (float)((int)((quad >= 2u ? (qlb.z >> 4) : (qlb.z & 0x0fu))
+                          | (((qhb.z >> (quad * 2u)) & 3u) << 4)) - 32),
+        s * (float)((int)((quad >= 2u ? (qlb.w >> 4) : (qlb.w & 0x0fu))
+                          | (((qhb.w >> (quad * 2u)) & 3u) << 4)) - 32));
+}
+
+static inline float4 vtm_i8_quad(device const char *q, uint base, uint col,
+                                 device const float *scales, ulong sc_off) {
+    uchar4 b = *(device const uchar4 *)(q + base + col);
+    float sc = scales[sc_off + ((base + col) >> 7)];
+
+    return float4(sc * (float)(char)b.x, sc * (float)(char)b.y,
+                  sc * (float)(char)b.z, sc * (float)(char)b.w);
+}
+
+#define VTM_TILE_DECL(NT)                                                    \
+    threadgroup float xs[128u * (NT)];                                       \
+    device const uchar *rp0;                                                 \
+    device const uchar *rp1;                                                 \
+    float acc0[(NT)], acc1[(NT)];                                            \
+    uint l8 = lane & 7u;                                                     \
+    uint li = lane >> 3;                                                     \
+    uint l4 = lane & 3u;                                                     \
+    uint liq = lane >> 2;                                                    \
+    uint row0 = tg * VTM_TILE_ROWS + sg * VTM_TILE_RPT;                      \
+    uint row1 = row0 + 1u;                                                   \
+    uint last = a.rows - 1u;                                                 \
+    uint act0 = row0 < a.rows;                                               \
+    uint act1 = row1 < a.rows;                                               \
+    (void)l8; (void)li; (void)l4; (void)liq;                                 \
+    if (row0 > last) row0 = last;                                            \
+    if (row1 > last) row1 = last;
+
+// Тело: две строки на поток, B-фрагмент (float4) из threadgroup-памяти — на
+// 8 MAC. SB и IX — выражения от k/lane конкретного формата весов.
+#define VTM_TILE_BODY(NT, BSTEP, KSTEP, QUAD, SB, IX, OFFX)                  \
+    for (uint j = 0; j < (NT); j++) { acc0[j] = 0.0f; acc1[j] = 0.0f; }      \
+    rp0 = w + a.w_off + (ulong)row0 * a.nblocks * (KSTEP);                   \
+    rp1 = w + a.w_off + (ulong)row1 * a.nblocks * (KSTEP);                   \
+    for (uint b = 0; b < a.nblocks; b++) {                                   \
+        _Pragma("unroll")                                                    \
+        for (uint k = 0; k < 2u; k++) {                                      \
+            VTM_TILE_LOAD(NT, b * 256u + k * 128u);                          \
+            float4 w0 = QUAD(rp0 + b * (BSTEP), (SB), (IX));                 \
+            float4 w1 = QUAD(rp1 + b * (BSTEP), (SB), (IX));                 \
+            _Pragma("unroll")                                                \
+            for (uint j = 0; j < (NT); j++) {                                \
+                float4 xv = *(threadgroup const float4 *)(xs + j * 128u      \
+                             + (OFFX));                                      \
+                acc0[j] += w0.x * xv.x + w0.y * xv.y + w0.z * xv.z           \
+                         + w0.w * xv.w;                                      \
+                acc1[j] += w1.x * xv.x + w1.y * xv.y + w1.z * xv.z           \
+                         + w1.w * xv.w;                                      \
+            }                                                                \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                 \
+        }                                                                    \
+    }                                                                        \
+    _Pragma("unroll")                                                        \
+    for (uint j = 0; j < (NT); j++) {                                        \
+        float t0 = simd_sum(acc0[j]);                                        \
+        float t1 = simd_sum(acc1[j]);                                        \
+        ulong ob = (ulong)a.y_off + (ulong)j * a.y_stride;                   \
+        ulong o0 = ob + (ulong)row0 * a.y_rstride;                           \
+        ulong o1 = ob + (ulong)row1 * a.y_rstride;                           \
+        if (lane == 0u && j < a.n_tokens) {                                  \
+            if (act0) y[o0] = t0;                                            \
+            if (act1) y[o1] = t1;                                            \
+        }                                                                    \
+    }
+
+#define VTM_TILE_KERNEL(NAME, NT)                                            \
+kernel void NAME(device const uchar *w [[buffer(0)]],                        \
+                 device const float *xt [[buffer(1)]],                       \
+                 device float *y [[buffer(2)]],                              \
+                 constant GemmArgs &a [[buffer(3)]],                         \
+                 uint tg [[threadgroup_position_in_grid]],                   \
+                 uint sg [[simdgroup_index_in_threadgroup]],                 \
+                 uint lane [[thread_index_in_simdgroup]],                    \
+                 uint tid [[thread_index_in_threadgroup]]) {                 \
+    VTM_TILE_DECL(NT)                                                        \
+    (void)tid;                                                               \
+    VTM_TILE_BODY(NT, 144u, 144u, vtm_q4k_quad, (4u * k + li), l8,           \
+                  (li * 32u + l8 * 4u))                                      \
+}
+
+#define VTM_TILE_KERNEL_Q6(NAME, NT)                                         \
+kernel void NAME(device const uchar *w [[buffer(0)]],                        \
+                 device const float *xt [[buffer(1)]],                       \
+                 device float *y [[buffer(2)]],                              \
+                 constant GemmArgs &a [[buffer(3)]],                         \
+                 uint tg [[threadgroup_position_in_grid]],                   \
+                 uint sg [[simdgroup_index_in_threadgroup]],                 \
+                 uint lane [[thread_index_in_simdgroup]],                    \
+                 uint tid [[thread_index_in_threadgroup]]) {                 \
+    VTM_TILE_DECL(NT)                                                        \
+    (void)tid;                                                               \
+    VTM_TILE_BODY(NT, 210u, 210u, vtm_q6k_quad, (8u * k + liq), l4,          \
+                  (liq * 16u + l4 * 4u))                                     \
+}
+
+VTM_TILE_KERNEL(vtm_q4k_gemm_t32, 32u)
+VTM_TILE_KERNEL(vtm_q4k_gemm_t16, 16u)
+VTM_TILE_KERNEL_Q6(vtm_q6k_gemm_t32, 32u)
+VTM_TILE_KERNEL_Q6(vtm_q6k_gemm_t16, 16u)
+
+// int8-таблица словаря (kind 4): блок 128 колонок, дорожка — 4 колонки,
+// масштаб общий на блок. Две строки на поток, как у Q4_K/Q6_K.
+#define VTM_I8_TILE_KERNEL(NAME, NT)                                         \
+kernel void NAME(device const char *q [[buffer(0)]],                         \
+                 device const float *xt [[buffer(1)]],                       \
+                 device float *y [[buffer(2)]],                              \
+                 constant GemmArgs &a [[buffer(3)]],                         \
+                 device const float *scales [[buffer(4)]],                   \
+                 uint tg [[threadgroup_position_in_grid]],                   \
+                 uint sg [[simdgroup_index_in_threadgroup]],                 \
+                 uint lane [[thread_index_in_simdgroup]],                    \
+                 uint tid [[thread_index_in_threadgroup]]) {                 \
+    VTM_TILE_DECL(NT)                                                        \
+    (void)tid; (void)li; (void)liq;                                          \
+    uint base0 = row0 * a.cols;                                              \
+    uint base1 = row1 * a.cols;                                              \
+    for (uint j = 0; j < (NT); j++) { acc0[j] = 0.0f; acc1[j] = 0.0f; }      \
+    for (uint blk = 0; blk < a.cols; blk += 128u) {                          \
+        VTM_TILE_LOAD(NT, blk);                                              \
+        float4 w0 = vtm_i8_quad(q + a.w_off, base0, blk + lane * 4u,         \
+                                scales, a.sc_off);                           \
+        float4 w1 = vtm_i8_quad(q + a.w_off, base1, blk + lane * 4u,         \
+                                scales, a.sc_off);                           \
+        _Pragma("unroll")                                                    \
+        for (uint j = 0; j < (NT); j++) {                                    \
+            float4 xv = *(threadgroup const float4 *)(xs + j * 128u          \
+                         + lane * 4u);                                       \
+            acc0[j] += w0.x * xv.x + w0.y * xv.y + w0.z * xv.z               \
+                     + w0.w * xv.w;                                          \
+            acc1[j] += w1.x * xv.x + w1.y * xv.y + w1.z * xv.z               \
+                     + w1.w * xv.w;                                          \
+        }                                                                    \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                     \
+    }                                                                        \
+    _Pragma("unroll")                                                        \
+    for (uint j = 0; j < (NT); j++) {                                        \
+        float t0 = simd_sum(acc0[j]);                                        \
+        float t1 = simd_sum(acc1[j]);                                        \
+        ulong ob = (ulong)a.y_off + (ulong)j * a.y_stride;                   \
+        ulong o0 = ob + (ulong)row0 * a.y_rstride;                           \
+        ulong o1 = ob + (ulong)row1 * a.y_rstride;                           \
+        if (lane == 0u && j < a.n_tokens) {                                  \
+            if (act0) y[o0] = t0;                                            \
+            if (act1) y[o1] = t1;                                            \
+        }                                                                    \
+    }                                                                        \
+}
+
+VTM_I8_TILE_KERNEL(vtm_i8_gemm_t32, 32u)
+VTM_I8_TILE_KERNEL(vtm_i8_gemm_t16, 16u)
+
+// ===========================================================================
+// 0214: attention ПАЧКИ prefill на GPU.
+//
+// На 250 токенах CPU-attention стоил 1,4 с из 5,0 (профиль 0214: op=0x0B 25%
+// стены), на 500 — уже 5,8 с из 15: это O(C²) в double на одном потоке, пока
+// GPU стоит. Здесь каждый токен пачки — та же задача, что у декода (q_len == 1
+// против кольцевого KV-кэша), поэтому ядро — копия vtm_attn_decode с двумя
+// отличиями: threadgroup'а выбирает (токен пачки, голова), а границы видимых
+// ключей считаются от позиции ЭТОГО токена (каузальность бесплатна: у токена i
+// свой n_keys = pos0 + i + 1 - start, поэтому "past" и "future" не нужны).
+//
+// K/V пачки уже лежат в кольце: KVW идёт по всем токенам пачки до ATTN.
+// Точность: f32 + online-softmax, как у декода (контракт — argmax + Δ≤1e-2).
+// ===========================================================================
+
+typedef struct {
+    uint  n_heads;
+    uint  rep;        // n_heads / n_kv_heads
+    uint  head_dim;
+    uint  kv_dim;
+    uint  win;        // слотов в кольце
+    uint  n_tokens;   // токенов в пачке
+    uint  pos0;       // позиция первого токена (+ imm инструкции)
+    uint  stride;     // шаг токена пачки в q/out, float
+    uint  q_off;      // смещение Q первого токена, float
+    uint  out_off;    // смещение out первого токена, float
+    uint  pad0;
+    uint  pad1;
+    float scale;
+} AttnBatchArgs;
+
+kernel void vtm_attn_prefill(device const float *q [[buffer(0)]],
+                             device const float *kc [[buffer(1)]],
+                             device const float *vc [[buffer(2)]],
+                             device float *out [[buffer(3)]],
+                             constant AttnBatchArgs &a [[buffer(4)]],
+                             uint tg [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    uint i = tg / a.n_heads;          // токен пачки
+    uint h = tg - i * a.n_heads;      // голова
+    uint kvh = h / a.rep;
+    uint pos = a.pos0 + i;
+    uint keys = pos + 1u;
+    uint start = keys > a.win ? keys - a.win : 0u;
+    uint nk = keys - start;
+    uint slot = start % a.win;
+    device const float *qh = q + (ulong)i * a.stride + a.q_off
+                           + (ulong)h * a.head_dim;
+    device const float *kb = kc + (ulong)kvh * a.head_dim;
+    device const float *vb = vc + (ulong)kvh * a.head_dim;
+    float qv[8];
+    float acc[8];
+    float m = -INFINITY;
+    float l = 0.0f;
+    uint d, n;
+
+    _Pragma("unroll")
+    for (d = 0; d < 8u; d++) {
+        uint j = lane + d * 32u;
+        qv[d] = (j < a.head_dim) ? qh[j] : 0.0f;
+        acc[d] = 0.0f;
+    }
+
+    for (n = 0; n < nk; n++) {
+        device const float *krow = kb + (ulong)slot * a.kv_dim;
+        device const float *vrow = vb + (ulong)slot * a.kv_dim;
+        float dot = 0.0f;
+        float s, p, corr;
+
+        _Pragma("unroll")
+        for (d = 0; d < 8u; d++) {
+            uint j = lane + d * 32u;
+            if (j < a.head_dim) dot = fma(qv[d], krow[j], dot);
+        }
+        dot = simd_sum(dot) * a.scale;
+        s = (dot > m) ? dot : m;
+        corr = exp(m - s);
+        p = exp(dot - s);
+        l = l * corr + p;
+        _Pragma("unroll")
+        for (d = 0; d < 8u; d++) {
+            uint j = lane + d * 32u;
+            if (j < a.head_dim) acc[d] = fma(p, vrow[j], acc[d] * corr);
+        }
+        m = s;
+        if (++slot == a.win) slot = 0u;
+    }
+
+    {
+        float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+        device float *orow = out + (ulong)i * a.stride + a.out_off
+                           + (ulong)h * a.head_dim;
+
+        _Pragma("unroll")
+        for (d = 0; d < 8u; d++) {
+            uint j = lane + d * 32u;
+            if (j < a.head_dim) orow[j] = acc[d] * inv;
         }
     }
 }

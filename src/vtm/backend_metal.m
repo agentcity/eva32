@@ -147,9 +147,10 @@ static id<MTLComputePipelineState> g_ps_i8;
 static id<MTLComputePipelineState> g_ps_q4k_r4;
 static id<MTLComputePipelineState> g_ps_q6k_r4;
 static id<MTLComputePipelineState> g_ps_q4k_g4;
-static id<MTLComputePipelineState> g_ps_q4k_gemm[3]; // 8/16/32 токенов
-static id<MTLComputePipelineState> g_ps_q6k_gemm[3];
-static id<MTLComputePipelineState> g_ps_i8_gemm[3];
+// 0214: тайловые батчевые GEMM (2 ряда на поток): [0] NT=16, [1] NT=32.
+static id<MTLComputePipelineState> g_ps_q4k_tile[2];
+static id<MTLComputePipelineState> g_ps_q6k_tile[2];
+static id<MTLComputePipelineState> g_ps_i8_tile[2];
 // Фаза 3: ядра графа токена (RMSNorm/RoPE/SiLU/MUL/ADD/KVW/attention).
 static id<MTLComputePipelineState> g_ps_norm;
 static id<MTLComputePipelineState> g_ps_rope;
@@ -158,6 +159,7 @@ static id<MTLComputePipelineState> g_ps_mul;
 static id<MTLComputePipelineState> g_ps_add;
 static id<MTLComputePipelineState> g_ps_kvw;
 static id<MTLComputePipelineState> g_ps_attn;
+static id<MTLComputePipelineState> g_ps_attn_batch;  // 0214: attention пачки
 static id<MTLComputePipelineState> g_ps_copy;
 
 static id<MTLBuffer> g_xbuf;
@@ -165,7 +167,11 @@ static size_t g_xcap;
 static id<MTLBuffer> g_ybuf;
 static size_t g_ycap;
 
-// Батчевый GEMM (prefill): token-major активации и token-minor результат.
+// Батчевый GEMM (prefill): staging входа (token-major) и выхода (token-major).
+// Оба — буферы Metal, а не zero-copy поверх памяти вызывающего: маленькие
+// malloc-буферы тестов могут кончаться на границе страницы, и no-copy буфер
+// над ними ловит SIGBUS (проверено --check). Живой prefill идёт другим путём —
+// vtm_metal_qk_gemm_arena на mmap-арене пачки.
 static id<MTLBuffer> g_gxbuf;
 static size_t g_gxcap;
 static id<MTLBuffer> g_gybuf;
@@ -195,6 +201,7 @@ static uint64_t g_alloc_before;
 static uint64_t g_gpu_ns;
 static uint64_t g_alloc_after;
 static uint64_t g_gemm_calls;
+static int g_gq_active;   // 0214: в очереди есть незакрытая группа GEMM
 static uint64_t g_defer_ops;
 static uint64_t g_defer_waits;
 static uint64_t g_graph_tokens;
@@ -418,33 +425,30 @@ static int metal_init(void) {
     g_ps_add = metal_pipeline("vtm_add");
     g_ps_kvw = metal_pipeline("vtm_kvw");
     g_ps_attn = metal_pipeline("vtm_attn_decode");
+    g_ps_attn_batch = metal_pipeline("vtm_attn_prefill");
     g_ps_copy = metal_pipeline("vtm_copy");
     if (!g_ps_q4k || !g_ps_q6k || !g_ps_i8) {
         metal_log("%s — откат на CPU", g_err);
         g_init = -1;
         return -1;
     }
-    // GEMM-ядра фазы 2: отсутствие в старом metallib не ломает GEMV — просто
-    // батчевый prefill останется на CPU (вызывающий проверит возврат -1).
+    // 0214: тайловые ядра. Их отсутствие (старый metallib) не ломает прогон:
+    // арена пачки не берётся, prefill идёт прежним путём.
     {
-        static const char *const names[3][3] = {
-            {"vtm_q4k_gemm8", "vtm_q4k_gemm16", "vtm_q4k_gemm32"},
-            {"vtm_q6k_gemm8", "vtm_q6k_gemm16", "vtm_q6k_gemm32"},
-            {"vtm_i8_gemm8", "vtm_i8_gemm16", "vtm_i8_gemm32"}
+        static const char *const tnames[3][2] = {
+            {"vtm_q4k_gemm_t16", "vtm_q4k_gemm_t32"},
+            {"vtm_q6k_gemm_t16", "vtm_q6k_gemm_t32"},
+            {"vtm_i8_gemm_t16", "vtm_i8_gemm_t32"}
         };
-        int n, v;
-        for (v = 0; v < 3; v++) {
-            g_ps_q4k_gemm[v] = metal_pipeline(names[0][v]);
-            g_ps_q6k_gemm[v] = metal_pipeline(names[1][v]);
-            g_ps_i8_gemm[v] = metal_pipeline(names[2][v]);
+        int v;
+        for (v = 0; v < 2; v++) {
+            g_ps_q4k_tile[v] = metal_pipeline(tnames[0][v]);
+            g_ps_q6k_tile[v] = metal_pipeline(tnames[1][v]);
+            g_ps_i8_tile[v] = metal_pipeline(tnames[2][v]);
         }
-        for (v = 0; v < 3; v++)
-            if (!g_ps_q4k_gemm[v] || !g_ps_q6k_gemm[v] || !g_ps_i8_gemm[v])
-                n = 0;
-        (void)n;
-        if (!g_ps_q4k_gemm[2] || !g_ps_q6k_gemm[2] || !g_ps_i8_gemm[2])
-            metal_log("GEMM-ядра недоступны (%s) — prefill останется на CPU",
-                      g_err);
+        if (!g_ps_q4k_tile[1] || !g_ps_q6k_tile[1] || !g_ps_i8_tile[1])
+            metal_log("тайловых GEMM-ядер нет (%s) — prefill пачкой пойдёт "
+                      "прежним путём", g_err);
     }
 
     g_alloc_after = (uint64_t)[g_dev currentAllocatedSize];
@@ -1122,38 +1126,358 @@ int vtm_metal_defer_end(void) {
     return rc;
 }
 
-// --- фаза 2: батчевый GEMM prefill ------------------------------------------
+// --- фаза 2/0214: батчевый GEMM prefill -------------------------------------
 //
-// N токенов пачки — один dispatch на матрицу (на chunk до 32 токенов).
-// Активации транспонируются в token-major staging (xt[j*cols + t]): дорожка
-// ядра — колонка, поэтому по warp'у читается 32 подряд идущих значения
-// одного токена. Результат — token-minor y[r*N + j], как у батчевых ядер.
-static int metal_gemm_body(int kind, float *y, const void *w,
-                           const float *scales, const float *x,
-                           int rows, int cols, int n_tokens) {
-    id<MTLBuffer> wb = nil, sb = nil;
-    uint64_t woff = 0, scoff = 0;
-    vtm_metal_args a;
-    id<MTLCommandBuffer> cb = nil;
-    id<MTLComputeCommandEncoder> enc = nil;
-    id<MTLComputePipelineState> ps;
-    size_t wbytes, scbytes, xbytes, ybytes;
-    int j0, nt, rc = -1, vi, vn, rpt;
+// 0214. Было (0196/0211): N токенов пачки гонялись через ОДИН dispatch на
+// chunk (до 32 токенов), но каждый chunk — отдельный командный буфер с
+// ожиданием, а активации хост транспонировал дважды: в b->xt (batch_tmv_apply)
+// и в g_gxbuf (ядро). Профиль 0211: GPU 3,73 с, хост-CPU 3,62 с, стена 8,65 с.
+//
+// Стало:
+//   1) ядро читает вход и пишет выход по шагам (x_stride/y_stride) и смещениям
+//      (x_off/y_off) — активации пачки лежат в арене interp.c и не копируются
+//      ни на хост, ни обратно (zero-copy MTLBuffer поверх mmap-арены);
+//   2) все chunk'и матрицы и подряд идущие матрицы слоя (q/k/v, gate/up)
+//      кодируются в ОДИН MTLCommandBuffer: CPU ждёт один раз, когда ему правда
+//      нужны числа (vtm_metal_gemm_flush из interp.c);
+//   3) ядро тайловое (vtm_*_gemm_t16/t32 в vtm_metal.metal): два ряда на поток
+//      и переиспользование float4 активаций из threadgroup-памяти.
+//
+// Отказ (-1/1) на любом шаге — прежний CPU-путь: прогон не падает.
 
-    if (!y || !w || !x || rows <= 0 || cols <= 0 || n_tokens <= 1) return -1;
-    // Пачка меньше 8 токенов на GPU проигрывает CPU (замер 0196): ядро всё
-    // равно считает 8 (минимум из вариантов), а накладные те же.
-    if (n_tokens < 8) return -1;
-    if (metal_strict_env()) return -1;
-    // Инъекция отказа (VTM_METAL_FORCE_FAIL) для проверки откала гибрида:
-    // первый GEMM «теряет» результат, режим выключается — весь остаток
-    // пачки/прогона считается CPU-ядрами, как при любой ошибке Metal.
+// Должно совпадать с GemmArgs в vtm_metal.metal (sizeof == 56).
+typedef struct {
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t nblocks;
+    uint32_t n_tokens;
+    uint32_t x_off;
+    uint32_t y_off;
+    uint32_t x_stride;
+    uint32_t y_stride;
+    uint32_t y_rstride;
+    uint32_t pad0;
+    uint64_t w_off;
+    uint64_t sc_off;
+} vtm_metal_gemm_args;
+
+#define VTM_METAL_TILE_TG   256u
+#define VTM_METAL_TILE_ROWS 16u
+// Хвост пачки: ядро варианта NT считает NT токенов, даже если их меньше.
+// Арена пачки выделяется с этим запасом (interp.c), чтобы чтение за последним
+// токеном не вышло за отображение.
+#define VTM_METAL_GEMM_PAD  32
+
+// Очередь батчевых GEMM: один командный буфер на группу матриц.
+typedef struct {
+    id<MTLCommandBuffer> cb;
+    id<MTLComputeCommandEncoder> enc;
+    int nops;
+    int failed;
+} metal_gemmq;
+
+static metal_gemmq g_gq;
+
+// Арена пачки. Одна на прогон пачки (b->mem в interp.c), привязывается ОДИН
+// раз: у матрицы меняется только смещение тензора в ней. Привязка «на каждую
+// матрицу» (no-copy MTLBuffer на 38 МиБ над 608-КиБ шагом токенов) стоила
+// дороже самого GEMM: драйвер отображает тысячи страниц, и живые 250 токенов
+// шли 6,2 с при 1,4 с на 64 (замер 0214 до этой правки).
+#define VTM_METAL_ARENA_MAX 4
+typedef struct {
+    const void *ptr;
+    size_t bytes;
+    id<MTLBuffer> buf;
+} metal_arena;
+static metal_arena g_arenas[VTM_METAL_ARENA_MAX];
+
+static int gemm_tile_env(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("VTM_METAL_GEMM_KERNEL");
+        cached = (e && *e && strcmp(e, "base") == 0) ? 0 : 1;
+    }
+    return cached;
+}
+
+// Ядро варианта по числу токенов chunk'а. vn — сколько токенов вариант
+// покрывает (16 или 32); tokens >= vn идут следующим chunk'ом.
+static id<MTLComputePipelineState> gemm_tile_ps(int kind, int nt, int *vn) {
+    int v = nt <= 16 ? 0 : 1;
+
+    *vn = v == 0 ? 16 : 32;
+    if (kind == 0) return g_ps_q4k_tile[v];
+    if (kind == 1) return g_ps_q6k_tile[v];
+    return g_ps_i8_tile[v];
+}
+
+// Размеры буферов весов/масштабов и число блоков. 0 — форма не та.
+static int gemm_wsize(int kind, int rows, int cols, size_t *wbytes,
+                      size_t *scbytes, uint32_t *nblocks) {
+    if (kind == 0 || kind == 1) {
+        if (cols % 256 != 0) return -1;
+        *nblocks = (uint32_t)(cols / 256);
+        *wbytes = ((size_t)rows * (size_t)cols / 256u)
+                * (kind == 0 ? 144u : 210u);
+        *scbytes = 0;
+        return 0;
+    }
+    if (kind != 2 || cols % 128 != 0) return -1;
+    {
+        uint64_t n = (uint64_t)rows * (uint64_t)cols;
+
+        *nblocks = 0;
+        *wbytes = (size_t)n;
+        *scbytes = (size_t)(n / 128u + (n % 128u ? 1u : 0u)) * sizeof(float);
+    }
+    return 0;
+}
+
+// Привязать арену пачки (zero-copy). Вызывается под g_lock. 0 — готово,
+// -1 — не вышло (тогда GEMM пойдёт CPU-путём).
+//
+// Буфер создаётся СВОЙ, не через metal_bind: кэш весов живёт до vtm_free, а
+// арена пачки освобождается в конце каждого vtm_run_batch — no-copy буфер не
+// должен переживать своё отображение (иначе «страницы, отданные другому
+// mmap»). Освобождение — gemm_arena_drop по указателю.
+static int gemm_arena_attach(const void *ptr, size_t bytes) {
+    int i, slot = -1;
+    long page = sysconf(_SC_PAGESIZE);
+    size_t plen;
+
+    if (!ptr || !bytes) return -1;
+    if (page <= 0) page = 16384;
+    if (((uintptr_t)ptr & (uintptr_t)((uintptr_t)page - 1u)) != 0u) return -1;
+    plen = (bytes + (size_t)page - 1u) & ~((size_t)page - 1u);
+    for (i = 0; i < VTM_METAL_ARENA_MAX; i++) {
+        if (g_arenas[i].buf && g_arenas[i].ptr == ptr
+            && g_arenas[i].bytes == plen)
+            return 0;
+        if (!g_arenas[i].buf && slot < 0) slot = i;
+    }
+    if (slot < 0) {
+        // Все слоты заняты (несколько контекстов): вытесняем первый.
+        slot = 0;
+        [g_arenas[slot].buf release];
+        g_arenas[slot].buf = nil;
+    }
+    {
+        id<MTLBuffer> b = [g_dev newBufferWithBytesNoCopy:(void *)ptr
+                                                   length:plen
+                                                  options:MTLResourceStorageModeShared
+                                                deallocator:nil];
+        if (!b) {
+            metal_set_err("арена пачки: no-copy buffer не создался (%zu Б)",
+                          plen);
+            return -1;
+        }
+        g_arenas[slot].ptr = ptr;
+        g_arenas[slot].bytes = plen;
+        g_arenas[slot].buf = b;
+        g_nocopy_bytes += (uint64_t)plen;
+    }
+    return 0;
+}
+
+// Отпустить арену (ptr == NULL — все). Вызывается под g_lock.
+static void gemm_arena_drop(const void *ptr) {
+    int i;
+
+    for (i = 0; i < VTM_METAL_ARENA_MAX; i++) {
+        if (!g_arenas[i].buf) continue;
+        if (ptr && g_arenas[i].ptr != ptr) continue;
+        [g_arenas[i].buf release];
+        g_arenas[i].buf = nil;
+        g_arenas[i].ptr = NULL;
+        g_arenas[i].bytes = 0;
+    }
+}
+
+// Найти арену, в которой лежит [p, p+need). Возвращает буфер и смещение в
+// байтах; nil — не в арене (тогда привязываем тензор отдельно).
+static id<MTLBuffer> gemm_arena_lookup(const void *p, size_t need,
+                                       uint64_t *off_out) {
+    int i;
+    uintptr_t a = (uintptr_t)p;
+
+    for (i = 0; i < VTM_METAL_ARENA_MAX; i++) {
+        uintptr_t base;
+
+        if (!g_arenas[i].buf) continue;
+        base = (uintptr_t)g_arenas[i].ptr;
+        if (a < base || a - base > g_arenas[i].bytes) continue;
+        if (need > g_arenas[i].bytes - (a - base)) continue;
+        *off_out = (uint64_t)(a - base);
+        return g_arenas[i].buf;
+    }
+    return nil;
+}
+
+// Один dispatch. Возвращает vn (сколько токенов покрыто), -1 — нет ядра.
+static int gemm_dispatch(id<MTLComputeCommandEncoder> enc, int kind,
+                         id<MTLBuffer> wb, uint64_t woff,
+                         id<MTLBuffer> sb, uint64_t scoff,
+                         id<MTLBuffer> xb, id<MTLBuffer> yb,
+                         int rows, int cols, int nt, long x_off,
+                         int x_stride, long y_off, int y_stride,
+                         int y_rstride, int tile) {
+    int vn = 0;
+
+    if (tile) {
+        vtm_metal_gemm_args a;
+        id<MTLComputePipelineState> ps = gemm_tile_ps(kind, nt, &vn);
+
+        if (!ps) return -1;
+        memset(&a, 0, sizeof a);
+        a.rows = (uint32_t)rows;
+        a.cols = (uint32_t)cols;
+        a.nblocks = kind == 2 ? 0u : (uint32_t)(cols / 256);
+        a.n_tokens = (uint32_t)nt;
+        a.x_off = (uint32_t)x_off;
+        a.y_off = (uint32_t)y_off;
+        a.x_stride = (uint32_t)x_stride;
+        a.y_stride = (uint32_t)y_stride;
+        a.y_rstride = (uint32_t)y_rstride;
+        a.w_off = woff;
+        a.sc_off = scoff / sizeof(float);
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:wb offset:0 atIndex:0];
+        [enc setBuffer:xb offset:0 atIndex:1];
+        [enc setBuffer:yb offset:0 atIndex:2];
+        [enc setBytes:&a length:sizeof a atIndex:3];
+        if (kind == 2) [enc setBuffer:sb offset:0 atIndex:4];
+        [enc dispatchThreadgroups:
+            MTLSizeMake(((NSUInteger)rows + VTM_METAL_TILE_ROWS - 1u)
+                        / VTM_METAL_TILE_ROWS, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(VTM_METAL_TILE_TG, 1, 1)];
+        return vn;
+    }
+    return -1;
+}
+
+// Все chunk'и одной матрицы. Смещения — в float от начала буферов.
+static int gemm_encode_matrix(id<MTLComputeCommandEncoder> enc, int kind,
+                              id<MTLBuffer> wb, uint64_t woff,
+                              id<MTLBuffer> sb, uint64_t scoff,
+                              id<MTLBuffer> xb, id<MTLBuffer> yb,
+                              int rows, int cols, int n_tokens, long x_off,
+                              int x_stride, long y_off, int y_stride,
+                              int y_rstride, int tile) {
+    int j0 = 0;
+
+    while (j0 < n_tokens) {
+        int nt = n_tokens - j0, vn, step;
+
+        if (nt > VTM_METAL_GEMM_MAX_N) nt = VTM_METAL_GEMM_MAX_N;
+        vn = gemm_dispatch(enc, kind, wb, woff, sb, scoff, xb, yb, rows, cols,
+                           nt, x_off + (long)j0 * x_stride, x_stride,
+                           y_off + (long)j0 * y_stride, y_stride, y_rstride,
+                           tile);
+        if (vn < 0) return -1;
+        step = nt < vn ? nt : vn;
+        j0 += step;
+    }
+    return 0;
+}
+
+// Открыть/закрыть общий командный буфер группы. Вызывается под g_lock.
+static int gemmq_open(void) {
+    if (g_gq.enc) return 0;
+    if (g_gq.failed) return -1;
+    if (!g_gq.cb) g_gq.cb = [[g_queue commandBuffer] retain];
+    if (!g_gq.cb) {
+        metal_set_err("commandBuffer вернул nil (gemm)");
+        return -1;
+    }
+    g_gq.enc = [[g_gq.cb computeCommandEncoder] retain];
+    if (!g_gq.enc) {
+        metal_set_err("computeCommandEncoder вернул nil (gemm)");
+        [g_gq.cb release];
+        g_gq.cb = nil;
+        return -1;
+    }
+    return 0;
+}
+
+// Закрыть группу и дождаться. 0 — всё посчитано, -1 — сбой Metal.
+static int gemmq_flush_locked(void) {
+    double gpu;
+
+    if (!g_gq.enc && !g_gq.cb) return g_gq.failed ? -1 : 0;
+    if (g_gq.enc) {
+        [g_gq.enc endEncoding];
+        [g_gq.enc release];
+        g_gq.enc = nil;
+    }
+    if (!g_gq.cb) return g_gq.failed ? -1 : 0;
+    if (g_gq.nops > 0) {
+        [g_gq.cb commit];
+        [g_gq.cb waitUntilCompleted];
+        gpu = (g_gq.cb.GPUEndTime - g_gq.cb.GPUStartTime) * 1e9;
+        if (gpu > 0.0) g_gpu_ns += (uint64_t)gpu;
+        if (getenv("VTM_METAL_TRACE"))
+            metal_log("gemm-группа: %d dispatch, GPU %.3f мс", g_gq.nops,
+                      (g_gq.cb.GPUEndTime - g_gq.cb.GPUStartTime) * 1e3);
+        if (g_gq.cb.status != MTLCommandBufferStatusCompleted
+            || g_gq.cb.error) {
+            if (g_fail == 0)
+                metal_log("gemm-группа: %s — дальше CPU-откат",
+                          g_gq.cb.error
+                              ? [[g_gq.cb.error localizedDescription] UTF8String]
+                              : "status != completed");
+            metal_set_err("командный буфер группы не завершился");
+            g_fail++;
+            g_gq.failed = 1;
+        }
+    }
+    [g_gq.cb release];
+    g_gq.cb = nil;
+    g_gq.nops = 0;
+    return g_gq.failed ? -1 : 0;
+}
+
+int vtm_metal_gemm_flush(void) {
+    int rc;
+
+    if (!__atomic_load_n(&g_gq_active, __ATOMIC_ACQUIRE)) return 0;
+    pthread_mutex_lock(&g_lock);
+    rc = gemmq_flush_locked();
+    pthread_mutex_unlock(&g_lock);
+    return rc;
+}
+
+// 0214: GEMM матрицы со шагами по токенам, прямо в памяти хоста (zero-copy).
+// 0 — dispatch'и в очереди (результат появится после vtm_metal_gemm_flush);
+// 1 — не взялся (форма/буфер/нет тайлового ядра): считать CPU-путём;
+// -1 — Metal отказал (тоже CPU-путь, режим выключается вызывающим).
+int vtm_metal_qk_gemm_arena(int kind, const void *w, const float *scales,
+                            int rows, int cols, int n_tokens,
+                            const float *x, int x_stride,
+                            float *y, int y_stride) {
+    id<MTLBuffer> wb = nil, sb = nil, xb = nil, yb = nil;
+    uint64_t woff = 0, scoff = 0, xoff = 0, yoff = 0;
+    size_t wbytes, scbytes, xbytes, ybytes;
+    uint32_t nblocks = 0;
+    int copied = 0;
+
+    if (!w || !x || !y || rows <= 0 || cols <= 0) return 1;
+    if (n_tokens < 1) return 1;
+    if (!gemm_tile_env() || metal_strict_env()) return 1;
     if (force_fail()) {
         metal_set_err("VTM_METAL_FORCE_FAIL: инъекция отказа Metal (GEMM)");
         g_fail++;
         vtm_metal_set_mode(VTM_METAL_OFF);
         return -1;
     }
+    // float4-загрузки входа: и указатель, и шаг должны быть выровнены.
+    if (((uintptr_t)x & 15u) != 0u || (x_stride & 3) != 0) return 1;
+    if (gemm_wsize(kind, rows, cols, &wbytes, &scbytes, &nblocks) != 0)
+        return 1;
+    if (kind == 2 && !scales) return 1;
+    xbytes = ((size_t)(n_tokens - 1) * (size_t)x_stride + (size_t)cols)
+           * sizeof(float);
+    ybytes = ((size_t)(n_tokens - 1) * (size_t)y_stride + (size_t)rows)
+           * sizeof(float);
 
     pthread_mutex_lock(&g_lock);
     if (metal_init() != 0) {
@@ -1161,177 +1485,327 @@ static int metal_gemm_body(int kind, float *y, const void *w,
         pthread_mutex_unlock(&g_lock);
         return -1;
     }
-    // 0211: вариант GEMM по числу токенов (8/16/32 аккумуляторов на поток).
-    // По умолчанию 32: на этой машине он быстрее 16 на длинных пачках (замер
-    // 128 токенов: 32,9 против 21,7 ток/с при 32/16 строках на threadgroup).
-    // VTM_METAL_GEMM_N=8|16 — A/B и старые metallib без gemm32.
-    {
-        static int gemm_n = -1;
-        if (gemm_n < 0) {
-            const char *e = getenv("VTM_METAL_GEMM_N");
-            int v = e ? atoi(e) : 0;
-            gemm_n = (v == 8 || v == 16 || v == 32) ? v : 32;
-        }
-        vn = n_tokens <= 8 ? 8 : (n_tokens <= gemm_n ? gemm_n : 32);
-        vi = vn == 8 ? 0 : (vn == 16 ? 1 : 2);
+    if (!g_ps_q4k_tile[1]) {
+        pthread_mutex_unlock(&g_lock);
+        return 1;
     }
-    ps = (kind == 0) ? g_ps_q4k_gemm[vi]
-       : (kind == 1) ? g_ps_q6k_gemm[vi] : g_ps_i8_gemm[vi];
-    if (!ps) {
+    if (metal_bind(w, wbytes, &wb, &woff, &copied) != 0) {
+        g_fail++;
+        pthread_mutex_unlock(&g_lock);
+        return 1;
+    }
+    if (kind == 2
+        && metal_bind(scales, scbytes, &sb, &scoff, &copied) != 0) {
+        g_fail++;
+        pthread_mutex_unlock(&g_lock);
+        return 1;
+    }
+    // Вход и выход — из привязанной арены пачки (одна привязка на прогон).
+    // Не в арене (общая активация, чужой буфер) — своя no-copy привязка.
+    xb = gemm_arena_lookup(x, xbytes, &xoff);
+    if (!xb && (metal_bind(x, xbytes, &xb, &xoff, &copied) != 0 || copied)) {
+        pthread_mutex_unlock(&g_lock);
+        return 1;
+    }
+    yb = gemm_arena_lookup(y, ybytes, &yoff);
+    if (!yb && (metal_bind(y, ybytes, &yb, &yoff, &copied) != 0 || copied)) {
+        pthread_mutex_unlock(&g_lock);
+        return 1;
+    }
+    if (gemmq_open() != 0) {
+        g_fail++;
         pthread_mutex_unlock(&g_lock);
         return -1;
     }
-    // Ядро всегда берёт 8 строк на threadgroup (256 потоков): столько нужно
-    // и коллективной загрузке x в threadgroup-память. Если pipeline не
-    // держит 256 потоков — на CPU.
-    rpt = (int)(ps.maxTotalThreadsPerThreadgroup / 32u);
-    // 0211: строк на threadgroup. Было 8 (256 потоков) — x пачки читался
-    // заново на каждые 8 строк, и GEMM упирался в эту полосу. Теперь до 16
-    // (512 потоков, 16 аккумуляторов на поток): x читается вдвое реже.
-    // VTM_METAL_GEMM_RPT=8 возвращает прежний замер 0196 для A/B.
-    {
-        static int rmax = -1;
-        if (rmax < 0) {
-            const char *e = getenv("VTM_METAL_GEMM_RPT");
-            rmax = (e && atoi(e) > 0) ? atoi(e) : 16;
-            if (rmax < 1) rmax = 1;
-            // 32 строки (1024 потока) на этой машине дают неверный результат
-            // на NT=32 — --check ловит это на 31/32/44; 16 проверено.
-            if (rmax > 16) rmax = 16;
-        }
-        if (rpt > rmax) rpt = rmax;
+    if (gemm_encode_matrix(g_gq.enc, kind, wb, woff, sb, scoff, xb, yb, rows,
+                           cols, n_tokens, (long)(xoff / sizeof(float)),
+                           x_stride, (long)(yoff / sizeof(float)), y_stride,
+                           1, 1) != 0) {
+        pthread_mutex_unlock(&g_lock);
+        return 1;
     }
-    // VTM_GEMM_LOAD_HALF делит 128*NT значений на rpt*32 потоков; при
-    // rpt > NT цикл загрузки пуст, поэтому потолок — NT.
-    if (rpt > vn) rpt = vn;
-    if (rpt < 1) rpt = 1;
-    if ((ps.maxTotalThreadsPerThreadgroup < (NSUInteger)rpt * 32u)) {
+    g_gq.nops += (n_tokens + 15) / 16 + 1;
+    g_gemm_calls++;
+    g_calls++;
+    __atomic_store_n(&g_gq_active, 1, __ATOMIC_RELEASE);
+    // VTM_METAL_GEMM_GROUP=0 — по командному буферу на матрицу (A/B группировки
+    // и разбивка GPU-времени по матрицам в VTM_METAL_TRACE).
+    {
+        static int group = -1;
+
+        if (group < 0) {
+            const char *e = getenv("VTM_METAL_GEMM_GROUP");
+            group = (e && *e && *e == '0') ? 0 : 1;
+        }
+        if (!group && gemmq_flush_locked() != 0) {
+            pthread_mutex_unlock(&g_lock);
+            return -1;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return 0;
+}
+
+// 0214: attention пачки. q/out — в арене пачки (шаг stride на токен), K/V — в
+// кольцевом кэше модели (общий, zero-copy). 0 — dispatch в очереди группы,
+// 1 — не взялся (форма/буфер), -1 — Metal отказал.
+typedef struct {
+    uint32_t n_heads;
+    uint32_t rep;
+    uint32_t head_dim;
+    uint32_t kv_dim;
+    uint32_t win;
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t stride;
+    uint32_t q_off;
+    uint32_t out_off;
+    uint32_t pad0;
+    uint32_t pad1;
+    float    scale;
+} vtm_metal_attn_batch_args;
+
+int vtm_metal_attn_prefill(float *out, const float *q, const float *kc,
+                           const float *vc, int n_heads, int n_kv_heads,
+                           int head_dim, int kv_dim, int win, int n_tokens,
+                           int pos0, int q_stride, int out_stride) {
+    id<MTLBuffer> qb = nil, ob = nil, kb = nil, vb = nil;
+    uint64_t qoff = 0, ooff = 0, koff = 0, voff = 0;
+    vtm_metal_attn_batch_args a;
+    int copied = 0;
+
+    if (!out || !q || !kc || !vc) return 1;
+    if (n_heads <= 0 || n_kv_heads <= 0 || n_heads % n_kv_heads != 0
+        || head_dim <= 0 || head_dim > 256 || kv_dim != n_kv_heads * head_dim
+        || win <= 0 || n_tokens <= 0 || pos0 < 0)
+        return 1;
+    if (metal_strict_env()) return 1;
+    if (force_fail()) {
+        metal_set_err("VTM_METAL_FORCE_FAIL: инъекция отказа Metal (attn)");
+        g_fail++;
+        vtm_metal_set_mode(VTM_METAL_OFF);
+        return -1;
+    }
+    a.n_heads = (uint32_t)n_heads;
+    a.rep = (uint32_t)(n_heads / n_kv_heads);
+    a.head_dim = (uint32_t)head_dim;
+    a.kv_dim = (uint32_t)kv_dim;
+    a.win = (uint32_t)win;
+    a.n_tokens = (uint32_t)n_tokens;
+    a.pos0 = (uint32_t)pos0;
+    a.stride = (uint32_t)q_stride;
+    a.q_off = 0;
+    a.out_off = 0;
+    a.pad0 = a.pad1 = 0;
+    a.scale = (float)(1.0 / sqrt((double)head_dim));
+
+    pthread_mutex_lock(&g_lock);
+    if (metal_init() != 0) {
+        g_fail++;
         pthread_mutex_unlock(&g_lock);
         return -1;
     }
-    if (kind == 0) {
-        if (cols % 256 != 0) { pthread_mutex_unlock(&g_lock); return -1; }
-        wbytes = ((size_t)rows * (size_t)cols / 256u) * 144u;
-        a.nblocks = (uint32_t)(cols / 256);
-    } else if (kind == 1) {
-        if (cols % 256 != 0) { pthread_mutex_unlock(&g_lock); return -1; }
-        wbytes = ((size_t)rows * (size_t)cols / 256u) * 210u;
-        a.nblocks = (uint32_t)(cols / 256);
-    } else {
-        wbytes = (size_t)rows * (size_t)cols;
-        a.nblocks = 0;
+    if (!g_ps_attn_batch) {
+        pthread_mutex_unlock(&g_lock);
+        return 1;
     }
-    if (metal_bind(w, wbytes, &wb, &woff, NULL) != 0) {
+    if (out_stride != q_stride) {
+        pthread_mutex_unlock(&g_lock);
+        return 1;
+    }
+    {
+        size_t qbytes = ((size_t)(n_tokens - 1) * (size_t)q_stride
+                         + (size_t)n_heads * (size_t)head_dim) * sizeof(float);
+        size_t ocap = (size_t)win * (size_t)kv_dim * sizeof(float);
+
+        qb = gemm_arena_lookup(q, qbytes, &qoff);
+        if (!qb && (metal_bind(q, qbytes, &qb, &qoff, &copied) != 0
+                    || copied)) {
+            pthread_mutex_unlock(&g_lock);
+            return 1;
+        }
+        ob = gemm_arena_lookup(out, qbytes, &ooff);
+        if (!ob && (metal_bind(out, qbytes, &ob, &ooff, &copied) != 0
+                    || copied)) {
+            pthread_mutex_unlock(&g_lock);
+            return 1;
+        }
+        // Кэш кольца — общий тензор модели: читать можно и из копии, но копия
+        // устарела бы (KVW пишет каждый токен), поэтому только zero-copy.
+        if (metal_bind(kc, ocap, &kb, &koff, &copied) != 0 || copied
+            || metal_bind(vc, ocap, &vb, &voff, &copied) != 0 || copied) {
+            pthread_mutex_unlock(&g_lock);
+            return 1;
+        }
+        a.q_off = (uint32_t)(qoff / sizeof(float));
+        a.out_off = (uint32_t)(ooff / sizeof(float));
+        if (gemmq_open() != 0) {
+            g_fail++;
+            pthread_mutex_unlock(&g_lock);
+            return -1;
+        }
+        [g_gq.enc setComputePipelineState:g_ps_attn_batch];
+        // K/V-кэш — из mmap модели: его смещение внутри страничного no-copy
+        // буфера передаём как offset (иначе ядро читало бы начало страницы).
+        [g_gq.enc setBuffer:qb offset:0 atIndex:0];
+        [g_gq.enc setBuffer:kb offset:(NSUInteger)koff atIndex:1];
+        [g_gq.enc setBuffer:vb offset:(NSUInteger)voff atIndex:2];
+        [g_gq.enc setBuffer:ob offset:0 atIndex:3];
+        [g_gq.enc setBytes:&a length:sizeof a atIndex:4];
+        [g_gq.enc dispatchThreadgroups:
+            MTLSizeMake((NSUInteger)n_tokens * (NSUInteger)n_heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
+    g_gq.nops++;
+    g_calls++;
+    __atomic_store_n(&g_gq_active, 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_lock);
+    return 0;
+}
+
+// --- прежний синхронный API (тесты, бенчмарк, откат) ------------------------
+//
+// Раскладка входа — x[t*n_tokens + j], выхода — y[r*n_tokens + j] (как у
+// батчевых ядер interp.c). Вход копируется в staging с нулевым хвостом до 32
+// токенов (ядро варианта NT читает ровно NT), выход тайловое ядро пишет прямо
+// в y по шагам. --metal-gemm меряет именно этот путь, живой prefill — арену.
+static int metal_gemm_body(int kind, float *y, const void *w,
+                           const float *scales, const float *x,
+                           int rows, int cols, int n_tokens) {
+    id<MTLBuffer> wb = nil, sb = nil;
+    uint64_t woff = 0, scoff = 0;
+    id<MTLCommandBuffer> cb = nil;
+    id<MTLComputeCommandEncoder> enc = nil;
+    size_t wbytes, scbytes, xbytes, ybytes;
+    int rc = -1, copied = 0, tile, j0, vnmax = VTM_METAL_GEMM_MAX_N;
+    uint32_t nblocks = 0;
+
+    if (!y || !w || !x || rows <= 0 || cols <= 0 || n_tokens <= 1) return -1;
+    // Пачка меньше 8 токенов на GPU проигрывает CPU (замер 0196): ядро всё
+    // равно считает 8 (минимум из вариантов), а накладные те же.
+    if (n_tokens < 8) return -1;
+    if (metal_strict_env()) return -1;
+    if (force_fail()) {
+        metal_set_err("VTM_METAL_FORCE_FAIL: инъекция отказа Metal (GEMM)");
+        g_fail++;
+        vtm_metal_set_mode(VTM_METAL_OFF);
+        return -1;
+    }
+    tile = gemm_tile_env();
+    if (gemm_wsize(kind, rows, cols, &wbytes, &scbytes, &nblocks) != 0)
+        return -1;
+
+    pthread_mutex_lock(&g_lock);
+    if (metal_init() != 0) {
+        g_fail++;
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    if (!g_ps_q4k_tile[0] && !g_ps_q4k_tile[1]) {
+        // Тайловых ядер нет (старый metallib) — батчевый prefill пойдёт CPU.
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    if (metal_bind(w, wbytes, &wb, &woff, &copied) != 0) {
         g_fail++;
         pthread_mutex_unlock(&g_lock);
         return -1;
     }
     if (kind == 2) {
-        uint64_t n = (uint64_t)rows * (uint64_t)cols;
-        scbytes = (size_t)(n / 128u + (n % 128u ? 1u : 0u)) * sizeof(float);
-        if (!scales || metal_bind(scales, scbytes, &sb, &scoff, NULL) != 0) {
+        if (!scales || metal_bind(scales, scbytes, &sb, &scoff, &copied) != 0) {
             g_fail++;
             pthread_mutex_unlock(&g_lock);
             return -1;
         }
-        a.sc_off = scoff / sizeof(float);
-    } else {
-        a.sc_off = 0;
     }
-    a.rows = (uint32_t)rows;
-    a.cols = (uint32_t)cols;
-    a.w_off = woff;
+    // Вход — в staging: все токены пачки, шаг токена cols (ядро читает
+    // xt[j*cols + t]), хвост до кратности 32 — нули (ядро варианта NT читает
+    // ровно NT токенов). Staging свой, копия безопасна.
+    {
+        int ntok_pad = (n_tokens + VTM_METAL_GEMM_MAX_N - 1)
+                     / VTM_METAL_GEMM_MAX_N * VTM_METAL_GEMM_MAX_N;
+        float *xt;
+        int t, j;
+        const int stride = cols;
 
-    xbytes = (size_t)cols * (size_t)VTM_METAL_GEMM_MAX_N * sizeof(float);
-    ybytes = (size_t)rows * (size_t)VTM_METAL_GEMM_MAX_N * sizeof(float);
-    if (metal_reserve(&g_gxbuf, &g_gxcap, xbytes) != 0
-        || metal_reserve(&g_gybuf, &g_gycap, ybytes) != 0) {
+        xbytes = (size_t)cols * (size_t)ntok_pad * sizeof(float);
+        if (metal_reserve(&g_gxbuf, &g_gxcap, xbytes) != 0) {
+            g_fail++;
+            pthread_mutex_unlock(&g_lock);
+            return -1;
+        }
+        xt = (float *)[g_gxbuf contents];
+        for (t = 0; t < cols; t++) {
+            for (j = 0; j < n_tokens; j++)
+                xt[(size_t)j * (size_t)stride + (size_t)t] =
+                    x[(size_t)t * (size_t)n_tokens + (size_t)j];
+            for (j = n_tokens; j < ntok_pad; j++)
+                xt[(size_t)j * (size_t)stride + (size_t)t] = 0.0f;
+        }
+    }
+    ybytes = (size_t)rows * (size_t)vnmax * sizeof(float);
+    if (metal_reserve(&g_gybuf, &g_gycap, ybytes) != 0) {
         g_fail++;
         pthread_mutex_unlock(&g_lock);
         return -1;
     }
-
-    // Токены пачки — по chunk'ам до 32: в ядре столько аккумуляторов-регистров.
-    // На chunk — свой командный буфер: результат копируется в y на CPU сразу
-    // после завершения, staging не переиспользуется под живым GPU.
-    for (j0 = 0; j0 < n_tokens; j0 += vn) {
-        int j, r;
-        nt = n_tokens - j0;
-        if (nt > vn) nt = vn;
-        {
-            float *xt = (float *)[g_gxbuf contents];
-            int t;
-            // x[t*n_tokens + j0 + j] -> xt[j*cols + t]; хвост до vn — нули.
-            for (t = 0; t < cols; t++) {
-                for (j = 0; j < nt; j++)
-                    xt[(size_t)j * (size_t)cols + (size_t)t] =
-                        x[(size_t)t * (size_t)n_tokens + (size_t)(j0 + j)];
-                for (j = nt; j < vn; j++)
-                    xt[(size_t)j * (size_t)cols + (size_t)t] = 0.0f;
-            }
-        }
-        a.n_tokens = (uint32_t)rpt;
-        cb = [g_queue commandBuffer];
-        if (!cb) {
-            metal_set_err("commandBuffer вернул nil (gemm)");
-            g_fail++;
-            goto out;
-        }
-        enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:ps];
-        [enc setBuffer:wb offset:0 atIndex:0];
-        [enc setBuffer:g_gxbuf offset:0 atIndex:1];
-        [enc setBuffer:g_gybuf offset:0 atIndex:2];
-        [enc setBytes:&a length:sizeof a atIndex:3];
-        if (kind == 2) [enc setBuffer:sb offset:0 atIndex:4];
-        [enc dispatchThreadgroups:
-            MTLSizeMake(((NSUInteger)rows + (NSUInteger)rpt - 1u)
-                        / (NSUInteger)rpt, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake((NSUInteger)rpt * 32u, 1, 1)];
+    cb = [g_queue commandBuffer];
+    if (!cb) {
+        metal_set_err("commandBuffer вернул nil (gemm)");
+        g_fail++;
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    enc = [cb computeCommandEncoder];
+    // Шаг выхода — rows: ядро пишет yt[j*rows + r] (на токен — все строки).
+    if (gemm_encode_matrix(enc, kind, wb, woff, sb, scoff, g_gxbuf, g_gybuf,
+                           rows, cols, n_tokens, 0, cols, 0, rows, 1,
+                           tile) != 0) {
         [enc endEncoding];
-        enc = nil;
-        [cb commit];
-        [cb waitUntilCompleted];
-        {
-            double gpu = (cb.GPUEndTime - cb.GPUStartTime) * 1e9;
-            if (gpu > 0.0) g_gpu_ns += (uint64_t)gpu;
-            if (getenv("VTM_METAL_TRACE"))
-                metal_log("gemm kind %d %dx%d n=%d: GPU %.3f мс", kind, rows,
-                          cols, nt,
-                          (cb.GPUEndTime - cb.GPUStartTime) * 1e3);
-        }
-        if (cb.status != MTLCommandBufferStatusCompleted || cb.error) {
-            if (g_fail == 0)
-                metal_log("GEMM-буфер: %s — дальше CPU",
-                          cb.error
-                              ? [[cb.error localizedDescription] UTF8String]
-                              : "status != completed");
-            metal_set_err("GEMM-буфер не завершился");
-            g_fail++;
-            // Ошибка командного буфера — не «форма не та», а сбой GPU: чтобы
-            // не повторять её на каждой матрице, режим выключается, и
-            // остаток прогона идёт чистым CPU-путём (0198, откат).
-            vtm_metal_set_mode(VTM_METAL_OFF);
-            goto out;
-        }
-        {
-            const float *yt = (const float *)[g_gybuf contents];
-            // Строка результата ядра — ровно N = vn столбцов (вариант
-            // gemm8/16/32 выбирается по n_tokens, хвост пачки добит нулями
-            // ещё в xt). Последний chunk может быть короче vn (nt < vn), но
-            // шаг строки в g_gybuf всё равно vn. Читать его как nt нельзя:
-            // 0199 — на nt != vn строки сдвигались, и весь батч (а с ним
-            // K/V префикса) превращался в мусор.
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    [enc endEncoding];
+    enc = nil;
+    [cb commit];
+    [cb waitUntilCompleted];
+    {
+        double gpu = (cb.GPUEndTime - cb.GPUStartTime) * 1e9;
+        if (gpu > 0.0) g_gpu_ns += (uint64_t)gpu;
+        if (getenv("VTM_METAL_TRACE"))
+            metal_log("gemm kind %d %dx%d n=%d: GPU %.3f мс", kind, rows, cols,
+                      n_tokens, (cb.GPUEndTime - cb.GPUStartTime) * 1e3);
+    }
+    if (cb.status != MTLCommandBufferStatusCompleted || cb.error) {
+        if (g_fail == 0)
+            metal_log("GEMM-буфер: %s — дальше CPU",
+                      cb.error ? [[cb.error localizedDescription] UTF8String]
+                               : "status != completed");
+        metal_set_err("GEMM-буфер не завершился");
+        g_fail++;
+        vtm_metal_set_mode(VTM_METAL_OFF);
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    {
+        // Выход ядра — token-major с шагом vnmax (yt[j*vnmax + r]): разнести
+        // по раскладке батчевых ядер y[r*n_tokens + j].
+        const float *yt = (const float *)[g_gybuf contents];
+        int r;
+
+        for (j0 = 0; j0 < n_tokens; j0 += vnmax) {
+            int nt = n_tokens - j0, j;
+
+            if (nt > vnmax) nt = vnmax;
             for (r = 0; r < rows; r++)
                 for (j = 0; j < nt; j++)
                     y[(size_t)r * (size_t)n_tokens + (size_t)(j0 + j)] =
-                        yt[(size_t)r * (size_t)vn + (size_t)j];
+                        yt[(size_t)(j0 + j) * (size_t)rows + (size_t)r];
         }
-        g_gemm_calls++;
-        g_calls++;
     }
+    g_gemm_calls++;
+    g_calls++;
     rc = 0;
-out:
     pthread_mutex_unlock(&g_lock);
     return rc;
 }
@@ -1341,6 +1815,33 @@ int vtm_metal_qk_gemm(int kind, float *y, const void *w, const float *scales,
     @autoreleasepool {
         return metal_gemm_body(kind, y, w, scales, x, rows, cols, n_tokens);
     }
+}
+
+int vtm_metal_gemm_pad(void) {
+    return VTM_METAL_GEMM_PAD;
+}
+
+int vtm_metal_batch_arena(const void *ptr, size_t bytes) {
+    int rc;
+
+    if (!ptr || !bytes) return -1;
+    if (metal_strict_env()) return -1;
+    pthread_mutex_lock(&g_lock);
+    if (metal_init() != 0) {
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    rc = gemm_arena_attach(ptr, bytes);
+    pthread_mutex_unlock(&g_lock);
+    return rc;
+}
+
+void vtm_metal_batch_arena_drop(const void *ptr) {
+    pthread_mutex_lock(&g_lock);
+    // Сначала дождаться группы: её dispatch'и читают/пишут эту арену.
+    (void)gemmq_flush_locked();
+    gemm_arena_drop(ptr);
+    pthread_mutex_unlock(&g_lock);
 }
 
 // Порог «мелкие формы — на CPU» (ADR 0021 §5): накладные Metal на GEMV
@@ -1388,6 +1889,19 @@ void vtm_metal_forget_all(void) {
         g_binds[i].buf = nil;
     }
     g_nbinds = 0;
+    for (i = 0; i < VTM_METAL_ARENA_MAX; i++) {
+        [g_arenas[i].buf release];
+        g_arenas[i].buf = nil;
+        g_arenas[i].ptr = NULL;
+        g_arenas[i].bytes = 0;
+    }
+    [g_gq.enc release];
+    g_gq.enc = nil;
+    [g_gq.cb release];
+    g_gq.cb = nil;
+    g_gq.nops = 0;
+    g_gq.failed = 0;
+    __atomic_store_n(&g_gq_active, 0, __ATOMIC_RELEASE);
     [g_g.tmp release];
     g_g.tmp = nil;
     g_g.tmpcap = 0;
@@ -1998,6 +2512,7 @@ void vtm_metal_stats_get(vtm_metal_stats *out) {
     out->graph_fail = g_graph_fail;
     out->graph_encode_ns = g_graph_encode_ns;
     out->wait_ns = g_wait_ns;
+    out->gpu_ns = g_gpu_ns;
     snprintf(out->last_error, sizeof out->last_error, "%s", g_err);
     pthread_mutex_unlock(&g_lock);
 }

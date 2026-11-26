@@ -5175,52 +5175,145 @@ static int run_api_tokens(const char *path, const char *backend) {
 
 // --- 0211: изолированный GPU-батч GEMM -------------------------------------
 //
-// --metal-gemm ROWS,COLS,N,ITERS. Меряет vtm_metal_qk_gemm без модели и без
-// перекладки активаций по слоям: так видно потолок самого ядра и эффект
-// VTM_METAL_GEMM_N/RPT, а не шум загрузки/страниц. Блоки весов нулевые —
-// арифметика та же, время честное.
+// --metal-gemm ROWS,COLS,N,ITERS[,STRIDE]. Меряет батчевый GEMM без модели и
+// без перекладки активаций по слоям: видно потолок ядра, а не шум загрузки.
+// Блоки весов нулевые — арифметика та же, время честное.
+//
+// STRIDE > 0 — «арена пачки» (0214): вход и выход лежат в одной
+// странично-выровненной арене с шагом STRIDE float на токен (так устроен
+// b->mem в interp.c), вызов идёт через vtm_metal_qk_gemm_arena +
+// vtm_metal_gemm_flush. Это ровно живой путь prefill; STRIDE = cols даёт
+// компактную раскладку, STRIDE = размер слота модели (609 КиБ у 3B Q4_K) —
+// живую. STRIDE = 0 — прежний упакованный путь vtm_metal_qk_gemm.
+//
+// Печатает wall (min из ITERS), GPU (min, из vtm_metal_stats.gpu_ns) и
+// GMAC/s по wall и по GPU.
+static float *bench_page_alloc(size_t bytes) {
+    void *p = NULL;
+    long page = sysconf(_SC_PAGESIZE);
+    size_t rounded;
+
+    if (page <= 0) page = 4096;
+    rounded = (bytes + (size_t)page - 1u) & ~((size_t)page - 1u);
+    if (rounded == 0) rounded = (size_t)page;
+    if (posix_memalign(&p, (size_t)page, rounded) != 0 || !p) return NULL;
+    memset(p, 0, rounded);
+    return (float *)p;
+}
+
 static int run_metal_gemm_bench(const char *spec) {
     int rows = 2048, cols = 2048, ntok = 64, iters = 10;
+    long stride = 0;
     unsigned char *blocks;
-    float *x, *y;
-    double t0, best = 1e300;
+    float *x = NULL, *y = NULL;
+    vtm_metal_stats st0, st1;
+    double t0, best = 1e300, best_gpu = 1e300;
     size_t wbytes;
     int it;
 
-    if (spec && *spec) sscanf(spec, "%d,%d,%d,%d", &rows, &cols, &ntok, &iters);
+    if (spec && *spec)
+        sscanf(spec, "%d,%d,%d,%d,%ld", &rows, &cols, &ntok, &iters, &stride);
     if (rows <= 0 || cols <= 0 || ntok <= 0 || iters <= 0
         || cols % 256 != 0) {
-        fprintf(stderr, "--metal-gemm ROWS,COLS,N,ITERS (COLS кратен 256)\n");
+        fprintf(stderr, "--metal-gemm ROWS,COLS,N,ITERS[,STRIDE] "
+                        "(COLS кратен 256)\n");
         return 2;
     }
     wbytes = (size_t)rows * (size_t)cols / 256u * 144u;
     blocks = (unsigned char *)calloc(wbytes ? wbytes : 1u, 1);
-    x = (float *)calloc((size_t)cols * (size_t)ntok, sizeof *x);
-    y = (float *)calloc((size_t)rows * (size_t)ntok, sizeof *y);
-    if (!blocks || !x || !y) {
-        free(blocks); free(x); free(y);
+    if (!blocks) {
         fprintf(stderr, "metal-gemm: нет памяти\n");
         return 1;
     }
-    printf("metal gemm %dx%d, %d токенов, %d итераций\n", rows, cols, ntok,
-           iters);
-    for (it = 0; it < iters; it++) {
-        int rc = vtm_metal_qk_gemm(0, y, blocks, NULL, x, rows, cols, ntok);
-        if (rc != 0) {
-            fprintf(stderr, "metal-gemm: ядро отказало (%d)\n", rc);
-            free(blocks); free(x); free(y);
+    if (stride > 0) {
+        // Арена: запас 32 токена (ядро варианта NT читает/пишет ровно NT).
+        size_t slot = (size_t)stride;
+        size_t ntok_pad = (size_t)ntok + 32u;
+        size_t abytes;
+        float *arena;
+
+        if (slot < (size_t)cols) slot = (size_t)cols;
+        abytes = ntok_pad * slot * sizeof(float);
+        arena = bench_page_alloc(abytes);
+        if (!arena) {
+            free(blocks);
+            fprintf(stderr, "metal-gemm: нет памяти под арену %zu байт\n",
+                    abytes);
             return 1;
         }
-        t0 = now_ms();
-        rc = vtm_metal_qk_gemm(0, y, blocks, NULL, x, rows, cols, ntok);
-        t0 = now_ms() - t0;
-        if (rc != 0) break;
-        if (t0 < best) best = t0;
+        x = arena;                          // вход — с начала слота
+        y = arena + (size_t)cols;           // выход — следующий тензор слота
+        // Привязка арены — как в живом prefill: одна на прогон, дальше только
+        // смещения тензоров. Без неё каждая матрица создаёт no-copy буфер на
+        // весь слот (608 КиБ/токен) и хост-время растёт втрое.
+        (void)vtm_metal_batch_arena(arena, abytes);
+        printf("metal gemm %dx%d, %d токенов, %d итераций, арена: шаг %ld "
+               "float (%.1f КиБ/токен, %.1f МиБ)\n", rows, cols, ntok, iters,
+               stride, (double)stride * 4.0 / 1024.0,
+               (double)abytes / (1024.0 * 1024.0));
+        for (it = 0; it < iters; it++) {
+            int rc = vtm_metal_qk_gemm_arena(0, blocks, NULL, rows, cols, ntok,
+                                             x, (int)slot, y, (int)slot);
+            if (rc != 0) {
+                fprintf(stderr, "metal-gemm: арена отказала (%d)\n", rc);
+                free(arena);
+                free(blocks);
+                return 1;
+            }
+            (void)vtm_metal_gemm_flush();
+            vtm_metal_stats_get(&st0);
+            t0 = now_ms();
+            rc = vtm_metal_qk_gemm_arena(0, blocks, NULL, rows, cols, ntok, x,
+                                         (int)slot, y, (int)slot);
+            if (rc == 0) rc = vtm_metal_gemm_flush();
+            t0 = now_ms() - t0;
+            vtm_metal_stats_get(&st1);
+            if (rc != 0) break;
+            if (t0 < best) best = t0;
+            {
+                double g = (double)(st1.gpu_ns - st0.gpu_ns) / 1e6;
+                if (g > 0.0 && g < best_gpu) best_gpu = g;
+            }
+        }
+        vtm_metal_batch_arena_drop(arena);
+        free(arena);
+    } else {
+        x = (float *)calloc((size_t)cols * (size_t)ntok, sizeof *x);
+        y = (float *)calloc((size_t)rows * (size_t)ntok, sizeof *y);
+        if (!x || !y) {
+            free(blocks); free(x); free(y);
+            fprintf(stderr, "metal-gemm: нет памяти\n");
+            return 1;
+        }
+        printf("metal gemm %dx%d, %d токенов, %d итераций, упакованный вход\n",
+               rows, cols, ntok, iters);
+        for (it = 0; it < iters; it++) {
+            int rc = vtm_metal_qk_gemm(0, y, blocks, NULL, x, rows, cols, ntok);
+            if (rc != 0) {
+                fprintf(stderr, "metal-gemm: ядро отказало (%d)\n", rc);
+                free(blocks); free(x); free(y);
+                return 1;
+            }
+            vtm_metal_stats_get(&st0);
+            t0 = now_ms();
+            rc = vtm_metal_qk_gemm(0, y, blocks, NULL, x, rows, cols, ntok);
+            t0 = now_ms() - t0;
+            vtm_metal_stats_get(&st1);
+            if (rc != 0) break;
+            if (t0 < best) best = t0;
+            {
+                double g = (double)(st1.gpu_ns - st0.gpu_ns) / 1e6;
+                if (g > 0.0 && g < best_gpu) best_gpu = g;
+            }
+        }
     }
     if (best < 1e299) {
         double mac = (double)rows * (double)cols * (double)ntok;
-        printf("  лучшее %.3f мс = %.1f GMAC/s, %.1f ток/с (для этой формы)\n",
-               best, mac / best * 1e-6, 1e3 * (double)ntok / best);
+        printf("  wall: %.3f мс = %.1f GMAC/s\n", best, mac / best * 1e-6);
+        if (best_gpu < 1e299)
+            printf("  GPU:  %.3f мс = %.1f GMAC/s (хост+ожидание %.3f мс)\n",
+                   best_gpu, mac / best_gpu * 1e-6,
+                   best - best_gpu > 0.0 ? best - best_gpu : 0.0);
     } else {
         printf("  metal недоступен/ядро отказало\n");
     }
