@@ -59,6 +59,11 @@ Silero работает отдельным **долгоживущим** проц
 через :meth:`ElevenLabsTTS.synthesize_audio`; серверу это нужно, чтобы
 выставить ``audio/mpeg`` вместо жёсткого ``audio/wav``.
 
+Перед синтезом числа превращаются в русские слова (:mod:`eva.ru_numbers`,
+задача 0205): Silero v4_ru не произносит токены-цифры и «Цена 1500 рублей»
+звучала втрое короче словесной формы. Нормализация общая для всех движков и
+делается до выбора движка, поэтому ElevenLabs и ``say`` тоже получают слова.
+
 Адаптеры умеют также :meth:`TTSAdapter.synthesize_timed` — с замерами
 ``synth_ms`` и ``first_fragment_ms`` для голосового цикла.
 
@@ -88,6 +93,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from .ru_numbers import numbers_to_words
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -129,6 +136,7 @@ __all__ = [
     "find_silero_python",
     "find_silero_torch_dir",
     "find_silero_worker",
+    "normalize_tts_text",
     "piper_help",
     "prewarm_silero_worker",
     "select_engine",
@@ -346,8 +354,21 @@ def _is_executable(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
 
 
+def normalize_tts_text(text: object) -> str:
+    """Текст для озвучки: числа — русскими словами (задача 0205).
+
+    Silero v4_ru пропускает токены-цифры («Цена 1500 рублей» звучала втрое
+    короче словесной формы), поэтому нормализация общая для всех движков:
+    она делается **до** выбора движка, в :func:`_synthesize_with_fallback`, и
+    повторно в :func:`_clean_text` — на случай прямого вызова
+    ``adapter.synthesize()``. Функция идемпотентна: слова повторно не
+    меняются.
+    """
+    return numbers_to_words(str(text or ""))
+
+
 def _clean_text(text: object) -> str:
-    value = str(text or "").strip()
+    value = normalize_tts_text(text).strip()
     if not value:
         raise TTSError("пустой текст для синтеза")
     return value
@@ -2760,6 +2781,10 @@ def _synthesize_with_fallback(
     одного — поднимаем исходную ошибку, а не отдаём тишину.
     """
     env_source = os.environ if env is None else env
+    # Числа — словами до выбора движка: иначе Silero молча пропускает цифры.
+    # Адаптеры нормализуют повторно в ``_clean_text``, но переопределённый
+    # ``synthesize`` (тесты, сторонние движки) получает уже готовый текст.
+    text = normalize_tts_text(text)
     chosen = engine or select_engine(
         prefer,
         piper_bin=piper_bin,

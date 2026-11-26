@@ -1367,7 +1367,7 @@
   {
     "id": "0205",
     "title": "Числа в слова перед озвучкой",
-    "status": "in_progress",
+    "status": "done",
     "file": "0205-tts-numbers.md",
     "assignee": "agent:tts-numbers"
   }

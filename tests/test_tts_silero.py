@@ -1127,9 +1127,12 @@ class SileroWorkerLockTests(InstalledSileroCase):
         self.assertEqual(len(results), len(phrases))
         self.assertEqual(len(created), 1)
         self.assertEqual(stats["max_active"], 1)
-        # Каждый поток получил свой WAV, а не ответ соседа.
+        # Каждый поток получил свой WAV, а не ответ соседа. Фраза в worker'е
+        # уже нормализована (числа — словами, задача 0205): «номер 0» →
+        # «номер ноль», поэтому сверяем с normalize_tts_text, а не с сырым
+        # текстом.
         for text, data in results.items():
-            self.assertEqual(data, FAKE_WAV + text.encode())
+            self.assertEqual(data, FAKE_WAV + tts.normalize_tts_text(text).encode())
 
 
 if __name__ == "__main__":
