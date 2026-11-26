@@ -1918,15 +1918,21 @@ static void moe_cache_unpin(moe_cache_entry *e) {
     MOE_CACHE_UNLOCK();
 }
 
+#if defined(F_GETPATH)
 // Один и тот же файл? Дескриптор для pread открывается по пути, а банки
 // адресуются смещениями из mmap-отображения. Если файл по пути успели
 // заменить, открылся бы другой inode, и pread вернул бы чужие веса — лучше
 // остаться на mmap-пути.
+//
+// Только для платформ с F_GETPATH (macOS): на Linux путь к файлу так не
+// получить, там используется dup(), и функция не нужна — без этого #if
+// сборка Linux падала на -Werror=unused-function (CI).
 static int moe_same_file(int a, int b) {
     struct stat sa, sb;
     if (fstat(a, &sa) != 0 || fstat(b, &sb) != 0) return 0;
     return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
 }
+#endif  /* F_GETPATH */
 
 // Дескриптор для pread: свой, чтобы F_NOCACHE не влиял на mmap-отображение.
 // Путь берём у оригинала через F_GETPATH (macOS); если так нельзя — dup:
