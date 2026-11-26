@@ -165,6 +165,16 @@ _INDEX_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+#: «Какие бумаги входят в индекс» / «топ по индексу» — нужен СОСТАВ, а не
+#: значение индекса: другой запрос к ISS (analytics) и цены по бумагам.
+_INDEX_TOP_RE = re.compile(
+    r"(?:"
+    r"входит|входят|входящ\w*|состав\w*|топ\w*|список\w*"
+    r"|бумаг\w*|акци\w*"
+    r")",
+    re.IGNORECASE,
+)
+
 #: Имя индекса в вопросе → тикер MOEX.
 _INDEX_TICKERS = (("ртс", "RTSI"), ("rtsi", "RTSI"), ("imoex", "IMOEX"),
                   ("мосбирж", "IMOEX"))
@@ -228,6 +238,17 @@ def detect(text: str) -> Intent | None:
     #    цене — не наша зона (модель ответит сама).
     if _CATALOG_GUARD_RE.search(value):
         return None
+    # Состав индекса спрашивают словами «топ/входит/состав/список/бумаги».
+    # Проверяем вместе с упоминанием индекса: «топ акций» без индекса — не наше.
+    index_top_hit = _INDEX_TOP_RE.search(raw) if _INDEX_RE.search(raw) else None
+    if index_top_hit:
+        lowered = raw.lower()
+        ticker = next(
+            (code for marker, code in _INDEX_TICKERS if marker in lowered),
+            "IMOEX",
+        )
+        return Intent("index_top", (ticker,), phrase=index_top_hit.group(0).strip())
+
     index_hit = _INDEX_RE.search(raw)
     if index_hit:
         lowered = index_hit.group(0).lower()

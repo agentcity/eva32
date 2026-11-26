@@ -1161,8 +1161,20 @@ static int metal_gemm_body(int kind, float *y, const void *w,
         pthread_mutex_unlock(&g_lock);
         return -1;
     }
-    vn = n_tokens <= 8 ? 8 : (n_tokens <= 16 ? 16 : 32);
-    vi = vn == 8 ? 0 : (vn == 16 ? 1 : 2);
+    // 0211: вариант GEMM по числу токенов (8/16/32 аккумуляторов на поток).
+    // По умолчанию 32: на этой машине он быстрее 16 на длинных пачках (замер
+    // 128 токенов: 32,9 против 21,7 ток/с при 32/16 строках на threadgroup).
+    // VTM_METAL_GEMM_N=8|16 — A/B и старые metallib без gemm32.
+    {
+        static int gemm_n = -1;
+        if (gemm_n < 0) {
+            const char *e = getenv("VTM_METAL_GEMM_N");
+            int v = e ? atoi(e) : 0;
+            gemm_n = (v == 8 || v == 16 || v == 32) ? v : 32;
+        }
+        vn = n_tokens <= 8 ? 8 : (n_tokens <= gemm_n ? gemm_n : 32);
+        vi = vn == 8 ? 0 : (vn == 16 ? 1 : 2);
+    }
     ps = (kind == 0) ? g_ps_q4k_gemm[vi]
        : (kind == 1) ? g_ps_q6k_gemm[vi] : g_ps_i8_gemm[vi];
     if (!ps) {
@@ -1173,7 +1185,24 @@ static int metal_gemm_body(int kind, float *y, const void *w,
     // и коллективной загрузке x в threadgroup-память. Если pipeline не
     // держит 256 потоков — на CPU.
     rpt = (int)(ps.maxTotalThreadsPerThreadgroup / 32u);
-    if (rpt > 8) rpt = 8;   // замер 0196: 16 строк не быстрее, а риск
+    // 0211: строк на threadgroup. Было 8 (256 потоков) — x пачки читался
+    // заново на каждые 8 строк, и GEMM упирался в эту полосу. Теперь до 16
+    // (512 потоков, 16 аккумуляторов на поток): x читается вдвое реже.
+    // VTM_METAL_GEMM_RPT=8 возвращает прежний замер 0196 для A/B.
+    {
+        static int rmax = -1;
+        if (rmax < 0) {
+            const char *e = getenv("VTM_METAL_GEMM_RPT");
+            rmax = (e && atoi(e) > 0) ? atoi(e) : 16;
+            if (rmax < 1) rmax = 1;
+            // 32 строки (1024 потока) на этой машине дают неверный результат
+            // на NT=32 — --check ловит это на 31/32/44; 16 проверено.
+            if (rmax > 16) rmax = 16;
+        }
+        if (rpt > rmax) rpt = rmax;
+    }
+    // VTM_GEMM_LOAD_HALF делит 128*NT значений на rpt*32 потоков; при
+    // rpt > NT цикл загрузки пуст, поэтому потолок — NT.
     if (rpt > vn) rpt = vn;
     if (rpt < 1) rpt = 1;
     if ((ps.maxTotalThreadsPerThreadgroup < (NSUInteger)rpt * 32u)) {

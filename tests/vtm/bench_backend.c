@@ -4954,6 +4954,13 @@ static double prefill_batch(vtm_t *m, const int32_t *ids, int n, double *cpu) {
 
 static const char *g_ttft_lens;   // --prefill-lens
 static int g_ttft_reps = 2;       // --prefill-reps
+// 0211: --prefill-backend выбирает бэкенд именно для prefill-замера (не
+// трогая прежнее поведение «по умолчанию simd»), --prefill-batch-only
+// убирает поштучный путь (он читает веса на каждый токен: 384 токена — это
+// ~770 ГБ, часы), --prefill-batch N задаёт VTM_BATCH_TOKENS до загрузки.
+static const char *g_prefill_backend;
+static int g_prefill_batch_only;
+static long g_prefill_batch;
 
 static int run_prefill_ttft(const char *explicit_path) {
     static const int lens_def[] = {64, 256, 512};
@@ -4973,10 +4980,10 @@ static int run_prefill_ttft(const char *explicit_path) {
     // полный прогон 64/256/512x2 занимает часы); --prefill-reps N — число
     // чередующихся повторов (по умолчанию 2, берётся минимум).
     if (g_ttft_lens && *g_ttft_lens) {
-        static int custom[8];
+        static int custom[16];
         const char *p = g_ttft_lens;
         int k = 0;
-        while (*p && k < 8) {
+        while (*p && k < 16) {
             custom[k++] = atoi(p);
             while (*p && *p != ',') p++;
             if (*p == ',') p++;
@@ -4991,14 +4998,52 @@ static int run_prefill_ttft(const char *explicit_path) {
         fprintf(stderr, "vtm_load(%s): %s\n", path, vtm_last_error());
         return 1;
     }
-    vtm_set_backend(m, &vtm_backend_simd);
+    // 0211: выбор бэкенда для этого замера. По умолчанию simd — прежнее
+    // поведение; hybrid/metal нужны, чтобы увидеть, где включается GPU-батч.
+    {
+        const vtm_backend *be = &vtm_backend_simd;
+        if (g_prefill_backend && *g_prefill_backend) {
+            be = vtm_backend_by_name(g_prefill_backend);
+            if (!be) {
+                fprintf(stderr, "неизвестный --prefill-backend: %s\n",
+                        g_prefill_backend);
+                vtm_free(m);
+                return 2;
+            }
+        }
+        vtm_set_backend(m, be);
+    }
+    if (g_prefill_batch > 0) {
+        char buf[32];
+        snprintf(buf, sizeof buf, "%ld", g_prefill_batch);
+        setenv("VTM_BATCH_TOKENS", buf, 1);
+    }
     for (i = 0; i < 512; i++) ids[i] = 1000 + (i * 37) % 150000;
-    printf("модель: %s\nTTFT prefill (один процесс, по токену против пачки; "
-           "пачка режется ядром по VTM_BATCH_TOKENS):\n", path);
+    {
+        const char *bt = getenv("VTM_BATCH_TOKENS");
+        char batch[32];
+
+        if (g_prefill_batch > 0)
+            snprintf(batch, sizeof batch, "%ld", g_prefill_batch);
+        else if (bt && *bt)
+            snprintf(batch, sizeof batch, "%s", bt);
+        else
+            snprintf(batch, sizeof batch, "по умолчанию");
+        printf("модель: %s\nTTFT prefill (один процесс%s; "
+               "VTM_BATCH_TOKENS=%s):\n", path,
+               g_prefill_batch_only ? ", только пачка"
+                                    : ", по токену против пачки",
+               batch);
+    }
     printf("int8-dot: %s (VTM_Q4_I8=%d)\n", vtm_q4_i8_name(),
            vtm_q4_i8_mode());
-    printf("  %6s %11s %11s %9s %11s %11s %9s\n", "токенов", "токен wall",
-           "пачка wall", "ускор.", "токен CPU", "пачка CPU", "ускор.CPU");
+    if (g_prefill_batch_only) {
+        printf("  %6s %11s %11s %9s\n", "токенов", "TTFT, мс", "ток/с",
+               "CPU, мс");
+    } else {
+        printf("  %6s %11s %11s %9s %11s %11s %9s\n", "токенов", "токен wall",
+               "пачка wall", "ускор.", "токен CPU", "пачка CPU", "ускор.CPU");
+    }
     for (li = 0; li < (size_t)nlens; li++) {
         const int n = lens[li];
         double t_tok = 1e300, t_bat = 1e300;
@@ -5006,7 +5051,10 @@ static int run_prefill_ttft(const char *explicit_path) {
         int rep;
         for (rep = 0; rep < g_ttft_reps; rep++) {
             double a, b, ca = -1.0, cb = -1.0;
-            if (rep == 0) {
+            if (g_prefill_batch_only) {
+                a = 0.0;
+                b = prefill_batch(m, ids, n, &cb);
+            } else if (rep == 0) {
                 a = prefill_token(m, ids, n, &ca);
                 b = prefill_batch(m, ids, n, &cb);
             } else {
@@ -5023,9 +5071,14 @@ static int run_prefill_ttft(const char *explicit_path) {
             if (ca >= 0.0 && ca < c_tok) c_tok = ca;
             if (cb >= 0.0 && cb < c_bat) c_bat = cb;
         }
-        printf("  %6d %11.2f %11.2f %8.2fx %11.2f %11.2f %8.2fx\n", n,
-               t_tok / 1e3, t_bat / 1e3, t_tok / t_bat, c_tok / 1e3,
-               c_bat / 1e3, c_tok / c_bat);
+        if (g_prefill_batch_only) {
+            printf("  %6d %11.2f %11.1f %9.2f\n", n, t_bat,
+                   t_bat > 0.0 ? 1e3 * (double)n / t_bat : 0.0, c_bat);
+        } else {
+            printf("  %6d %11.2f %11.2f %8.2fx %11.2f %11.2f %8.2fx\n", n,
+                   t_tok / 1e3, t_bat / 1e3, t_tok / t_bat, c_tok / 1e3,
+                   c_bat / 1e3, c_tok / c_bat);
+        }
     }
     vtm_free(m);
     return 0;
@@ -5120,6 +5173,158 @@ static int run_api_tokens(const char *path, const char *backend) {
     return 0;
 }
 
+// --- 0211: изолированный GPU-батч GEMM -------------------------------------
+//
+// --metal-gemm ROWS,COLS,N,ITERS. Меряет vtm_metal_qk_gemm без модели и без
+// перекладки активаций по слоям: так видно потолок самого ядра и эффект
+// VTM_METAL_GEMM_N/RPT, а не шум загрузки/страниц. Блоки весов нулевые —
+// арифметика та же, время честное.
+static int run_metal_gemm_bench(const char *spec) {
+    int rows = 2048, cols = 2048, ntok = 64, iters = 10;
+    unsigned char *blocks;
+    float *x, *y;
+    double t0, best = 1e300;
+    size_t wbytes;
+    int it;
+
+    if (spec && *spec) sscanf(spec, "%d,%d,%d,%d", &rows, &cols, &ntok, &iters);
+    if (rows <= 0 || cols <= 0 || ntok <= 0 || iters <= 0
+        || cols % 256 != 0) {
+        fprintf(stderr, "--metal-gemm ROWS,COLS,N,ITERS (COLS кратен 256)\n");
+        return 2;
+    }
+    wbytes = (size_t)rows * (size_t)cols / 256u * 144u;
+    blocks = (unsigned char *)calloc(wbytes ? wbytes : 1u, 1);
+    x = (float *)calloc((size_t)cols * (size_t)ntok, sizeof *x);
+    y = (float *)calloc((size_t)rows * (size_t)ntok, sizeof *y);
+    if (!blocks || !x || !y) {
+        free(blocks); free(x); free(y);
+        fprintf(stderr, "metal-gemm: нет памяти\n");
+        return 1;
+    }
+    printf("metal gemm %dx%d, %d токенов, %d итераций\n", rows, cols, ntok,
+           iters);
+    for (it = 0; it < iters; it++) {
+        int rc = vtm_metal_qk_gemm(0, y, blocks, NULL, x, rows, cols, ntok);
+        if (rc != 0) {
+            fprintf(stderr, "metal-gemm: ядро отказало (%d)\n", rc);
+            free(blocks); free(x); free(y);
+            return 1;
+        }
+        t0 = now_ms();
+        rc = vtm_metal_qk_gemm(0, y, blocks, NULL, x, rows, cols, ntok);
+        t0 = now_ms() - t0;
+        if (rc != 0) break;
+        if (t0 < best) best = t0;
+    }
+    if (best < 1e299) {
+        double mac = (double)rows * (double)cols * (double)ntok;
+        printf("  лучшее %.3f мс = %.1f GMAC/s, %.1f ток/с (для этой формы)\n",
+               best, mac / best * 1e-6, 1e3 * (double)ntok / best);
+    } else {
+        printf("  metal недоступен/ядро отказало\n");
+    }
+    free(blocks); free(x); free(y);
+    return 0;
+}
+
+// --- 0211: кэш префикса через C-ABI, как в чате -----------------------------
+//
+// Повторяет путь сервера: один контекст, cache_prefix=1, растущая история.
+// Для каждой длины L: запрос на промпте ids[0..L) (первый раз — с хвостом,
+// которого не было в кэше), затем ТОТ ЖЕ промпт ещё раз (должен взять весь
+// префикс из снимка, без единого нового токена). Печатает TTFT, длину
+// снимка и счётчики попаданий/промахов — так видно, что кэш реально
+// переиспользует KV, а не просто «стало быстрее».
+static int run_api_cache(const char *explicit_path, const char *backend) {
+    static const int def_lens[] = {40, 80, 154, 214, 250, 500};
+    int lens[16];
+    int nlens = (int)(sizeof def_lens / sizeof def_lens[0]);
+    int32_t ids[512];
+    vtm_api_options opts;
+    vtm_api_t *ctx;
+    const char *path = find_model(explicit_path);
+    size_t li;
+    int i;
+
+    if (!path) {
+        fprintf(stderr, "модель не найдена (--api-cache PATH)\n");
+        return 2;
+    }
+    if (g_ttft_lens && *g_ttft_lens) {
+        const char *p = g_ttft_lens;
+        int k = 0;
+        while (*p && k < 16) {
+            lens[k++] = atoi(p);
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+        if (k > 0) nlens = k;
+    }
+    for (i = 0; i < 512; i++) ids[i] = 1000 + (i * 37) % 150000;
+
+    setenv("VTM_TEMPERATURE", "0", 1);
+    setenv("VTM_TOP_K", "0", 1);
+    setenv("VTM_TOP_P", "1", 1);
+    memset(&opts, 0, sizeof opts);
+    opts.struct_size = sizeof opts;
+    opts.backend_name = backend;
+    opts.max_new_tokens = 1;      // только TTFT первого токена
+    opts.eos_token_id = -1;
+    opts.cache_prefix = 1;
+    opts.prefill_batch = 256;
+    ctx = vtm_api_open(path, &opts);
+    if (!ctx) {
+        fprintf(stderr, "api-cache: open(%s): %s\n", backend ? backend : "auto",
+                vtm_api_last_error(NULL));
+        return 1;
+    }
+    printf("BACKEND %s\n", backend ? backend : "auto");
+    printf("  %6s %11s %11s %7s %10s %10s %7s %7s\n", "токенов", "1-й TTFT",
+           "повтор TTFT", "хвост", "снимок", "hits", "misses", "ток/с");
+    for (li = 0; li < (size_t)nlens; li++) {
+        const int L = lens[li];
+        double t_first, t_repeat;
+        uint64_t h0 = 0, m0 = 0, h1 = 0, m1 = 0;
+        int len_before, len_after;
+        int rc;
+
+        if (L <= 0 || L > 512) {
+            fprintf(stderr, "api-cache: длина %d вне 1..512\n", L);
+            vtm_api_close(ctx);
+            return 2;
+        }
+        vtm_api_cache_stats(ctx, &h0, &m0);
+        len_before = vtm_api_cache_prefix_len(ctx);
+        t_first = now_ms();
+        rc = vtm_api_generate(ctx, ids, (size_t)L, NULL, NULL);
+        t_first = now_ms() - t_first;
+        len_after = vtm_api_cache_prefix_len(ctx);
+        if (rc != VTM_API_OK) {
+            fprintf(stderr, "api-cache: generate(%d) -> %d: %s\n", L, rc,
+                    vtm_api_last_error(ctx));
+            vtm_api_close(ctx);
+            return 1;
+        }
+        t_repeat = now_ms();
+        rc = vtm_api_generate(ctx, ids, (size_t)L, NULL, NULL);
+        t_repeat = now_ms() - t_repeat;
+        if (rc != VTM_API_OK) {
+            fprintf(stderr, "api-cache: повтор(%d) -> %d: %s\n", L, rc,
+                    vtm_api_last_error(ctx));
+            vtm_api_close(ctx);
+            return 1;
+        }
+        vtm_api_cache_stats(ctx, &h1, &m1);
+        printf("  %6d %11.2f %11.2f %7d %10d %10llu %7llu %7.1f\n", L,
+               t_first, t_repeat, L - 1 - len_before, len_after,
+               (unsigned long long)(h1 - h0), (unsigned long long)(m1 - m0),
+               t_first > 0.0 ? 1e3 * (double)L / t_first : 0.0);
+    }
+    vtm_api_close(ctx);
+    return 0;
+}
+
 // --- main ------------------------------------------------------------------
 
 static void usage(const char *prog) {
@@ -5134,6 +5339,8 @@ static void usage(const char *prog) {
            "[--q4-batch]]\n"
            "          [--prefill-check PATH] [--prefill-ttft PATH]\n"
            "          [--prefill-lens 64,256,512] [--prefill-reps N]\n"
+           "          [--prefill-backend simd|hybrid|metal] [--prefill-batch-only]\n"
+           "          [--prefill-batch N]\n"
            "          [--metal PATH] [--metal-new N] [--metal-lens 64,128]\n"
            "          [--decode-bench PATH --prompts FILE [--decode-new N]\n"
            "           [--decode-reps N]]\n"
@@ -5145,6 +5352,9 @@ static void usage(const char *prog) {
            "           [--f32-table]]\n"
            "          [--qk-proj PATH [--iters N]]\n"
            "          [--api-tokens PATH [--backend simd|hybrid]]\n"
+           "          [--api-cache PATH [--backend simd|hybrid|metal]\n"
+           "           [--prefill-lens 40,80,154,214,250,500]]\n"
+           "          [--metal-gemm ROWS,COLS,N,ITERS]\n"
            "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
            "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8);\n"
            "  env VTM_Q4_I8 — int8-dot (SDOT/VNNI): 0 — выключить; 1/2/3 —\n"
@@ -5176,6 +5386,8 @@ int main(int argc, char **argv) {
     const char *metal_bench_path = NULL;
     int metal_new = 16;
     const char *api_tokens_path = NULL;
+    const char *api_cache_path = NULL;
+    const char *metal_gemm_spec = NULL;
     const char *backend_name = NULL;
     const vtm_backend *cand;
     int i;
@@ -5215,6 +5427,10 @@ int main(int argc, char **argv) {
             g_metal_lens = argv[++i];   // длины prefill, по умолчанию 64,128
         } else if (strcmp(argv[i], "--api-tokens") == 0) {
             api_tokens_path = (i + 1 < argc) ? argv[++i] : "";
+        } else if (strcmp(argv[i], "--api-cache") == 0) {
+            api_cache_path = (i + 1 < argc) ? argv[++i] : "";
+        } else if (strcmp(argv[i], "--metal-gemm") == 0 && i + 1 < argc) {
+            metal_gemm_spec = argv[++i];
         } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
             backend_name = argv[++i];
         } else if (strcmp(argv[i], "--check") == 0) {
@@ -5241,6 +5457,16 @@ int main(int argc, char **argv) {
             g_ttft_reps = atoi(argv[++i]);
             if (g_ttft_reps < 1) g_ttft_reps = 1;
             if (g_ttft_reps > 8) g_ttft_reps = 8;
+        } else if (strcmp(argv[i], "--prefill-backend") == 0 && i + 1 < argc) {
+            g_prefill_backend = argv[++i];
+        } else if (strcmp(argv[i], "--prefill-batch-only") == 0) {
+            g_prefill_batch_only = 1;
+        } else if (strcmp(argv[i], "--prefill-batch") == 0 && i + 1 < argc) {
+            g_prefill_batch = atol(argv[++i]);
+            if (g_prefill_batch < 1 || g_prefill_batch > 256) {
+                fprintf(stderr, "--prefill-batch должен быть 1..256\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--decode-check") == 0 && i + 1 < argc) {
             decode_check_path = argv[++i];
         } else if (strcmp(argv[i], "--prompts") == 0 && i + 1 < argc) {
@@ -5314,6 +5540,12 @@ int main(int argc, char **argv) {
     if (api_tokens_path)
         return run_api_tokens(*api_tokens_path ? api_tokens_path : NULL,
                               cand->name);
+    // 0211: кэш префикса через C-ABI (два одинаковых запроса подряд).
+    if (api_cache_path)
+        return run_api_cache(*api_cache_path ? api_cache_path : NULL,
+                             cand->name);
+    if (metal_gemm_spec)
+        return run_metal_gemm_bench(metal_gemm_spec);
     if (emb_check_path_set)
         return run_emb_check(emb_check_path, decode_prompts_path, decode_new,
                              decode_limit);

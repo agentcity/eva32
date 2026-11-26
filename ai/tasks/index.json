@@ -1409,7 +1409,7 @@
   {
     "id": "0211",
     "title": "Prefill: провал на длинных промптах",
-    "status": "in_progress",
+    "status": "done",
     "file": "0211-prefill-scaling.md",
     "assignee": "agent:prefill-scale"
   },

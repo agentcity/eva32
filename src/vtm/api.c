@@ -35,6 +35,11 @@ int vtm_session_prune(const char *dir, uint64_t limit_bytes,
 // поведение (на SIMD побитовый путь по токену), batch > 0 — пачки и на SIMD.
 vtm_status vtm_cache_prefix_ex(vtm_t *m, const int32_t *ids, int n, int batch);
 vtm_status vtm_run_cached_ex(vtm_t *m, const int32_t *ids, int n, int batch);
+// 0211: продлить снимок кэша до уже посчитанных n токенов. Нужна C-ABI:
+// vtm_run_cached_ex() на попадании оставляет короткий префикс (ветвление), а
+// чат с растущей историей обязан двигать снимок вперёд, иначе он каждый раз
+// пересчитывает всю историю после первого запроса.
+void vtm_cache_prefix_extend(vtm_t *m, const int32_t *ids, int n);
 
 // --- батчевый prefill (задачи 0112, 0114) ----------------------------------
 //
@@ -508,6 +513,13 @@ static int api_run_cached(vtm_api_t *ctx, const int32_t *prompt_ids, size_t n,
                         "vtm_api_generate: промпт[0..%zu): %s: %s", prefill,
                         vtm_strerror(st), vtm_error_message(m));
     }
+    // 0211: снимок кэша после только что посчитанных prefill токенов. На
+    // промахе его уже сделал vtm_run_cached_ex/vtm_cache_prefix_ex; на
+    // попадании он остался на прежнем (более коротком) префиксе — продлеваем,
+    // иначе следующий запрос чата с той же историей и новым хвостом заново
+    // считал бы весь хвост от первого вопроса. Ветвление («тот же префикс,
+    // другой хвост») не страдает: снимок по-прежнему начинается с токена 0.
+    vtm_cache_prefix_extend(m, prompt_ids, (int)prefill);
     // Отмена во время префикса, пришедшая уже после прогона: проверяем
     // здесь, чтобы не начинать генерацию.
     if (api_cancelled(ctx)) {
@@ -771,4 +783,23 @@ void vtm_api_close(vtm_api_t *ctx) {
 const char *vtm_api_last_error(const vtm_api_t *ctx) {
     if (ctx == NULL) return g_open_error;
     return ctx->error;
+}
+
+// --- диагностика кэша префикса (0211) --------------------------------------
+//
+// Тонкие обёртки над vtm_cache_prefix_len()/vtm_cache_stats() из interp.c:
+// по ним видно, переиспользовал ли конкретный generate() снимок KV, а не
+// только «TTFT стал меньше». Нужны тестам и bench_backend --api-cache.
+int vtm_api_cache_prefix_len(const vtm_api_t *ctx) {
+    return ctx ? vtm_cache_prefix_len(ctx->m) : 0;
+}
+
+void vtm_api_cache_stats(const vtm_api_t *ctx, uint64_t *hits,
+                         uint64_t *misses) {
+    if (ctx == NULL) {
+        if (hits) *hits = 0;
+        if (misses) *misses = 0;
+        return;
+    }
+    vtm_cache_stats(ctx->m, hits, misses);
 }

@@ -236,6 +236,14 @@ DEFAULT_OLLAMA_MODELS: tuple[tuple[str, str], ...] = (
 #: ``make -C src/vtm test``), а не разговорная модель. Её место — в тестах, и в
 #: списке чата она только путает: выбор даёт ошибку «token вне vocab».
 VTM_SEARCH_DIRS: tuple[str, ...] = ("runs", "export")
+#: Порядок моделей в каталоге: 4B — модель по умолчанию (задача 0213),
+#: 3B — «быстрый» вариант, 30B — «умный» тяжёлый. Остальные (старые A/B,
+#: 0.5B) идут после: первый элемент реестра — то, что UI выбирает слева.
+PREFERRED_VTM_ORDER: tuple[str, ...] = (
+    "runs/q4/4b-q4k.vtm",
+    "runs/q4/3b-q4k.vtm",
+    "runs/q4/qwen3-30b-a3b.vtm",
+)
 #: Токенизатор-заглушка: фикстура BPE (287) совпадает с ``runs/tiny``.
 #: Для демо-модели (vocab=128) она не подходит — чат вернёт понятную ошибку.
 FALLBACK_TOKENIZER = ROOT / "tests" / "vtm" / "fixtures" / "tokenizer.json"
@@ -323,7 +331,13 @@ def _resolve_tokenizer(model_path: Path, explicit: str | None = None) -> str:
     # разные словари, и общий tokenizer.json даёт «неизвестный token id» на
     # служебных токенах Qwen3. Поэтому сначала ищем файл с именем модели.
     stem = model_path.name.split("-")[0].split(".")[0]
-    for name in (stem + "-tokenizer.json", pathlib.Path(stem).stem + "-tokenizer.json"):
+    # `4b-q4k.vtm` -> `4b-tokenizer.json` или `qwen3-4b-tokenizer.json`
+    # (у 30B — `qwen3-tokenizer.json`, он же первый вариант).
+    for name in (
+        stem + "-tokenizer.json",
+        "qwen3-" + stem + "-tokenizer.json",
+        pathlib.Path(stem).stem + "-tokenizer.json",
+    ):
         candidates.append(model_path.with_name(name))
     candidates.append(model_path.with_name("tokenizer.json"))
     candidates.append(ROOT / "tokenizer.json")
@@ -344,6 +358,12 @@ def _discover_vtm_models() -> list[pathlib.Path]:
         for path in sorted(root.rglob("*.vtm")):
             if path.is_file():
                 found.append(path)
+    # Стабильный приоритет: 4B по умолчанию, 3B — «быстрый», 30B — тяжёлый.
+    rank = {name: index for index, name in enumerate(PREFERRED_VTM_ORDER)}
+    found.sort(key=lambda path: (
+        rank.get(path.relative_to(ROOT).as_posix(), len(rank)),
+        path.relative_to(ROOT).as_posix(),
+    ))
     return found
 
 
@@ -2810,7 +2830,7 @@ PAGE_HTML = """<!doctype html>
       <label class="field inline" for="mode">режим
         <select id="mode">
           <option value="fast">быстро — 3B (слово за 0,25 с)</option>
-          <option value="smart">умно — 30B MoE (слово за 1 с)</option>
+          <option value="smart" selected>умно — 4B (по умолчанию)</option>
         </select>
       </label>
       <button id="ask" type="button">Спросить</button>
@@ -4225,7 +4245,7 @@ PAGE_HTML = """<!doctype html>
   // Не трогает Ollama-колонку — сравнение с ней остаётся на месте.
   var MODE_MODELS = {
     fast: "runs/q4/3b-q4k.vtm",
-    smart: "runs/q4/qwen3-30b-a3b.vtm"
+    smart: "runs/q4/4b-q4k.vtm"
   };
 
   function applyMode(mode) {
@@ -4242,7 +4262,7 @@ PAGE_HTML = """<!doctype html>
       }
     });
     refreshModels();
-    setStatus("режим: " + (mode === "fast" ? "быстро (3B)" : "умно (30B MoE)"), false);
+    setStatus("режим: " + (mode === "fast" ? "быстро (3B)" : "умно (4B)"), false);
   }
 
   byId("mode").addEventListener("change", function () {

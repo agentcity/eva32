@@ -54,6 +54,19 @@ def _index_fact(ctx: PluginContext, ticker: str) -> Fact | None:
     return fact
 
 
+def _index_top_fact(ctx: PluginContext, ticker: str) -> Fact | None:
+    """Топ бумаг индекса по весу с ценами (два запроса: состав + котировки)."""
+    ctx.check_url(_fresh.MOEX_INDEX_MEMBERS_URL.format(ticker=str(ticker).upper()))
+    ctx.check_url(_fresh.MOEX_URL.format(ticker="SBER"))
+    try:
+        return _fresh.index_top_fact(ticker, limit=5, fetch=_fetch_through(ctx))
+    except PluginPermissionError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - сеть/парсинг деградируют
+        ctx.log.warning("топ индекса %s не получен: %s", ticker, exc)
+        return None
+
+
 class StocksPlugin:
     """Одна котировка одним фактом; сеть упала — честное «не удалось»."""
 
@@ -68,8 +81,10 @@ class StocksPlugin:
         # Намерение — из роутера 0208 (он уже отличил бумагу от товара).
         if _intent is not None:
             detected = _intent.detect(text)
-            if detected is None or detected.kind not in ("stock", "index"):
+            if detected is None or detected.kind not in ("stock", "index", "index_top"):
                 return None
+            if detected.kind == "index_top":
+                return _index_top_fact(ctx, detected.params[0] if detected.params else "IMOEX")
             if detected.kind == "index":
                 return _index_fact(ctx, detected.params[0] if detected.params else "IMOEX")
             tickers = list(detected.params)

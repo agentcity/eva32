@@ -250,6 +250,14 @@ void vtm_api_close(vtm_api_t *ctx);
 // ошибка последнего vtm_api_open() (статический буфер). Строку не освобождать.
 const char *vtm_api_last_error(const vtm_api_t *ctx);
 
+// Диагностика кэша префикса (0211): длина годного снимка и счётчики
+// попаданий/промахов. Нужны тестам и замерам TTFT: по ним видно, что второй
+// запрос действительно взял KV из кэша, а не просто «стал быстрее».
+// Возвращают 0/пишут 0 при ctx == NULL.
+int vtm_api_cache_prefix_len(const vtm_api_t *ctx);
+void vtm_api_cache_stats(const vtm_api_t *ctx, uint64_t *hits,
+                         uint64_t *misses);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

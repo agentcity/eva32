@@ -87,6 +87,12 @@ MOEX_INDEX_URL = (
     "https://iss.moex.com/iss/engines/stock/markets/index/boards/SNDX/"
     "securities/{ticker}.json?iss.meta=off"
 )
+#: Состав индекса с весами: кто входит и с какой долей.
+MOEX_INDEX_MEMBERS_URL = (
+    "https://iss.moex.com/iss/statistics/engines/stock/markets/index/"
+    "analytics/{ticker}.json?iss.meta=off&iss.only=analytics&limit=100"
+)
+
 #: Имена индексов для человека.
 INDEX_TITLES = {
     "IMOEX": "Индекс Мосбиржи",
@@ -550,6 +556,116 @@ def parse_moex_index(raw: bytes | str | Mapping[str, Any]) -> Quote | None:
         prev_price=None,
         updated=_updated(row),
         board="SNDX",
+    )
+
+
+def parse_moex_members(raw: bytes | str | Mapping[str, Any]) -> list[tuple[str, str, float]]:
+    """Состав индекса из ISS: ``[(тикер, имя, вес %), …]`` по убыванию веса.
+
+    Вес в ISS уже в процентах (0.27 = 0,27 %); наружу отдаём как есть.
+    """
+    payload = raw
+    if isinstance(raw, (bytes, str)):
+        text = _decode_json(raw)
+        if not text:
+            return []
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            return []
+    if not isinstance(payload, Mapping):
+        return []
+    table = _moex_table(payload.get("analytics"))
+    if not table or not table.get("rows"):
+        return []
+    members: list[tuple[str, str, float]] = []
+    for row in table["rows"]:
+        ticker = str(row.get("ticker") or row.get("secids") or "").strip().upper()
+        if not ticker:
+            continue
+        name = str(row.get("shortnames") or "").strip()
+        weight = _first_number(row, ("weight",), allow_zero=True) or 0.0
+        members.append((ticker, name, float(weight)))
+    members.sort(key=lambda item: item[2], reverse=True)
+    return members
+
+
+def index_members(
+    ticker: str = "IMOEX",
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    fetch: Callable[[str, float], bytes] | None = None,
+    use_cache: bool = True,
+) -> tuple[tuple[str, str, float], ...]:
+    """Состав индекса (``IMOEX``/``RTSI``) по весам; сеть упала → пусто."""
+    code = str(ticker or "IMOEX").strip().upper() or "IMOEX"
+    key = "members:" + code
+    if use_cache:
+        cached = _MOEX_CACHE.get(key)
+        if isinstance(cached, tuple):
+            return cached
+    url = MOEX_INDEX_MEMBERS_URL.format(ticker=urllib.parse.quote(code))
+    try:
+        members = tuple(parse_moex_members(_fetch(url, timeout, fetch)))
+    except Exception as exc:  # noqa: BLE001 — сеть/парсинг деградируют
+        logger.info("состав индекса %s не получен: %s", code, exc)
+        return ()
+    if members and use_cache:
+        # Состав меняется раз в квартал, а ISS отдаёт прошлую сессию:
+        # держим дольше котировок.
+        _MOEX_CACHE.put(key, members)
+    return members
+
+
+def index_top_fact(
+    ticker: str = "IMOEX",
+    *,
+    limit: int = 5,
+    timeout: float = DEFAULT_TIMEOUT,
+    fetch: Callable[[str, float], bytes] | None = None,
+    use_cache: bool = True,
+) -> Fact | None:
+    """Топ бумаг индекса по весу + их цены одним фактом.
+
+    «Какие акции в топе индекса Мосбиржи» — это ДВА запроса: состав с весами
+    и цена каждой бумаги. Состав берём из ISS analytics (limit=100), цены — из
+    обычных котировок (кэш 60 с), поэтому повторный вопрос дешёвый.
+    """
+    code = str(ticker or "IMOEX").strip().upper() or "IMOEX"
+    members = index_members(
+        code, timeout=timeout, fetch=fetch, use_cache=use_cache
+    )
+    if not members:
+        return None
+    title = INDEX_TITLES.get(code, code)
+    parts: list[str] = []
+    for member_ticker, member_name, weight in members[: max(1, int(limit))]:
+        fact = stock_quote(
+            member_ticker, timeout=timeout, fetch=fetch, use_cache=use_cache
+        )
+        price = ""
+        if fact is not None:
+            # «SBER (Сбербанк) = 285,17 ₽» → берём цену и процент
+            match = re.search(r"= ([\d\s,]+) ₽(.*)", fact.data)
+            if match:
+                price = f"{match.group(1).strip()} ₽"
+        label = member_name or member_ticker
+        # Цена — первой: модель охотнее переносит в ответ то, что стоит
+        # в начале фрагмента (живой случай: без цен в ответе).
+        if price:
+            piece = f"{member_ticker} ({label}) — {price}, вес {format_number(weight, 2)} %"
+        else:
+            piece = f"{member_ticker} ({label}) — вес {format_number(weight, 2)} %"
+        parts.append(piece)
+    if not parts:
+        return None
+    return Fact(
+        kind="index_top",
+        data=(
+            f"{title} ({code}), топ по весу (цена, вес): " + "; ".join(parts)
+            + ". Назови каждую бумагу с её ценой."
+        ),
+        source="MOEX ISS",
     )
 
 
