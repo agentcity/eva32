@@ -165,8 +165,11 @@ rel-RMS 77 %, а TWN — 43–49 % при тех же байтах сегмен�
 Ограничения
 ===========
 
-* Поддержаны Qwen2/Llama-имена. Qwen3 (`attn_q_norm` и т. п.) отвергается
-  по имени тензора.
+* Поддержаны Qwen2/Llama-имена и плотный Qwen3: `attn_q_norm`/`attn_k_norm`
+  мапятся в `self_attn.q_norm`/`k_norm` (`architecture.qk_norm=true`), а
+  `head_dim` берётся из `attention.key_length` или из длины q_norm — у Qwen3
+  hidden (2560) не равен q_dim (32×128=4096). MoE-раскладка (`*_exps`,
+  `ffn_gate_inp`) по-прежнему не здесь, а в `tools/moe_import.py`.
 * `rope.scaling` (linear/yarn) не реализован в VTM — импорт отказывает, а не
   пишет модель с неверным RoPE.
 * `<arch>.attention.head_count`/`head_count_kv` массивом по слоям не
@@ -1673,6 +1676,8 @@ LAYER_TENSORS: dict[str, tuple[str, str, str]] = {
     "attn_norm.weight": ("input_layernorm.weight", "norm", "norm1"),
     "ffn_norm.weight": ("post_attention_layernorm.weight", "norm", "norm2"),
     "attn_q.weight": ("self_attn.q_proj.weight", "matrix", "q_proj"),
+    "attn_q_norm.weight": ("self_attn.q_norm.weight", "norm", "q_norm"),
+    "attn_k_norm.weight": ("self_attn.k_norm.weight", "norm", "k_norm"),
     "attn_k.weight": ("self_attn.k_proj.weight", "matrix", "k_proj"),
     "attn_v.weight": ("self_attn.v_proj.weight", "matrix", "v_proj"),
     "attn_output.weight": ("self_attn.o_proj.weight", "matrix", "o_proj"),
@@ -1719,8 +1724,8 @@ def map_tensor_name(name: str) -> tuple[str, str, int | None, str]:
             return f"model.layers.{layer}.{hf_tail}", role, layer, key
     raise GgufError(
         f"тензор {name!r}: имя не из Qwen2/Llama (поддержаны token_embd, "
-        "output_norm, output и blk.N.{attn_*, ffn_*}); для Qwen3 и других "
-        "архитектур с дополнительными нормами импорт не реализован"
+        "output_norm, output и blk.N.{attn_*, ffn_*}); для MoE и "
+        "архитектур с другими именами используйте tools/moe_import.py"
     )
 
 
@@ -1745,6 +1750,10 @@ class ModelConfig:
     rope_theta: float
     rms_norm_eps: float
     tie_word_embeddings: bool
+    #: QK-norm Qwen3: RMSH по head_dim на Q и K до RoPE. У Qwen3-4B
+    #: hidden=2560, а q_dim=n_heads*head_dim=4096, поэтому «hidden == q_dim»
+    #: проверяется только у Qwen2/Llama.
+    qk_norm: bool = False
     n_layers_source: int = 0
     vocab_source: int = 0
 
@@ -1771,6 +1780,7 @@ class ModelConfig:
             "rms_norm_eps": self.rms_norm_eps,
             "rope_layout": "half",
             "tie_word_embeddings": self.tie_word_embeddings,
+            "qk_norm": bool(self.qk_norm),
         }
 
 
@@ -1842,11 +1852,35 @@ def infer_config(
     eps = _meta_float(
         gguf.metadata, prefix + "attention.layer_norm_rms_epsilon", 1e-6
     )
+    # Qwen3 хранит head_dim=128 при hidden=2560 и 32 головах: hidden/heads
+    # даёт 80 и молча ломает RoPE/формы. Если key_length в GGUF нет, у Qwen3
+    # размер головы берётся из attn_q_norm (вектор ровно head_dim).
+    q_norm = gguf.has_tensor("blk.0.attn_q_norm.weight")
+    k_norm = gguf.has_tensor("blk.0.attn_k_norm.weight")
+    if q_norm != k_norm:
+        raise GgufError(
+            "есть только одна из attn_q_norm/attn_k_norm — QK-norm неполный; "
+            "такой контейнер дал бы правдоподобно неверные логиты"
+        )
+    qk_norm = bool(q_norm)
+    norm_head_dim = 0
+    if qk_norm:
+        dims = gguf.tensor("blk.0.attn_q_norm.weight").dims
+        if len(dims) != 1:
+            raise GgufError(
+                f"attn_q_norm.weight: {len(dims)} измерений, ожидалось 1"
+            )
+        norm_head_dim = int(dims[0])
     head_dim = _meta_int(
         gguf.metadata,
         prefix + "attention.key_length",
-        default=hidden // n_heads if n_heads else 0,
+        default=norm_head_dim or (hidden // n_heads if n_heads else 0),
     )
+    if qk_norm and head_dim != norm_head_dim:
+        raise GgufError(
+            f"конфиг: attention.key_length={head_dim}, а attn_q_norm "
+            f"длиной {norm_head_dim} — QK-norm и RoPE разошлись"
+        )
 
     for label, value in (
         ("block_count", n_layers_source), ("embedding_length", hidden),
@@ -1865,10 +1899,14 @@ def infer_config(
         raise GgufError(
             f"конфиг: n_heads={n_heads} не делятся на n_kv_heads={n_kv_heads}"
         )
-    if hidden != n_heads * head_dim:
+    if not qk_norm and hidden != n_heads * head_dim:
         raise GgufError(
             f"конфиг: hidden={hidden} != n_heads×head_dim="
             f"{n_heads * head_dim}; VTM ждёт Qwen/Llama-раскладку"
+        )
+    if qk_norm and hidden % head_dim:
+        raise GgufError(
+            f"конфиг: hidden={hidden} не делится на head_dim={head_dim}"
         )
     if not math.isfinite(rope_theta) or rope_theta <= 0:
         raise GgufError(f"конфиг: rope_theta={rope_theta!r}")
@@ -1953,6 +1991,7 @@ def infer_config(
         rope_theta=rope_theta,
         rms_norm_eps=eps,
         tie_word_embeddings=tie_flag,
+        qk_norm=qk_norm,
         n_layers_source=n_layers_source,
         vocab_source=vocab,
     )
@@ -2164,6 +2203,8 @@ def plan_import(
         raise GgufError("в GGUF нет output.weight, а tied-эмбеддинги выключены")
     required = {"q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj", "norm1", "norm2"}
+    if cfg.qk_norm:
+        required |= {"q_norm", "k_norm"}
     for index in range(cfg.n_layers):
         missing = sorted(required - layer_keys.get(index, set()))
         if missing:
@@ -2184,6 +2225,8 @@ def _expected_shape(
         return (cfg.vocab, cfg.hidden)
     if role == "lm_head" or key == "lm_head":
         return (cfg.vocab, cfg.hidden)
+    if key in ("q_norm", "k_norm"):
+        return (cfg.head_dim,)
     if key.endswith("_bias"):
         dims = {
             "q_bias": cfg.q_dim, "k_bias": cfg.kv_dim, "v_bias": cfg.kv_dim,

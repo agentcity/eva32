@@ -288,6 +288,80 @@ def build_tiny_model(
     return builder.write(path)
 
 
+def build_tiny_qwen3(path: Path, *, hidden: int = 16, heads: int = 4,
+                     kv_heads: int = 2, head_dim: int = 8,
+                     intermediate: int = 32, vocab: int = 32,
+                     layers: int = 1, context: int = 64) -> Path:
+    """Крошечный Qwen3: hidden != heads*head_dim и QK-norm.
+
+    У настоящей Qwen3-4B hidden=2560, а q_dim=32*128=4096 — прежняя проверка
+    «hidden == n_heads*head_dim» отвергала модель. Здесь те же пропорции в
+    миниатюре: hidden=16, heads=4, head_dim=8, q_dim=32.
+    """
+    import random
+
+    rng = random.Random(17)
+    builder = GgufBuilder()
+    builder.add_metadata("general.architecture", "qwen3")
+    builder.add_metadata("general.name", "Tiny Qwen3 test")
+    builder.add_metadata("qwen3.block_count", layers)
+    builder.add_metadata("qwen3.embedding_length", hidden)
+    builder.add_metadata("qwen3.attention.head_count", heads)
+    builder.add_metadata("qwen3.attention.head_count_kv", kv_heads)
+    # key_length обязателен: hidden/heads = 4 здесь не равен head_dim = 8.
+    builder.add_metadata("qwen3.attention.key_length", head_dim)
+    builder.add_metadata("qwen3.feed_forward_length", intermediate)
+    builder.add_metadata("qwen3.context_length", context)
+    builder.add_metadata("qwen3.rope.freq_base", 5_000_000.0)
+    builder.add_metadata("qwen3.attention.layer_norm_rms_epsilon", 1e-6)
+    builder.add_metadata_strings(
+        "tokenizer.ggml.tokens", [f"t{index}" for index in range(vocab)]
+    )
+
+    def rand(n: int) -> list[float]:
+        return [rng.uniform(-0.05, 0.05) for _ in range(n)]
+
+    q_dim = heads * head_dim
+    kv_dim = kv_heads * head_dim
+    builder.add_f32("token_embd.weight", (hidden, vocab), rand(hidden * vocab))
+    builder.add_f32("output_norm.weight", (hidden,), [1.0] * hidden)
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        builder.add_f32(f"{prefix}attn_norm.weight", (hidden,), [1.0] * hidden)
+        builder.add_f32(f"{prefix}ffn_norm.weight", (hidden,), [1.0] * hidden)
+        builder.add_q4_0(
+            f"{prefix}attn_q.weight", (hidden, q_dim), rand(q_dim * hidden)
+        )
+        builder.add_q4_0(
+            f"{prefix}attn_k.weight", (hidden, kv_dim), rand(kv_dim * hidden)
+        )
+        builder.add_q4_0(
+            f"{prefix}attn_v.weight", (hidden, kv_dim), rand(kv_dim * hidden)
+        )
+        builder.add_q4_0(
+            f"{prefix}attn_output.weight", (q_dim, hidden), rand(hidden * q_dim)
+        )
+        builder.add_f32(
+            f"{prefix}attn_q_norm.weight", (head_dim,), [1.0] * head_dim
+        )
+        builder.add_f32(
+            f"{prefix}attn_k_norm.weight", (head_dim,), [1.0] * head_dim
+        )
+        builder.add_q4_0(
+            f"{prefix}ffn_gate.weight", (hidden, intermediate),
+            rand(intermediate * hidden),
+        )
+        builder.add_q4_0(
+            f"{prefix}ffn_up.weight", (hidden, intermediate),
+            rand(intermediate * hidden),
+        )
+        builder.add_q4_0(
+            f"{prefix}ffn_down.weight", (intermediate, hidden),
+            rand(hidden * intermediate),
+        )
+    return builder.write(path)
+
+
 class GgufTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="gguf-import-")
@@ -534,11 +608,11 @@ class ValidationTests(GgufTestBase):
         builder.add_metadata("qwen2.attention.key_length", 8)
         builder.add_f32("token_embd.weight", (32, 64), [0.0] * (32 * 64))
         builder.add_f32("output_norm.weight", (32,), [1.0] * 32)
-        builder.add_f32("blk.0.attn_q_norm.weight", (8,), [1.0] * 8)
-        path = builder.write(self.tmp / "qwen3.gguf")
+        builder.add_f32("blk.0.attn_x_norm.weight", (8,), [1.0] * 8)
+        path = builder.write(self.tmp / "unknown.gguf")
         with self.assertRaises(gi.GgufError) as ctx:
             gi.import_gguf(path, self.tmp / "out")
-        self.assertIn("attn_q_norm", str(ctx.exception))
+        self.assertIn("attn_x_norm", str(ctx.exception))
         self.assertIn("неизвестные тензоры", str(ctx.exception))
 
     def test_name_mapping(self) -> None:
@@ -566,11 +640,15 @@ class ValidationTests(GgufTestBase):
             "blk.2.attn_q.bias": (
                 "model.layers.2.self_attn.q_proj.bias", "bias", 2, "q_bias"
             ),
+            "blk.0.attn_q_norm.weight": (
+                "model.layers.0.self_attn.q_norm.weight", "norm", 0, "q_norm"
+            ),
+            "blk.0.attn_k_norm.weight": (
+                "model.layers.0.self_attn.k_norm.weight", "norm", 0, "k_norm"
+            ),
         }
         for gguf_name, expected in cases.items():
             self.assertEqual(gi.map_tensor_name(gguf_name), expected)
-        with self.assertRaises(gi.GgufError):
-            gi.map_tensor_name("blk.0.attn_q_norm.weight")
         with self.assertRaises(gi.GgufError):
             gi.map_tensor_name("class_embedding")
 
@@ -588,6 +666,19 @@ class ValidationTests(GgufTestBase):
         self.assertEqual(cfg.vocab, TINY["vocab"])
         self.assertEqual(cfg.rope_theta, 10000.0)
         self.assertAlmostEqual(cfg.rms_norm_eps, 0.001, places=7)
+        self.assertTrue(cfg.tie_word_embeddings)
+
+    def test_config_qwen3_qk_norm_and_head_dim(self) -> None:
+        path = build_tiny_qwen3(self.tmp / "qwen3.gguf")
+        cfg = gi.infer_config(gi.read_gguf(path))
+        self.assertEqual(cfg.architecture, "qwen3")
+        self.assertTrue(cfg.qk_norm)
+        # hidden != n_heads*head_dim — главное отличие Qwen3 от Qwen2.
+        self.assertEqual(cfg.hidden, 16)
+        self.assertEqual(cfg.head_dim, 8)
+        self.assertEqual(cfg.q_dim, 32)
+        self.assertNotEqual(cfg.hidden, cfg.q_dim)
+        self.assertEqual(cfg.vocab, 32)
         self.assertTrue(cfg.tie_word_embeddings)
 
     def test_config_rejects_rope_scaling(self) -> None:
@@ -745,6 +836,34 @@ class Q4ImportTests(GgufTestBase):
                 str(self.tmp / "q4-model.vtm"), vtm.tensors, vtm.program,
                 vtm.meta,
             )
+
+    def test_qwen3_qk_norm_imports_and_compiles(self) -> None:
+        source = build_tiny_qwen3(self.tmp / "qwen3.gguf")
+        result = gi.import_gguf(source, self.tmp / "qwen3-out", fmt="q4")
+        manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+        self.assertTrue(manifest["architecture"]["qk_norm"])
+        self.assertTrue(manifest["architecture"]["tie_word_embeddings"])
+        by_key = {
+            entry["key"]: entry for entry in manifest["non_ternary"]["tensors"]
+            if entry["layer"] == 0
+        }
+        self.assertEqual(by_key["q_norm"]["shape"], [8])
+        self.assertEqual(by_key["k_norm"]["shape"], [8])
+        matrices = {
+            entry["key"]: entry for entry in manifest["tensors"]
+            if entry["layer"] == 0
+        }
+        self.assertEqual(matrices["q_proj"]["shape"], [32, 16])
+        self.assertEqual(matrices["o_proj"]["shape"], [16, 32])
+
+        export = vtm_compile.load_export(str(result.manifest_path))
+        self.assertTrue(export.cfg.qk_norm)
+        vtm = vtm_compile.compile_model(export.cfg, export.weights)
+        target = self.tmp / "qwen3.vtm"
+        vtm_ref.write_vtm(str(target), vtm.tensors, vtm.program, vtm.meta)
+        executed = vtm_ref.execute(str(target), tokens=[1], max_new=1)
+        self.assertEqual(len(executed.logits), 32)
+        self.assertTrue(all(math.isfinite(value) for value in executed.logits))
 
     def test_q4_quantizer_matches_reference(self) -> None:
         if not HAS_Q4_REF:

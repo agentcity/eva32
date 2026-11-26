@@ -1423,7 +1423,7 @@
   {
     "id": "0213",
     "title": "Qwen3-4B-Instruct-2507 как рабочая модель",
-    "status": "in_progress",
+    "status": "done",
     "file": "0213-qwen3-4b.md",
     "assignee": "agent:qwen4b"
   },
@@ -1433,5 +1433,12 @@
     "status": "done",
     "file": "0214-metal-fast-gemm.md",
     "assignee": "agent:metal-gemm"
+  },
+  {
+    "id": "0215",
+    "title": "4B prefill: разобрать 4,4×",
+    "status": "pending",
+    "file": "0215-4b-prefill.md",
+    "assignee": "agent:4b-prefill"
   }
 ]
