@@ -189,6 +189,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from eva.chat_template import DEFAULT_REASONING_BUDGET  # noqa: E402
+from eva.ru_gender import GenderStreamer, feminize  # noqa: E402
 
 #: Ollama — только этот адрес; клиент не может подставить свой.
 OLLAMA_BASE = "http://127.0.0.1:11434/v1"
@@ -227,7 +228,7 @@ FALLBACK_TOKENIZER = ROOT / "tests" / "vtm" / "fixtures" / "tokenizer.json"
 #: Системный промпт EVA32: одинаковый для обеих моделей — сравнение честное.
 #: Боевой промпт (6 правил, ~1500 символов) — для сильных моделей.
 SYSTEM_PROMPT_PATH = ROOT / "prompts" / "system.assistant.md"
-#: Компактный промпт для квантованных моделей: 3 строки. На длинном промпте
+#: Компактный промпт для квантованных моделей: 4 строки. На длинном промпте
 #: 3B Q4_1 теряет следование инструкции и уходит в посторонние темы, на
 #: компактном — отвечает по делу; prefill при этом в разы дешевле.
 COMPACT_PROMPT_PATH = ROOT / "prompts" / "system.compact.md"
@@ -2213,6 +2214,10 @@ def _run_side(
     answer_for_history = ""
     delta_buffer: list[str] = []
     delta_flushed = time.monotonic()
+    # Женский род в первом лице (задача 0207): модель 3B пишет «я понял».
+    # Замена идёт по словам прямо в потоке, поэтому клиент и история получают
+    # один и тот же текст; недописанное слово стример придерживает до границы.
+    gender = GenderStreamer()
     try:
         iterator = iter(adapter.stream(messages, max_tokens=max_tokens))
         try:
@@ -2224,29 +2229,33 @@ def _run_side(
                     text = piece.text if isinstance(piece, StreamPiece) else str(piece)
                     if text:
                         char_count += len(text)
-                        answer_parts.append(text)
                         if first_token_ms is None:
                             first_token_ms = max(
                                 0, int((time.monotonic() - started) * 1000)
                             )
-                        # Склеиваем куски перед отправкой: у ВТМ токен — это
-                        # 1–3 символа русского слова (BPE), и посимвольная
-                        # выдача выглядит как «печатает по буквам». Копим до
-                        # 60 мс или до границы слова, чтобы глаз видел слова,
-                        # а не буквы.
-                        delta_buffer.append(text)
-                        now = time.monotonic()
-                        boundary = text.endswith(
-                            (" ", ".", ",", "!", "?", ":", ";", "\n")
-                        )
-                        if boundary or (now - delta_flushed) >= 0.06:
-                            events.put({
-                                "type": "delta",
-                                "side": index,
-                                "text": "".join(delta_buffer),
-                            })
-                            delta_buffer.clear()
-                            delta_flushed = now
+                        spoken = gender.feed(text)
+                        if spoken:
+                            answer_parts.append(spoken)
+                            # Склеиваем куски перед отправкой: у ВТМ токен —
+                            # это 1–3 символа русского слова (BPE), и
+                            # посимвольная выдача выглядит как «печатает по
+                            # буквам». Копим до 60 мс или до границы слова,
+                            # чтобы глаз видел слова, а не буквы.
+                            delta_buffer.append(spoken)
+                            now = time.monotonic()
+                            boundary = text.endswith(
+                                (" ", ".", ",", "!", "?", ":", ";", "\n")
+                            )
+                            if delta_buffer and (
+                                boundary or (now - delta_flushed) >= 0.06
+                            ):
+                                events.put({
+                                    "type": "delta",
+                                    "side": index,
+                                    "text": "".join(delta_buffer),
+                                })
+                                delta_buffer.clear()
+                                delta_flushed = now
                     if isinstance(piece, StreamPiece) and piece.done:
                         usage = dict(piece.usage or {})
                         finish_reason = piece.finish_reason or finish_reason
@@ -2266,6 +2275,13 @@ def _run_side(
             # равно остановка по запросу, а не штатный конец генерации.
             if not cancelled and cancel.requested(index):
                 cancelled = True
+            # Хвост, ждавший границы слова («я понял» без точки в конце), —
+            # в тот же поток и в историю: иначе последнее слово ответа
+            # осталось бы мужским.
+            tail = gender.flush()
+            if tail:
+                answer_parts.append(tail)
+                delta_buffer.append(tail)
             if delta_buffer:
                 events.put({"type": "delta", "side": index,
                             "text": "".join(delta_buffer)})
@@ -2276,6 +2292,10 @@ def _run_side(
             if callable(closer):
                 closer()
     except BaseException as exc:  # noqa: BLE001 - ошибка одной колонки не рвёт другую
+        tail = gender.flush()
+        if tail:
+            answer_parts.append(tail)
+            delta_buffer.append(tail)
         if delta_buffer:
             events.put({"type": "delta", "side": index,
                         "text": "".join(delta_buffer)})
@@ -4222,6 +4242,8 @@ _URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 #: Markdown-разметка: ``*`` (курсив/жирный), ``#`` (заголовки), ``` ` ``` (код),
 #: ``~`` (зачёркнутый). Прочие символы не трогаем: они часть текста.
 _MD_DECOR_RE = re.compile(r"[*#`~]+")
+#: Хештег как слово: «#маркетинг» → «хештег маркетинг» (до общей чистки #).
+_HASHTAG_RE = re.compile(r"#+(?=[A-Za-zА-Яа-яЁё0-9_])")
 
 
 def clean_tts_text(text: object) -> str:
@@ -4241,6 +4263,9 @@ def clean_tts_text(text: object) -> str:
     value = _THINK_TAG_RE.sub(" ", value)
     value = _MD_LINK_RE.sub(r"\1", value)
     value = _URL_RE.sub(" ", value)
+    # Хештег — это слово, а не разметка: «#маркетинг» должно звучать, а не
+    # исчезать вместе с решёткой (иначе Silero получает пустоту и молчит).
+    value = _HASHTAG_RE.sub(" хештег ", value)
     value = _MD_DECOR_RE.sub(" ", value)
     return " ".join(value.split())
 
@@ -4853,6 +4878,11 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         продолжит работать. Откат ElevenLabs → Silero/system делает
         ``eva/tts.py``, поэтому сюда ошибка приходит только если запасного
         голоса тоже нет.
+
+        Женский род (задача 0207): фразу чистим, затем
+        :func:`eva.ru_gender.feminize`. Клиент обычно присылает уже
+        исправленный текст ответа, но озвучка — отдельный вход: прямой
+        ``POST /api/tts`` с «я понял» тоже должен звучать «я поняла».
         """
         payload = self._read_json_body()
         if not isinstance(payload, Mapping):
@@ -4873,7 +4903,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                     ),
                     code="unknown_voice",
                 )
-        text = clean_tts_text(raw_text)
+        # Сначала род (код в бэктиках ещё виден и не переписывается), потом
+        # чистка разметки — так речь получает женские формы, а код остаётся.
+        text = clean_tts_text(feminize(raw_text))
         if not text:
             raise ClientError(
                 "После чистки текста нечего озвучивать: остались только "

@@ -59,10 +59,13 @@ Silero работает отдельным **долгоживущим** проц
 через :meth:`ElevenLabsTTS.synthesize_audio`; серверу это нужно, чтобы
 выставить ``audio/mpeg`` вместо жёсткого ``audio/wav``.
 
-Перед синтезом числа превращаются в русские слова (:mod:`eva.ru_numbers`,
-задача 0205): Silero v4_ru не произносит токены-цифры и «Цена 1500 рублей»
-звучала втрое короче словесной формы. Нормализация общая для всех движков и
-делается до выбора движка, поэтому ElevenLabs и ``say`` тоже получают слова.
+Перед синтезом текст проговаривается словами: числа — :mod:`eva.ru_numbers`
+(задача 0205), знаки, сокращения, телефоны и email — :mod:`eva.ru_speech`
+(задача 0206). Silero v4_ru не произносит токены-цифры и молча пропускает
+«×», «€», «км²», «#», а ``info@example.com`` выпадает целиком; «Цена 1500
+рублей» звучала втрое короче словесной формы. Нормализация общая для всех
+движков и делается до выбора движка, поэтому ElevenLabs и ``say`` тоже
+получают слова.
 
 Адаптеры умеют также :meth:`TTSAdapter.synthesize_timed` — с замерами
 ``synth_ms`` и ``first_fragment_ms`` для голосового цикла.
@@ -94,7 +97,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .ru_numbers import numbers_to_words
+from .ru_speech import speech_to_words
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -355,16 +358,18 @@ def _is_executable(path: Path) -> bool:
 
 
 def normalize_tts_text(text: object) -> str:
-    """Текст для озвучки: числа — русскими словами (задача 0205).
+    """Текст для озвучки: знаки и числа — русскими словами (0205/0206).
 
     Silero v4_ru пропускает токены-цифры («Цена 1500 рублей» звучала втрое
-    короче словесной формы), поэтому нормализация общая для всех движков:
-    она делается **до** выбора движка, в :func:`_synthesize_with_fallback`, и
+    короче словесной формы) и молча выкидывает знаки («2 × 3», «50 €»,
+    «info@example.com»). Поэтому нормализация общая для всех движков: она
+    делается **до** выбора движка, в :func:`_synthesize_with_fallback`, и
     повторно в :func:`_clean_text` — на случай прямого вызова
-    ``adapter.synthesize()``. Функция идемпотентна: слова повторно не
-    меняются.
+    ``adapter.synthesize()``. Ступени: :mod:`eva.ru_speech` (символы,
+    сокращения, телефоны, email) и :mod:`eva.ru_numbers` (числа). Функция
+    идемпотентна: слова повторно не меняются.
     """
-    return numbers_to_words(str(text or ""))
+    return speech_to_words(str(text or ""))
 
 
 def _clean_text(text: object) -> str:
