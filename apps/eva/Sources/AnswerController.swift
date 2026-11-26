@@ -66,6 +66,9 @@ final class AnswerController {
         filter = ThinkFilter()
         splitter = PhraseSplitter()
         speak = enabled
+        if enabled {
+            voice.beginStream()
+        }
         hadError = false
         stats = ""
         startedAt = Date()
@@ -105,6 +108,10 @@ final class AnswerController {
                 self.publish(visible: self.filter.visible, thinking: self.filter.thinking)
                 if self.speak {
                     self.voice.enqueue(self.splitter.flush())
+                    // Только теперь очередь может объявить «досказали»:
+                    // иначе follow-up открывал микрофон посреди длинной
+                    // сказки и последняя фраза обрывалась.
+                    self.voice.endStream()
                 }
                 log("sse finished: кусков \(self.deltaCount), видимых символов "
                     + "\(self.filter.visible.count), размышления "

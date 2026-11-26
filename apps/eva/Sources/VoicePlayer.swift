@@ -42,7 +42,8 @@ final class VoicePlayer {
 
     /// Очередь пуста: ничего не играет, не ждёт и не синтезируется.
     var isDrained: Bool {
-        player == nil && pendingWav.isEmpty && texts.isEmpty && synthesis == nil
+        streamDone && player == nil && pendingWav.isEmpty && texts.isEmpty
+            && synthesis == nil
     }
 
     /// Текст фразы, которая звучит прямо сейчас; `nil` — тишина. Эхо-защита
@@ -53,6 +54,12 @@ final class VoicePlayer {
     /// Уже сообщили, что очередь опустела: не повторяем на каждый чих.
     private var drainedNotified = true
 
+    /// Ответ ещё приходит. Очередь может опустеть между двумя дельтами —
+    /// в этот момент «доиграли» ещё не значит «досказали»: длинная сказка
+    /// приходит кусками, и ранний дренаж открывал микрофон посреди текста
+    /// (жалоба: последняя фраза сказки не звучит).
+    private var streamDone = true
+
     func configure(server: URL?, voice id: String) {
         self.server = server
         self.voice = id
@@ -61,6 +68,18 @@ final class VoicePlayer {
     /// Новый вопрос: глушим всё и начинаем с чистого листа.
     func reset() {
         stop()
+    }
+
+    /// Ответ начался: до его конца дренаж не объявляем.
+    func beginStream() {
+        streamDone = false
+        drainedNotified = false
+    }
+
+    /// Стрим закончился: очередь доиграет и только тогда объявит дренаж.
+    func endStream() {
+        streamDone = true
+        notifyDrainedIfIdle()
     }
 
     func enqueue(_ phrases: [String]) {
