@@ -2239,17 +2239,22 @@ int vtm_q6k_dequant_row(float *y, const uint8_t *blocks, int64_t base,
 // --- батчевые kind 6/7 (задача 0167) --------------------------------------
 //
 // Контракт — как у vtm_q4_*_batch (vtm_backend.h): x[t*N + j], y[r*N + j],
-// строка W разворачивается один раз на пачку. NEON-ядро (backend_neon.c)
-// держит развёрнутую строку в f32; скалярный откат — qk_mm: он деквантизует
-// строку один раз на n столбцов в double, то есть по смыслу это то же самое,
-// только активации в double (медленнее, зато побитово как поштучный путь).
-// Отказ ядра (-1) — нет памяти или cols не кратен 256; тогда работает откат.
-// VTM_Q4K_BATCH=0 — выключить батчевое ядро kind 6/7 (A/B-замер и откат на
-// скалярный эталон qk_mm). По умолчанию включено.
+// строка W разворачивается один раз на пачку. С 0189 первым работает
+// int8-dot GEMM (vtm_neon_qk_batch_i8, backend_neon.c): строка весов
+// разворачивается в int8 ТОЧНО (как у декода 0169) и умножается на 4 токена
+// пачки за SDOT, поэтому пачка не только читает вес один раз, но и делает
+// 16 MAC за инструкцию вместо 4 у FMA. Арифметика ядра повторяет поштучный
+// int8-GEMV бит в бит, поэтому пачка на SIMD больше не «в пределах 1e-5».
 //
-// VTM_Q4K_STRICT=1 (см. backend_neon.c) — эталонное f64-накопление: батчевое
-// ядро тоже не включается, пачка идёт через qk_mm (double). Так strict-режим
-// остаётся полностью эталонным — как в 0165, до f32-ядер.
+// Порядок ступеней: int8-dot (плоскости — как у декода, VTM_Q4K_BATCH_I8 может
+// переопределить) -> f32-ядро 0167 (вес в f32, 4 MAC/FMA) -> скалярный qk_mm
+// (double, побитово как поштучный скалярный путь). Любой отказ (-1: нет
+// памяти, cols не кратен 256, CPU без FEAT_DotProd) переводит на следующую
+// ступень, прогон не падает.
+//
+// VTM_Q4K_BATCH=0 — выключить батчевые ядра kind 6/7 целиком (A/B и откат).
+// VTM_Q4K_STRICT=1 — эталонное f64-накопление: ни int8, ни f32-пачка не
+// включаются, пачка идёт через qk_mm (double).
 static int q4k_batch_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -2257,6 +2262,54 @@ static int q4k_batch_enabled(void) {
         const char *st = getenv("VTM_Q4K_STRICT");
         int strict = (st && *st && *st != '0') ? 1 : 0;
         cached = (e && *e && *e == '0') || strict ? 0 : 1;
+    }
+    return cached;
+}
+
+// Число int8-плоскостей у батчевого GEMM kind 6/7 (задача 0189).
+// VTM_Q4K_BATCH_I8=0 — f32-ядро 0167; 1/2/3 — int8 с явным числом плоскостей;
+// не задано — как у поштучного декода (vtm_q4k_i8_mode()), тогда пачка
+// побитово равна поштучному пути. Мусор в переменной — 0 (выключить int8).
+static int q4k_batch_i8_planes(void) {
+    static int env = -2;
+
+    if (env == -2) {
+        const char *e = getenv("VTM_Q4K_BATCH_I8");
+        int v = -1;
+
+        if (e && *e >= '0' && *e <= '3' && e[1] == '\0') v = *e - '0';
+        else if (e && *e) v = 0;
+        env = v;
+    }
+    if (env >= 0) return env;
+    return vtm_q4k_i8_mode();
+}
+
+#if VTM_Q4_NEON
+// Два int8-ядра (0189): точное (побитово как поштучный декод) и быстрое
+// (4 токена в дорожках SDOT, но иной порядок f32-сложения — Δlogits 1e-4).
+extern int vtm_neon_qk_batch_i8(float *y, const uint8_t *blocks,
+                                const float *x, int rows, int cols, int ntok,
+                                int q6, int planes);
+extern int vtm_neon_qk_batch_i8_fast(float *y, const uint8_t *blocks,
+                                     const float *x, int rows, int cols,
+                                     int ntok, int q6, int planes);
+#define VTM_QK_BATCH_I8_NEON 1
+#else
+#define VTM_QK_BATCH_I8_NEON 0
+#endif
+
+// Какое int8-ядро зовёт батчевый путь: 0 — точное (по умолчанию), 1 — быстрое.
+// VTM_Q4K_BATCH_KERNEL=fast — быстрое (A/B-замер и машины, где важнее
+// скорость: точность тогда как у f32-ядра 0167, Δlogits ~1e-4 к поштучному).
+static int q4k_batch_kernel_fast(void) {
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *e = getenv("VTM_Q4K_BATCH_KERNEL");
+
+        cached = (e && e[0] == 'f' && e[1] == 'a' && e[2] == 's' && e[3] == 't'
+                  && e[4] == '\0') ? 1 : 0;
     }
     return cached;
 }
@@ -2269,6 +2322,25 @@ static int qk_tmv_batch(float *y, const uint8_t *blocks, const float *x,
 #if VTM_Q4_NEON
     if (q4k_batch_enabled() && q4_simd_enabled() && vtm_simd_available()) {
         int rc;
+
+#if VTM_QK_BATCH_I8_NEON
+        // int8-dot GEMM (0189): первый выбор — он и быстрее f32-ядра, и
+        // побитово равен поштучному int8-GEMV.
+        {
+            const int planes = q4k_strict_env() ? 0 : q4k_batch_i8_planes();
+
+            if (planes > 0) {
+                const int fast = q4k_batch_kernel_fast();
+
+                rc = fast
+                   ? vtm_neon_qk_batch_i8_fast(y, blocks, x, rows, cols, ntok,
+                                               kind == VTM_TENSOR_Q6K, planes)
+                   : vtm_neon_qk_batch_i8(y, blocks, x, rows, cols, ntok,
+                                          kind == VTM_TENSOR_Q6K, planes);
+                if (rc == 0) return 0;
+            }
+        }
+#endif
         if (kind == VTM_TENSOR_Q4K)
             rc = vtm_neon_q4k_batch(y, blocks, x, rows, cols, ntok);
         else

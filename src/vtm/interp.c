@@ -3818,32 +3818,38 @@ static vtm_status batch_sequential(vtm_t *m, const int32_t *ids, int n,
                                    int pos0);
 static int batch_use_simd(const vtm_t *m);
 
-// Окупается ли пачка в кэш-пути на этом графе и бэкенде (0180).
+// Окупается ли пачка в кэш-пути на этом графе и бэкенде (0180, 0189).
 //
 // У MoE — всегда: эксперт читается один раз на всех, кому он нужен (0179), и
-// это главный выигрыш. У плотного графа на SIMD с весами Q4_K/Q6_K — нет:
-// батчевое ядро kind 6/7 разворачивает вес в f32 на пачку, а поштучный
-// int8-dot на этой машине быстрее (замер на 3B Q4_K: TTFT 9,3 с по токену
-// против 11,4 с пачкой 128 при кэше). Поэтому такой граф остаётся на прежнем
-// побитовом пути по токену; на скалярном бэкенде батчевые ядра kind 6/7 идут
-// через double и выигрывают (0168), там пачка остаётся.
-static int cache_batch_worthwhile(const vtm_t *m) {
-    uint32_t i;
-    int has_moe = 0, has_q4k_dense = 0;
+// это главный выигрыш.
+//
+// У плотного графа на SIMD с весами Q4_K/Q6_K до 0189 пачка была не выгодна:
+// батчевое ядро kind 6/7 разворачивало вес в f32 на пачку, а поштучный
+// int8-dot на этой машине оказывался быстрее (замер: TTFT 9,3 с по токену
+// против 11,4 с пачкой 128). С 0189 у пачки есть int8-dot GEMM
+// (vtm_neon_qk_batch_i8): строка весов читается и распаковывается один раз на
+// пачку, а арифметика побитово повторяет поштучный путь. Поэтому гейт «12
+// токенов» снят для всех плотных графов: чем длиннее пачка, тем реже 2 ГиБ
+// блоков читаются из файла (на машине с занятым page cache это разница в
+// разы: 6,8 с на токен по токену против 0,8 с у пачки 16, 3B Q4_K), а
+// фиксированный размер пачки теперь задаёт бюджет активаций (ниже).
+//
+// VTM_BATCH_DENSE=0 — вернуть прежнее поведение (по токену на SIMD),
+// A/B-замер «до/после» на одном бинарнике.
+static int dense_batch_enabled(void) {
+    static int cached = -1;
 
-    if (!batch_use_simd(m)) return 1;
-    for (i = 0; i < m->n_instr; i++) {
-        const vtm_instr *in = &m->instr[i];
-        const vtm_tensor *t;
-        if (in->opcode == VTM_OP_MOE) has_moe = 1;
-        if (in->opcode != VTM_OP_TMV && in->opcode != VTM_OP_MM) continue;
-        if (in->a == VTM_NO_TENSOR || in->a >= m->n_tensors) continue;
-        t = &m->tensors[in->a];
-        if (t->kind == VTM_TENSOR_Q4K || t->kind == VTM_TENSOR_Q6K) {
-            has_q4k_dense = 1;
-        }
+    if (cached < 0) {
+        const char *e = getenv("VTM_BATCH_DENSE");
+
+        cached = !(e && *e && *e == '0');
     }
-    return has_moe || !has_q4k_dense;
+    return cached;
+}
+
+static int cache_batch_worthwhile(const vtm_t *m) {
+    if (!batch_use_simd(m)) return 1;
+    return dense_batch_enabled();
 }
 
 static vtm_status cache_run_tokens(vtm_t *m, const int32_t *ids, int n,
@@ -4140,6 +4146,19 @@ static void moe_batch_limits(int *cap, size_t *bytes) {
     *cap = (int)moe_env_long("VTM_MOE_BATCH_TOKENS", VTM_MOE_BATCH_TOKENS, 4,
                              VTM_BATCH_TOKENS_MAX);
     *bytes = mb << 20;
+}
+
+// Потолок пачки для плотного графа: VTM_BATCH_TOKENS (4..VTM_BATCH_TOKENS_MAX),
+// по умолчанию VTM_BATCH_TOKENS (32). Размер выбран замером 0189 (свип
+// 8/16/32/64 на 3B Q4_K: 4,18 / 4,05 / 3,72 / 3,83 с на 64 токена): время на
+// токен падает, пока вес на токен читается реже (2 ГиБ блоков на пачку, а не
+// на каждые C токенов), и после 32 не меняется — L1-обрыва, как у f32-ядра в
+// 0168 (оптимум 8–12), у int8-ядра нет: его рабочее множество — строка весов
+// и квантованные активации, а не f32-копия активаций пачки (cols·C·4).
+// Память под активации при этом растёт линейно, её и ограничивает бюджет.
+static int dense_batch_tokens(void) {
+    return (int)moe_env_long("VTM_BATCH_TOKENS", VTM_BATCH_TOKENS, 4,
+                             VTM_BATCH_TOKENS_MAX);
 }
 
 // Минимальная пачка для батчевого плотного (fp32) TMV/MM: ядро 0159
@@ -5707,7 +5726,7 @@ vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
     // У MoE-графов потолок и бюджет свои (moe_batch_limits, 0179): эксперты
     // читаются один раз на пачку, и выигрыш растёт с ней почти линейно, пока
     // растёт доля «общих» экспертов.
-    cmax = VTM_BATCH_TOKENS;
+    cmax = dense_batch_tokens();
     {
         size_t budget = VTM_BATCH_SCRATCH_BYTES;
         size_t lim;
@@ -5717,9 +5736,13 @@ vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
             moe_batch_limits(&cap, &budget);
             cmax = cap;
         }
-        // У плотных графов единица — сумма активаций (размер пачки выбран в
-        // 0168 по L1), у MoE — упакованный слот (0181: память под пачку).
-        lim = budget / ((b.has_moe ? b.slot : b.sum_slot) * sizeof(float));
+        // Предел ставит бюджет активаций пачки. Упакованный слот (0181) —
+        // это и есть память под пачку: C*sloat float. До 0189 у плотных
+        // графов в пределе стояла СУММА активаций (sum_slot), чтобы получить
+        // выбранные в 0168 по L1 12 токенов; с int8 GEMM 0189 рабочее
+        // множество ядра — строка весов + квантованные активации по токенам,
+        // и L1 больше не режет пачку (замер свипа в отчёте 0189).
+        lim = budget / (b.slot * sizeof(float));
         if (lim < 1u) lim = 1u;
         if ((size_t)cmax > lim) cmax = (int)lim;
     }

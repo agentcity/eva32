@@ -1708,6 +1708,16 @@ done:
 // Батчевое ядро kind 6/7 (задача 0167) против поштучного пути — критерий
 // приёмки: y[r*N+j] пачки = N вызовов поштучного ядра на contiguous вход
 // токена j. Поштучное ядро уже сверено с double-эталоном выше.
+// Ядро батча kind 6/7 — точное (побитовое) или A/B-вариант со своей точностью.
+static int q4k_batch_parity_kernel(void) {
+    const char *pi8 = getenv("VTM_Q4K_BATCH_I8");
+    const char *ker = getenv("VTM_Q4K_BATCH_KERNEL");
+
+    if (pi8 && *pi8) return 0;
+    if (ker && strcmp(ker, "fast") == 0) return 0;
+    return 1;
+}
+
 static void check_q4k_batch_case(int rows, int cols, int ntok, int q6) {
     int n = rows * cols;
     uint32_t seed = 0x3e00u + (uint32_t)rows * 29u + (uint32_t)cols * 7u
@@ -1720,7 +1730,7 @@ static void check_q4k_batch_case(int rows, int cols, int ntok, int q6) {
     float *yt = (float *)malloc((size_t)rows * sizeof(float));
     char label[128];
     double ref = 0.0;
-    int j, r, t, rc;
+    int j, r, t, rc, pl;
 
     if (!blocks || !x || !y_ref || !y_bat || !xt || !yt) {
         fprintf(stderr, "check_q4k_batch_case: нет памяти\n");
@@ -1751,6 +1761,37 @@ static void check_q4k_batch_case(int rows, int cols, int ntok, int q6) {
              q6 ? "Q6_K" : "Q4_K", rows, cols, ntok);
     report(label, max_diff(y_bat, y_ref, (size_t)rows * (size_t)ntok, &ref),
            ref, CHECK_TOL);
+
+    // 0189: батчевое int8-ядро обязано быть ПОБИТОВО равно поштучному при
+    // любом числе плоскостей: оно зовёт ту же функцию строки, что декод,
+    // меняется только сетка квантования активаций — и она общая у обоих путей.
+    // Проверка имеет смысл только у точного ядра: f32-ядро 0167 и быстрое
+    // int8-ядро сетку плоскостей не повторяют (VTM_Q4K_BATCH_I8=0 или
+    // VTM_Q4K_BATCH_KERNEL=fast — это A/B-режимы со своей точностью).
+    for (pl = 1; pl <= 2 && q4k_batch_parity_kernel(); pl++) {
+        int k, i;
+
+        if (vtm_q4k_i8_set_mode(pl) != pl) break;
+        for (k = 0; k < ntok; k++) {
+            for (t = 0; t < cols; t++)
+                xt[t] = x[(size_t)t * (size_t)ntok + (size_t)k];
+            rc = q6 ? vtm_q6k_tmv(yt, blocks, xt, rows, cols)
+                    : vtm_q4k_tmv(yt, blocks, xt, rows, cols);
+            if (rc != 0) break;
+            for (i = 0; i < rows; i++)
+                y_ref[(size_t)i * (size_t)ntok + (size_t)k] = yt[i];
+        }
+        rc = q6 ? vtm_q6k_tmv_batch(y_bat, blocks, x, rows, cols, ntok)
+                : vtm_q4k_tmv_batch(y_bat, blocks, x, rows, cols, ntok);
+        snprintf(label, sizeof label, "%s TMV-батч int8/%d %dx%dx%d",
+                 q6 ? "Q6_K" : "Q4_K", pl, rows, cols, ntok);
+        report(label, rc == 0
+                   ? max_diff(y_bat, y_ref,
+                              (size_t)rows * (size_t)ntok, &ref)
+                   : 1e9,
+               ref, CHECK_TOL);
+    }
+    vtm_q4k_i8_set_mode(-1);
 done:
     free(blocks);
     free(x);

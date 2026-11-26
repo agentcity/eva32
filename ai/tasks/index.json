@@ -1262,7 +1262,7 @@
   {
     "id": "0189",
     "title": "Плотный prefill через GEMM",
-    "status": "in_progress",
+    "status": "done",
     "file": "0189-dense-prefill-gemm.md",
     "assignee": "agent:prefill-gemm"
   },

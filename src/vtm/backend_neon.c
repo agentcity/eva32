@@ -2507,6 +2507,12 @@ typedef struct {
     int cols;
     int q6;            // 0 — Q4_K, 1 — Q6_K
     int planes;        // 1..3
+    // 0189: строка весов, уже развёрнутая в int8 (cols байт). Батчевый GEMM
+    // разворачивает её ОДИН раз на строку и подставляет сюда, чтобы N токенов
+    // пачки не распаковывали нибблы/6-битки заново. NULL (декод) — веса
+    // берутся из блоков, как раньше: арифметика и порядок те же, поэтому
+    // результат батча побитово равен поштучному ядру.
+    const int8_t *wrow;
 } qk_i8_job;
 
 // Квантование активаций: один проход по cols на токен (а не на строку).
@@ -2644,8 +2650,14 @@ static float qk_i8_row_q4k(const qk_i8_job *j, int r) {
         const int8_t *xp = j->xq + (size_t)(sb + (S)) * 32u;               \
         int8x16_t w0, w1;                                                  \
         int32x4_t it;                                                      \
-        q4k_i8_sub(bp + 16u + (size_t)((S) >> 1) * 32u, (S) & 1,           \
-                   &w0, &w1);                                              \
+        if (j->wrow) {                                                     \
+            const int8_t *ws = j->wrow + (size_t)(sb + (S)) * 32u;         \
+            w0 = vld1q_s8(ws);                                             \
+            w1 = vld1q_s8(ws + 16u);                                       \
+        } else {                                                           \
+            q4k_i8_sub(bp + 16u + (size_t)((S) >> 1) * 32u, (S) & 1,       \
+                       &w0, &w1);                                          \
+        }                                                                  \
         it = VTM_SDOT(VTM_SDOT(vdupq_n_s32(0), w0, vld1q_s8(xp)),          \
                       w1, vld1q_s8(xp + 16));                              \
         if (planes >= 2) {                                                 \
@@ -2731,13 +2743,20 @@ static float qk_i8_row_q6k(const qk_i8_job *j, int r) {
         const int sbx = sb + ((S) >> 1);                                   \
         const int off = ((int)(S) & 1) * 16;                               \
         const int8_t *xp = j->xq + (size_t)sbx * 32u + (size_t)off;        \
-        const uint8x16_t nib = (HIGH) ? vshrq_n_u8(QLB, 4)                 \
-                                      : vandq_u8(QLB, vdupq_n_u8(0x0fu));  \
-        const uint8x16_t two = vandq_u8(vshlq_u8(QHB, vdupq_n_s8(-(SH))),  \
-                                        vdupq_n_u8(0x03u));                \
-        int8x16_t w = vsubq_s8(                                            \
-            vreinterpretq_s8_u8(vorrq_u8(nib, vshlq_n_u8(two, 4))),        \
-            vdupq_n_s8(32));                                               \
+        int8x16_t w;                                                       \
+        if (j->wrow) {                                                     \
+            w = vld1q_s8(j->wrow + (size_t)sb * 32u                      \
+                                  + (size_t)(S) * 16u);                    \
+        } else {                                                           \
+            const uint8x16_t nib = (HIGH)                                  \
+                ? vshrq_n_u8(QLB, 4)                                       \
+                : vandq_u8(QLB, vdupq_n_u8(0x0fu));                        \
+            const uint8x16_t two = vandq_u8(                               \
+                vshlq_u8(QHB, vdupq_n_s8(-(SH))), vdupq_n_u8(0x03u));      \
+            w = vsubq_s8(                                                  \
+                vreinterpretq_s8_u8(vorrq_u8(nib, vshlq_n_u8(two, 4))),    \
+                vdupq_n_s8(32));                                           \
+        }                                                                  \
         int32x4_t it = VTM_SDOT(vdupq_n_s32(0), w, vld1q_s8(xp));          \
         if (planes >= 2) {                                                 \
             const int8_t *rp = j->xr + (size_t)sbx * 32u + (size_t)off;    \
@@ -2872,6 +2891,650 @@ int vtm_neon_qk_gemv_i8(float *y, const uint8_t *blocks, const float *x,
     free(job.xs);
     free(job.sx);
     free(job.xsum);
+    return 0;
+}
+
+// --- NEON: int8-dot GEMM для prefill kind 6/7 (задача 0189) ----------------
+//
+// Зачем. Батчевое f32-ядро 0167 (qk_batch_neon) разворачивает строку весов в
+// f32 и на каждый токен пачки делает 2048/4 = 512 FMA на 2048 значений
+// (4 MAC за инструкцию). Здесь та же строка разворачивается в int8 (веса
+// Q4_K/Q6_K представимы в int8 ТОЧНО) и умножается на 4 токена сразу: SDOT
+// даёт 16 MAC за инструкцию, а дорожки int32 — четыре токена. На M1 Pro
+// (замер микроядра: 8,2 G SDOT/s против 6,2 G FMLA/s на поток) это ~5x по
+// MAC/инструкцию; prefill перестаёт упираться в FMLA.
+//
+// Точность — ПОБИТОВОЕ равенство с поштучным путём. Это не «приятный бонус»:
+// поштучный декод kind 6/7 — тоже int8-dot (0169), и квантование активаций
+// дискретно, поэтому расхождение 1e-7 на скрытом состоянии после 36 слоёв
+// даёт 1e-4 на логитах (замер: f32-пачка 0167 против поштучного пути —
+// max|Δlogits| = 1,15e-4, --prefill-check FAIL). Здесь повторён весь порядок
+// операций поштучного ядра (qk_i8_row_q4k/q6k):
+//   * та же сетка квантования: под-блок 32 значения, sx = max|x|/127,
+//     точная Σx, плоскости sx / sx/254 / sx/(254·127) (режим — как у декода,
+//     VTM_Q4_I8: 1/2/3, по умолчанию 3);
+//   * те же int32-суммы: it = i1·32258 + i2·127 + i3 (и kf = 1/32258 у d);
+//   * тот же порядок f32-сложения: у Q4_K — 8 аккумуляторов (по под-блокам
+//     блока) и то же дерево vaddq, у Q6_K — 4 аккумулятора acc[S & 3];
+//   * минимум Q4_K вычитается из double до q-слагаемых блока, как в декоде.
+// Поэтому y[r*N+j] пачки совпадает с y[r] поштучного ядра бит в бит
+// (проверяет bench_backend --q4k / --prefill-check).
+//
+// Раскладка активаций — как у батчевого Q4 0163 (vtm_neon_q4_batch_i8): блок
+// из 4 токенов, под-блок 32 значения = 128 байт = 8 операндов SDOT по 16
+// байт, из них дорожка l — 4 значения токена l. Квантование — один проход по
+// cols на токен (а не на строку весов), так что его цена не зависит от rows.
+//
+// Отказ (−1): CPU без FEAT_DotProd, cols не кратен 256, ntok < 2, нет памяти
+// или VTM_Q4K_STRICT=1 — диспетчер backend_scalar.c идёт в f32-ядро 0167
+// (и дальше в скалярный эталон), прогон не падает.
+
+typedef struct {
+    float *y;              // [rows * ntok]
+    const uint8_t *blocks;
+    int rows, cols, ntok;
+    int q6;                // 0 — Q4_K, 1 — Q6_K
+    int planes;            // 1..3 — плоскостей int8 у активаций
+    int nsub;              // cols/32 — под-блоков сетки квантования
+    int ntb;               // (ntok+3)/4 — блоков по 4 токена
+    int stride;            // ntb*4 — выравненное число токенов
+    int8_t *xq;            // [stride*cols] 1-я плоскость
+    int8_t *xr;            // [stride*cols] остаток (planes >= 2)
+    int8_t *xs;            // [stride*cols] остаток 2-й плоскости (planes = 3)
+    float *sx;             // [nsub*stride] масштаб под-блока по токенам
+    float *xsum;           // [nsub*stride] точная Σx под-блока (Q4_K)
+    float *xt;             // [ntok*cols] транспонированный вход: [tok*cols+t]
+    int8_t *wb_all;        // vt*cols: int8-строка весов на поток
+    int8_t *wb4_all;       // vt*cols*4: она же, размноженная по 4 дорожкам
+} qk_i8b_job;
+
+// Строка весов -> int8: Q4_K — нибблы 0..15 (как q4k_block_to_f32), Q6_K —
+// (q − 32) (как q6k_block_to_f32). Ровно те целые, что раскладывает в f32
+// поштучное ядро, поэтому ошибки от весов нет.
+static void qk_i8b_expand_row(const uint8_t *blocks, int cols, int q6, int r,
+                              int8_t *wb)
+{
+    const int nblk = cols / (int)VTM_Q4K_BLOCK_VALUES;
+    int b, s;
+
+    if (!q6) {
+        for (b = 0; b < nblk; b++) {
+            const uint8_t *bp = blocks
+                + ((size_t)r * (size_t)nblk + (size_t)b)
+                  * (size_t)VTM_Q4K_BLOCK_BYTES;
+            int8_t *o = wb + (size_t)b * 256u;
+            for (s = 0; s < 8; s++) {
+                const uint8_t *qs = bp + 16u + (size_t)(s >> 1) * 32u;
+                const uint8x16_t m = vdupq_n_u8(0x0fu);
+                const uint8x16_t b0 = vld1q_u8(qs);
+                const uint8x16_t b1 = vld1q_u8(qs + 16);
+                uint8x16_t n0, n1;
+
+                if (s & 1) {
+                    n0 = vshrq_n_u8(b0, 4);
+                    n1 = vshrq_n_u8(b1, 4);
+                } else {
+                    n0 = vandq_u8(b0, m);
+                    n1 = vandq_u8(b1, m);
+                }
+                vst1q_s8(o + (size_t)s * 32u, vreinterpretq_s8_u8(n0));
+                vst1q_s8(o + (size_t)s * 32u + 16u, vreinterpretq_s8_u8(n1));
+            }
+        }
+        return;
+    }
+    for (b = 0; b < nblk; b++) {
+        const uint8_t *bp = blocks
+            + ((size_t)r * (size_t)nblk + (size_t)b)
+              * (size_t)VTM_Q6K_BLOCK_BYTES;
+        int8_t *o = wb + (size_t)b * 256u;
+        for (s = 0; s < 16; s++) {
+            const unsigned chunk = (unsigned)s >> 3, in = (unsigned)s & 7u;
+            const unsigned quad = in >> 1, half = in & 1u;
+            const uint8_t *ql = bp + (size_t)chunk * 64u
+                              + (size_t)(quad & 1u) * 32u + (size_t)half * 16u;
+            const uint8_t *qh = bp + 128u + (size_t)chunk * 32u
+                              + (size_t)half * 16u;
+            const uint8x16_t qlb = vld1q_u8(ql);
+            const uint8x16_t qhb = vld1q_u8(qh);
+            const uint8x16_t nib = (quad >= 2u) ? vshrq_n_u8(qlb, 4)
+                                                : vandq_u8(qlb,
+                                                           vdupq_n_u8(0x0fu));
+            const uint8x16_t two = vandq_u8(
+                vshlq_u8(qhb, vdupq_n_s8(-(int)(quad * 2u))),
+                vdupq_n_u8(0x03u));
+            const int8x16_t q = vsubq_s8(
+                vreinterpretq_s8_u8(vorrq_u8(nib, vshlq_n_u8(two, 4))),
+                vdupq_n_s8(32));
+
+            vst1q_s8(o + (size_t)s * 16u, q);
+        }
+    }
+}
+
+// 4 значения строки -> 16 байт (четыре дорожки): операнд SDOT, одинаковый для
+// всех токенов пачки. Строится один раз на строку (cols/4 итераций), а
+// используется ntok/4 раз — иначе на каждый SDOT уходили бы load+dup.
+static void qk_i8b_bcast(int8_t *wb4, const int8_t *wb, int cols)
+{
+    int i;
+
+    for (i = 0; i + 4 <= cols; i += 4) {
+        uint32_t v;
+        memcpy(&v, wb + i, sizeof v);
+        vst1q_s8(wb4 + (size_t)i * 4u, vreinterpretq_s8_u32(vdupq_n_u32(v)));
+    }
+}
+
+// Квантование активаций пачки: та же арифметика, что qk_i8_quant (декод),
+// только раскладка «4 токена в дорожках» и sx/xsum — по токенам.
+static void qk_i8b_quant(qk_i8b_job *j)
+{
+    const int cols = j->cols;
+    const int ntok = j->ntok;
+    const int nsub = j->nsub;
+    const int stride = j->stride;
+    const int32x4_t v127 = vdupq_n_s32(127);
+    const int32x4_t vn127 = vdupq_n_s32(-127);
+    int tok, g, i;
+
+    for (tok = 0; tok < ntok; tok++) {
+        const float *p = j->xt + (size_t)tok * (size_t)cols;
+        const int tb = tok >> 2, lane = tok & 3;
+        int8_t *q1 = j->xq + (size_t)tb * 4u * (size_t)cols
+                   + (size_t)lane * 4u;
+        int8_t *r1 = j->xr ? j->xr + (size_t)tb * 4u * (size_t)cols
+                                  + (size_t)lane * 4u : NULL;
+        int8_t *s1 = j->xs ? j->xs + (size_t)tb * 4u * (size_t)cols
+                                  + (size_t)lane * 4u : NULL;
+
+        for (g = 0; g < nsub; g++) {
+            const float *pp = p + (size_t)g * 32u;
+            float32x4_t mv = vdupq_n_f32(0.0f), sv = vdupq_n_f32(0.0f);
+            float m, s, inv;
+            int8_t *qg = q1 + (size_t)g * 128u;
+            int8_t *rg = r1 ? r1 + (size_t)g * 128u : NULL;
+            int8_t *sg = s1 ? s1 + (size_t)g * 128u : NULL;
+
+            for (i = 0; i < 32; i += 4) {
+                const float32x4_t v = vld1q_f32(pp + i);
+
+                mv = vmaxq_f32(mv, vabsq_f32(v));
+                sv = vaddq_f32(sv, v);
+            }
+            m = vmaxvq_f32(mv);
+            // Как в qk_i8_quant: вырожденный под-блок не даёт 1/sx = inf.
+            s = (m > 1e-30f) ? m / 127.0f : 1.0f;
+            inv = 1.0f / s;
+            j->sx[(size_t)g * (size_t)stride + (size_t)tok] = s;
+            if (j->xsum)
+                j->xsum[(size_t)g * (size_t)stride + (size_t)tok]
+                    = vaddvq_f32(sv);
+
+            for (i = 0; i < 32; i += 4) {
+                const float32x4_t v = vld1q_f32(pp + i);
+                int32x4_t qi = vcvtnq_s32_f32(vmulq_n_f32(v, inv));
+
+                qi = vmaxq_s32(vminq_s32(qi, v127), vn127);
+                vst1_lane_s32((int32_t *)(qg + (size_t)(i >> 2) * 16u),
+                              q4_i8_pack4(qi), 0);
+                if (j->planes >= 2) {
+                    const float32x4_t r = vfmsq_f32(v, vcvtq_f32_s32(qi),
+                                                    vdupq_n_f32(s));
+                    int32x4_t ri = vcvtnq_s32_f32(
+                        vmulq_n_f32(r, inv * 254.0f));
+
+                    ri = vmaxq_s32(vminq_s32(ri, v127), vn127);
+                    vst1_lane_s32((int32_t *)(rg + (size_t)(i >> 2) * 16u),
+                                  q4_i8_pack4(ri), 0);
+                    if (j->planes >= 3) {
+                        const float32x4_t r2 = vfmsq_f32(
+                            r, vcvtq_f32_s32(ri),
+                            vdupq_n_f32(s * (1.0f / 254.0f)));
+                        int32x4_t ri2 = vcvtnq_s32_f32(
+                            vmulq_n_f32(r2, inv * (254.0f * 127.0f)));
+
+                        ri2 = vmaxq_s32(vminq_s32(ri2, v127), vn127);
+                        vst1_lane_s32(
+                            (int32_t *)(sg + (size_t)(i >> 2) * 16u),
+                            q4_i8_pack4(ri2), 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Одна строка: 4 токена пачки за проход (дорожки int32), все под-блоки блока
+// в работе — 8 независимых цепочек SDOT. Порядок f32-сложения повторяет
+// qk_i8_row_q4k/q6k (см. шапку секции) — результат побитовый.
+static void qk_i8b_row(const qk_i8b_job *j, int8_t *wb, int8_t *wb4, int r)
+{
+    const int cols = j->cols;
+    const int q6 = j->q6;
+    const int planes = j->planes;
+    const int ssz = q6 ? 16 : 32;              // значений в под-блоке весов
+    const int nch = ssz / 4;                   // чанков по 4 значения в нём
+    const int ngrp = cols / (8 * ssz);         // групп по 8 под-блоков
+    // Сетка квантования активаций — под-блоки по 32 значения: у Q4_K это сам
+    // под-блок, у Q6_K (16 значений) — его половина, поэтому два соседних
+    // под-блока делят sx. Отсюда grp*(8*ssz/32) и s>>q6.
+    const int sbase = 8 * ssz / 32;
+    const int ntb = j->ntb;
+    const int stride = j->stride;
+    const int nblk = cols / (int)VTM_Q4K_BLOCK_VALUES;
+    const size_t bsz = q6 ? (size_t)VTM_Q6K_BLOCK_BYTES
+                          : (size_t)VTM_Q4K_BLOCK_BYTES;
+    // kf — как у поштучного ядра: у 3 плоскостей шаг младшей 1/32258.
+    const float kf = (planes >= 3) ? (1.0f / 32258.0f)
+                   : (planes == 2) ? (1.0f / 254.0f) : 1.0f;
+    const uint8_t *bp_row = j->blocks + (size_t)r * (size_t)nblk * bsz;
+    float *yrow = j->y + (size_t)r * (size_t)j->ntok;
+    int tb, grp, s, k, p;
+
+    qk_i8b_expand_row(j->blocks, cols, q6, r, wb);
+    qk_i8b_bcast(wb4, wb, cols);
+
+    for (tb = 0; tb < ntb; tb++) {
+        const size_t xoff = (size_t)tb * 4u * (size_t)cols;
+        const int8_t *act[3];
+        float64x2_t dlo = vdupq_n_f64(0.0), dhi = dlo;
+        float32x4_t acc[8];
+
+        act[0] = j->xq + xoff;
+        act[1] = j->xr ? j->xr + xoff : j->xq + xoff;
+        act[2] = j->xs ? j->xs + xoff : j->xq + xoff;
+        for (s = 0; s < 8; s++) acc[s] = vdupq_n_f32(0.0f);
+
+        for (grp = 0; grp < ngrp; grp++) {
+            const uint8_t *bp = bp_row + (size_t)(grp >> q6) * bsz;
+            const size_t abase = (size_t)grp * (size_t)(8 * ssz / 32) * 128u;
+            const size_t wbase = (size_t)grp * (size_t)(8 * ssz);
+            float sca[8], mna[8];   // масштаб и минимум 8 под-блоков группы
+            float dk, dmin = 0.0f;
+            int32x4_t c[8];
+
+            if (!q6) {
+                // Q4_K: d, dmin fp16 и 8 (sc, mn) по 6 бит — как в декоде.
+                float32x4_t sc0, sc1, mn0, mn1;
+
+                dk = q4k_f16(bp) * kf;
+                dmin = q4k_f16(bp + 2);
+                q4k_scmn_f32(bp + 4, &sc0, &sc1, &mn0, &mn1);
+                vst1q_f32(sca, sc0);
+                vst1q_f32(sca + 4, sc1);
+                vst1q_f32(mna, mn0);
+                vst1q_f32(mna + 4, mn1);
+            } else {
+                float32x4_t sc6[4];
+                // Q6_K: 16 int8-масштабов на блок (по 16 значений), группа —
+                // половина блока, то есть 8 масштабов: 0..7 у чётной группы
+                // и 8..15 у нечётной.
+                const int g2 = (grp & 1) * 2;
+
+                dk = q4k_f16(bp + 208u) * kf;
+                q4_i8x16_to_f32x4(vld1q_s8((const int8_t *)(bp + 192u)), sc6);
+                vst1q_f32(sca, sc6[g2]);
+                vst1q_f32(sca + 4, sc6[g2 + 1]);
+            }
+
+            // --- int32-суммы: it = i1·32258 + i2·127 + i3 (как в декоде) ---
+            for (p = 0; p < planes; p++) {
+                const int8_t *ap = act[p] + abase;
+                int32x4_t t[8];
+
+                for (s = 0; s < 8; s++) t[s] = vdupq_n_s32(0);
+                for (k = 0; k < nch; k++) {
+                    for (s = 0; s < 8; s++) {
+                        const size_t wo = (wbase
+                            + (size_t)s * (size_t)ssz + (size_t)k * 4u) * 4u;
+                        const size_t xo = (size_t)(s >> q6) * 128u
+                                        + (size_t)(s & q6) * 64u
+                                        + (size_t)k * 16u;
+
+                        t[s] = VTM_SDOT(t[s], vld1q_s8(wb4 + wo),
+                                        vld1q_s8(ap + xo));
+                    }
+                }
+                if (p == 0) {
+                    for (s = 0; s < 8; s++)
+                        c[s] = (planes >= 3) ? vmulq_n_s32(t[s], 32258)
+                             : (planes == 2) ? vmulq_n_s32(t[s], 254) : t[s];
+                } else if (p == 1) {
+                    if (planes >= 3) {
+                        for (s = 0; s < 8; s++)
+                            c[s] = vmlaq_n_s32(c[s], t[s], 127);
+                    } else {
+                        for (s = 0; s < 8; s++)
+                            c[s] = vaddq_s32(c[s], t[s]);
+                    }
+                } else {
+                    for (s = 0; s < 8; s++)
+                        c[s] = vaddq_s32(c[s], t[s]);
+                }
+            }
+
+            // --- f32: aq = (sc·sx)·dk, затем аккумуляторы блока -----------
+            if (!q6) {
+                float32x4_t mres[4];
+                for (s = 0; s < 4; s++)
+                    mres[s] = vdupq_n_f32(0.0f);
+                for (s = 0; s < 8; s++) {
+                    const float sc = sca[s];
+                    const size_t sg = (size_t)(grp * sbase + (s >> q6))
+                                    * (size_t)stride + (size_t)tb * 4u;
+                    const float32x4_t sxv = vld1q_f32(j->sx + sg);
+                    const float32x4_t aqv = vmulq_n_f32(
+                        vmulq_n_f32(sxv, sc), dk);
+                    // минимум: mq = (mn·Σx)·dmin — как в qk_i8_row_q4k;
+                    // mres[i] = mq_i + mq_{i+4} — ровно vaddq(mq0, mq1).
+                    const float32x4_t xsv = vld1q_f32(j->xsum + sg);
+                    const float32x4_t mv = vmulq_n_f32(
+                        vmulq_n_f32(xsv, mna[s]), dmin);
+
+                    acc[s] = vfmaq_f32(acc[s], vcvtq_f32_s32(c[s]), aqv);
+                    mres[s & 3] = vaddq_f32(mres[s & 3], mv);
+                }
+                // total -= (double)Σmin — ДО q-слагаемых блока (как в декоде).
+                {
+                    float32x4_t ms = vaddq_f32(
+                        vaddq_f32(mres[0], mres[1]),
+                        vaddq_f32(mres[2], mres[3]));
+
+                    dlo = vsubq_f64(dlo,
+                                    vcvt_f64_f32(vget_low_f32(ms)));
+                    dhi = vsubq_f64(dhi,
+                                    vcvt_f64_f32(vget_high_f32(ms)));
+                }
+                {
+                    float32x4_t qs = vaddq_f32(
+                        vaddq_f32(vaddq_f32(acc[0], acc[1]),
+                                  vaddq_f32(acc[2], acc[3])),
+                        vaddq_f32(vaddq_f32(acc[4], acc[5]),
+                                  vaddq_f32(acc[6], acc[7])));
+
+                    dlo = vaddq_f64(dlo, vcvt_f64_f32(vget_low_f32(qs)));
+                    dhi = vaddq_f64(dhi, vcvt_f64_f32(vget_high_f32(qs)));
+                    for (s = 0; s < 8; s++) acc[s] = vdupq_n_f32(0.0f);
+                }
+            } else {
+                for (s = 0; s < 8; s++) {
+                    const float sc = sca[s];
+                    const size_t sg = (size_t)(grp * sbase + (s >> q6))
+                                    * (size_t)stride + (size_t)tb * 4u;
+                    const float32x4_t sxv = vld1q_f32(j->sx + sg);
+                    const float32x4_t aqv = vmulq_n_f32(
+                        vmulq_n_f32(sxv, sc), dk);
+
+                    acc[s & 3] = vfmaq_f32(acc[s & 3], vcvtq_f32_s32(c[s]),
+                                           aqv);
+                }
+                // Q6_K: блок = 2 группы, double-свёртка по границе блока.
+                if (grp & 1) {
+                    float32x4_t qs = vaddq_f32(
+                        vaddq_f32(acc[0], acc[1]),
+                        vaddq_f32(acc[2], acc[3]));
+
+                    dlo = vaddq_f64(dlo, vcvt_f64_f32(vget_low_f32(qs)));
+                    dhi = vaddq_f64(dhi, vcvt_f64_f32(vget_high_f32(qs)));
+                    for (s = 0; s < 4; s++) acc[s] = vdupq_n_f32(0.0f);
+                }
+            }
+        }
+
+        // y = (float)total: одна свёртка double -> f32 на строку и токен.
+        {
+            const int n = (j->ntok - tb * 4) < 4 ? (j->ntok - tb * 4) : 4;
+
+            if (n == 4) {
+                vst1q_f32(yrow + (size_t)tb * 4u, vcombine_f32(
+                    vcvt_f32_f64(dlo), vcvt_f32_f64(dhi)));
+            } else {
+                float tmp[4];
+                int q;
+
+                vst1q_f32(tmp, vcombine_f32(vcvt_f32_f64(dlo),
+                                            vcvt_f32_f64(dhi)));
+                for (q = 0; q < n; q++) yrow[(size_t)tb * 4u + (size_t)q] = tmp[q];
+            }
+        }
+    }
+}
+
+static void qk_i8b_worker(void *p, int tid, int r0, int r1)
+{
+    const qk_i8b_job *j = (const qk_i8b_job *)p;
+    int8_t *wb = j->wb_all + (size_t)tid * (size_t)j->cols;
+    int8_t *wb4 = j->wb4_all + (size_t)tid * (size_t)j->cols * 4u;
+    int r;
+
+    for (r = r0; r < r1; r++) qk_i8b_row(j, wb, wb4, r);
+}
+
+int vtm_neon_qk_batch_i8_fast(float *y, const uint8_t *blocks,
+                              const float *x, int rows, int cols,
+                              int ntok, int q6, int planes)
+{
+    qk_i8b_job job;
+    size_t xsz, ssz;
+    int vt, tok, t;
+
+    if (!y || !blocks || !x) return -1;
+    if (rows <= 0 || cols <= 0 || ntok <= 0) return -1;
+    if (ntok < 2) return -1;                        // 1 токен — GEMV
+    if (cols % (int)VTM_Q4K_BLOCK_VALUES) return -1;  // строка не по блокам
+    if (planes < 1) return -1;
+    if (planes > 3) planes = 3;
+    if (!vtm_dotprod_cpu()) return -1;              // CPU без FEAT_DotProd
+    if (q4k_strict_mode()) return -1;               // эталонный режим — f64
+    memset(&job, 0, sizeof job);
+    job.y = y;
+    job.blocks = blocks;
+    job.cols = cols;
+    job.ntok = ntok;
+    job.q6 = q6 ? 1 : 0;
+    job.planes = planes;
+    job.nsub = cols / 32;
+    job.ntb = (ntok + 3) / 4;
+    job.stride = job.ntb * 4;
+    vt = vtm_threads();
+    xsz = (size_t)job.stride * (size_t)cols;
+    ssz = (size_t)job.nsub * (size_t)job.stride;
+
+    job.xq = (int8_t *)calloc(xsz, 1);
+    if (planes >= 2) job.xr = (int8_t *)calloc(xsz, 1);
+    if (planes >= 3) job.xs = (int8_t *)calloc(xsz, 1);
+    // calloc: у хвоста пачки (ntok % 4) дорожки за пределами ntok должны быть
+    // нулями — их sx иначе была бы мусором, а 0·inf дал бы NaN.
+    job.sx = (float *)calloc(ssz, sizeof(float));
+    if (!job.q6) job.xsum = (float *)calloc(ssz, sizeof(float));
+    job.xt = (float *)malloc((size_t)ntok * (size_t)cols * sizeof(float));
+    job.wb_all = (int8_t *)malloc((size_t)vt * (size_t)cols);
+    job.wb4_all = (int8_t *)malloc((size_t)vt * (size_t)cols * 4u);
+    if (!job.xq || !job.sx || !job.xt || !job.wb_all || !job.wb4_all
+        || (planes >= 2 && !job.xr) || (planes >= 3 && !job.xs)
+        || (!job.q6 && !job.xsum)) {
+        free(job.xq);
+        free(job.xr);
+        free(job.xs);
+        free(job.sx);
+        free(job.xsum);
+        free(job.xt);
+        free(job.wb_all);
+        free(job.wb4_all);
+        return -1;
+    }
+    // Транспонирование один раз на вызов: квантование идёт по токену
+    // (подряд идущие cols значений), а вход пачки лежит как x[t*ntok + j].
+    for (tok = 0; tok < ntok; tok++)
+        for (t = 0; t < cols; t++)
+            job.xt[(size_t)tok * (size_t)cols + (size_t)t]
+                = x[(size_t)t * (size_t)ntok + (size_t)tok];
+    qk_i8b_quant(&job);
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok
+                            * (double)planes, qk_i8b_worker, &job);
+    free(job.xq);
+    free(job.xr);
+    free(job.xs);
+    free(job.sx);
+    free(job.xsum);
+    free(job.xt);
+    free(job.wb_all);
+    free(job.wb4_all);
+    return 0;
+}
+
+// Точный (побитовый) GEMM для prefill kind 6/7 — второй, основной путь.
+//
+// «Быстрое» ядро выше считает 4 токена в дорожках int32 и поэтому складывает
+// f32-слагаемые в другом порядке, чем поштучный декод: на одну строку это
+// 1e-7 отн., но квантование активаций дискретно — после 36 слоёв такое
+// расхождение даёт max|Δlogits| ≈ 1,15e-4 (замер --prefill-check на 3B Q4_K;
+// ровно столько же давало f32-ядро 0167). Приёмка требует ≤1e-5, поэтому по
+// умолчанию работает этот путь: он гоняет ТУ ЖЕ функцию строки, что декод
+// (qk_i8_row_q4k/q6k), только веса берёт из строки, развёрнутой в int8 один
+// раз на пачку (j->wrow). Арифметика, порядок f32-сложения и double-свёртка
+// буквально те же — результат совпадает с поштучным путём бит в бит.
+//
+// Скорость берётся не из 4-дорожечного SDOT, а из того, что строка весов
+// пачки читается и распаковывается ОДИН раз: 64 токена промпта читают 2 ГиБ
+// блоков вместо 64×2 ГиБ, а распаковка нибблов идёт не N раз, а один.
+// На машинах с холодным page cache это главный выигрыш: поштучный путь
+// читает всю матрицу на каждый токен.
+
+typedef struct {
+    float *y;                // [rows * ntok]
+    const uint8_t *blocks;
+    int rows, cols, ntok;
+    int q6, planes;
+    int nsub;                // cols/32
+    qk_i8_job rowj;          // шаблон строки: blocks/cols/planes/q6
+    int8_t *xq_all;          // [ntok*cols]
+    int8_t *xr_all;          // [ntok*cols] (planes ≥ 2)
+    int8_t *xs_all;          // [ntok*cols] (planes = 3)
+    float *sx_all;           // [ntok*nsub]
+    float *xsum_all;         // [ntok*nsub] (Q4_K)
+    float *xt;               // [ntok*cols] транспонированный вход
+    int8_t *wrow_all;        // vt*cols: int8-строка весов на поток
+} qk_i8p_job;
+
+// Строки делятся между потоками, каждый токен пачки — тем же кодом строки,
+// что у декода. Указатели на активации токена подставляются в копию шаблона
+// на поток, поэтому гонки за job нет.
+static void qk_i8p_worker(void *p, int tid, int r0, int r1)
+{
+    const qk_i8p_job *pj = (const qk_i8p_job *)p;
+    const int cols = pj->cols, ntok = pj->ntok, nsub = pj->nsub;
+    qk_i8_job j = pj->rowj;
+    int8_t *wrow = pj->wrow_all + (size_t)tid * (size_t)cols;
+    int r, tok;
+
+    for (r = r0; r < r1; r++) {
+        qk_i8b_expand_row(pj->blocks, cols, pj->q6, r, wrow);
+        j.wrow = wrow;
+        for (tok = 0; tok < ntok; tok++) {
+            const size_t off = (size_t)tok * (size_t)cols;
+
+            j.xq = pj->xq_all + off;
+            j.xr = pj->xr_all ? pj->xr_all + off : NULL;
+            j.xs = pj->xs_all ? pj->xs_all + off : NULL;
+            j.sx = pj->sx_all + (size_t)tok * (size_t)nsub;
+            j.xsum = pj->xsum_all
+                   ? pj->xsum_all + (size_t)tok * (size_t)nsub : NULL;
+            pj->y[(size_t)r * (size_t)ntok + (size_t)tok]
+                = pj->q6 ? qk_i8_row_q6k(&j, r) : qk_i8_row_q4k(&j, r);
+        }
+    }
+}
+
+int vtm_neon_qk_batch_i8(float *y, const uint8_t *blocks, const float *x,
+                         int rows, int cols, int ntok, int q6, int planes)
+{
+    qk_i8p_job job;
+    qk_i8_job qj;
+    size_t xsz, ssz;
+    int vt, tok, t;
+
+    if (!y || !blocks || !x) return -1;
+    if (rows <= 0 || cols <= 0 || ntok <= 0) return -1;
+    if (ntok < 2) return -1;                        // 1 токен — GEMV
+    if (cols % (int)VTM_Q4K_BLOCK_VALUES) return -1;  // строка не по блокам
+    if (planes < 1) return -1;
+    if (planes > 3) planes = 3;
+    if (!vtm_dotprod_cpu()) return -1;              // CPU без FEAT_DotProd
+    if (q4k_strict_mode()) return -1;               // эталонный режим — f64
+
+    memset(&job, 0, sizeof job);
+    job.y = y;
+    job.blocks = blocks;
+    job.cols = cols;
+    job.ntok = ntok;
+    job.q6 = q6 ? 1 : 0;
+    job.planes = planes;
+    job.nsub = cols / 32;
+    vt = vtm_threads();
+    xsz = (size_t)ntok * (size_t)cols;
+    ssz = (size_t)ntok * (size_t)job.nsub;
+
+    job.xq_all = (int8_t *)calloc(xsz, 1);
+    if (planes >= 2) job.xr_all = (int8_t *)calloc(xsz, 1);
+    if (planes >= 3) job.xs_all = (int8_t *)calloc(xsz, 1);
+    job.sx_all = (float *)calloc(ssz, sizeof(float));
+    // xsum нужен только Q4_K (минимум), но qk_i8_quant пишет его всегда —
+    // поэтому буфер выделяется и для Q6_K (это ntok*nsub float, копейки).
+    job.xsum_all = (float *)calloc(ssz, sizeof(float));
+    job.xt = (float *)malloc(xsz * sizeof(float));
+    job.wrow_all = (int8_t *)malloc((size_t)vt * (size_t)cols);
+    if (!job.xq_all || !job.sx_all || !job.xsum_all || !job.xt
+        || !job.wrow_all
+        || (planes >= 2 && !job.xr_all) || (planes >= 3 && !job.xs_all)) {
+        free(job.xq_all);
+        free(job.xr_all);
+        free(job.xs_all);
+        free(job.sx_all);
+        free(job.xsum_all);
+        free(job.xt);
+        free(job.wrow_all);
+        return -1;
+    }
+    // Транспонирование один раз на вызов: квантование идёт по токену.
+    for (tok = 0; tok < ntok; tok++)
+        for (t = 0; t < cols; t++)
+            job.xt[(size_t)tok * (size_t)cols + (size_t)t]
+                = x[(size_t)t * (size_t)ntok + (size_t)tok];
+
+    // Квантование — тем же кодом, что у декода (qk_i8_quant), по токенам.
+    memset(&qj, 0, sizeof qj);
+    qj.cols = cols;
+    qj.planes = planes;
+    qj.q6 = job.q6;
+    for (tok = 0; tok < ntok; tok++) {
+        const size_t off = (size_t)tok * (size_t)cols;
+
+        qj.x = job.xt + off;
+        qj.xq = job.xq_all + off;
+        qj.xr = job.xr_all ? job.xr_all + off : NULL;
+        qj.xs = job.xs_all ? job.xs_all + off : NULL;
+        qj.sx = job.sx_all + (size_t)tok * (size_t)job.nsub;
+        qj.xsum = job.xsum_all
+                ? job.xsum_all + (size_t)tok * (size_t)job.nsub : NULL;
+        qk_i8_quant(&qj);
+    }
+
+    job.rowj.blocks = blocks;
+    job.rowj.cols = cols;
+    job.rowj.planes = planes;
+    job.rowj.q6 = job.q6;
+    job.rowj.xsum = job.q6 ? NULL : job.xsum_all;   // Q6_K: минимума нет
+    vtm_parallel_rows(rows, (double)rows * (double)cols * (double)ntok
+                            * (double)planes, qk_i8p_worker, &job);
+    free(job.xq_all);
+    free(job.xr_all);
+    free(job.xs_all);
+    free(job.sx_all);
+    free(job.xsum_all);
+    free(job.xt);
+    free(job.wrow_all);
     return 0;
 }
 
