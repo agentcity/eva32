@@ -1377,5 +1377,12 @@
     "status": "in_progress",
     "file": "0206-tts-symbols.md",
     "assignee": "agent:tts-symbols"
+  },
+  {
+    "id": "0207",
+    "title": "Женский род в речи Евы",
+    "status": "in_progress",
+    "file": "0207-feminine-speech.md",
+    "assignee": "agent:feminine"
   }
 ]
