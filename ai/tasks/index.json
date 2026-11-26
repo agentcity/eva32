@@ -1342,5 +1342,12 @@
     "status": "in_progress",
     "file": "0200-qwen-template-thinking.md",
     "assignee": "agent:qwen-template"
+  },
+  {
+    "id": "0201",
+    "title": "Декод: память и параллелизм строк",
+    "status": "in_progress",
+    "file": "0201-decode-memory-parallelism.md",
+    "assignee": "agent:decode-mlp"
   }
 ]
