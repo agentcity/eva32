@@ -1321,5 +1321,12 @@
     "status": "done",
     "file": "0197-switch-to-silero-only.md",
     "assignee": "agent:silero-only"
+  },
+  {
+    "id": "0198",
+    "title": "Гибрид: GPU prefill + CPU декод",
+    "status": "in_progress",
+    "file": "0198-hybrid-gpu-prefill.md",
+    "assignee": "agent:hybrid"
   }
 ]
