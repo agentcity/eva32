@@ -1,0 +1,15 @@
+{
+  "id": "ru-facts",
+  "name": "Чистка служебных пометок фактов",
+  "version": "1.0.0",
+  "api": 1,
+  "entry": "plugin.py",
+  "capabilities": ["filter.run"],
+  "permissions": {"network": [], "filesystem": []},
+  "settings": {},
+  "description": "Вырезает из ответа «[Факт: …]», «СПРАВКА:» и «(источник: …)» — пользователь не видит служебное",
+  "owner": "eva32",
+  "priority": 40,
+  "scope": "all",
+  "stateful": false
+}

@@ -4,7 +4,8 @@
     "currency",
     "ru-numbers",
     "ru-gender",
-    "stocks"
+    "stocks",
+    "ru-facts"
   ],
   "settings": {}
 }

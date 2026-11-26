@@ -93,7 +93,12 @@ from eva.plugins import (  # noqa: E402
     PluginRegistry,
     default_registry,
 )
-from eva.skills.intent import with_fact  # noqa: E402
+from eva.skills.intent import (  # noqa: E402
+    FactGuardStream,
+    fact_block,
+    fact_entries,
+    with_fact,
+)
 from eva.ru_gender import GenderStreamer  # noqa: E402
 
 __all__ = [
@@ -1470,7 +1475,11 @@ def resolve_system(value: str | None) -> str:
 # --------------------------------------------------------------------------- #
 
 def _fresh_fact(question: str, registry: PluginRegistry | None = None) -> str:
-    """Блок ``[Факт: …]`` из включённых skill-плагинов; пусто — вставлять нечего.
+    """Секция ``СПРАВКА`` из включённых skill-плагинов; пусто — нечего.
+
+    Строки данных (без заголовка) возвращает :func:`fact_entries` — их
+    использует страж противоречия, чтобы ответить фактом, а не служебной
+    инструкцией.
 
     Задача 0209: ядро не знает имён скиллов — оно спрашивает все включённые
     плагины способности ``skill.fetch`` (не больше ``DEFAULT_FACT_LIMIT``).
@@ -1484,7 +1493,8 @@ def _fresh_fact(question: str, registry: PluginRegistry | None = None) -> str:
         )
     except Exception:  # noqa: BLE001 — данные не стоят сломанного хода
         return ""
-    return "\n".join(fact.line() for fact in facts)
+    # Задача 0212: заголовок секции печатается один раз на все факты.
+    return fact_block(fact.line() for fact in facts)
 
 
 HELP_TEXT = """команды:
@@ -1582,9 +1592,10 @@ class ChatRepl:
         if not text:
             return None
         self.session.add_user(text)
-        # [Факт: …] — до сборки запроса, чтобы он попал в системный блок
-        # (и в подсчёт токенов хода). Без намерения строка пустая.
+        # Секция СПРАВКА — до сборки запроса, чтобы она попала в системный
+        # блок (и в подсчёт токенов хода). Без намерения строки пустые.
         fact = _fresh_fact(text, self.plugins) if self.facts else ""
+        fact_lines = fact_entries(fact)
         messages, trim = self.session.build_messages()
         if fact:
             messages = with_fact(messages, fact)
@@ -1610,9 +1621,14 @@ class ChatRepl:
         # выключен, женский род в первом лице всё равно применяется.
         # ``feminize`` идемпотентна — двойной прогон (плагин + ядро) безопасен.
         gender = GenderStreamer()
+        # Страж противоречия (задача 0212): «не могу предоставить» при
+        # наличии справки заменяется фактической фразой. Без справки он
+        # прозрачен — обычное «не знаю» остаётся как есть.
+        guard = FactGuardStream(fact_lines)
 
         def emit(text: str) -> None:
             piece = filters.feed(text) if filters else text
+            piece = guard.feed(piece)
             piece = gender.feed(piece)
             if piece:
                 chunks.append(piece)
@@ -1636,6 +1652,7 @@ class ChatRepl:
                     first = self.clock()
                 emit(event.text)
             tail = filters.flush() if filters else ""
+            tail = guard.feed(tail) + guard.flush()
             tail = gender.feed(tail) + gender.flush()
             if tail:
                 chunks.append(tail)
@@ -1973,7 +1990,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-facts",
         dest="facts",
         action="store_false",
-        help="не подкладывать в системный блок [Факт] со свежими данными "
+        help="не подкладывать в системный блок СПРАВКУ со свежими данными "
         "(время, курс ЦБ, котировка MOEX); по умолчанию включено",
     )
     parser.add_argument(

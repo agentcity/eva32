@@ -197,7 +197,12 @@ from eva.plugins import (  # noqa: E402
     PluginRestartRequired,
     default_registry as default_plugin_registry,
 )
-from eva.skills.intent import with_fact  # noqa: E402
+from eva.skills.intent import (  # noqa: E402
+    FactGuardStream,
+    fact_block,
+    fact_entries,
+    with_fact,
+)
 from eva.ru_gender import GenderStreamer, feminize  # noqa: E402
 
 #: Ollama — только этот адрес; клиент не может подставить свой.
@@ -1881,7 +1886,7 @@ def _last_question(messages: Sequence[Mapping[str, str]]) -> str:
 
 
 def _fresh_fact(question: str, server: Any = None) -> str:
-    """Блок ``[Факт: …]`` из включённых skill-плагинов; пусто — фактов нет.
+    """Секция ``СПРАВКА`` из включённых skill-плагинов; пусто — фактов нет.
 
     Задача 0209: ядро больше не знает про время/курс/котировки — оно спрашивает
     все включённые плагины способности ``skill.fetch`` и склеивает их ответы
@@ -1911,8 +1916,10 @@ def _fresh_fact(question: str, server: Any = None) -> str:
         return ""
     if not facts:
         return ""
-    line = "\n".join(fact.line() for fact in facts)
-    logger.debug("факты плагинов: %s", line.replace("\n", " | "))
+    # Задача 0212: не «[Факт: …]», а секция с командой модели. Заголовок
+    # печатается один раз, строки данных — по одной на факт.
+    line = fact_block(fact.line() for fact in facts)
+    logger.debug("справка плагинов: %s", line.replace("\n", " | "))
     return line
 
 
@@ -2211,6 +2218,7 @@ def _run_side(
     cancel: "_CancelState",
     server: Any = None,
     prompt_text: str = "",
+    facts: Sequence[str] = (),
 ) -> None:
     """Сгенерировать одну колонку и сложить события в очередь.
 
@@ -2272,6 +2280,11 @@ def _run_side(
         if server is not None
         else None
     )
+    # Страж противоречия (задача 0212): ответ «не могу предоставить» при
+    # наличии справки заменяется фактической фразой. Держит только начало
+    # ответа (первое предложение), поэтому стриминг не страдает; без справки
+    # он прозрачен и обычное «не знаю» остаётся как есть.
+    guard = FactGuardStream(facts)
     gender = GenderStreamer()
     try:
         iterator = iter(adapter.stream(messages, max_tokens=max_tokens))
@@ -2289,6 +2302,7 @@ def _run_side(
                                 0, int((time.monotonic() - started) * 1000)
                             )
                         spoken = filters.feed(text) if filters is not None else text
+                        spoken = guard.feed(spoken)
                         spoken = gender.feed(spoken)
                         if spoken:
                             answer_parts.append(spoken)
@@ -2336,6 +2350,7 @@ def _run_side(
             # осталось бы мужским. Хвост плагина проходит через ядерный
             # стример, чтобы порядок стадий не терялся.
             tail = filters.flush() if filters is not None else ""
+            tail = guard.feed(tail) + guard.flush()
             tail = gender.feed(tail) + gender.flush()
             if tail:
                 answer_parts.append(tail)
@@ -2351,6 +2366,7 @@ def _run_side(
                 closer()
     except BaseException as exc:  # noqa: BLE001 - ошибка одной колонки не рвёт другую
         tail = filters.flush() if filters is not None else ""
+        tail = guard.feed(tail) + guard.flush()
         tail = gender.feed(tail) + gender.flush()
         if tail:
             answer_parts.append(tail)
@@ -4709,8 +4725,12 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             # хостов, таймаут, кэш); сбой → «не удалось получить», а не
             # выдуманная цифра. Выключенный плагин фактов не даёт.
             fact = ""
+            fact_lines: list[str] = []
             if use_system and self.server.facts:
                 fact = _fresh_fact(question, self.server)
+                # Строки данных без заголовка: страж ответа подставляет
+                # именно данные, а не служебную инструкцию.
+                fact_lines = fact_entries(fact)
             # Запрос у каждой колонки свой (задача 0182): общий системный
             # промпт, её собственная история и текущий вопрос. Историю берём
             # снимком до старта генерации: дописывать её будет уже HTTP-поток
@@ -4727,7 +4747,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 if fact:
                     messages = with_fact(messages, fact)
                 side_messages.append(messages)
-            self._stream_sides(sides, side_messages, max_tokens)
+            self._stream_sides(
+                sides, side_messages, max_tokens, facts=fact_lines
+            )
         except ClientError as exc:
             self._send_json(
                 exc.status,
@@ -5147,6 +5169,8 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         sides: Sequence[Mapping[str, Any]],
         side_messages: Sequence[Sequence[Mapping[str, str]]],
         max_tokens: int,
+        *,
+        facts: Sequence[str] = (),
     ) -> None:
         """Отдать обе колонки в SSE и дописать их ответы в историю.
 
@@ -5193,6 +5217,7 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                     cancel,
                     self.server,
                     _prompt_text(messages),
+                    tuple(facts),
                 ),
                 name="chat-side-{}".format(index),
                 daemon=True,
@@ -5401,7 +5426,7 @@ def create_server(
     нет), ``history_turns`` — максимум последних реплик.
     ``think`` — разрешить рассуждение у ВТМ (по умолчанию нет);
     ``reasoning_budget`` — сколько токенов на него, сверх ``max_tokens``.
-    ``facts`` — подкладывать ли в системный блок ``[Факт: …]`` со свежими
+    ``facts`` — подкладывать ли в системный блок секцию ``СПРАВКА`` со свежими
     данными (время, курс ЦБ, котировка MOEX; ``--no-facts`` выключает).
     ``facts_limit`` — потолок фактов на запрос; ``plugins`` — готовый реестр
     плагинов (по умолчанию ``plugins/`` + ``config/plugins.json``).
@@ -5562,7 +5587,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-facts",
         dest="facts",
         action="store_false",
-        help="не подкладывать в системный блок [Факт] со свежими данными "
+        help="не подкладывать в системный блок СПРАВКУ со свежими данными "
         "(время, курс ЦБ, котировка MOEX); по умолчанию включено",
     )
     parser.add_argument(
@@ -5629,7 +5654,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         print("автовыгрузка ВТМ: после {:.0f} с бездействия".format(server.keep_alive))
     if server.facts:
-        print("свежие данные: включены ([Факт] со временем, курсом ЦБ, MOEX; --no-facts выключает)")
+        print("свежие данные: включены (СПРАВКА со временем, курсом ЦБ, MOEX; --no-facts выключает)")
     else:
         print("свежие данные: выключены (--no-facts)")
     if server.history.enabled:
