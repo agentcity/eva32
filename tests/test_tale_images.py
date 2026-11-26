@@ -14,10 +14,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import importlib.util
 import json
 import random
+import re
 import sys
 import tempfile
 import threading
@@ -99,8 +101,8 @@ class TestAnswerContract(unittest.TestCase):
         self.assertIsInstance(images, list)
         assert isinstance(text, str) and isinstance(images, list)
         self.assertIn("Колобок", text)
-        self.assertGreaterEqual(len(images), 2)
-        self.assertLessEqual(len(images), 4)
+        self.assertGreaterEqual(len(images), 8)
+        self.assertLessEqual(len(images), 10)
 
         positions = []
         for image in images:
@@ -154,6 +156,148 @@ class TestAnswerContract(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # HTTP: SSE с картинками и /media
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Комплекты иллюстраций: 6–10 на сказку, credits, привязка к абзацам
+# --------------------------------------------------------------------------- #
+
+#: Сказка корпуса → каталог картинок (у «Сивко-бурко» исторический слаг
+#: каталога — «сивка-бурка», его и оставляем).
+TALE_IMAGE_SLUGS = {
+    "kolobok": "kolobok",
+    "repka": "repka",
+    "teremok": "teremok",
+    "lisa-i-zhuravl": "lisa-i-zhuravl",
+    "tri-medvedya": "tri-medvedya",
+    "gusi-lebedi": "gusi-lebedi",
+    "tsarevna-lyagushka": "tsarevna-lyagushka",
+    "baba-yaga": "baba-yaga",
+    "sivko-burko": "sivka-burka",
+}
+
+
+def paragraph_ends(text: str) -> list[int]:
+    """Позиции концов абзацев: там и должны стоять картинки."""
+    ends: list[int] = []
+    offset = 0
+    for part in text.split("\n\n")[:-1]:
+        offset += len(part) + 2
+        ends.append(offset)
+    return ends
+
+
+def credits_sections() -> dict[str, str]:
+    """Разделы ``credits.md`` по слагу каталога картинок."""
+    raw = (PLUGIN_DIR / "images" / "credits.md").read_text(encoding="utf-8")
+    sections: dict[str, str] = {}
+    for chunk in re.split(r"(?m)^##\s+", raw)[1:]:
+        heading, _, body = chunk.partition("\n")
+        match = re.search(r"images/([a-z0-9-]+)/", heading)
+        if match:
+            sections[match.group(1)] = body
+    return sections
+
+
+class TestIllustrationSets(unittest.TestCase):
+    """Каждая из девяти сказок: 6–10 картинок, credits, привязка к абзацам."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.plugin = fairy.FairyTalesPlugin(rng=random.Random(3))
+        cls.ctx = make_ctx()
+        cls.tales = {tale.slug: tale for tale in cls.plugin.load_tales(cls.ctx)}
+        cls.credits = credits_sections()
+
+    def test_nine_tales_have_six_to_ten_images(self) -> None:
+        for slug, image_slug in TALE_IMAGE_SLUGS.items():
+            with self.subTest(slug=slug):
+                self.assertIn(slug, self.tales, f"нет сказки {slug}")
+                tale = self.tales[slug]
+                text = self.plugin.render(tale)
+                images = self.plugin.images_for(tale, text, self.ctx)
+                self.assertGreaterEqual(
+                    len(images), 6, f"{slug}: нужно не меньше 6 картинок"
+                )
+                self.assertLessEqual(len(images), 10)
+                files = sorted(
+                    path.name
+                    for path in (PLUGIN_DIR / "images" / image_slug).glob("*.jpg")
+                )
+                self.assertEqual(
+                    [image["path"] for image in images],
+                    [f"images/{image_slug}/{name}" for name in files],
+                    "показываются все файлы каталога, по порядку имён",
+                )
+                self.assertEqual(
+                    files, [f"{index:02d}.jpg" for index in range(1, len(files) + 1)]
+                )
+
+                bounds = set(paragraph_ends(text))
+                positions = []
+                for image in images:
+                    after = image["after_chars"]
+                    self.assertIsInstance(after, int)
+                    self.assertGreater(after, 0)
+                    self.assertLess(after, len(text))
+                    self.assertIn(after, bounds, "картинка не на границе абзаца")
+                    positions.append(after)
+                self.assertEqual(positions, sorted(positions))
+                self.assertEqual(len(positions), len(set(positions)))
+
+                hashes = set()
+                for name in files:
+                    path = PLUGIN_DIR / "images" / image_slug / name
+                    self.assertLessEqual(
+                        path.stat().st_size,
+                        300 * 1024,
+                        f"{path}: больше 300 КБ",
+                    )
+                    self.assertEqual(path.read_bytes()[:2], b"\xff\xd8", "не JPEG")
+                    digest = hashlib.sha1(path.read_bytes()).hexdigest()
+                    self.assertNotIn(digest, hashes, f"{path}: дубль картинки")
+                    hashes.add(digest)
+                    self.assertIn(
+                        f"`{name}`",
+                        self.credits.get(image_slug, ""),
+                        f"{path}: нет строки в credits.md",
+                    )
+
+    def test_credits_have_license_and_author(self) -> None:
+        for slug, image_slug in TALE_IMAGE_SLUGS.items():
+            with self.subTest(slug=slug):
+                section = self.credits.get(image_slug, "")
+                self.assertTrue(section, f"нет раздела credits для {image_slug}")
+                self.assertTrue(
+                    "Public domain" in section or "CC BY" in section,
+                    f"{image_slug}: не указана лицензия",
+                )
+                self.assertRegex(
+                    section, r"\|\s*`\d{2}\.jpg`[^\n]*\|[^\n]*\|[^\n]*\|",
+                    f"{image_slug}: строки таблицы должны содержать автора и файл",
+                )
+                self.assertIn("commons.wikimedia.org", section)
+
+    def test_total_size_below_25_mb(self) -> None:
+        total = sum(
+            path.stat().st_size
+            for path in (PLUGIN_DIR / "images").glob("*/*.jpg")
+        )
+        self.assertLessEqual(total, 25 * 1024 * 1024, "иллюстрации тяжелее 25 МБ")
+
+    def test_positions_spread_over_text(self) -> None:
+        """Картинки идут по всей сказке, а не только в начале."""
+        for slug, image_slug in TALE_IMAGE_SLUGS.items():
+            with self.subTest(slug=slug):
+                tale = self.tales[slug]
+                text = self.plugin.render(tale)
+                positions = [
+                    image["after_chars"]
+                    for image in self.plugin.images_for(tale, text, self.ctx)
+                ]
+                self.assertGreater(
+                    positions[-1], len(text) // 2, "нет картинок во второй половине"
+                )
 
 
 class MockAdapter:
