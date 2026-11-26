@@ -1,10 +1,13 @@
-"""Готовая озвучка сказок (задача 0223): запись вместо пересказа.
+"""Готовая озвучка сказок (задачи 0223 и 0231): запись вместо пересказа.
 
-Проверяем четыре границы:
+Проверяем пять границ:
 
 * фразы «включи запись сказки», «поставь аудиосказку», «сказку в
   исполнении» запускают локальный файл через ``afplay`` (список argv, без
   shell, ``start_new_session``), а «выключи»/«стоп сказку» — завершают;
+* темп — детский 0.9 в argv ``afplay -r``; «медленнее/быстрее/обычный темп»
+  меняют его шагом 0.05 в границах 0.75…1.15, а смена во время игры
+  перезапускает запись с той же позиции (или честно начинает сначала);
 * если записи нет, плагин честно отвечает и не падает;
 * ``silent: true`` доходит до клиента в SSE ``delta``/``done``, чтобы Ева не
   говорила поверх записи;
@@ -135,6 +138,30 @@ class AudioCase(unittest.TestCase):
             result = self.plugin.answer(self.ctx, phrase)
         return result, popen, process
 
+    def answer_with(self, phrase: str, process: FakeProcess | None = None):
+        """Ответить на команду, подменив ``afplay`` и системный звук.
+
+        Запись уже может играть: Popen мок нужен и для перезапуска с новым
+        темпом, а ``_system_volume`` — чтобы тест не трогал звук Mac.
+        """
+        process = process if process is not None else FakeProcess()
+        with mock.patch.object(
+            fairy.subprocess, "Popen", return_value=process
+        ) as popen, mock.patch.object(fairy.time, "sleep"), mock.patch.object(
+            fairy.FairyTalesPlugin, "_system_volume", return_value=None
+        ), mock.patch.object(
+            fairy.FairyTalesPlugin, "_set_system_volume", return_value=False
+        ):
+            result = self.plugin.answer(self.ctx, phrase)
+        return result, popen, process
+
+
+def popen_argv(popen) -> list[str]:
+    """argv процесса ``afplay`` из мока ``Popen``."""
+    call_args = popen.call_args
+    assert call_args is not None
+    return list(call_args[0][0])
+
 
 class TestAudioRecognition(AudioCase):
     def test_start_phrases_play_local_file(self) -> None:
@@ -150,9 +177,10 @@ class TestAudioRecognition(AudioCase):
                 self.assertIn("Включаю запись", text)
                 self.assertIn("«", text)
                 popen.assert_called_once()
-                argv, kwargs = popen.call_args
-                self.assertEqual(argv[0][0], fairy.AFPLAY)
-                path = Path(argv[0][1])
+                call, kwargs = popen.call_args
+                self.assertEqual(call[0][0], fairy.AFPLAY)
+                self.assertEqual(call[0][1:3], ["-r", "0.9"], "детский темп")
+                path = Path(call[0][-1])
                 self.assertEqual(path.suffix, ".mp3")
                 self.assertEqual(path.parent, AUDIO_DIR)
                 self.assertTrue(path.is_file())
@@ -167,8 +195,7 @@ class TestAudioRecognition(AudioCase):
         text = answer_text(result)
         assert text is not None
         self.assertIn("Баба-яга", text)
-        argv, _ = popen.call_args
-        self.assertEqual(Path(argv[0][1]).stem, "baba-yaga")
+        self.assertEqual(Path(popen_argv(popen)[-1]).stem, "baba-yaga")
 
     def test_pro_kota_prefers_tale_with_recording(self) -> None:
         # «Кот и лиса» короче и без записи; запись есть у «Кот, петух и лиса».
@@ -177,8 +204,7 @@ class TestAudioRecognition(AudioCase):
         text = answer_text(result)
         assert text is not None
         self.assertIn("Кот, петух и лиса", text)
-        argv, _ = popen.call_args
-        self.assertEqual(Path(argv[0][1]).stem, "kot-petuh-i-lisa")
+        self.assertEqual(Path(popen_argv(popen)[-1]).stem, "kot-petuh-i-lisa")
 
     def test_two_columns_ask_same_tale_start_one_process(self) -> None:
         # Сервер зовёт answer для каждой колонки: два одинаковых запроса не
@@ -241,6 +267,279 @@ class TestAudioStop(AudioCase):
         # «выключи музыку» — зона music; без активной записи сказка молчит.
         self.assertIsNone(self.plugin.answer(self.ctx, "Выключи музыку"))
         self.assertIsNone(self.plugin.answer(self.ctx, "Пауза"))
+
+
+class TestAudioPace(AudioCase):
+    """Темп готовой записи (задача 0231): 0.9 по умолчанию и команды."""
+
+    def play_for(self, seconds: float = 30.0):
+        """Включить «Теремок» и сделать вид, что прошло ``seconds`` секунд."""
+        _, popen, process = self.start("Включи запись сказки про теремок")
+        with self.plugin._audio_lock:
+            assert self.plugin._audio_started_at is not None
+            self.plugin._audio_started_at -= seconds
+        return popen, process
+
+    def test_default_rate_in_argv(self) -> None:
+        popen, _ = self.play_for(0.0)
+        argv = popen_argv(popen)
+        self.assertEqual(argv[:3], [fairy.AFPLAY, "-r", "0.9"])
+        self.assertEqual(self.plugin.audio_rate, fairy.DEFAULT_RATE)
+        self.assertTrue(argv[-1].endswith(".mp3"))
+
+    def test_slower_restarts_same_position(self) -> None:
+        _, old_process = self.play_for(30.0)
+        # 30 секунд на 0.9 — это 27 секунд записи.
+        self.assertAlmostEqual(self.plugin.audio_position, 27.0, places=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            trimmed = Path(tmp) / "eva-tale-trim.wav"
+            trimmed.write_bytes(b"RIFF" + b"\x00" * 128)
+            new_process = FakeProcess()
+            with mock.patch.object(
+                fairy.FairyTalesPlugin, "_trim_audio", return_value=trimmed
+            ) as trim:
+                result, popen, _ = self.answer_with("Медленнее", new_process)
+            self.assertTrue(old_process.terminated, "старый процесс должен уйти")
+            argv = popen_argv(popen)
+            self.assertEqual(argv[:3], [fairy.AFPLAY, "-r", "0.85"])
+            self.assertEqual(argv[-1], str(trimmed), "продолжаем с обрезки")
+            trim.assert_called_once()
+            self.assertAlmostEqual(trim.call_args[0][1], 27.0, places=1)
+        assert isinstance(result, dict)
+        self.assertTrue(result.get("silent"))
+        text = answer_text(result)
+        assert text is not None
+        self.assertIn("85 процентах", text)
+        self.assertNotIn("сначала", text)
+        self.assertEqual(self.plugin.audio_rate, 0.85)
+        self.assertAlmostEqual(self.plugin.audio_position, 27.0, places=1)
+        self.assertIs(self.plugin._audio_process, new_process)
+
+    def test_faster_restarts_same_position(self) -> None:
+        self.play_for(20.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            trimmed = Path(tmp) / "eva-tale-fast.wav"
+            trimmed.write_bytes(b"RIFF" + b"\x00" * 128)
+            with mock.patch.object(
+                fairy.FairyTalesPlugin, "_trim_audio", return_value=trimmed
+            ):
+                result, popen, _ = self.answer_with("Быстрее")
+            self.assertEqual(popen_argv(popen)[:3], [fairy.AFPLAY, "-r", "0.95"])
+            self.assertAlmostEqual(self.plugin.audio_position, 18.0, places=1)
+        text = answer_text(result)
+        assert text is not None
+        self.assertIn("95 процентах", text)
+
+    def test_honest_restart_when_position_lost(self) -> None:
+        self.play_for(15.0)
+        new_process = FakeProcess()
+        with mock.patch.object(
+            fairy.FairyTalesPlugin, "_trim_audio", return_value=None
+        ):
+            result, popen, _ = self.answer_with("Читай медленнее", new_process)
+        argv = popen_argv(popen)
+        self.assertEqual(argv[:3], [fairy.AFPLAY, "-r", "0.85"])
+        self.assertTrue(argv[-1].endswith(".mp3"), "играем исходный файл")
+        self.assertAlmostEqual(self.plugin.audio_position, 0.0, places=1)
+        text = answer_text(result)
+        assert text is not None
+        self.assertIn("сначала", text)
+        self.assertIn("не получилось сохранить место", text)
+
+    def test_slower_never_below_minimum(self) -> None:
+        self.play_for(10.0)
+        with mock.patch.object(
+            fairy.FairyTalesPlugin, "_trim_audio", return_value=None
+        ):
+            for _ in range(5):
+                self.answer_with("Читай медленнее")
+                self.assertGreaterEqual(self.plugin.audio_rate, fairy.MIN_RATE)
+        self.assertEqual(self.plugin.audio_rate, fairy.MIN_RATE)
+        with mock.patch.object(
+            fairy.FairyTalesPlugin, "_trim_audio", return_value=None
+        ):
+            result, popen, _ = self.answer_with("Медленнее")
+        popen.assert_not_called()
+        text = answer_text(result)
+        assert text is not None
+        self.assertIn("75 процентах", text)
+        self.assertIn("нельзя", text)
+
+    def test_faster_never_above_maximum(self) -> None:
+        self.play_for(10.0)
+        with mock.patch.object(
+            fairy.FairyTalesPlugin, "_trim_audio", return_value=None
+        ):
+            for _ in range(8):
+                self.answer_with("Читай быстрее")
+                self.assertLessEqual(self.plugin.audio_rate, fairy.MAX_RATE)
+        self.assertEqual(self.plugin.audio_rate, fairy.MAX_RATE)
+        result, popen, _ = self.answer_with("Быстрее")
+        popen.assert_not_called()
+        text = answer_text(result)
+        assert text is not None
+        self.assertIn("115 процентах", text)
+        self.assertIn("нельзя", text)
+
+    def test_normal_tempo_returns_one(self) -> None:
+        self.play_for(12.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            trimmed = Path(tmp) / "eva-tale-normal.wav"
+            trimmed.write_bytes(b"RIFF" + b"\x00" * 128)
+            with mock.patch.object(
+                fairy.FairyTalesPlugin, "_trim_audio", return_value=trimmed
+            ):
+                result, popen, _ = self.answer_with("Обычный темп")
+            self.assertEqual(popen_argv(popen)[:3], [fairy.AFPLAY, "-r", "1.0"])
+        self.assertEqual(self.plugin.audio_rate, fairy.NORMAL_RATE)
+        text = answer_text(result)
+        assert text is not None
+        self.assertIn("100 процентах", text)
+
+    def test_tempo_setting_survives_between_recordings(self) -> None:
+        # «Медленнее» без игры запоминает темп для следующей записи.
+        self.play_for(5.0)
+        self.plugin.answer(self.ctx, "Выключи")
+        result, popen, _ = self.answer_with("Читай медленнее")
+        self.assertIsInstance(result, str)
+        assert isinstance(result, str)
+        self.assertIn("85 процентах", result)
+        popen.assert_not_called()
+        self.assertEqual(self.plugin.audio_rate, 0.85)
+        _, popen, _ = self.start("Включи запись сказки про бабу-ягу")
+        self.assertEqual(popen_argv(popen)[:3], [fairy.AFPLAY, "-r", "0.85"])
+
+    def test_pace_commands_keep_one_process(self) -> None:
+        _, old_process = self.play_for(10.0)
+        with mock.patch.object(
+            fairy.FairyTalesPlugin, "_trim_audio", return_value=None
+        ):
+            second = FakeProcess()
+            _, popen, _ = self.answer_with("Медленнее", second)
+        self.assertTrue(old_process.terminated)
+        self.assertIs(self.plugin._audio_process, second)
+        popen.assert_called_once()
+        # И «выключи» после смены темпа гасит именно новый процесс.
+        self.assertEqual(self.plugin.answer(self.ctx, "Выключи"), "Выключила запись.")
+        self.assertTrue(second.terminated)
+        self.assertIsNone(self.plugin._audio_process)
+
+    def test_restart_failure_is_honest(self) -> None:
+        # afplay пропал между запусками: не делаем вид, что запись играет.
+        self.play_for(10.0)
+        with mock.patch.object(
+            fairy.FairyTalesPlugin, "_trim_audio", return_value=None
+        ), mock.patch.object(
+            fairy.subprocess, "Popen", side_effect=OSError("afplay")
+        ), mock.patch.object(fairy.time, "sleep"):
+            result = self.plugin.answer(self.ctx, "Медленнее")
+        self.assertIsInstance(result, str)
+        assert isinstance(result, str)
+        self.assertIn("не получилось", result)
+        self.assertIsNone(self.plugin._audio_process)
+        self.assertEqual(self.plugin.audio_rate, 0.85)
+
+    def test_trim_file_removed_on_stop(self) -> None:
+        self.play_for(10.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            trimmed = Path(tmp) / "eva-tale-trim.wav"
+            trimmed.write_bytes(b"RIFF" + b"\x00" * 128)
+            with mock.patch.object(
+                fairy.FairyTalesPlugin, "_trim_audio", return_value=trimmed
+            ):
+                self.answer_with("Медленнее")
+            self.assertTrue(trimmed.is_file(), "пока играет — файл нужен")
+            self.plugin.answer(self.ctx, "Выключи")
+            self.assertFalse(trimmed.is_file(), "после «выключи» временный WAV не нужен")
+
+    def test_bare_pace_without_recording_falls_through(self) -> None:
+        fresh = fairy.FairyTalesPlugin(rng=random.Random(1))
+        self.assertIsNone(fresh.answer(self.ctx, "Медленнее"))
+        self.assertIsNone(fresh.answer(self.ctx, "Быстрее"))
+        # С контекстом чтения — это команда, даже если запись ещё не играет.
+        self.assertIn(
+            "85 процентах", fresh.answer(self.ctx, "Читай медленнее") or ""
+        )
+        self.assertEqual(fresh.audio_rate, 0.85)
+
+    def test_plain_chat_not_affected(self) -> None:
+        fresh = fairy.FairyTalesPlugin(rng=random.Random(1))
+        for phrase in (
+            "Который час",
+            "Расскажи про погоду",
+            "Включи музыку",
+            "Включи музыку быстрее",
+            "Поезд едет быстрее самолёта",
+            "Обычный день",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(fresh.answer(self.ctx, phrase))
+        self.assertEqual(fresh.audio_rate, fairy.DEFAULT_RATE)
+
+    def test_story_request_with_adverb_is_not_pace(self) -> None:
+        # «Расскажи медленно сказку» — просьба сказки, а не команда темпа.
+        fresh = fairy.FairyTalesPlugin(rng=random.Random(1))
+        result = fresh.answer(self.ctx, "Расскажи медленно сказку про репку")
+        text = answer_text(result)
+        assert text is not None
+        self.assertIn("Слушай сказку", text)
+        self.assertNotIn("скорости", text)
+        self.assertEqual(fresh.audio_rate, fairy.DEFAULT_RATE)
+
+
+class TestTrimAudio(unittest.TestCase):
+    """``afconvert --offset``: позиция для продолжения в кадрах, не «на глаз»."""
+
+    def test_offset_is_position_in_frames(self) -> None:
+        plugin = fairy.FairyTalesPlugin(rng=random.Random(1))
+        calls: list[list[str]] = []
+
+        class Result:
+            returncode = 0
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            Path(argv[-1]).write_bytes(b"RIFF" + b"\x00" * 256)
+            return Result()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "teremok.mp3"
+            path.write_bytes(b"x")
+            with mock.patch.object(
+                fairy.FairyTalesPlugin, "_audio_probe", return_value=(22050, 138.24)
+            ), mock.patch.object(fairy.subprocess, "run", side_effect=fake_run):
+                trimmed = plugin._trim_audio(path, 27.0)
+            self.assertIsNotNone(trimmed)
+            assert trimmed is not None
+            self.addCleanup(trimmed.unlink, missing_ok=True)
+            argv = calls[0]
+            self.assertEqual(argv[0], fairy.AFCONVERT)
+            self.assertEqual(
+                argv[argv.index("--offset") + 1], str(int(27.0 * 22050))
+            )
+            self.assertEqual(argv[-3:], [str(path), "-o", str(trimmed)])
+
+    def test_no_trim_when_probe_failed(self) -> None:
+        plugin = fairy.FairyTalesPlugin(rng=random.Random(1))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "teremok.mp3"
+            path.write_bytes(b"x")
+            with mock.patch.object(
+                fairy.FairyTalesPlugin, "_audio_probe", return_value=(None, None)
+            ), mock.patch.object(fairy.subprocess, "run") as run:
+                self.assertIsNone(plugin._trim_audio(path, 10.0))
+            run.assert_not_called()
+
+    def test_no_trim_past_the_end(self) -> None:
+        plugin = fairy.FairyTalesPlugin(rng=random.Random(1))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "teremok.mp3"
+            path.write_bytes(b"x")
+            with mock.patch.object(
+                fairy.FairyTalesPlugin, "_audio_probe", return_value=(22050, 30.0)
+            ), mock.patch.object(fairy.subprocess, "run") as run:
+                self.assertIsNone(plugin._trim_audio(path, 29.5))
+            run.assert_not_called()
 
 
 class TestNoRecording(AudioCase):

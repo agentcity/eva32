@@ -1528,7 +1528,7 @@
   {
     "id": "0231",
     "title": "Темп готовых записей",
-    "status": "in_progress",
+    "status": "done",
     "file": "0231-recording-pace.md",
     "assignee": "agent:rec-pace"
   }

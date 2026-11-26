@@ -30,10 +30,12 @@
 
 from __future__ import annotations
 
+import os
 import random
 import re
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -85,6 +87,19 @@ OSASCRIPT = "/usr/bin/osascript"
 #: включении и говорим об этом, чтобы не было «включила, но тихо».
 QUIET_THRESHOLD = 25
 DEFAULT_LOUD_VOLUME = 65
+
+#: Темп готовой записи (задача 0231): 0.9 — детский режим, на 10 % медленнее.
+#: ``afplay -r`` меняет скорость без изменения тона; границы 0.75…1.15.
+DEFAULT_RATE = 0.9
+MIN_RATE = 0.75
+MAX_RATE = 1.15
+RATE_STEP = 0.05
+NORMAL_RATE = 1.0
+#: ``afplay`` не умеет начинать файл с середины, поэтому для продолжения «с
+#: того же места» первые секунды отрезает ``afconvert`` во временный WAV.
+AFCONVERT = "/usr/bin/afconvert"
+AFINFO = "/usr/bin/afinfo"
+AUDIO_TEMP_PREFIX = "eva-tale-"
 
 #: Просьба именно записи, а не пересказа: «включи запись сказки»,
 #: «поставь аудиосказку», «сказку в исполнении». Проверяется до выбора.
@@ -273,6 +288,19 @@ _LOUDER_RE = re.compile(r"громче|погромче|прибавь\s+зву�
 _QUIETER_RE = re.compile(r"тише|потише|убавь\s+звук|сделай\s+тише")
 _VOLUME_RE = re.compile(r"громкость\s*(?:на\s*)?(\d{1,3})|звук\s*(?:на\s*)?(\d{1,3})")
 _MUTE_RE = re.compile(r"выключи\s+звук|без\s+звука|молчком|mute")
+#: Темп чтения записи (задача 0231): «медленнее», «быстрее», «обычный темп».
+#: Это не громкость: «тише/громче» по-прежнему управляют системным звуком.
+_PACE_SLOWER_RE = re.compile(r"медленн|помедленн|не\s+так\s+быстро")
+_PACE_FASTER_RE = re.compile(r"быстре|поскорее|ускорь|ускорить")
+_PACE_NORMAL_RE = re.compile(
+    r"обычн\w*\s+(?:темп|скорост)|нормальн\w*\s+(?:темп|скорост)"
+)
+#: Голая «медленнее» — команда, только если запись играет/только что играла
+#: или в фразе есть контекст чтения. Иначе «поезд едет быстрее» — не наша
+#: команда, и плагин не должен её перехватывать.
+_PACE_CONTEXT_RE = re.compile(
+    r"чит|сказк|запис|аудио|темп|скорост|говор|голос|поставь|включи|воспроизв"
+)
 #: «Какие сказки есть», «список сказок» — перечень, чтобы можно было выбрать.
 _LIST_RE = re.compile(
     r"(?:какие|какой|что\s+за)\s+(?:у\s+тебя\s+)?(?:есть\s+)?сказк"
@@ -524,6 +552,22 @@ def _title_key(text: str) -> str:
     return re.sub(r"[^а-яa-z0-9]+", "", _normalize(text))
 
 
+def _clamp_rate(rate: float) -> float:
+    """Темп в границах 0.75…1.15 с шагом 0.05 (без хвостов float)."""
+    return round(max(MIN_RATE, min(MAX_RATE, rate)), 2)
+
+
+def _format_rate(rate: float) -> str:
+    """Темп для argv ``afplay -r``: 0.9, 0.85, 1.0 — коротко и без «0.90»."""
+    text = f"{rate:.2f}".rstrip("0")
+    return text + "0" if text.endswith(".") else text
+
+
+def _percent(rate: float) -> int:
+    """Темп в процентах для ответа: 0.9 → 90."""
+    return int(round(rate * 100))
+
+
 def _paragraph_ends(text: str) -> list[int]:
     """Концы абзацев ``text``: позиции сразу после ``\\n\\n``.
 
@@ -624,6 +668,17 @@ class FairyTalesPlugin:
         # Момент последней остановки: сервер зовёт answer для двух колонок,
         # и вторая должна получить тот же ответ, а не уйти к модели.
         self._audio_stopped_at: float | None = None
+        # Темп записи (задача 0231): 0.9 — детский режим. Живёт в объекте
+        # плагина, поэтому «медленнее» действует и на следующую запись.
+        self._audio_rate = DEFAULT_RATE
+        # Позиция в записи: смещение (сек) на момент запуска процесса плюс
+        # прошедшее время × темп. По ней продолжаем с того же места, когда
+        # темп меняют во время игры. ``_audio_path`` — исходный файл,
+        # ``_audio_trim`` — временный обрезанный WAV для продолжения.
+        self._audio_path: Path | None = None
+        self._audio_offset = 0.0
+        self._audio_started_at: float | None = None
+        self._audio_trim: Path | None = None
 
     # -- корпус --------------------------------------------------------------
 
@@ -632,6 +687,18 @@ class FairyTalesPlugin:
         """Индекс последней рассказанной сказки (для тестов и ``next``)."""
         with self._lock:
             return self._last_index
+
+    @property
+    def audio_rate(self) -> float:
+        """Темп готовой записи (0.75…1.15; по умолчанию 0.9, задача 0231)."""
+        with self._audio_lock:
+            return self._audio_rate
+
+    @property
+    def audio_position(self) -> float:
+        """Сколько секунд записи уже прошло: смещение + время × темп."""
+        with self._audio_lock:
+            return self._audio_position()
 
     def load_tales(self, ctx: PluginContext | None = None) -> tuple[Tale, ...]:
         """Прочитать корпус; битые файлы пропускаются, пустой каталог — []."""
@@ -907,6 +974,11 @@ class FairyTalesPlugin:
         text = _normalize(raw)
         if self._is_audio_stop(text):
             return self._audio_stop_answer(text)
+        # Темп записи (0231) — до выбора сказки и до громкости: «медленнее»
+        # не должно ни подбирать сказку, ни менять системный звук.
+        pace = self._answer_pace(text)
+        if pace is not None:
+            return pace
         tales = self.load_tales(ctx)
         if not tales:
             return None
@@ -1077,6 +1149,10 @@ class FairyTalesPlugin:
         одновременно попросить одну и ту же запись. Проверка и запуск идут
         под одним замком: второй вызов видит уже играющий файл и не плодит
         второй ``afplay`` (иначе «выключи» убил бы только один процесс).
+
+        Темп — ``self._audio_rate`` (по умолчанию 0.9, задача 0231): ребёнку
+        обычный темп актёрской записи быстрый. ``-r`` меняет скорость без
+        изменения тона.
         """
         # «Включила, но очень тихо»: если выход почти выключен, поднимаем до
         # слышимого уровня и честно сообщаем об этом. Пользователь не видит
@@ -1098,19 +1174,18 @@ class FairyTalesPlugin:
             ):
                 return {"text": f"Включаю запись «{tale.title}».{volume_note}", "silent": True}
             self._stop_audio()
+            started = time.monotonic()
             try:
-                process = subprocess.Popen(
-                    [AFPLAY, str(path)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
+                process = self._spawn_afplay(path, self._audio_rate)
             except FileNotFoundError:
                 return "Не получилось включить запись: на этом Mac нет afplay."
             except OSError:
                 return "Не получилось включить запись: afplay не запустился."
             self._audio_process = process
             self._audio_slug = tale.slug
+            self._audio_path = path
+            self._audio_offset = 0.0
+            self._audio_started_at = started
             self._audio_stopped_at = None
         # afplay падает сразу, если файл не открылся (битый MP3, нет прав).
         # Даём мгновение, чтобы не обещать запись в пустоту.
@@ -1118,10 +1193,18 @@ class FairyTalesPlugin:
         if self._audio_exited(process):
             with self._audio_lock:
                 if self._audio_process is process:
-                    self._audio_process = None
-                    self._audio_slug = None
+                    self._finish_audio_locked()
             return "Не получилось включить запись: файл не открылся."
         return {"text": f"Включаю запись «{tale.title}».{volume_note}", "silent": True}
+
+    def _spawn_afplay(self, path: Path, rate: float) -> subprocess.Popen[bytes]:
+        """Процесс ``afplay -r <темп> <файл>``; argv без shell и без строки."""
+        return subprocess.Popen(
+            [AFPLAY, "-r", _format_rate(rate), str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
     @staticmethod
     def _audio_exited(process: object) -> bool:
@@ -1141,10 +1224,22 @@ class FairyTalesPlugin:
         if self._audio_exited(process):
             with self._audio_lock:
                 if self._audio_process is process:
-                    self._audio_process = None
-                    self._audio_slug = None
+                    self._finish_audio_locked()
             return False
         return True
+
+    def _audio_position(self) -> float:
+        """Позиция в записи: смещение плюс прошедшее время × темп.
+
+        ``afplay`` с ``-r 0.9`` проходит за секунду 0.9 секунды файла, поэтому
+        позиция — не «сколько прошло», а «сколько файла проиграно».
+        """
+        with self._audio_lock:
+            started = self._audio_started_at
+            if started is None:
+                return 0.0
+            elapsed = max(0.0, time.monotonic() - started)
+            return self._audio_offset + elapsed * self._audio_rate
 
     def _recently_stopped(self) -> bool:
         """Запись остановили только что: вторая колонка должна ответить так же."""
@@ -1173,7 +1268,7 @@ class FairyTalesPlugin:
 
         Метка остановки ставится под тем же замком, что и очистка процесса:
         вторая колонка, пришедшая одновременно, не должна увидеть «записи
-        нет» и уйти к модели.
+        нет» и уйти к модели. Временный обрезанный файл (если был) удаляется.
         """
         with self._audio_lock:
             process = self._audio_process
@@ -1181,8 +1276,17 @@ class FairyTalesPlugin:
                 self._audio_stopped_at = time.monotonic()
             self._audio_process = None
             self._audio_slug = None
+            self._audio_path = None
+            self._audio_offset = 0.0
+            self._audio_started_at = None
+            self._drop_trim_locked()
         if process is None:
             return False
+        self._terminate_process(process)
+        return True
+
+    def _terminate_process(self, process: object) -> None:
+        """SIGCONT → terminate → kill по таймауту (afplay мог стоять на паузе)."""
         try:
             if not self._audio_exited(process):
                 try:
@@ -1196,7 +1300,225 @@ class FairyTalesPlugin:
                     process.kill()
         except (ProcessLookupError, OSError):
             pass
-        return True
+
+    def _finish_audio_locked(self) -> None:
+        """Забыть процесс и позицию: запись доиграла или упала."""
+        self._audio_process = None
+        self._audio_slug = None
+        self._audio_path = None
+        self._audio_offset = 0.0
+        self._audio_started_at = None
+        self._drop_trim_locked()
+
+    def _drop_trim_locked(self) -> None:
+        """Удалить временный обрезанный WAV, если он был."""
+        trim = self._audio_trim
+        self._audio_trim = None
+        if trim is None:
+            return
+        try:
+            trim.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # -- темп записи (задача 0231) -------------------------------------------
+
+    @staticmethod
+    def _pace_kind(text: str) -> str | None:
+        """Какая команда темпа: ``slower``/``faster``/``normal`` или None."""
+        if _PACE_NORMAL_RE.search(text):
+            return "normal"
+        if _PACE_SLOWER_RE.search(text):
+            return "slower"
+        if _PACE_FASTER_RE.search(text):
+            return "faster"
+        return None
+
+    def _answer_pace(self, text: str) -> str | dict[str, object] | None:
+        """«Медленнее/быстрее/обычный темп»: шаг 0.05 в границах 0.75…1.15.
+
+        Вне игры «медленно» часто наречие: «расскажи медленно сказку» — это
+        просьба сказки, «включи музыку быстрее» — зона music. Поэтому без
+        играющей записи команда принимается, только если в ней явно есть
+        темп/чтение и нет «сказка/история/музыка». Ответ называет процент
+        скорости; во время игры он ``silent``, чтобы Ева не говорила поверх
+        записи.
+        """
+        kind = self._pace_kind(text)
+        if kind is None:
+            return None
+        playing = self._audio_active()
+        if not playing and not self._recently_stopped():
+            # Вне игры «медленно» бывает наречием: «расскажи медленно сказку»
+            # — это просьба сказки, а «включи музыку быстрее» — зона music.
+            # Команду темпа принимаем, только если это явно про темп/чтение.
+            if re.search(r"сказк|истори|музык", text):
+                return None
+            if not (
+                _PACE_NORMAL_RE.search(text) or _PACE_CONTEXT_RE.search(text)
+            ):
+                return None
+        current = self.audio_rate
+        if kind == "normal":
+            target = NORMAL_RATE
+        elif kind == "slower":
+            target = _clamp_rate(current - RATE_STEP)
+        else:
+            target = _clamp_rate(current + RATE_STEP)
+        if abs(target - current) < 1e-9:
+            percent = _percent(current)
+            if kind == "slower":
+                answer = f"Медленнее уже нельзя: читаю на {percent} процентах скорости."
+            elif kind == "faster":
+                answer = f"Быстрее уже нельзя: читаю на {percent} процентах скорости."
+            else:
+                answer = f"Читаю на {percent} процентах скорости."
+            if playing:
+                return {"text": answer, "silent": True}
+            return answer
+        if not playing:
+            with self._audio_lock:
+                self._audio_rate = target
+            return f"Хорошо, буду читать на {_percent(target)} процентах скорости."
+        kept, position, restarted = self._restart_audio(target)
+        if not restarted:
+            return (
+                f"Темп — {_percent(target)} процентов,"
+                " но перезапустить запись не получилось."
+            )
+        note = ""
+        if not kept and position > 0.2:
+            note = " Начну запись сначала — не получилось сохранить место."
+        return {
+            "text": f"Читаю на {_percent(target)} процентах скорости.{note}",
+            "silent": True,
+        }
+
+    def _restart_audio(self, target: float) -> tuple[bool, float, bool]:
+        """Перезапустить идущую запись на новой скорости с того же места.
+
+        Возвращает ``(позиция сохранена, позиция в секундах, запись играет)``.
+        Позицию считаем по прошедшему времени и старому темпу: ``afplay`` с
+        0.9 за секунду проходит 0.9 секунды записи. Начать файл с середины
+        ``afplay`` не умеет, поэтому первые секунды отрезает ``afconvert``
+        во временный WAV; если не вышло — начинаем сначала и говорим об этом.
+        """
+        with self._audio_lock:
+            process = self._audio_process
+            path = self._audio_path
+            if process is None or path is None:
+                self._audio_rate = target
+                return True, 0.0, False
+            position = self._audio_position()
+            self._audio_rate = target
+            if self._audio_exited(process):
+                self._finish_audio_locked()
+                return True, position, False
+            self._terminate_process(process)
+            play_path, offset, kept = self._seek_source(path, position)
+            started = time.monotonic()
+            try:
+                new_process = self._spawn_afplay(play_path, target)
+            except OSError:
+                if play_path != path:
+                    try:
+                        play_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                self._finish_audio_locked()
+                return False, position, False
+            self._drop_trim_locked()
+            self._audio_process = new_process
+            self._audio_started_at = started
+            self._audio_offset = offset
+            self._audio_trim = play_path if play_path != path else None
+            self._audio_stopped_at = None
+        return kept, position, True
+
+    def _seek_source(
+        self, path: Path, position: float
+    ) -> tuple[Path, float, bool]:
+        """Файл для продолжения: ``(путь, смещение, позиция сохранена)``."""
+        if position < 0.2:
+            return path, position, True
+        trimmed = self._trim_audio(path, position)
+        if trimmed is not None:
+            return trimmed, position, True
+        return path, 0.0, False
+
+    def _trim_audio(self, path: Path, seconds: float) -> Path | None:
+        """Временный WAV с началом на ``seconds``; None — обрезать не вышло.
+
+        ``afconvert --offset`` — единственный способ начать файл с середины
+        без сторонних библиотек; WAV потом играет тот же ``afplay``.
+        """
+        if seconds < 0.2:
+            return None
+        sample_rate, duration = self._audio_probe(path)
+        if sample_rate is None:
+            return None
+        if duration is not None and seconds >= duration - 1.0:
+            return None  # уже конец записи: продолжаем заново, а не с пустоты
+        frames = int(seconds * sample_rate)
+        try:
+            handle, name = tempfile.mkstemp(prefix=AUDIO_TEMP_PREFIX, suffix=".wav")
+            os.close(handle)
+        except OSError:
+            return None
+        target = Path(name)
+        try:
+            result = subprocess.run(
+                [
+                    AFCONVERT,
+                    "--offset",
+                    str(frames),
+                    "-f",
+                    "WAVE",
+                    "-d",
+                    "LEI16",
+                    str(path),
+                    "-o",
+                    str(target),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            target.unlink(missing_ok=True)
+            return None
+        if result.returncode != 0 or not target.is_file():
+            target.unlink(missing_ok=True)
+            return None
+        try:
+            if target.stat().st_size <= 44:  # пустой WAV: один заголовок
+                target.unlink(missing_ok=True)
+                return None
+        except OSError:
+            return None
+        return target
+
+    @staticmethod
+    def _audio_probe(path: Path) -> tuple[int | None, float | None]:
+        """Частота дискретизации и длительность по ``afinfo`` (или None)."""
+        try:
+            result = subprocess.run(
+                [AFINFO, str(path)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None, None
+        if result.returncode != 0:
+            return None, None
+        rate_hit = re.search(r"(\d+)\s+Hz", result.stdout)
+        duration_hit = re.search(r"duration:\s*([\d.]+)\s*sec", result.stdout)
+        sample_rate = int(rate_hit.group(1)) if rate_hit else None
+        duration = float(duration_hit.group(1)) if duration_hit else None
+        return sample_rate, duration
 
     @staticmethod
     def _no_recording(tale: Tale | None = None) -> str:
