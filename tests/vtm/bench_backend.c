@@ -5175,8 +5175,10 @@ static int run_api_tokens(const char *path, const char *backend) {
 
 // --- 0211: изолированный GPU-батч GEMM -------------------------------------
 //
-// --metal-gemm ROWS,COLS,N,ITERS[,STRIDE]. Меряет батчевый GEMM без модели и
-// без перекладки активаций по слоям: видно потолок ядра, а не шум загрузки.
+// --metal-gemm ROWS,COLS,N,ITERS[,STRIDE[,KIND]]. Меряет батчевый GEMM без
+// модели и без перекладки активаций по слоям: видно потолок ядра, а не шум
+// загрузки. KIND (0216): 0 — Q4_K, 1 — Q6_K; веса нулевые, важен только
+// формат блока (144/210 байт).
 // Блоки весов нулевые — арифметика та же, время честное.
 //
 // STRIDE > 0 — «арена пачки» (0214): вход и выход лежат в одной
@@ -5204,6 +5206,7 @@ static float *bench_page_alloc(size_t bytes) {
 static int run_metal_gemm_bench(const char *spec) {
     int rows = 2048, cols = 2048, ntok = 64, iters = 10;
     long stride = 0;
+    int kind = 0;   // 0216: 0 — Q4_K, 1 — Q6_K (формат задаёт только блок)
     unsigned char *blocks;
     float *x = NULL, *y = NULL;
     vtm_metal_stats st0, st1;
@@ -5212,14 +5215,16 @@ static int run_metal_gemm_bench(const char *spec) {
     int it;
 
     if (spec && *spec)
-        sscanf(spec, "%d,%d,%d,%d,%ld", &rows, &cols, &ntok, &iters, &stride);
+        sscanf(spec, "%d,%d,%d,%d,%ld,%d", &rows, &cols, &ntok, &iters,
+               &stride, &kind);
     if (rows <= 0 || cols <= 0 || ntok <= 0 || iters <= 0
-        || cols % 256 != 0) {
-        fprintf(stderr, "--metal-gemm ROWS,COLS,N,ITERS[,STRIDE] "
-                        "(COLS кратен 256)\n");
+        || cols % 256 != 0 || kind < 0 || kind > 1) {
+        fprintf(stderr, "--metal-gemm ROWS,COLS,N,ITERS[,STRIDE[,KIND]] "
+                        "(COLS кратен 256, KIND 0 — Q4_K, 1 — Q6_K)\n");
         return 2;
     }
-    wbytes = (size_t)rows * (size_t)cols / 256u * 144u;
+    wbytes = (size_t)rows * (size_t)cols / 256u
+           * (kind == 1 ? VTM_Q6K_BLOCK_BYTES : VTM_Q4K_BLOCK_BYTES);
     blocks = (unsigned char *)calloc(wbytes ? wbytes : 1u, 1);
     if (!blocks) {
         fprintf(stderr, "metal-gemm: нет памяти\n");
@@ -5247,13 +5252,15 @@ static int run_metal_gemm_bench(const char *spec) {
         // смещения тензоров. Без неё каждая матрица создаёт no-copy буфер на
         // весь слот (608 КиБ/токен) и хост-время растёт втрое.
         (void)vtm_metal_batch_arena(arena, abytes);
-        printf("metal gemm %dx%d, %d токенов, %d итераций, арена: шаг %ld "
-               "float (%.1f КиБ/токен, %.1f МиБ)\n", rows, cols, ntok, iters,
-               stride, (double)stride * 4.0 / 1024.0,
+        printf("metal gemm %s %dx%d, %d токенов, %d итераций, арена: шаг %ld "
+               "float (%.1f КиБ/токен, %.1f МиБ)\n",
+               kind == 1 ? "Q6_K" : "Q4_K", rows, cols, ntok, iters, stride,
+               (double)stride * 4.0 / 1024.0,
                (double)abytes / (1024.0 * 1024.0));
         for (it = 0; it < iters; it++) {
-            int rc = vtm_metal_qk_gemm_arena(0, blocks, NULL, rows, cols, ntok,
-                                             x, (int)slot, y, (int)slot);
+            int rc = vtm_metal_qk_gemm_arena(kind, blocks, NULL, rows, cols,
+                                             ntok, x, (int)slot, y,
+                                             (int)slot);
             if (rc != 0) {
                 fprintf(stderr, "metal-gemm: арена отказала (%d)\n", rc);
                 free(arena);
@@ -5263,8 +5270,8 @@ static int run_metal_gemm_bench(const char *spec) {
             (void)vtm_metal_gemm_flush();
             vtm_metal_stats_get(&st0);
             t0 = now_ms();
-            rc = vtm_metal_qk_gemm_arena(0, blocks, NULL, rows, cols, ntok, x,
-                                         (int)slot, y, (int)slot);
+            rc = vtm_metal_qk_gemm_arena(kind, blocks, NULL, rows, cols, ntok,
+                                         x, (int)slot, y, (int)slot);
             if (rc == 0) rc = vtm_metal_gemm_flush();
             t0 = now_ms() - t0;
             vtm_metal_stats_get(&st1);
@@ -5285,10 +5292,11 @@ static int run_metal_gemm_bench(const char *spec) {
             fprintf(stderr, "metal-gemm: нет памяти\n");
             return 1;
         }
-        printf("metal gemm %dx%d, %d токенов, %d итераций, упакованный вход\n",
-               rows, cols, ntok, iters);
+        printf("metal gemm %s %dx%d, %d токенов, %d итераций, упакованный "
+               "вход\n", kind == 1 ? "Q6_K" : "Q4_K", rows, cols, ntok, iters);
         for (it = 0; it < iters; it++) {
-            int rc = vtm_metal_qk_gemm(0, y, blocks, NULL, x, rows, cols, ntok);
+            int rc = vtm_metal_qk_gemm(kind, y, blocks, NULL, x, rows, cols,
+                                       ntok);
             if (rc != 0) {
                 fprintf(stderr, "metal-gemm: ядро отказало (%d)\n", rc);
                 free(blocks); free(x); free(y);
@@ -5296,7 +5304,8 @@ static int run_metal_gemm_bench(const char *spec) {
             }
             vtm_metal_stats_get(&st0);
             t0 = now_ms();
-            rc = vtm_metal_qk_gemm(0, y, blocks, NULL, x, rows, cols, ntok);
+            rc = vtm_metal_qk_gemm(kind, y, blocks, NULL, x, rows, cols,
+                                   ntok);
             t0 = now_ms() - t0;
             vtm_metal_stats_get(&st1);
             if (rc != 0) break;
@@ -5447,7 +5456,7 @@ static void usage(const char *prog) {
            "          [--api-tokens PATH [--backend simd|hybrid]]\n"
            "          [--api-cache PATH [--backend simd|hybrid|metal]\n"
            "           [--prefill-lens 40,80,154,214,250,500]]\n"
-           "          [--metal-gemm ROWS,COLS,N,ITERS]\n"
+           "          [--metal-gemm ROWS,COLS,N,ITERS[,STRIDE[,KIND]]]\n"
            "  env VTM_BACKEND — то же, что --backend (по умолчанию simd);\n"
            "  env VTM_THREADS — число потоков ядер (по умолчанию ядра, ≤ 8);\n"
            "  env VTM_Q4_I8 — int8-dot (SDOT/VNNI): 0 — выключить; 1/2/3 —\n"

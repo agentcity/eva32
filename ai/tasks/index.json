@@ -1444,7 +1444,7 @@
   {
     "id": "0216",
     "title": "f16 Metal-GEMM (simdgroup_matrix)",
-    "status": "in_progress",
+    "status": "done",
     "file": "0216-metal-f16-gemm.md",
     "assignee": "agent:metal-f16"
   }

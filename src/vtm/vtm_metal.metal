@@ -19,6 +19,7 @@
 // произвольное (кратно 32, но не странице).
 
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 // Должно совпадать с vtm_metal_args в backend_metal.m (sizeof == 32).
@@ -986,6 +987,165 @@ kernel void NAME(device const char *q [[buffer(0)]],                         \
 
 VTM_I8_TILE_KERNEL(vtm_i8_gemm_t32, 32u)
 VTM_I8_TILE_KERNEL(vtm_i8_gemm_t16, 16u)
+
+// ===========================================================================
+// 0216: f16-GEMM на simdgroup_matrix — матричный блок Apple.
+//
+// Диагноз 0214: f32-тайловое ядро на 128 MAC (4 веса × 32 токена) тратит
+// ~128 FFMA + 32 LDS.128 + ~16 инструкций декванта, то есть упирается в ВЫДАЧУ
+// инструкций, а не в АЛУ: 307–325 GMAC/s при пике f32 ≈ 2,6 TMAC/s (12%).
+// Матричный блок 8×8 half делает 512 MAC одной инструкцией, поэтому те же
+// 128 MAC превращаются из 160 инструкций в 4 MMA + 4 LDS: 32 токена на тайл
+// перестают быть «32 отдельных FFMA».
+//
+// Схема (та же, что у kernel_mul_mm в llama.cpp metal):
+//   ws[MT][KT+PAD]  — деквантованные веса: ДЕКВАНТ ОДИН РАЗ на k-tile;
+//   xs[NT][KT+PAD]  — активации пачки, f32→half при загрузке из устройства;
+//   acc[NT/8]       — simdgroup_float8x8: накопление f32, выдача f32.
+// A-фрагмент (8 строк × 8 k) читается из ws, B-фрагмент (8 k × 8 токенов) —
+// из xs с transpose: xs лежит по токенам (как активации в памяти хоста), а
+// фрагменту B нужна раскладка [k][токен], поэтому транспонирование делает
+// сам simdgroup_load, без отдельной перекладки и без второго чтения веса.
+//
+// Деквантование: 16 дорожек на строку весов, дорожка — 4 подряд идущих
+// значения (одна uchar4-загрузка). 64 колонки k-tile — это ровно 2 под-блока
+// Q4_K (по 32) или 4 под-блока Q6_K (по 16), поэтому sc/mn читаются один раз
+// на дорожку и работают на 4 веса: вес читается ровно один раз за k-tile, как
+// и в f32-ядре. Дорожки 0..15 — строка r, 16..31 — строка r+1 (два ряда на
+// итерацию, четыре независимые загрузки в полёте).
+//
+// Точность: веса и активации — half (11 бит мантиссы), накопление — f32.
+// Ошибка на вес ~5e-4 относительной, по сумме 2048 слагаемых не растёт
+// (независимые округления): контракт f16-пути — argmax + Δlogits ≤ 1e-2.
+// Строгий допуск 1e-5 держит только f32-путь (VTM_METAL_GEMM_F16=0).
+//
+// Кэш: ws и xs вместе 14 КиБ (MT=64, NT=32) — два threadgroup'а на ядро
+// (потолок M1 Pro 32 КиБ), поэтому короткие матрицы (2048 строк = 32 TG)
+// укладываются в одну волну занятости и не дают «хвоста», как f32-ядро с
+// 16 строками на TG.
+// ===========================================================================
+
+#define VTM_F16_MT   64u                    // строк весов на threadgroup
+#define VTM_F16_KT   64u                    // колонок (k) на k-tile
+#define VTM_F16_ST   (VTM_F16_KT + 8u)      // шаг строки: 72 half = 144 Б =
+                                            // 36 банков, соседние строки
+                                            // сдвинуты на 4 банка
+
+// Деквант quadruple-а в half: (sb, koff) считаются от номера k-tile, поэтому
+// формат (Q4_K/Q6_K) задаётся только этими двумя выражениями.
+static inline half4 vtm_q4k_quad_h(device const uchar *bp, uint sb, uint koff) {
+    float4 f = vtm_q4k_quad(bp, sb, (koff & 31u) >> 2);
+
+    return half4((half)f.x, (half)f.y, (half)f.z, (half)f.w);
+}
+
+static inline half4 vtm_q6k_quad_h(device const uchar *bp, uint sb, uint koff) {
+    float4 f = vtm_q6k_quad(bp, sb, (koff & 15u) >> 2);
+
+    return half4((half)f.x, (half)f.y, (half)f.z, (half)f.w);
+}
+
+// NT — токенов в варианте (16 или 32), BSTEP — байт на блок веса (144/210),
+// SB(k34, l16) — под-блок формата, KOFF(l16) — смещение четырёх значений
+// внутри k-tile.
+#define VTM_F16_KERNEL(NAME, NT, BSTEP, QUADH, SB, KOFF)                     \
+kernel void NAME(device const uchar *w [[buffer(0)]],                        \
+                 device const float *xt [[buffer(1)]],                       \
+                 device float *y [[buffer(2)]],                              \
+                 constant GemmArgs &a [[buffer(3)]],                         \
+                 uint tg [[threadgroup_position_in_grid]],                   \
+                 uint sg [[simdgroup_index_in_threadgroup]],                 \
+                 uint lane [[thread_index_in_simdgroup]],                    \
+                 uint tid [[thread_index_in_threadgroup]]) {                 \
+    threadgroup half ws[VTM_F16_MT * VTM_F16_ST];                            \
+    threadgroup half xs[(NT) * VTM_F16_ST];                                  \
+    simdgroup_float8x8 acc[(NT) / 8u];                                       \
+    uint rows8 = tg * VTM_F16_MT + sg * 8u;                                  \
+    uint last8 = a.rows - 8u;                                                \
+    uint two = lane >> 4;                                                    \
+    uint l16 = lane & 15u;                                                   \
+    uint nt;                                                                 \
+                                                                              \
+    /* Хвост по строкам: тайл, вышедший за матрицу, клампят к последним 8    \
+       строкам — считает то же самое (значения те же), лишние строки не      \
+       пишутся. Так rows не обязана быть кратной 64, а строки, которые       \
+       никто не считает, не появляются. */                                   \
+    if (rows8 > last8) rows8 = last8;                                        \
+    _Pragma("unroll")                                                        \
+    for (nt = 0; nt < (NT) / 8u; nt++)                                       \
+        acc[nt] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);            \
+                                                                              \
+    for (uint b = 0; b < a.nblocks; b++) {                                   \
+        _Pragma("unroll")                                                    \
+        for (uint kt4 = 0; kt4 < 4u; kt4++) {                                \
+            uint kt = b * 256u + kt4 * 64u;                                  \
+            uint m;                                                          \
+                                                                              \
+            /* xs: 256 потоков по два float4 (NT=32) — строка токена, k       \
+               подряд, поэтому загрузка из устройства слитная. */             \
+            _Pragma("unroll")                                                \
+            for (m = 0; m < (NT) / 16u; m++) {                               \
+                uint fl = (tid + 256u * m) * 4u;                             \
+                uint j = fl >> 6;                                            \
+                uint k = fl & 63u;                                           \
+                float4 xv = *(device const float4 *)(xt                       \
+                             + (ulong)j * a.x_stride + a.x_off + kt + k);     \
+                *(threadgroup half4 *)(xs + j * VTM_F16_ST + k) =             \
+                    half4((half)xv.x, (half)xv.y, (half)xv.z, (half)xv.w);    \
+            }                                                                \
+            /* ws: 8 строк warpa, две на итерацию (дорожки 0..15 и 16..31).*/ \
+            _Pragma("unroll")                                                \
+            for (m = 0; m < VTM_F16_MT / 16u; m++) {                         \
+                uint r = m * 2u + two;                                       \
+                uint koff = KOFF;                                            \
+                uint sb = SB;                                                \
+                device const uchar *bp = w + a.w_off                         \
+                    + (ulong)(rows8 + r) * a.nblocks * (BSTEP) + b * (BSTEP); \
+                *(threadgroup half4 *)(ws + (sg * 8u + r) * VTM_F16_ST        \
+                                       + koff) = QUADH(bp, sb, koff);         \
+            }                                                                \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                 \
+            _Pragma("unroll")                                                \
+            for (uint kk = 0; kk < VTM_F16_KT; kk += 8u) {                   \
+                simdgroup_half8x8 fa;                                        \
+                                                                              \
+                simdgroup_load(fa, ws + (sg * 8u) * VTM_F16_ST + kk,          \
+                               VTM_F16_ST);                                  \
+                _Pragma("unroll")                                            \
+                for (nt = 0; nt < (NT) / 8u; nt++) {                         \
+                    simdgroup_half8x8 fb;                                    \
+                    simdgroup_load(fb, xs + (nt * 8u) * VTM_F16_ST + kk,      \
+                                   VTM_F16_ST, ulong2(0, 0), true);          \
+                    simdgroup_multiply_accumulate(acc[nt], fa, fb, acc[nt]);  \
+                }                                                            \
+            }                                                                \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                 \
+        }                                                                    \
+    }                                                                        \
+    /* Выход: y[токен][строка], строки токена подряд (y_rstride == 1) —       \
+       поэтому store тоже транспонированный: элементы C[строка][токен] лягут \
+       в память как [токен][строка]. */                                       \
+    _Pragma("unroll")                                                        \
+    for (nt = 0; nt < (NT) / 8u; nt++) {                                     \
+        if ((nt * 8u) < a.n_tokens) {                                        \
+            device float *op = y + (ulong)a.y_off                            \
+                             + (ulong)(nt * 8u) * a.y_stride                 \
+                             + (ulong)rows8;                                 \
+            simdgroup_store(acc[nt], op, a.y_stride, ulong2(0, 0), true);    \
+        }                                                                    \
+    }                                                                        \
+}
+
+VTM_F16_KERNEL(vtm_q4k_gemm_f16_t32, 32u, 144u, vtm_q4k_quad_h,
+               (kt4 * 2u + (l16 >> 3)), ((l16 >> 3) * 32u + (l16 & 7u) * 4u))
+VTM_F16_KERNEL(vtm_q4k_gemm_f16_t16, 16u, 144u, vtm_q4k_quad_h,
+               (kt4 * 2u + (l16 >> 3)), ((l16 >> 3) * 32u + (l16 & 7u) * 4u))
+VTM_F16_KERNEL(vtm_q6k_gemm_f16_t32, 32u, 210u, vtm_q6k_quad_h,
+               (kt4 * 4u + ((l16 >> 2) & 3u)),
+               (((l16 >> 2) & 3u) * 16u + (l16 & 3u) * 4u))
+VTM_F16_KERNEL(vtm_q6k_gemm_f16_t16, 16u, 210u, vtm_q6k_quad_h,
+               (kt4 * 4u + ((l16 >> 2) & 3u)),
+               (((l16 >> 2) & 3u) * 16u + (l16 & 3u) * 4u))
 
 // ===========================================================================
 // 0214: attention ПАЧКИ prefill на GPU.

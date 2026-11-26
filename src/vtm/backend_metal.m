@@ -151,6 +151,10 @@ static id<MTLComputePipelineState> g_ps_q4k_g4;
 static id<MTLComputePipelineState> g_ps_q4k_tile[2];
 static id<MTLComputePipelineState> g_ps_q6k_tile[2];
 static id<MTLComputePipelineState> g_ps_i8_tile[2];
+// 0216: f16-GEMM на simdgroup_matrix (64 строк × k-tile на threadgroup):
+// [0] NT=16, [1] NT=32. Нет в старом metallib — prefill идёт f32-тайловым.
+static id<MTLComputePipelineState> g_ps_q4k_f16[2];
+static id<MTLComputePipelineState> g_ps_q6k_f16[2];
 // Фаза 3: ядра графа токена (RMSNorm/RoPE/SiLU/MUL/ADD/KVW/attention).
 static id<MTLComputePipelineState> g_ps_norm;
 static id<MTLComputePipelineState> g_ps_rope;
@@ -449,6 +453,25 @@ static int metal_init(void) {
         if (!g_ps_q4k_tile[1] || !g_ps_q6k_tile[1] || !g_ps_i8_tile[1])
             metal_log("тайловых GEMM-ядер нет (%s) — prefill пачкой пойдёт "
                       "прежним путём", g_err);
+    }
+    // 0216: f16-ядра на simdgroup_matrix. Их отсутствие (старый metallib или
+    // GPU без матричного блока) не ломает прогон: батчевый GEMM останется на
+    // f32-тайловом ядре, точность — строже (Δ ≤ 1e-5).
+    {
+        static const char *const fnames[2][2] = {
+            {"vtm_q4k_gemm_f16_t16", "vtm_q4k_gemm_f16_t32"},
+            {"vtm_q6k_gemm_f16_t16", "vtm_q6k_gemm_f16_t32"}
+        };
+        int v;
+        for (v = 0; v < 2; v++) {
+            g_ps_q4k_f16[v] = metal_pipeline(fnames[0][v]);
+            g_ps_q6k_f16[v] = metal_pipeline(fnames[1][v]);
+        }
+        if (!g_ps_q4k_f16[1] || !g_ps_q6k_f16[1])
+            metal_log("f16-GEMM-ядер нет (%s) — prefill останется на f32 "
+                      "(VTM_METAL_GEMM_F16=1 не сработает)", g_err);
+        else if (!g_ps_q4k_f16[0] || !g_ps_q6k_f16[0])
+            metal_log("f16-GEMM t16 нет (%s) — до 16 токенов пойдёт f32", g_err);
     }
 
     g_alloc_after = (uint64_t)[g_dev currentAllocatedSize];
@@ -1163,6 +1186,9 @@ typedef struct {
 
 #define VTM_METAL_TILE_TG   256u
 #define VTM_METAL_TILE_ROWS 16u
+// 0216: f16-ядро — 256 потоков (8 warp по 8 строк) и 64 строки на threadgroup.
+#define VTM_METAL_F16_TG    256u
+#define VTM_METAL_F16_ROWS  64u
 // Хвост пачки: ядро варианта NT считает NT токенов, даже если их меньше.
 // Арена пачки выделяется с этим запасом (interp.c), чтобы чтение за последним
 // токеном не вышло за отображение.
@@ -1209,6 +1235,30 @@ static id<MTLComputePipelineState> gemm_tile_ps(int kind, int nt, int *vn) {
     if (kind == 0) return g_ps_q4k_tile[v];
     if (kind == 1) return g_ps_q6k_tile[v];
     return g_ps_i8_tile[v];
+}
+
+// 0216: f16-путь (simdgroup_matrix) включается по умолчанию, =0 — откат на
+// f32-тайловое ядро (строгий допуск 1e-5 и побитовая воспроизводимость
+// прежних замеров). Читается один раз.
+static int gemm_f16_env(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("VTM_METAL_GEMM_F16");
+        cached = (e && *e && *e == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+// Ядро f16-варианта: та же нумерация по токенам, но нет для int8 (внутренний
+// kind 2, в файле — kind 4): таблица словаря не в горячем пути prefill и
+// осталась на f32.
+static id<MTLComputePipelineState> gemm_f16_ps(int kind, int nt, int *vn) {
+    int v = nt <= 16 ? 0 : 1;
+
+    *vn = v == 0 ? 16 : 32;
+    if (kind == 0) return g_ps_q4k_f16[v];
+    if (kind == 1) return g_ps_q6k_f16[v];
+    return nil;
 }
 
 // Размеры буферов весов/масштабов и число блоков. 0 — форма не та.
@@ -1322,7 +1372,45 @@ static int gemm_dispatch(id<MTLComputeCommandEncoder> enc, int kind,
                          int x_stride, long y_off, int y_stride,
                          int y_rstride, int tile) {
     int vn = 0;
+    id<MTLComputePipelineState> ps16 = nil;
 
+    // 0216: f16-путь на simdgroup_matrix. Ограничения ядра: выход —
+    // [токен][строка] с шагом строки 1 (транспонированный simdgroup_store),
+    // не меньше 8 строк (тайл в 64 строки клампит хвост), вход грузится
+    // float4 — смещение и шаг по токену кратны 4. Иначе — f32-ядро.
+    if (tile && gemm_f16_env() && y_rstride == 1 && rows >= 8
+        && (x_off & 3) == 0 && (x_stride & 3) == 0)
+        ps16 = gemm_f16_ps(kind, nt, &vn);
+    if (ps16) {
+        vtm_metal_gemm_args a;
+
+        if (getenv("VTM_METAL_TRACE"))
+            metal_log("f16-gemm kind %d %dx%d nt=%d x_off=%ld xs=%d y_off=%ld "
+                      "ys=%d", kind, rows, cols, nt, x_off, x_stride, y_off,
+                      y_stride);
+        memset(&a, 0, sizeof a);
+        a.rows = (uint32_t)rows;
+        a.cols = (uint32_t)cols;
+        a.nblocks = (uint32_t)(cols / 256);
+        a.n_tokens = (uint32_t)nt;
+        a.x_off = (uint32_t)x_off;
+        a.y_off = (uint32_t)y_off;
+        a.x_stride = (uint32_t)x_stride;
+        a.y_stride = (uint32_t)y_stride;
+        a.y_rstride = (uint32_t)y_rstride;
+        a.w_off = woff;
+        a.sc_off = scoff / sizeof(float);
+        [enc setComputePipelineState:ps16];
+        [enc setBuffer:wb offset:0 atIndex:0];
+        [enc setBuffer:xb offset:0 atIndex:1];
+        [enc setBuffer:yb offset:0 atIndex:2];
+        [enc setBytes:&a length:sizeof a atIndex:3];
+        [enc dispatchThreadgroups:
+            MTLSizeMake(((NSUInteger)rows + VTM_METAL_F16_ROWS - 1u)
+                        / VTM_METAL_F16_ROWS, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(VTM_METAL_F16_TG, 1, 1)];
+        return vn;
+    }
     if (tile) {
         vtm_metal_gemm_args a;
         id<MTLComputePipelineState> ps = gemm_tile_ps(kind, nt, &vn);
