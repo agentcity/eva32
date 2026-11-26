@@ -378,6 +378,13 @@ def build_shared_library(
     command = [compiler, "-dynamiclib" if macos else "-shared", "-o", str(temporary)]
     if macos:
         command += ["-Wl,-all_load", str(static)]
+        # libvtm.a на Darwin содержит backend_metal.o (задача 0192): без этих
+        # фреймворков линковка падает на _objc_msgSend/MTLCreateSystemDefaultDevice.
+        command += [
+            "-framework", "Metal",
+            "-framework", "Foundation",
+            "-lobjc",
+        ]
     else:
         command += ["-Wl,--whole-archive", str(static), "-Wl,--no-whole-archive"]
     command += ["-lm", "-lpthread"]
