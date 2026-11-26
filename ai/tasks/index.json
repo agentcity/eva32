@@ -1475,5 +1475,12 @@
     "status": "in_progress",
     "file": "0220-afanasyev-corpus.md",
     "assignee": "agent:tales-more"
+  },
+  {
+    "id": "0221",
+    "title": "Иллюстрации к сказкам",
+    "status": "in_progress",
+    "file": "0221-tale-pictures.md",
+    "assignee": "agent:tale-images"
   }
 ]
