@@ -1,4 +1,4 @@
-"""Плагин сказок (задача 0218): распознавание, выбор, озвучка, реестр.
+"""Плагин сказок (задачи 0218/0220): корпус, распознавание, выбор, озвучка.
 
 Тесты не ходят в сеть: корпус лежит в репозитории, а «пустой» и «числовой»
 корпуса создаются во временных каталогах. Живой Викитека-источник проверяется
@@ -27,6 +27,16 @@ from eva.plugins import (  # noqa: E402
 )
 
 PLUGIN_DIR = ROOT / "plugins" / "fairy-tales"
+TALES_DIR = PLUGIN_DIR / "tales"
+
+FOX_TITLES = {
+    "Лиса и рак",
+    "Лиса и журавль",
+    "Кот и лиса",
+    "Кот, петух и лиса",
+    "Лиса, заяц и петух",
+    "Снегурушка и лиса",
+}
 
 
 def _load_plugin_module():
@@ -52,15 +62,38 @@ def make_ctx(plugin_dir: Path = PLUGIN_DIR) -> PluginContext:
     )
 
 
-def title_of(answer: str | None) -> str | None:
-    if not answer:
+def answer_text(answer: object) -> str | None:
+    """Сервер принимает и строку, и словарь ``{"text", "images"}``."""
+    if isinstance(answer, dict):
+        value = answer.get("text")
+        return value if isinstance(value, str) else None
+    return answer if isinstance(answer, str) else None
+
+
+def title_of(answer: object) -> str | None:
+    text = answer_text(answer)
+    if not text:
         return None
-    match = re.search(r"«([^»]+)»", answer)
+    match = re.search(r"«([^»]+)»", text)
     return match.group(1) if match else None
 
 
+def split_frontmatter(raw: str) -> tuple[dict[str, str], str]:
+    assert raw.startswith("---\n")
+    end = raw.find("\n---", 3)
+    assert end >= 0
+    header = raw[4:end]
+    body = raw[end + 4 :].lstrip("\n")
+    data: dict[str, str] = {}
+    for line in header.splitlines():
+        key, separator, value = line.partition(":")
+        assert separator, f"битая строка шапки: {line!r}"
+        data[key.strip()] = value.strip()
+    return data, body
+
+
 class TestRecognition(unittest.TestCase):
-    """10+ живых формулировок, которые обязаны включать сказку."""
+    """Живые формулировки, которые обязаны включать сказку."""
 
     PHRASES = (
         "Расскажи сказку",
@@ -77,6 +110,12 @@ class TestRecognition(unittest.TestCase):
         "Сказку про кота",
         "Расскажи историю про петуха",
         "Про вершки и корешки",
+        "Расскажи волшебную сказку",
+        "Сказку про бабу-ягу",
+        "Расскажи короткую сказку",
+        "Сказку для малыша",
+        "Про снегурочку",
+        "Про зайца",
     )
 
     def setUp(self) -> None:
@@ -87,13 +126,28 @@ class TestRecognition(unittest.TestCase):
         for phrase in self.PHRASES:
             with self.subTest(phrase=phrase):
                 answer = self.plugin.answer(self.ctx, phrase)
-                self.assertIsInstance(answer, str)
-                assert answer is not None
-                self.assertIn("Слушай сказку", answer)
+                text = answer_text(answer)
+                assert text is not None
+                self.assertIn("Слушай сказку", text)
                 self.assertTrue(
-                    "Сказке конец" in answer or "Сладких снов" in answer
+                    "Сказке конец" in text or "Сладких снов" in text
                 )
                 self.assertTrue(title_of(answer))
+
+    def test_count_phrase(self) -> None:
+        tales = self.plugin.load_tales(self.ctx)
+        for phrase in (
+            "Сколько у тебя сказок?",
+            "Сколько сказок у тебя есть?",
+            "Много ли у тебя сказок?",
+        ):
+            with self.subTest(phrase=phrase):
+                answer = self.plugin.answer(self.ctx, phrase)
+                assert answer is not None
+                self.assertIn(f"{fairy.numbers_to_words(str(len(tales)))}", answer)
+                self.assertIn("сказ", answer)
+                self.assertIsNone(re.search(r"\d", answer))
+                self.assertGreaterEqual(answer.count("«"), 2)
 
     def test_not_our_topic_returns_none(self) -> None:
         for phrase in (
@@ -118,6 +172,7 @@ class TestRecognition(unittest.TestCase):
             self.assertIsNone(plugin.answer(ctx, "Расскажи сказку"))
             self.assertIsNone(plugin.answer(ctx, "Следующая сказка"))
             self.assertIsNone(plugin.answer(ctx, "Про колобка"))
+            self.assertIsNone(plugin.answer(ctx, "Сколько у тебя сказок?"))
 
 
 class TestSelection(unittest.TestCase):
@@ -126,10 +181,13 @@ class TestSelection(unittest.TestCase):
     def setUp(self) -> None:
         self.plugin = fairy.FairyTalesPlugin(rng=random.Random(11))
         self.ctx = make_ctx()
+        self.tales = self.plugin.load_tales(self.ctx)
+
+    def _tale(self, title: str) -> fairy.Tale:
+        return next(tale for tale in self.tales if tale.title == title)
 
     def test_tag_and_title_selection(self) -> None:
         cases = {
-            "Расскажи сказку про лису": "Лиса и журавль",
             "Сказку про зиму": "Зимовье зверей",
             "Про колобка": "Колобок",
             "Про репку": "Репка",
@@ -137,10 +195,17 @@ class TestSelection(unittest.TestCase):
             "Про теремок": "Теремок",
             "Про вершки": "Вершки и корешки",
             "Про журавля": "Лиса и журавль",
+            "Про зайца": "Лиса, заяц и петух",
         }
         for phrase, expected in cases.items():
             with self.subTest(phrase=phrase):
                 self.assertEqual(title_of(self.plugin.answer(self.ctx, phrase)), expected)
+
+    def test_fox_request_returns_fox_tale(self) -> None:
+        title = title_of(self.plugin.answer(self.ctx, "Расскажи сказку про лису"))
+        self.assertIn(title, FOX_TITLES)
+        tale = self._tale(title)
+        self.assertTrue("лиса" in tale.tags or "лиса" in tale.title.lower())
 
     def test_bear_matches_known_bear_tale(self) -> None:
         answer = self.plugin.answer(self.ctx, "Расскажи сказку про медведя")
@@ -155,42 +220,102 @@ class TestSelection(unittest.TestCase):
         )
 
     def test_next_goes_in_order_and_wraps(self) -> None:
-        tales = self.plugin.load_tales(self.ctx)
-        self.assertEqual(len(tales), 9)
+        self.assertGreaterEqual(len(self.tales), 25)
         first = self.plugin.answer(self.ctx, "Про колобка")
         self.assertEqual(title_of(first), "Колобок")
-        self.assertEqual(self.plugin.last_index, 0)
-        second = self.plugin.answer(self.ctx, "Следующая сказка")
-        self.assertEqual(title_of(second), tales[1].title)
-        third = self.plugin.answer(self.ctx, "Ещё сказку")
-        self.assertEqual(title_of(third), tales[2].title)
-        self.assertEqual(self.plugin.last_index, 2)
+        kolobok_index = next(
+            index for index, tale in enumerate(self.tales) if tale.title == "Колобок"
+        )
+        self.assertEqual(self.plugin.last_index, kolobok_index)
 
-        self.plugin.answer(self.ctx, "Про зимовье")
-        self.assertEqual(self.plugin.last_index, len(tales) - 1)
+        second = self.plugin.answer(self.ctx, "Следующая сказка")
+        self.assertEqual(title_of(second), self.tales[kolobok_index + 1].title)
+        third = self.plugin.answer(self.ctx, "Ещё сказку")
+        self.assertEqual(title_of(third), self.tales[kolobok_index + 2].title)
+
+        first_safe = next(
+            tale.title for tale in self.tales if not tale.is_scary
+        )
+        self.plugin.answer(self.ctx, "Про золотую рыбку")
+        self.assertEqual(self.plugin.last_index, len(self.tales) - 1)
         wrapped = self.plugin.answer(self.ctx, "Следующая сказка")
-        self.assertEqual(title_of(wrapped), tales[0].title)
+        self.assertEqual(title_of(wrapped), first_safe)
 
     def test_night_ending_survives_next(self) -> None:
-        first = self.plugin.answer(self.ctx, "Сказка на ночь")
+        first = answer_text(self.plugin.answer(self.ctx, "Сказка на ночь"))
         assert first is not None
         self.assertIn("Слушай сказку на ночь", first)
         self.assertIn("Сладких снов", first)
 
-        second = self.plugin.answer(self.ctx, "Следующая сказка")
+        second = answer_text(self.plugin.answer(self.ctx, "Следующая сказка"))
         assert second is not None
         self.assertIn("Сладких снов", second)
         self.assertNotIn("кто слушал — молодец", second)
 
-    def test_generic_request_is_short(self) -> None:
+    def test_generic_request_is_not_very_long(self) -> None:
         answer = self.plugin.answer(self.ctx, "Расскажи сказку")
         title = title_of(answer)
-        tales = {tale.title: tale for tale in self.plugin.load_tales(self.ctx)}
-        assert title is not None
-        self.assertTrue(tales[title].is_short)
+        tale = self._tale(title)
+        self.assertLessEqual(len(tale.body), fairy.DEFAULT_LIMIT)
 
     def test_next_without_state_returns_none(self) -> None:
         self.assertIsNone(self.plugin.answer(self.ctx, "Продолжи"))
+
+
+class TestNewPhrases(unittest.TestCase):
+    """«Волшебная», «баба-яга», «короткая», «для малыша», «страшная»."""
+
+    def setUp(self) -> None:
+        self.plugin = fairy.FairyTalesPlugin(rng=random.Random(3))
+        self.ctx = make_ctx()
+        self.tales = self.plugin.load_tales(self.ctx)
+        self.by_title = {tale.title: tale for tale in self.tales}
+
+    def _answer_tale(self, phrase: str) -> fairy.Tale:
+        answer = self.plugin.answer(self.ctx, phrase)
+        assert answer is not None
+        title = title_of(answer)
+        assert title is not None
+        return self.by_title[title]
+
+    def test_magic(self) -> None:
+        tale = self._answer_tale("Расскажи волшебную сказку")
+        self.assertIn("волшебная", tale.tags)
+        self.assertFalse(tale.is_scary)
+
+    def test_baba_yaga(self) -> None:
+        tale = self._answer_tale("Расскажи сказку про бабу-ягу")
+        self.assertIn("баба-яга", tale.tags)
+        self.assertFalse(tale.is_scary)
+
+    def test_short(self) -> None:
+        tale = self._answer_tale("Расскажи короткую сказку")
+        self.assertLessEqual(len(tale.body), 800)
+
+    def test_toddler(self) -> None:
+        tale = self._answer_tale("Сказку для малыша")
+        self.assertEqual(tale.age, "3+")
+
+    def test_scary_only_on_explicit_request(self) -> None:
+        tale = self._answer_tale("Расскажи страшную сказку")
+        self.assertIn("страшная", tale.tags)
+
+    def test_scary_never_in_random_choice(self) -> None:
+        phrases = (
+            "Расскажи сказку",
+            "Расскажи волшебную сказку",
+            "Расскажи короткую сказку",
+            "Сказку для малыша",
+            "Сказку про бабу-ягу",
+        )
+        for seed in range(40):
+            plugin = fairy.FairyTalesPlugin(rng=random.Random(seed))
+            for phrase in phrases:
+                with self.subTest(seed=seed, phrase=phrase):
+                    answer = plugin.answer(self.ctx, phrase)
+                    assert answer is not None
+                    tale = self.by_title[title_of(answer)]
+                    self.assertNotIn("страшная", tale.tags)
 
 
 class TestSpeechText(unittest.TestCase):
@@ -202,7 +327,7 @@ class TestSpeechText(unittest.TestCase):
         self.tales = self.plugin.load_tales(self.ctx)
 
     def test_all_tales_are_clean(self) -> None:
-        self.assertGreaterEqual(len(self.tales), 6)
+        self.assertGreaterEqual(len(self.tales), 25)
         for tale in self.tales:
             for night in (False, True):
                 with self.subTest(tale=tale.slug, night=night):
@@ -210,8 +335,10 @@ class TestSpeechText(unittest.TestCase):
                     self.assertTrue(text.startswith("Слушай сказку"))
                     self.assertIsNone(re.search(r"\d", text))
                     self.assertIsNone(re.search(r"[#*`\[\]]", text))
+                    self.assertIsNone(re.search(r"[A-Za-z]", text))
                     self.assertNotIn("http", text)
                     self.assertNotIn("Примечания", text)
+                    self.assertNotIn("вариант", text.lower())
                     if night:
                         self.assertIn("Сладких снов", text)
                     else:
@@ -248,6 +375,43 @@ class TestSpeechText(unittest.TestCase):
             self.assertIsNone(re.search(r"\d", answer))
 
 
+class TestCorpus(unittest.TestCase):
+    """Корпус: количество, шапка, источник, возраст, объём."""
+
+    def setUp(self) -> None:
+        self.plugin = fairy.FairyTalesPlugin()
+        self.ctx = make_ctx()
+        self.tales = self.plugin.load_tales(self.ctx)
+
+    def test_at_least_25_tales(self) -> None:
+        self.assertGreaterEqual(len(self.tales), 25)
+        self.assertEqual(len({tale.slug for tale in self.tales}), len(self.tales))
+
+    def test_frontmatter_is_complete(self) -> None:
+        for path in sorted(TALES_DIR.glob("*.md")):
+            with self.subTest(path=path.name):
+                data, body = split_frontmatter(path.read_text(encoding="utf-8"))
+                self.assertTrue(data.get("title"))
+                self.assertTrue(data.get("tags"))
+                self.assertIn(data.get("age"), {"3+", "5+", "7+"})
+                self.assertTrue(
+                    data.get("source", "").startswith(
+                        "https://ru.wikisource.org/wiki/"
+                    )
+                )
+                self.assertGreater(len(body.strip()), 200)
+
+    def test_corpus_size(self) -> None:
+        total = sum(path.stat().st_size for path in TALES_DIR.glob("*.md"))
+        self.assertLessEqual(total, 120 * 1024, f"корпус {total} байт")
+
+    def test_scary_tales_are_marked(self) -> None:
+        scary = [tale for tale in self.tales if tale.is_scary]
+        self.assertGreaterEqual(len(scary), 1)
+        for tale in scary:
+            self.assertIn(tale.age, {"7+"})
+
+
 class TestManifestAndRegistry(unittest.TestCase):
     """Манифест и подключение к реестру: capability видна снаружи."""
 
@@ -269,7 +433,7 @@ class TestManifestAndRegistry(unittest.TestCase):
         text = registry.run_answer("Расскажи сказку про лису")
         self.assertIsInstance(text, str)
         assert text is not None
-        self.assertEqual(title_of(text), "Лиса и журавль")
+        self.assertIn(title_of(text), FOX_TITLES)
 
 
 if __name__ == "__main__":

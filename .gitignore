@@ -226,6 +226,8 @@ __marimo__/
 # Данные и модели
 data/*
 !data/catalog.json
+# Словарь ударений для Silero — часть кода, а не локальные данные (задача 0222)
+!data/stress.txt
 local_model/
 *.gguf
 *.safetensors

@@ -1472,7 +1472,7 @@
   {
     "id": "0220",
     "title": "Корпус сказок Афанасьева до 25–30",
-    "status": "in_progress",
+    "status": "done",
     "file": "0220-afanasyev-corpus.md",
     "assignee": "agent:tales-more"
   },
@@ -1486,7 +1486,7 @@
   {
     "id": "0222",
     "title": "Ударения для Silero",
-    "status": "in_progress",
+    "status": "done",
     "file": "0222-silero-stress.md",
     "assignee": "agent:stress"
   },

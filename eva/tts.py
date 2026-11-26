@@ -67,6 +67,13 @@ Silero работает отдельным **долгоживущим** проц
 движков и делается до выбора движка, поэтому ElevenLabs и ``say`` тоже
 получают слова.
 
+Для Silero к этому добавляются **ударения** (задача 0222): модель понимает
+знак ``+`` перед ударной гласной («Колоб+ок»), но по умолчанию ошибается на
+сказочных словах и именах. :meth:`SileroTTS._prepare_text` применяет
+:func:`eva.ru_stress.apply_stress` только на пути в движок — текст ответа
+пользователю остаётся без плюсов. Откат — ``EVA_STRESS=0``; словарь можно
+расширять в ``data/stress.txt`` (``слово<TAB>разметка``).
+
 Адаптеры умеют также :meth:`TTSAdapter.synthesize_timed` — с замерами
 ``synth_ms`` и ``first_fragment_ms`` для голосового цикла.
 
@@ -98,6 +105,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .ru_speech import speech_to_words
+from .ru_stress import apply_stress
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -595,6 +603,15 @@ class TTSAdapter:
         """
         return None
 
+    def _prepare_text(self, text: object) -> str:
+        """Текст, который уходит в движок: чистка + правки конкретного движка.
+
+        Базовая реализация — только :func:`_clean_text` (слова вместо знаков и
+        чисел). :class:`SileroTTS` переопределяет метод и добавляет ударения:
+        ``+`` понимает лишь Silero, остальным движкам он был бы мусором.
+        """
+        return _clean_text(text)
+
     def synthesize(
         self,
         text: str,
@@ -608,15 +625,19 @@ class TTSAdapter:
 
         Без ``out_path`` возвращает WAV-байты, с ``out_path`` — путь к файлу
         (контракт ``synthesize(text) -> bytes|Path``).
+
+        Чистка и правки движка делаются ровно один раз — в
+        :meth:`synthesize_timed`: повторная нормализация уже размеченного
+        текста испортила бы знак ударения (``ru_speech`` читает ``+`` как
+        «плюс»).
         """
-        clean = _clean_text(text)
         if out_path is not None:
             target = _prepare_target(out_path)
-            self.synthesize_timed(clean, target, rate=rate, voice=voice, timeout=timeout)
+            self.synthesize_timed(text, target, rate=rate, voice=voice, timeout=timeout)
             return target
         with tempfile.TemporaryDirectory(prefix="eva-tts-") as tmp:
             target = Path(tmp) / "reply.wav"
-            self.synthesize_timed(clean, target, rate=rate, voice=voice, timeout=timeout)
+            self.synthesize_timed(text, target, rate=rate, voice=voice, timeout=timeout)
             return target.read_bytes()
 
     def synthesize_timed(
@@ -629,10 +650,29 @@ class TTSAdapter:
         timeout: float = DEFAULT_TIMEOUT,
     ) -> SynthesisResult:
         """Синтезировать в WAV и вернуть замеры (синтез + первый фрагмент)."""
-        clean = _clean_text(text)
+        clean = self._prepare_text(text)
+        return self._synthesize_prepared(
+            clean, out_path, rate=rate, voice=voice, timeout=timeout
+        )
+
+    def _synthesize_prepared(
+        self,
+        text: str,
+        out_path: str | Path,
+        *,
+        rate: int | None = None,
+        voice: str | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+    ) -> SynthesisResult:
+        """Синтезировать **уже подготовленный** текст (без чистки и разметки).
+
+        Отделено от :meth:`synthesize_timed`, чтобы Silero мог пройти путь
+        «чистка → ударения» ровно один раз: ``+`` перед синтезом уже стоит, а
+        повторная нормализация прочитала бы его как слово «плюс».
+        """
         target = Path(out_path).expanduser()
         command, stdin_text = self.build_command(
-            clean, target, rate=rate, voice=voice
+            text, target, rate=rate, voice=voice
         )
         synth_ms, first_fragment_ms = _run_to_file(
             command,
@@ -1629,6 +1669,9 @@ class SileroTTS(TTSAdapter):
     ``SILERO_WORKER_START_TIMEOUT`` таймаут старта, сек (по умолчанию 30)
     ``SILERO_SPEAKER``         голос: ``baya``/``kseniya``/``xenia``/``aidar``/…
     ``SILERO_CACHE``           ``0`` отключает LRU-кэш повторных фраз
+    ``EVA_STRESS``             ``0`` отключает расстановку ударений (0222)
+    ``EVA_STRESS_FILE``        свой словарь ударений (по умолчанию
+                               ``data/stress.txt``)
     ========================== ============================================
 
     Голос задаётся моделью, а не пост-обработкой: ``voice``, совпавший с
@@ -1751,6 +1794,16 @@ class SileroTTS(TTSAdapter):
             return candidate
         return self._configured_speaker()
 
+    def _prepare_text(self, text: object) -> str:
+        """Текст для Silero: чистка + знак ударения ``+`` перед гласной.
+
+        Silero v4_ru понимает ``+`` («Колоб+ок» → Колобо́к), но сам ошибается
+        на сказочных словах; :func:`eva.ru_stress.apply_stress` расставляет
+        знаки по словарю. Это единственный движок, которому уходит разметка:
+        в тексте ответа пользователю плюсов нет, ``EVA_STRESS=0`` отключает.
+        """
+        return apply_stress(_clean_text(text), env=self._env)
+
     def build_command(
         self,
         text: str,
@@ -1771,7 +1824,9 @@ class SileroTTS(TTSAdapter):
             "--sample-rate",
             str(SILERO_SAMPLE_RATE),
         ]
-        return command, text + "\n"
+        # Прямой вызов build_command тоже должен получить разметку: обычно
+        # текст уже подготовлен _prepare_text, а apply_stress идемпотентна.
+        return command, apply_stress(text, env=self._env) + "\n"
 
     def subprocess_env(self) -> dict[str, str] | None:
         """Окружение дочернего процесса: только вендорный torch и кэш модели."""
@@ -1939,7 +1994,7 @@ class SileroTTS(TTSAdapter):
         обход, если worker на машине не работает.
         """
         global _SILERO_WARMUP_MS
-        clean = _clean_text(text)
+        clean = self._prepare_text(text)
         target = Path(out_path).expanduser()
         runtime = self.resolve()
         speaker = self._speaker_for(voice)
@@ -1969,7 +2024,7 @@ class SileroTTS(TTSAdapter):
                 clean, target, speaker, runtime, timeout
             )
         else:
-            result = super().synthesize_timed(
+            result = self._synthesize_prepared(
                 clean, target, rate=rate, voice=voice, timeout=timeout
             )
 
