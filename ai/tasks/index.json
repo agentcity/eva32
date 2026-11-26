@@ -1286,5 +1286,12 @@
     "status": "in_progress",
     "file": "0192-metal-gemv.md",
     "assignee": "agent:metal"
+  },
+  {
+    "id": "0193",
+    "title": "Silero TTS — локальный русский нейроголос",
+    "status": "in_progress",
+    "file": "0193-silero-tts.md",
+    "assignee": "agent:silero"
   }
 ]
