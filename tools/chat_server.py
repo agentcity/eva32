@@ -4999,6 +4999,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/plugins":
                 self._handle_plugins()
                 return
+            if path == "/api/audio/stop":
+                self._handle_audio_stop()
+                return
             if path != "/api/chat":
                 self._send_json(
                     404,
@@ -5358,6 +5361,34 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         )
 
     # -- плагины (задача 0209) -----------------------------------------------
+
+    def _handle_audio_stop(self) -> None:
+        """Остановить внешнее воспроизведение (запись сказки, музыка, радио).
+
+        Записи и музыка играют не в браузере/приложении, а на Mac через
+        afplay/Music.app — их не остановит ни voice.stop(), ни отмена
+        генерации. Приложение зовёт этот эндпоинт по «Стоп, Ева» (0219/0223):
+        плагины получают ту же команду, что и голосом — «выключи».
+        """
+        stopped: list[str] = []
+        try:
+            for binding in self.server.plugins.answers():
+                try:
+                    answer = binding.run(binding.ctx, "выключи")
+                except Exception:  # noqa: BLE001 - один плагин не блокирует другие
+                    logger.warning("аудио: %s не остановился", binding.plugin_id)
+                    continue
+                # Плагин, у которого нечего останавливать, вернёт None или
+                # текст «нечего выключать» — считаем остановленным только
+                # того, кто реально ответил.
+                if isinstance(answer, str) and answer.strip():
+                    stopped.append(binding.plugin_id)
+                elif isinstance(answer, dict) and str(answer.get("text") or "").strip():
+                    stopped.append(binding.plugin_id)
+        except Exception:  # noqa: BLE001 - остановка не должна падать
+            logger.exception("аудио: остановка упала")
+        logger.info("аудио: остановлено плагинами: %s", stopped or "—")
+        self._send_json(200, {"stopped": stopped})
 
     def _handle_plugins(self) -> None:
         """``POST /api/plugins``: включить/выключить плагин без перезапуска.

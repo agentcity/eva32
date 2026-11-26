@@ -1503,5 +1503,12 @@
     "status": "done",
     "file": "0224-app-tale-images.md",
     "assignee": "agent:app-images"
+  },
+  {
+    "id": "0225",
+    "title": "Стоп глушит внешнее аудио (afplay/Music)",
+    "status": "done",
+    "file": "0224-app-tale-images.md",
+    "assignee": "saron"
   }
 ]

@@ -1013,6 +1013,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let result = await ChatSession.cancelRemote(base: server, side: 0)
             log("отмена: \(result)")
         }
+        // Запись сказки / музыка играют на Mac (afplay, Music.app), а не в
+        // приложении: отмена генерации их не остановит. «Стоп, Ева» должна
+        // глушить и внешнее аудио (0225).
+        Task {
+            let stopped = await ChatSession.stopRemoteAudio(base: server)
+            log("аудио: \(stopped)")
+        }
     }
 
     // MARK: - Большой круг

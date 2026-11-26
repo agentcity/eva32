@@ -221,6 +221,30 @@ final class ChatSession {
     ///
     /// Возвращает короткую строку для журнала; сетевые ошибки глотаются —
     /// «Стоп» уже сработал локально.
+    /// Остановить внешнее воспроизведение на Mac (запись сказки, музыка,
+    /// радио). Эти звуки играет сервер через afplay/Music.app — «Стоп, Ева»
+    /// их не остановит, если не позвать `/api/audio/stop` (0225).
+    nonisolated static func stopRemoteAudio(base: URL) async -> String {
+        var request = URLRequest(url: base.appendingPathComponent("api/audio/stop"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("{}".utf8)
+        request.timeoutInterval = 3
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard code == 200 else { return "сервер ответил HTTP \(code)" }
+            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let stopped = object["stopped"] as? [String], !stopped.isEmpty
+            {
+                return "остановлено: \(stopped.joined(separator: ", "))"
+            }
+            return "нечего останавливать"
+        } catch {
+            return "сервер не ответил (\(error.localizedDescription))"
+        }
+    }
+
     nonisolated static func cancelRemote(base: URL, side: Int = 0) async -> String {
         var request = URLRequest(url: base.appendingPathComponent("api/cancel"))
         request.httpMethod = "POST"
