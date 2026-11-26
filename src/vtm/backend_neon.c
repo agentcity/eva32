@@ -4776,8 +4776,12 @@ const vtm_backend vtm_backend_simd = {
 // (prefill >= 1,3x, декод не хуже simd), поэтому auto выбирает hybrid, когда
 // Metal собран и устройство есть. Одна константа, чтобы вернуть simd без
 // правок логики: 0 — auto=simd.
+// 2026-11-26: auto=simd. Гибрид (0198) даёт верные числа на прямых прогонах
+// vtm run, но через C-ABI (vtm_api_generate: кэш префикса + батчевый prefill)
+// выдаёт мусор — похоже на гонку асинхронной отправки GPU. До исправления
+// гибрид доступен только явно: VTM_BACKEND=hybrid.
 #ifndef VTM_AUTO_HYBRID
-#define VTM_AUTO_HYBRID 1
+#define VTM_AUTO_HYBRID 0
 #endif
 
 // Гибридный бэкенд (0198): ядра — simd, а батчевые GEMM prefill уходят на GPU
