@@ -1419,5 +1419,12 @@
     "status": "in_progress",
     "file": "0212-fact-answer-guard.md",
     "assignee": "agent:fact-guard"
+  },
+  {
+    "id": "0213",
+    "title": "Qwen3-4B-Instruct-2507 как рабочая модель",
+    "status": "in_progress",
+    "file": "0213-qwen3-4b.md",
+    "assignee": "agent:qwen4b"
   }
 ]
