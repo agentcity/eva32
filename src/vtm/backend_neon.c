@@ -27,6 +27,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Metal-бэкенд (0192) собирается только на Darwin (backend_metal.m). Без него
+// вызовы в выборе бэкенда — no-op, чтобы диспетчер собирался на любой ОС.
+#ifndef VTM_WITH_METAL
+#define VTM_WITH_METAL 0
+#endif
+#if !VTM_WITH_METAL
+#define vtm_metal_set_active(on) ((void)(on))
+#endif
+
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 // FEAT_DotProd (int8-dot, задача 0163): на Apple спрашиваем sysctl, на Linux —
@@ -4762,18 +4771,48 @@ const vtm_backend vtm_backend_simd = {
 
 const vtm_backend *vtm_backend_by_name(const char *name) {
     if (!name || !*name) return vtm_backend_from_env();
-    if (strcmp(name, "auto") == 0)
+    if (strcmp(name, "auto") == 0) {
+#if VTM_WITH_METAL
+        // ADR 0021, фаза 1: auto = simd. Замеры 0192 на M1 Pro показали, что
+        // Metal на СИНХРОННЫХ GEMV медленнее CPU (7,8 против 20,8 ток/с):
+        // 181 командный буфер на токен — накладные больше выигрыша. GPU
+        // включится по умолчанию только после фазы 2 (батч/persistent pipeline);
+        // до тех пор метал доступен явно: VTM_BACKEND=metal.
+        vtm_metal_set_active(0);
+#else
+        vtm_metal_set_active(0);
+#endif
         return vtm_simd_available() ? &vtm_backend_simd
                                     : &vtm_backend_scalar_lut;
+    }
+    if (strcmp(name, "metal") == 0) {
+#if VTM_WITH_METAL
+        if (vtm_metal_compiled()) {
+            vtm_metal_set_active(1);
+            return vtm_backend_metal();
+        }
+        fprintf(stderr, "VTM: Metal недоступен — бэкенд simd (откат)\n");
+#else
+        fprintf(stderr, "VTM: сборка без Metal — бэкенд simd (откат)\n");
+#endif
+        vtm_metal_set_active(0);
+        return &vtm_backend_simd;
+    }
     if (strcmp(name, "simd") == 0 || strcmp(name, "neon") == 0 ||
         strcmp(name, "avx2") == 0 || strcmp(name, "simd-neon") == 0 ||
-        strcmp(name, "simd-avx2") == 0)
+        strcmp(name, "simd-avx2") == 0) {
+        vtm_metal_set_active(0);
         return &vtm_backend_simd;
+    }
     if (strcmp(name, "scalar") == 0 || strcmp(name, "lut") == 0 ||
-        strcmp(name, "scalar-lut243") == 0)
+        strcmp(name, "scalar-lut243") == 0) {
+        vtm_metal_set_active(0);
         return &vtm_backend_scalar_lut;
-    if (strcmp(name, "direct") == 0 || strcmp(name, "scalar-direct") == 0)
+    }
+    if (strcmp(name, "direct") == 0 || strcmp(name, "scalar-direct") == 0) {
+        vtm_metal_set_active(0);
         return &vtm_backend_scalar_direct;
+    }
     return NULL;
 }
 
@@ -4789,6 +4828,7 @@ const vtm_backend *vtm_backend_from_env(void) {
     backend = vtm_backend_by_name(env);
     if (backend) return backend;
     fprintf(stderr, "vtm: неизвестный VTM_BACKEND='%s' "
-                    "(auto|scalar|simd|direct), беру scalar\n", env);
+                    "(auto|metal|scalar|simd|direct), беру scalar\n", env);
+    vtm_metal_set_active(0);
     return &vtm_backend_scalar_lut;
 }

@@ -33,11 +33,20 @@ ElevenLabs и локальный Silero: если движок не сработ
 откатывается на следующий локальный движок** (Silero → Piper → system),
 чтобы пользователь не остался без голоса.
 
-Silero запускается отдельным процессом (как Piper): torch импортируется
-только внутри него, поэтому память чат-сервера не растёт на ~300 МБ. Цена —
-холодный старт процесса (импорт torch + загрузка модели) на каждую новую
-фразу; повторные одинаковые фразы отдаются из LRU-кэша адаптера. Первый
-замер печатается в лог и в :meth:`SileroTTS.describe`.
+Silero работает отдельным **долгоживущим** процессом
+``tools/silero_worker.py`` (задача 0195): torch импортируется только внутри
+него, поэтому память чат-сервера не растёт на ~300 МБ, а модель грузится
+**один раз** — при первой фразе, а не на каждую (как было в 0193 с
+одноразовым ``tools/silero_speak.py``). Worker поднимается лениво, живёт до
+конца процесса чата (keep-alive, ``atexit``), запросы сериализуются lock'ом,
+при падении перезапускается не больше одного раза, при таймауте (20 с)
+убивается и уступает место Piper. Повторные одинаковые фразы по-прежнему
+отдаются из LRU-кэша адаптера. Замеры — в :meth:`SileroTTS.describe` и
+:func:`silero_worker_info`.
+
+:func:`prewarm_silero_worker` поднимает worker заранее (фоном): ленивый старт
+стоит ~1,5–2 с на импорт torch и модель, и первая фраза после старта чата
+укладывается в 2 с только с prewarm.
 
 Контракт синтеза — ``synthesize(text) -> bytes | Path | (bytes, content_type)``::
 
@@ -62,9 +71,11 @@ torch живёт в отдельном процессе Silero, реальный
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -77,7 +88,7 @@ import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -89,6 +100,8 @@ __all__ = [
     "DEFAULT_ELEVENLABS_VOICE_ID",
     "DEFAULT_SAY_VOICE",
     "DEFAULT_SILERO_SPEAKER",
+    "DEFAULT_SILERO_WORKER_START_TIMEOUT",
+    "DEFAULT_SILERO_WORKER_TIMEOUT",
     "DEFAULT_TIMEOUT",
     "DEFAULT_TTS_LANG",
     "ELEVENLABS_API_URL",
@@ -98,6 +111,7 @@ __all__ = [
     "NullTTS",
     "PiperTTS",
     "SileroTTS",
+    "SileroWorker",
     "SystemTTS",
     "SynthesisResult",
     "TTSAdapter",
@@ -115,10 +129,14 @@ __all__ = [
     "find_silero_model_dir",
     "find_silero_python",
     "find_silero_torch_dir",
+    "find_silero_worker",
     "piper_help",
+    "prewarm_silero_worker",
     "select_engine",
     "silero_cache_info",
     "silero_help",
+    "silero_worker_info",
+    "stop_silero_worker",
     "synthesize",
     "synthesize_audio",
     "system_help",
@@ -248,8 +266,25 @@ SILERO_TORCH_DIR = "vendor/torch-py"
 #: Кэш модели и репозитория torch.hub: ``TORCH_HOME=vendor/silero``.
 SILERO_MODEL_DIR = "vendor/silero"
 
-#: Скрипт-синтезатор: читает текст из stdin, пишет WAV в argv[1].
+#: Скрипт одноразового синтеза: читает текст из stdin, пишет WAV в argv[1].
+#: Больше не используется по умолчанию (его место занял worker), но остаётся
+#: для ``SILERO_WORKER=0`` и ручных прогонов ``tools/install_silero.sh``.
 SILERO_SCRIPT = "tools/silero_speak.py"
+
+#: Долгоживущий worker (задача 0195): модель грузится один раз, дальше — фразы.
+SILERO_WORKER_SCRIPT = "tools/silero_worker.py"
+
+#: Таймаут одного запроса к worker'у, сек. Дольше — считаем, что он завис:
+#: фраза ждать не может, worker убивается, синтез уходит на Piper.
+DEFAULT_SILERO_WORKER_TIMEOUT = 20.0
+
+#: Таймаут старта worker'а, сек (импорт torch + загрузка модели v4_ru).
+#: Холодный старт ≈1,5–2,5 с; 30 с — с запасом на медленный диск.
+DEFAULT_SILERO_WORKER_START_TIMEOUT = 30.0
+
+#: Сколько раз перезапускать worker в пределах одной фразы при падении.
+#: 1 — «не более одного раза» из задачи 0195: второй сбой = откат на Piper.
+SILERO_WORKER_RESTARTS = 1
 
 #: Python для Silero. 3.13 — единственный с колёсами torch на arm64 macOS;
 #: python3.14 их пока не имеет.
@@ -330,6 +365,20 @@ def _env_flag(env: Mapping[str, str] | None, name: str, default: bool = True) ->
     if raw is None:
         return default
     return raw.strip().lower() not in ("0", "false", "no", "off", "нет")
+
+
+def _env_float(
+    env: Mapping[str, str] | None, name: str, default: float
+) -> float:
+    """Число из окружения (``SILERO_WORKER_TIMEOUT``); мусор → ``default``."""
+    raw = _env(env, name)
+    if raw is None:
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    return value if value > 0 else float(default)
 
 
 def _content_type_for_format(output_format: str) -> str:
@@ -1066,26 +1115,498 @@ def _silero_cache_put(key: tuple[str, str, int], value: bytes) -> None:
             _SILERO_CACHE.popitem(last=False)
 
 
+# --------------------------------------------------------------------------- #
+# Silero worker: долгоживущий процесс (задача 0195)
+# --------------------------------------------------------------------------- #
+class _WorkerFailure(TTSError):
+    """Транспорт worker'а сломался: не ответил, умер, не поднялся."""
+
+
+class _WorkerGone(_WorkerFailure):
+    """Worker закрыл stdout/умер между запросами — помогает перезапуск."""
+
+
+class _WorkerTimeout(_WorkerFailure):
+    """Worker не ответил за отведённое время — его надо убить и начать заново."""
+
+
+def _worker_reader(stream, sink: "queue.Queue[dict[str, Any]]") -> None:
+    """Читать stdout worker'а построчно и складывать JSON в очередь.
+
+    Отдельный поток нужен из-за таймаута: ``readline`` на пайпе блокирующий,
+    а ждать ответа надо с ограничением по времени. Поток живёт столько же,
+    сколько процесс: на EOF кладёт сентинел ``{"eof": True}``.
+    """
+    try:
+        for line in stream:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                # Не наш вывод (например, чужое предупреждение в stdout).
+                continue
+            if isinstance(payload, dict):
+                sink.put(payload)
+    except (OSError, ValueError):
+        pass
+    finally:
+        sink.put({"ok": False, "eof": True})
+
+
+class SileroWorker:
+    """Один процесс ``tools/silero_worker.py``: модель загружена один раз.
+
+    Протокол — JSON-строка на строку (stdin → stdout), см. докстринг
+    ``tools/silero_worker.py``. Запросы обязаны сериализоваться
+    (:data:`_SILERO_WORKER_LOCK`): «запрос → ответ» не помечен id, и два
+    параллельных запроса перепутали бы ответы.
+
+    Класс ничего не знает про кэш и откаты: это делает :class:`SileroTTS`.
+    """
+
+    name = "silero"
+
+    def __init__(
+        self,
+        python: str | Path,
+        script: str | Path,
+        *,
+        speaker: str = DEFAULT_SILERO_SPEAKER,
+        sample_rate: int = SILERO_SAMPLE_RATE,
+        env: Mapping[str, str] | None = None,
+        timeout: float = DEFAULT_SILERO_WORKER_TIMEOUT,
+        start_timeout: float = DEFAULT_SILERO_WORKER_START_TIMEOUT,
+    ) -> None:
+        self._python = Path(python)
+        self._script = Path(script)
+        self._speaker = speaker
+        self._sample_rate = int(sample_rate)
+        self._env = dict(env) if env is not None else None
+        self.timeout = float(timeout)
+        self.start_timeout = float(start_timeout)
+        self._proc: subprocess.Popen | None = None
+        self._sink: "queue.Queue[dict[str, Any]]" | None = None
+        self._stderr = None
+        self._reader: threading.Thread | None = None
+        self._load_ms: float | None = None
+        self._requests = 0
+
+    # -- состояние ----------------------------------------------------------
+
+    @property
+    def pid(self) -> int | None:
+        """PID живого worker'а (``None`` — не запущен/уже умер)."""
+        proc = self._proc
+        if proc is None:
+            return None
+        return proc.pid if proc.poll() is None else None
+
+    def alive(self) -> bool:
+        return self.pid is not None
+
+    @property
+    def load_ms(self) -> float | None:
+        """Сколько заняла загрузка модели в worker'е (мс), если известна."""
+        return self._load_ms
+
+    @property
+    def requests(self) -> int:
+        """Сколько фраз синтезировал этот worker."""
+        return self._requests
+
+    def stderr_tail(self, *, lines: int = 3) -> str:
+        """Последние строки stderr worker'а — причина падения без догадок."""
+        handle = self._stderr
+        if handle is None:
+            return ""
+        try:
+            handle.flush()
+            handle.seek(0)
+            data = handle.read()
+        except (OSError, ValueError):
+            return ""
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", "replace")
+        rows = [row.strip() for row in str(data).strip().splitlines() if row.strip()]
+        return " | ".join(rows[-lines:]) if rows else ""
+
+    # -- жизненный цикл -----------------------------------------------------
+
+    def start(self) -> None:
+        """Запустить процесс и дождаться ``{"ready": true}`` от модели."""
+        if self.alive():
+            return
+        self.stop()
+        command = [
+            str(self._python),
+            str(self._script),
+            "--speaker",
+            self._speaker,
+            "--sample-rate",
+            str(self._sample_rate),
+        ]
+        stderr_file = tempfile.TemporaryFile()
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                # stderr — в файл, не в PIPE: torch пишет предупреждения, и
+                # незабранный PIPE рано или поздно заблокировал бы worker.
+                stderr=stderr_file,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+                env=dict(self._env) if self._env is not None else None,
+            )
+        except OSError as exc:
+            stderr_file.close()
+            raise TTSUnavailable(
+                f"silero: worker не запустился ({command[0]}): {exc}"
+            ) from None
+
+        sink: "queue.Queue[dict[str, Any]]" = queue.Queue()
+        reader = threading.Thread(
+            target=_worker_reader,
+            args=(proc.stdout, sink),
+            name=f"silero-worker-{proc.pid}",
+            daemon=True,
+        )
+        reader.start()
+        self._proc = proc
+        self._sink = sink
+        self._stderr = stderr_file
+        self._reader = reader
+        self._load_ms = None
+        self._requests = 0
+
+        try:
+            ready = self._await(self.start_timeout, what="готовности")
+        except _WorkerFailure:
+            self.stop()
+            raise
+        if not ready.get("ready"):
+            self.stop()
+            raise _WorkerFailure(
+                "silero: worker не подтвердил готовность: "
+                f"{ready.get('error') or ready!r}"
+            )
+        try:
+            self._load_ms = float(ready.get("load_ms") or 0.0) or None
+        except (TypeError, ValueError):
+            self._load_ms = None
+        logger.info(
+            "silero: worker поднят (pid %s, torch %s: импорт %.0f мс, "
+            "модель %.0f мс, всего %.0f мс)",
+            proc.pid,
+            ready.get("torch"),
+            float(ready.get("import_ms") or 0.0),
+            float(ready.get("model_ms") or 0.0),
+            self._load_ms or 0.0,
+        )
+
+    def stop(self, *, grace: float = 1.0) -> None:
+        """Попросить worker закрыться (``shutdown`` → SIGTERM → SIGKILL)."""
+        proc = self._proc
+        self._proc = None
+        self._sink = None
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    try:
+                        if proc.stdin is not None:
+                            proc.stdin.write('{"cmd": "shutdown"}\n')
+                            proc.stdin.flush()
+                    except (BrokenPipeError, OSError, ValueError):
+                        pass
+                    try:
+                        proc.wait(timeout=grace)
+                    except subprocess.TimeoutExpired:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=grace)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            try:
+                                proc.wait(timeout=grace)
+                            except subprocess.TimeoutExpired:
+                                pass
+            finally:
+                for stream in (proc.stdin, proc.stdout):
+                    try:
+                        if stream is not None:
+                            stream.close()
+                    except (OSError, ValueError):
+                        pass
+                handle, self._stderr = self._stderr, None
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+
+    # -- запросы ------------------------------------------------------------
+
+    def _await(self, limit: float, *, what: str = "ответа") -> dict[str, Any]:
+        """Взять один ответ из очереди с таймаутом."""
+        sink = self._sink
+        if sink is None:
+            raise _WorkerGone("silero: worker не запущен")
+        try:
+            reply = sink.get(timeout=max(0.001, float(limit)))
+        except queue.Empty:
+            raise _WorkerTimeout(
+                f"worker не ответил ({what}) за {float(limit):g} с"
+            ) from None
+        if not isinstance(reply, dict):
+            raise _WorkerFailure("silero: worker вернул не JSON-объект")
+        if reply.get("eof"):
+            tail = self.stderr_tail()
+            detail = f": {tail}" if tail else ""
+            raise _WorkerGone(f"worker завершился (EOF){detail}")
+        return reply
+
+    def request(
+        self, payload: Mapping[str, Any], *, timeout: float | None = None
+    ) -> dict[str, Any]:
+        """Отправить один запрос и дождаться одного ответа."""
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            raise _WorkerGone("silero: worker не запущен")
+        line = json.dumps(dict(payload), ensure_ascii=False) + "\n"
+        try:
+            if proc.stdin is None:
+                raise _WorkerGone("silero: у worker'а нет stdin")
+            proc.stdin.write(line)
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            raise _WorkerGone(f"worker не принял запрос: {exc}") from None
+        limit = self.timeout if timeout is None else float(timeout)
+        return self._await(limit)
+
+    def ping(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        """Проверка живости на старте: worker отвечает на ``{"cmd": "ping"}``."""
+        reply = self.request({"cmd": "ping"}, timeout=timeout)
+        if not reply.get("pong"):
+            raise _WorkerFailure(
+                f"silero: worker не ответил на ping: {reply.get('error') or reply!r}"
+            )
+        return reply
+
+    def synthesize(
+        self,
+        text: str,
+        speaker: str,
+        out_path: str | Path,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Синтезировать фразу в ``out_path``; вернуть ответ worker'а."""
+        reply = self.request(
+            {"text": text, "speaker": speaker, "out": str(out_path)},
+            timeout=timeout,
+        )
+        if not reply.get("ok"):
+            raise TTSError(
+                f"silero: {reply.get('error') or 'worker вернул ошибку'}"
+            )
+        self._requests += 1
+        return reply
+
+
+#: Единственный worker на процесс чата: ``select_engine`` создаёт адаптер на
+#: каждый запрос, поэтому процесс должен жить на уровне модуля (иначе каждая
+#: фраза снова платила бы за torch и модель).
+_SILERO_WORKER: "SileroWorker | None" = None
+_SILERO_WORKER_KEY: tuple[str, str] | None = None
+
+#: Lock сериализует запросы к worker'у (один запрос за раз) и защищает
+#: создание/остановку процесса. RLock: ``prewarm``/``stop`` вызываются
+#: вложенно из тех же путей.
+_SILERO_WORKER_LOCK = threading.RLock()
+
+
+def find_silero_worker(
+    explicit: str | Path | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Найти скрипт worker'а: аргумент → ``SILERO_WORKER_SCRIPT`` → tools/.
+
+    Отсутствие файла — ошибка конфигурации, а не молчаливая подмена движка:
+    worker лежит в репозитории, его пропажа означает сломанную установку.
+    """
+    raw = explicit or _env(env, "SILERO_WORKER_SCRIPT")
+    path = Path(raw).expanduser() if raw else ROOT / SILERO_WORKER_SCRIPT
+    if not path.is_file():
+        raise TTSUnavailable(
+            f"Silero: worker не найден: {path}. Ожидается "
+            f"{SILERO_WORKER_SCRIPT} в репозитории (путь переопределяет "
+            "SILERO_WORKER_SCRIPT)."
+        )
+    return path
+
+
+def silero_worker_info() -> dict[str, object]:
+    """Состояние worker'а: жив ли, pid, число фраз, время загрузки модели."""
+    worker = _SILERO_WORKER
+    pid = worker.pid if worker is not None else None
+    return {
+        "running": pid is not None,
+        "pid": pid,
+        "requests": worker.requests if worker is not None else 0,
+        "load_ms": round(worker.load_ms, 1)
+        if worker is not None and worker.load_ms
+        else None,
+        "timeout": worker.timeout if worker is not None else None,
+    }
+
+
+def _silero_worker_ensure(
+    runtime: _SileroRuntime,
+    *,
+    script: Path,
+    speaker: str,
+    timeout: float,
+    start_timeout: float,
+    env: Mapping[str, str] | None,
+) -> SileroWorker:
+    """Вернуть живой worker, подняв его при необходимости (lock снаружи)."""
+    global _SILERO_WORKER, _SILERO_WORKER_KEY
+    key = (str(runtime.python), str(script))
+    worker = _SILERO_WORKER
+    if worker is not None and _SILERO_WORKER_KEY != key:
+        logger.info("silero: конфигурация изменилась — перезапускаю worker")
+        worker.stop()
+        worker = None
+    if worker is not None and not worker.alive():
+        worker.stop()
+        worker = None
+    if worker is not None:
+        worker.timeout = max(1.0, float(timeout))
+        return worker
+
+    candidate = SileroWorker(
+        runtime.python,
+        script,
+        speaker=speaker,
+        env=env,
+        timeout=timeout,
+        start_timeout=start_timeout,
+    )
+    try:
+        candidate.start()
+        candidate.ping()
+    except TTSError:
+        candidate.stop()
+        _SILERO_WORKER = None
+        _SILERO_WORKER_KEY = None
+        raise
+    _SILERO_WORKER = candidate
+    _SILERO_WORKER_KEY = key
+    return candidate
+
+
+def _drop_silero_worker() -> None:
+    """Убить worker и забыть о нём (следующий вызов поднимет заново)."""
+    global _SILERO_WORKER, _SILERO_WORKER_KEY
+    worker = _SILERO_WORKER
+    _SILERO_WORKER = None
+    _SILERO_WORKER_KEY = None
+    if worker is not None:
+        worker.stop()
+
+
+def stop_silero_worker(*, timeout: float = 1.0) -> None:
+    """Остановить worker (``atexit`` и явная уборка); без worker'а — no-op."""
+    global _SILERO_WORKER, _SILERO_WORKER_KEY
+    acquired = _SILERO_WORKER_LOCK.acquire(timeout=max(0.0, float(timeout)))
+    try:
+        worker = _SILERO_WORKER
+        _SILERO_WORKER = None
+        _SILERO_WORKER_KEY = None
+        if worker is not None:
+            logger.info("silero: останавливаю worker (pid %s)", worker.pid)
+            worker.stop()
+    finally:
+        if acquired:
+            _SILERO_WORKER_LOCK.release()
+
+
+#: Процесс чата не должен оставлять после себя 550 МБ torch: worker получает
+#: SIGTERM при выходе, даже если вызывающий код забыл про уборку.
+atexit.register(stop_silero_worker)
+
+
+def prewarm_silero_worker(
+    engine: "SileroTTS | None" = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> threading.Thread | None:
+    """Поднять worker заранее, фоном: первая фраза станет ~0,05–0,2 с.
+
+    Ленивый старт (первый синтез) платит ~1,5–2,5 с за импорт torch и модель,
+    поэтому первая фраза после старта чата дольше последующих. Если сервер
+    (или голосовой цикл) вызовет эту функцию на старте, к приходу первой
+    фразы worker уже готов. Это не ошибка и не обязательство: Silero может
+    быть не установлен, тогда просто возвращается ``None``.
+    """
+    adapter = engine if engine is not None else SileroTTS(env=env)
+    try:
+        if not adapter.available():
+            return None
+    except TTSError:
+        return None
+    if silero_worker_info()["running"]:
+        return None
+
+    def _warm() -> None:
+        try:
+            adapter.prewarm()
+        except TTSError as exc:
+            logger.warning(
+                "silero: prewarm не удался (%s) — останется ленивый старт", exc
+            )
+        except Exception as exc:  # noqa: BLE001 — фон не должен шуметь трейсом
+            logger.warning("silero: prewarm упал (%s)", exc)
+
+    thread = threading.Thread(target=_warm, name="silero-prewarm", daemon=True)
+    thread.start()
+    return thread
+
+
 class SileroTTS(TTSAdapter):
-    """Локальный Silero v4_ru в отдельном процессе python3.13.
+    """Локальный Silero v4_ru в долгоживущем процессе python3.13 (worker).
 
-    Команда::
+    ``tools/silero_worker.py`` грузит модель **один раз** и дальше принимает
+    фразы JSON-строками (stdin → stdout)::
 
-        python3.13 tools/silero_speak.py OUT.wav --speaker baya \
-            --sample-rate 48000
+        python3.13 tools/silero_worker.py --speaker baya --sample-rate 48000
+          → {"text": "...", "speaker": "baya", "out": "/tmp/reply.wav"}
+          ← {"ok": true, "ms": 41.2, "duration_s": 1.19, ...}
 
-    Текст — в stdin, WAV — в ``OUT.wav``. ``torch`` импортируется только
-    внутри дочернего процесса; ``PYTHONPATH=vendor/torch-py``,
-    ``TORCH_HOME=vendor/silero``. Пути/голос:
+    Старт ленивый (при первой фразе), дальше процесс живёт до конца процесса
+    чата: ``torch`` и модель не грузятся повторно. ``PYTHONPATH`` ровно на
+    ``vendor/torch-py``, ``TORCH_HOME=vendor/silero``. Один worker на процесс
+    (``select_engine`` создаёт адаптер на запрос, поэтому процесс — модульный
+    синглтон), запросы по одному (lock), падение — один перезапуск, таймаут
+    (20 с) — убить и уступить Piper, ``atexit`` — SIGTERM. Повторные
+    одинаковые фразы отдаёт LRU-кэш и не трогает worker.
 
-    ====================== ================================================
-    ``SILERO_PYTHON``      python3.13 (по умолчанию из PATH или Homebrew)
-    ``SILERO_TORCH_DIR``   каталог вендорного torch (``vendor/torch-py``)
-    ``SILERO_MODEL_DIR``   кэш модели (``vendor/silero``)
-    ``SILERO_SCRIPT``      скрипт-синтезатор (``tools/silero_speak.py``)
-    ``SILERO_SPEAKER``     голос: ``baya``/``kseniya``/``xenia``/``aidar``/…
-    ``SILERO_CACHE``       ``0`` отключает LRU-кэш повторных фраз
-    ====================== ================================================
+    ========================== ============================================
+    ``SILERO_PYTHON``          python3.13 (по умолчанию из PATH или Homebrew)
+    ``SILERO_TORCH_DIR``       каталог вендорного torch (``vendor/torch-py``)
+    ``SILERO_MODEL_DIR``       кэш модели (``vendor/silero``)
+    ``SILERO_SCRIPT``          одноразовый синтезатор-фолбэк (0193)
+    ``SILERO_WORKER_SCRIPT``   скрипт worker'а (``tools/silero_worker.py``)
+    ``SILERO_WORKER``          ``0`` — не использовать worker (одноразовый путь)
+    ``SILERO_WORKER_TIMEOUT``  таймаут запроса, сек (по умолчанию 20)
+    ``SILERO_WORKER_START_TIMEOUT`` таймаут старта, сек (по умолчанию 30)
+    ``SILERO_SPEAKER``         голос: ``baya``/``kseniya``/``xenia``/``aidar``/…
+    ``SILERO_CACHE``           ``0`` отключает LRU-кэш повторных фраз
+    ========================== ============================================
 
     Пресеты Piper (``irina``/``soft``/``young``) отбрасываются: у Silero
     свой тембр и никакого питч-шифта. ``voice``, совпавший с именем голоса
@@ -1139,6 +1660,10 @@ class SileroTTS(TTSAdapter):
                 f"Silero: скрипт-синтезатор не найден: {script}. "
                 "Ожидается tools/silero_speak.py в репозитории."
             )
+        if _env_flag(self._env, "SILERO_WORKER", True):
+            # Worker — основной путь: сломанная установка (нет скрипта) должна
+            # быть видна в available(), а не выясняться на первой фразе.
+            find_silero_worker(None, env=self._env)
         speaker = self._configured_speaker()
         if speaker not in SILERO_SPEAKERS:
             raise TTSUnavailable(
@@ -1168,18 +1693,26 @@ class SileroTTS(TTSAdapter):
         return True
 
     def describe(self) -> str:
+        """Строка для отчёта: ``silero (worker, pid N; …)`` или «не запущен»."""
         try:
             runtime = self.resolve()
         except TTSUnavailable:
             return (
                 "silero (недоступен: не установлен — sh tools/install_silero.sh)"
             )
+        info = silero_worker_info()
+        if info["running"]:
+            head = f"silero (worker, pid {info['pid']}"
+        else:
+            head = "silero (worker не запущен"
         text = (
-            f"silero (голос {runtime.speaker}, {SILERO_SAMPLE_RATE} Гц, "
+            f"{head}; голос {runtime.speaker}, {SILERO_SAMPLE_RATE} Гц, "
             f"{runtime.python.name}, модель {runtime.weights.name}"
         )
+        if info["load_ms"]:
+            text += f", модель грузилась {float(info['load_ms']):.0f} мс"
         if _SILERO_WARMUP_MS is not None:
-            text += f", первый синтез {_SILERO_WARMUP_MS:.0f} мс"
+            text += f", первая фраза {_SILERO_WARMUP_MS:.0f} мс"
         return text + ")"
 
     def _speaker_for(self, requested: str | None) -> str:
@@ -1201,6 +1734,7 @@ class SileroTTS(TTSAdapter):
         rate: int | None = None,
         voice: str | None = None,
     ) -> tuple[list[str], str | None]:
+        """Команда одноразового скрипта (путь 0193, ``SILERO_WORKER=0``)."""
         runtime = self.resolve()
         speaker = self._speaker_for(voice)
         command = [
@@ -1229,6 +1763,141 @@ class SileroTTS(TTSAdapter):
         env["SILERO_SPEAKER"] = runtime.speaker
         return env
 
+    def _worker_timeout(self, timeout: float | None) -> float:
+        """Таймаут запроса к worker'у: ``SILERO_WORKER_TIMEOUT`` или явный меньше."""
+        base = _env_float(
+            self._env, "SILERO_WORKER_TIMEOUT", DEFAULT_SILERO_WORKER_TIMEOUT
+        )
+        # Базовый контракт передаёт DEFAULT_TIMEOUT (120 с), даже когда
+        # значение не задавали: для фразы это бессмысленно долго.
+        if timeout is None or float(timeout) >= DEFAULT_TIMEOUT:
+            return base
+        return max(1.0, min(base, float(timeout)))
+
+    def _worker_start_timeout(self) -> float:
+        return _env_float(
+            self._env,
+            "SILERO_WORKER_START_TIMEOUT",
+            DEFAULT_SILERO_WORKER_START_TIMEOUT,
+        )
+
+    def prewarm(self) -> int | None:
+        """Поднять worker заранее (и прогреть синтез), вернуть его pid.
+
+        Нужен серверу/голосовому циклу, если первая фраза не должна платить
+        ~1,5–2,5 с за torch и модель: вызовите до первого запроса синтеза.
+        Короткий пробный синтез во временный файл догревает TorchScript
+        (первый ``apply_tts`` на ~1,2 с дороже остальных), поэтому после
+        prewarm первая настоящая фраза идёт за ~0,05–0,2 с.
+        """
+        runtime = self.resolve()
+        script = find_silero_worker(None, env=self._env)
+        timeout = self._worker_timeout(None)
+        with _SILERO_WORKER_LOCK:
+            worker = _silero_worker_ensure(
+                runtime,
+                script=script,
+                speaker=runtime.speaker,
+                timeout=timeout,
+                start_timeout=self._worker_start_timeout(),
+                env=self.subprocess_env(),
+            )
+            with tempfile.TemporaryDirectory(prefix="eva-silero-warmup-") as tmp:
+                try:
+                    worker.synthesize(
+                        "Э.",
+                        runtime.speaker,
+                        Path(tmp) / "warmup.wav",
+                        timeout=min(timeout, 10.0),
+                    )
+                except TTSError as exc:
+                    # Прогрев не обязателен: фраза всё равно синтезируется,
+                    # просто первый вызов будет дороже.
+                    logger.debug("silero: прогрев синтеза не удался (%s)", exc)
+        return worker.pid
+
+    def _synthesize_with_worker(
+        self,
+        text: str,
+        target: Path,
+        speaker: str,
+        runtime: _SileroRuntime,
+        timeout: float,
+    ) -> SynthesisResult:
+        """Фраза через worker: lock, один перезапуск при падении, таймаут."""
+        script = find_silero_worker(None, env=self._env)
+        worker_timeout = self._worker_timeout(timeout)
+        start_timeout = self._worker_start_timeout()
+        env = self.subprocess_env()
+        target = _prepare_target(target)
+        started = time.perf_counter()
+
+        with _SILERO_WORKER_LOCK:
+            worker = _silero_worker_ensure(
+                runtime,
+                script=script,
+                speaker=speaker,
+                timeout=worker_timeout,
+                start_timeout=start_timeout,
+                env=env,
+            )
+            attempt = 0
+            while True:
+                try:
+                    worker.synthesize(
+                        text, speaker, target, timeout=worker_timeout
+                    )
+                    break
+                except _WorkerTimeout as exc:
+                    # Зависший процесс бесполезен: убиваем. Следующий вызов
+                    # поднимет worker заново (это и есть «перезапуск»), а
+                    # текущая фраза уходит на Piper — ждать 2×20 с нельзя.
+                    _drop_silero_worker()
+                    raise TTSError(
+                        f"silero: {exc}; worker остановлен, "
+                        "следующий вызов поднимет его заново"
+                    ) from None
+                except _WorkerGone as exc:
+                    _drop_silero_worker()
+                    if attempt >= SILERO_WORKER_RESTARTS:
+                        raise TTSError(
+                            f"silero: worker падает повторно ({exc})"
+                        ) from None
+                    attempt += 1
+                    logger.warning(
+                        "silero: worker упал (%s) — перезапускаю (попытка %d из %d)",
+                        exc,
+                        attempt,
+                        SILERO_WORKER_RESTARTS,
+                    )
+                    worker = _silero_worker_ensure(
+                        runtime,
+                        script=script,
+                        speaker=speaker,
+                        timeout=worker_timeout,
+                        start_timeout=start_timeout,
+                        env=env,
+                    )
+
+        synth_ms = (time.perf_counter() - started) * 1000.0
+        try:
+            size = target.stat().st_size if target.is_file() else 0
+        except OSError:
+            size = 0
+        if size <= MIN_WAV_BYTES:
+            raise TTSError(
+                f"silero: worker не создал аудио ({target}). "
+                "Проверьте голос/модель и права на запись."
+            )
+        # Worker отвечает целиком после синтеза, поэтому «первый фрагмент» =
+        # полное время (как у ElevenLabs: потоковой отдачи байт нет).
+        return SynthesisResult(
+            path=target,
+            synth_ms=synth_ms,
+            first_fragment_ms=synth_ms,
+            engine=self.name,
+        )
+
     def synthesize_timed(
         self,
         text: str,
@@ -1238,7 +1907,12 @@ class SileroTTS(TTSAdapter):
         voice: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
     ) -> SynthesisResult:
-        """Синтез с LRU-кэшем повторных фраз и замером холодного старта."""
+        """Синтез через worker с LRU-кэшем и замером первой фразы.
+
+        ``SILERO_WORKER=0`` возвращает одноразовый путь 0193
+        (``tools/silero_speak.py``): он нужен для отладки и как аварийный
+        обход, если worker на машине не работает.
+        """
         global _SILERO_WARMUP_MS
         clean = _clean_text(text)
         target = Path(out_path).expanduser()
@@ -1265,9 +1939,15 @@ class SileroTTS(TTSAdapter):
                     engine=self.name,
                 )
 
-        result = super().synthesize_timed(
-            clean, target, rate=rate, voice=voice, timeout=timeout
-        )
+        if _env_flag(self._env, "SILERO_WORKER", True):
+            result = self._synthesize_with_worker(
+                clean, target, speaker, runtime, timeout
+            )
+        else:
+            result = super().synthesize_timed(
+                clean, target, rate=rate, voice=voice, timeout=timeout
+            )
+
         if use_cache:
             try:
                 data = target.read_bytes()
@@ -1278,8 +1958,8 @@ class SileroTTS(TTSAdapter):
         if _SILERO_WARMUP_MS is None:
             _SILERO_WARMUP_MS = result.synth_ms
             logger.info(
-                "silero: первый синтез %.0f мс (torch + модель v4_ru в "
-                "отдельном процессе; повторные одинаковые фразы — из кэша)",
+                "silero: первая фраза %.0f мс (старт worker'а: torch + модель "
+                "v4_ru; дальше модель уже загружена)",
                 result.synth_ms,
             )
         return result

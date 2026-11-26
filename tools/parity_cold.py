@@ -941,7 +941,11 @@ def ensure_probe_built(workdir: Path, cc: str) -> Path:
     cmd = [
         cc, "-std=c99", "-O2", "-Wall", "-Wextra", "-D_GNU_SOURCE",
         "-I", str(VTM_INCLUDE), "-o", str(binary), str(source),
-        str(VTM_LIB), "-lm",
+        str(VTM_LIB),
+        # На Darwin libvtm.a содержит backend_metal.o (Metal/Foundation).
+        *(["-framework", "Metal", "-framework", "Foundation"]
+          if sys.platform == "darwin" else []),
+        "-lm",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:

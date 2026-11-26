@@ -1718,6 +1718,13 @@ static int q4k_batch_parity_kernel(void) {
     return 1;
 }
 
+// При metal-бэкенде эталонный поштучный путь идёт на GPU (иной порядок
+// суммирования), а батчевый пока остаётся на CPU: побитового паритета тут нет,
+// контракт 0192 — Δ ≤ 1e-2 (как у int8-пути).
+static double qk_batch_tol(void) {
+    return vtm_metal_active() ? 2.0 * CHECK_TOL_I8 : CHECK_TOL;
+}
+
 static void check_q4k_batch_case(int rows, int cols, int ntok, int q6) {
     int n = rows * cols;
     uint32_t seed = 0x3e00u + (uint32_t)rows * 29u + (uint32_t)cols * 7u
@@ -1760,7 +1767,7 @@ static void check_q4k_batch_case(int rows, int cols, int ntok, int q6) {
     snprintf(label, sizeof label, "%s TMV-батч %dx%dx%d",
              q6 ? "Q6_K" : "Q4_K", rows, cols, ntok);
     report(label, max_diff(y_bat, y_ref, (size_t)rows * (size_t)ntok, &ref),
-           ref, CHECK_TOL);
+           ref, qk_batch_tol());
 
     // 0189: батчевое int8-ядро обязано быть ПОБИТОВО равно поштучному при
     // любом числе плоскостей: оно зовёт ту же функцию строки, что декод,
@@ -1789,7 +1796,7 @@ static void check_q4k_batch_case(int rows, int cols, int ntok, int q6) {
                    ? max_diff(y_bat, y_ref,
                               (size_t)rows * (size_t)ntok, &ref)
                    : 1e9,
-               ref, CHECK_TOL);
+               ref, qk_batch_tol());
     }
     vtm_q4k_i8_set_mode(-1);
 done:
@@ -3678,6 +3685,170 @@ static float *copy_logits(vtm_t *m, int *n_out, int *argmax) {
     return out;
 }
 
+// --- Metal-бэкенд: точность и скорость декода (задача 0192) ----------------
+//
+// Один процесс, одна загрузка модели. Точность: три промпта по 5 токенов,
+// SIMD-эталон и metal, сравниваются сырые логиты и argmax (контракт 0192 —
+// Δlogits ≤ 1e-2). Скорость: префикс по токену и N шагов greedy-декода для
+// обоих бэкендов, берётся минимум из двух повторов. Печатается статистика
+// Metal: время инициализации/компиляции MSL, zero-copy байты, копии,
+// currentAllocatedSize и phys_footprint до/после.
+static int metal_step(vtm_t *m, int token, int pos, int *out) {
+    *out = -1;
+    vtm_set_position(m, pos);
+    vtm_set_token(m, token);
+    return vtm_run(m, emit_first, out) == VTM_OK ? 0 : -1;
+}
+
+static float *metal_bench_logits(vtm_t *m, const vtm_backend *b,
+                                 const int *ids, int n, int *n_out,
+                                 int *argmax) {
+    int i, out = -1;
+
+    vtm_set_backend(m, b);
+    vtm_reset(m);
+    for (i = 0; i < n; i++)
+        if (metal_step(m, ids[i], i, &out) != 0) return NULL;
+    return copy_logits(m, n_out, argmax);
+}
+
+static int metal_bench_decode(vtm_t *m, const vtm_backend *b,
+                              const int *prompt, int np, int ngen,
+                              double *prefill_ms, double *ms_per_tok) {
+    int i, pos, tok = -1, next = -1;
+    double t0, t1;
+
+    vtm_set_backend(m, b);
+    vtm_reset(m);
+    t0 = now_ms();
+    for (i = 0; i < np - 1; i++)
+        if (metal_step(m, prompt[i], i, &next) != 0) return -1;
+    t1 = now_ms();
+    *prefill_ms = t1 - t0;
+    if (metal_step(m, prompt[np - 1], np - 1, &tok) != 0) return -1;
+    pos = np;
+    t0 = now_ms();
+    for (i = 0; i < ngen; i++) {
+        if (metal_step(m, tok, pos, &next) != 0) return -1;
+        tok = next;
+        pos++;
+    }
+    t1 = now_ms();
+    *ms_per_tok = (t1 - t0) / (double)ngen;
+    return 0;
+}
+
+static int run_metal_bench(const char *explicit_path, int ngen) {
+    static const int prompts[3][5] = {
+        {1, 2, 3, 4, 5},
+        {100, 200, 300, 400, 500},
+        {1000, 2000, 3000, 4000, 5000}
+    };
+    const char *path = find_model(explicit_path);
+    const vtm_backend *simd = vtm_backend_by_name("simd");
+    const vtm_backend *metal = vtm_backend_by_name("metal");
+    vtm_metal_stats st;
+    vtm_t *m;
+    size_t rss0, rss_load;
+    int pi, i, rc = 0;
+
+    if (!path) {
+        fprintf(stderr, "модель не найдена (--metal PATH)\n");
+        return 2;
+    }
+    if (!metal || !metal->name || strcmp(metal->name, "metal") != 0) {
+        printf("metal: бэкенд недоступен в этой сборке — откат проверен, "
+               "замер пропущен\n");
+        return 0;
+    }
+    if (ngen < 1) ngen = 1;
+    printf("модель: %s\n", path);
+    rss0 = rss_bytes();
+    m = vtm_load(path);
+    if (!m) {
+        fprintf(stderr, "vtm_load(%s): %s\n", path, vtm_last_error());
+        return 1;
+    }
+    rss_load = rss_bytes();
+    printf("точность (3 промпта по 5 токенов, эталон simd):\n");
+    for (pi = 0; pi < 3; pi++) {
+        float *ref = NULL, *got = NULL;
+        int n_ref = 0, n_got = 0, tok_ref = -1, tok_got = -1;
+        double d, refmax = 0.0;
+
+        ref = metal_bench_logits(m, simd, prompts[pi], 5, &n_ref, &tok_ref);
+        got = metal_bench_logits(m, metal, prompts[pi], 5, &n_got, &tok_got);
+        if (!ref || !got || n_ref != n_got) {
+            fprintf(stderr, "metal: логиты не получены (промпт %d)\n", pi);
+            free(ref);
+            free(got);
+            rc = 1;
+            continue;
+        }
+        d = max_diff(got, ref, (size_t)n_ref, &refmax);
+        printf("  промпт %d: max|Δlogits|=%.3e (max|ref|=%.2f), argmax "
+               "%d/%d %s\n", pi + 1, d, refmax, tok_ref, tok_got,
+               tok_ref == tok_got ? "(совпал)" : "(РАЗОШЁЛСЯ)");
+        if (tok_ref != tok_got || d > 1e-2) rc = 1;
+        free(ref);
+        free(got);
+    }
+
+    printf("декод (префикс 5, %d токенов, min из 2):\n", ngen);
+    {
+        const vtm_backend *bs[2];
+        double best[2] = {1e300, 1e300};
+        double pre[2] = {0.0, 0.0};
+
+        bs[0] = simd;
+        bs[1] = metal;
+        for (i = 0; i < 2; i++) {
+            int rep;
+            for (rep = 0; rep < 2; rep++) {
+                double prefill = 0.0, ms = 0.0;
+                if (metal_bench_decode(m, bs[i], prompts[0], 5, ngen,
+                                       &prefill, &ms) != 0) {
+                    fprintf(stderr, "metal: декод %s — ошибка\n",
+                            bs[i]->name);
+                    rc = 1;
+                    continue;
+                }
+                if (rep == 0 || prefill < pre[i]) pre[i] = prefill;
+                if (ms < best[i]) best[i] = ms;
+            }
+        }
+        for (i = 0; i < 2; i++)
+            printf("  %-10s prefill %.1f мс, декод %.2f мс/токен = %.1f "
+                   "ток/с\n", bs[i]->name, pre[i], best[i],
+                   1000.0 / best[i]);
+        if (best[0] < 1e299 && best[1] < 1e299)
+            printf("  ускорение декода: %.2fx\n", best[0] / best[1]);
+    }
+
+    vtm_metal_stats_get(&st);
+    printf("metal stats: init %llu мс (MSL %llu мс), вызовов %llu, отказов "
+           "%llu\n", (unsigned long long)st.init_ms,
+           (unsigned long long)st.compile_ms,
+           (unsigned long long)st.calls, (unsigned long long)st.failures);
+    printf("  zero-copy: %.1f МиБ привязано без копии, копий %.1f МиБ; "
+           "currentAllocatedSize %.1f МиБ (до init %.1f, после %.1f)\n",
+           (double)st.nocopy_bytes / (1024.0 * 1024.0),
+           (double)st.copy_bytes / (1024.0 * 1024.0),
+           (double)st.current_allocated / (1024.0 * 1024.0),
+           (double)st.alloc_before / (1024.0 * 1024.0),
+           (double)st.alloc_after / (1024.0 * 1024.0));
+    printf("  phys_footprint: до загрузки %.1f МиБ, после загрузки %.1f МиБ, "
+           "сейчас %.1f МиБ (Δ после GPU %.1f МиБ)\n",
+           (double)rss0 / (1024.0 * 1024.0),
+           (double)rss_load / (1024.0 * 1024.0),
+           (double)rss_bytes() / (1024.0 * 1024.0),
+           ((double)rss_bytes() - (double)rss_load) / (1024.0 * 1024.0));
+    if (st.last_error[0])
+        printf("  последняя ошибка Metal: %s\n", st.last_error);
+    vtm_free(m);
+    return rc;
+}
+
 static int run_prefill_check(const char *explicit_path, int ntok) {
     const char *path = find_model(explicit_path);
     int32_t *ids = NULL;
@@ -4566,6 +4737,8 @@ int main(int argc, char **argv) {
     int emb_check_path_set = 0, i8_gemv = 0, i8_f32_table = 0;
     const char *qk_proj_path = NULL;
     const char *emb_check_path = NULL;
+    const char *metal_bench_path = NULL;
+    int metal_new = 16;
     const char *backend_name = NULL;
     const vtm_backend *cand;
     int i;
@@ -4597,6 +4770,10 @@ int main(int argc, char **argv) {
             q4_batch = 1;
         } else if (strcmp(argv[i], "--scale-block") == 0 && i + 1 < argc) {
             scale_block = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--metal") == 0) {
+            metal_bench_path = (i + 1 < argc) ? argv[++i] : "";
+        } else if (strcmp(argv[i], "--metal-new") == 0 && i + 1 < argc) {
+            metal_new = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
             backend_name = argv[++i];
         } else if (strcmp(argv[i], "--check") == 0) {
@@ -4695,6 +4872,9 @@ int main(int argc, char **argv) {
         return run_i8_gemv_bench(rows, cols, iters, i8_f32_table);
     if (qk_proj_path)
         return run_qk_proj(*qk_proj_path ? qk_proj_path : NULL, iters);
+    if (metal_bench_path)
+        return run_metal_bench(*metal_bench_path ? metal_bench_path : NULL,
+                               metal_new);
     if (decode_bench_path)
         return run_decode_bench(*decode_bench_path ? decode_bench_path : NULL,
                                 decode_prompts_path, decode_new, decode_reps);

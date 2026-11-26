@@ -17,9 +17,44 @@
 #endif
 #include "vtm.h"
 #include "vtm_backend.h"
+#include <string.h>
+
+// Metal-бэкенд (0192) собирается только на Darwin; см. src/vtm/Makefile.
+#ifndef VTM_WITH_METAL
+#define VTM_WITH_METAL 0
+#endif
+
+// Заглушки Metal-API для сборки без Metal (WITH_METAL=0, не-Darwin): тесты и
+// bench_backend ссылаются на эти символы независимо от наличия бэкенда.
+#if !VTM_WITH_METAL
+int vtm_metal_available(void) { return 0; }
+int vtm_metal_compiled(void) { return 0; }
+int vtm_metal_active(void) { return 0; }
+void vtm_metal_set_active(int on) { (void)on; }
+void vtm_metal_forget_all(void) { }
+double vtm_metal_min_mac(void) { return 0.0; }
+const vtm_backend *vtm_backend_metal(void) { return NULL; }
+int vtm_metal_q4k_gemv(float *y, const uint8_t *b, const float *x, int r,
+                       int c) {
+    (void)y; (void)b; (void)x; (void)r; (void)c;
+    return -1;
+}
+int vtm_metal_q6k_gemv(float *y, const uint8_t *b, const float *x, int r,
+                       int c) {
+    (void)y; (void)b; (void)x; (void)r; (void)c;
+    return -1;
+}
+int vtm_metal_i8_gemv(float *y, const int8_t *q, const float *sc,
+                      const float *x, int r, int c) {
+    (void)y; (void)q; (void)sc; (void)x; (void)r; (void)c;
+    return -1;
+}
+void vtm_metal_stats_get(vtm_metal_stats *out) {
+    if (out) memset(out, 0, sizeof *out);
+}
+#endif
 
 #include <math.h>
-#include <string.h>
 
 #if !defined(_WIN32) && !defined(VTM_NO_THREADS)
 #define VTM_HAVE_PTHREAD 1
@@ -2166,6 +2201,19 @@ static int qk_tmv(float *y, const uint8_t *blocks, const float *x, int rows,
     job.x = x;
     job.cols = cols;
     job.kind = kind;
+#if VTM_WITH_METAL
+    // GPU-путь декода (0192): те же GEMV, но на Metal. Отказ (-1: нет
+    // устройства/шейдера/буфера, форма не кратна блоку) — прежний CPU-путь
+    // ниже, прогон не падает. VTM_Q4K_STRICT=1 — эталонное f64-накопление,
+    // GPU его не повторяет, поэтому strict всегда идёт мимо Metal.
+    if (!q4k_strict_env() && vtm_metal_active()
+        && (double)rows * (double)cols >= vtm_metal_min_mac()) {
+        const int rc = kind == VTM_TENSOR_Q6K
+                     ? vtm_metal_q6k_gemv(y, blocks, x, rows, cols)
+                     : vtm_metal_q4k_gemv(y, blocks, x, rows, cols);
+        if (rc == 0) return 0;
+    }
+#endif
 #if VTM_Q4_NEON
     if (q4_simd_enabled() && vtm_simd_available()) {
         // int8-dot декод (0169): активации квантуются один раз на токен,
@@ -2523,6 +2571,15 @@ int vtm_i8_gemv(float *y, const int8_t *q, const float *scales,
     if (!y || !q || !scales || !x) return -1;
     if (rows < 0 || cols < 0) return -1;
     if (!rows || !cols) return 0;
+#if VTM_WITH_METAL
+    // int8-таблица словаря (kind 4) на GPU (0192). GPU считает f32-аккумулятор,
+    // а не int8-плоскости; точность выше, argmax/Δ укладываются в 1e-2.
+    if (!q4k_strict_env() && vtm_metal_active()
+        && (double)rows * (double)cols >= vtm_metal_min_mac()) {
+        if (vtm_metal_i8_gemv(y, q, scales, x, rows, cols) == 0)
+            return 0;
+    }
+#endif
 #if VTM_Q4_NEON
     if (q4_simd_enabled() && vtm_simd_available()) {
         const int planes = q4k_strict_env() ? 0 : vtm_q4k_i8_mode();
@@ -2540,6 +2597,24 @@ int vtm_i8_gemv(float *y, const int8_t *q, const float *scales,
     job.cols = cols;
     vtm_parallel_rows(rows, (double)rows * (double)cols, i8_tmv_worker, &job);
     return 0;
+}
+
+// Сообщить диспетчеру, какой бэкенд сейчас у машины: vtm_set_backend() может
+// сменить metal на simd/scalar уже после выбора из env, и GEMV kind 4/6/7 не
+// должны остаться на GPU. Зовётся из loader.c (одна строка) и из выбора.
+// Закрыть Metal-кэш перед освобождением модели (no-copy буферы держат VA).
+void vtm_backend_forget_metal(void) {
+#if VTM_WITH_METAL
+    vtm_metal_forget_all();
+#endif
+}
+
+void vtm_backend_note_active(const vtm_backend *b) {
+#if VTM_WITH_METAL
+    vtm_metal_set_active(b && b->name && strcmp(b->name, "metal") == 0);
+#else
+    (void)b;
+#endif
 }
 
 // --- публичные описатели бэкендов -----------------------------------------

@@ -5474,6 +5474,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         print("история диалога: выключена (--history-tokens 0)")
+    # Голос по умолчанию — Silero (локальный нейроголос). Его worker грузит
+    # torch+модель ~1,5–2,5 с, поэтому поднимаем фоном заранее: первая фраза
+    # звучит за 0,05–0,2 с вместо 3 с (задача 0195). Нет Silero — no-op.
+    try:
+        from eva.tts import prewarm_silero_worker
+
+        prewarm_silero_worker()
+    except Exception as exc:  # noqa: BLE001 - голос не должен мешать запуску
+        logger.info("silero: прогрев не запущен: %s", exc)
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

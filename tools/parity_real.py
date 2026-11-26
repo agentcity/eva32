@@ -113,6 +113,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -506,6 +507,9 @@ def build_probe_compile_command(
         str(workdir / "parity_probe"),
         str(workdir / "parity_probe.c"),
         str(lib),
+        # На Darwin libvtm.a содержит backend_metal.o (Metal/Foundation).
+        *(["-framework", "Metal", "-framework", "Foundation"]
+          if sys.platform == "darwin" else []),
         "-lm",
     ]
 

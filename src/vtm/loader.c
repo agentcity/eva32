@@ -2500,6 +2500,9 @@ vtm_t *vtm_load(const char *path) {
 
 void vtm_free(vtm_t *m) {
     if (!m) return;
+    // No-copy MTLBuffer'ы смотрят в mmap/арену: закрыть их до освобождения
+    // памяти (иначе кэш Metal переживёт страницы).
+    vtm_backend_forget_metal();
 #if !defined(_WIN32)
     if (m->fd >= 0) {
         close(m->fd);
@@ -2582,6 +2585,9 @@ const vtm_instr *vtm_instruction(const vtm_t *m, uint32_t index) {
 void vtm_set_backend(vtm_t *m, const vtm_backend *backend) {
     if (!m) return;
     m->backend = backend ? backend : vtm_backend_from_env();
+    // Одна строка вне зоны 0192, но без неё GEMV kind 4/6/7 остались бы на GPU
+    // после явной смены бэкенда на scalar/simd (см. vtm_backend.h).
+    vtm_backend_note_active(m->backend);
 }
 
 const char *vtm_backend_name(const vtm_t *m) {

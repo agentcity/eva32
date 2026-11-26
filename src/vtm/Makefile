@@ -24,6 +24,31 @@ LDFLAGS  ?=
 # на Linux нужен -lpthread. Отдельная переменная: LDLIBS задают снаружи.
 THREAD_LIBS ?= -lpthread
 
+# --- Metal-бэкенд (задача 0192, ADR 0021) ---------------------------------
+# backend_metal.m — Objective-C: MTLDevice/MTLBuffer и GEMV-ядра. Веса не
+# копируются: newBufferWithBytesNoCopy на срез mmap-региона контейнера.
+#
+# MSL (vtm_metal.metal) по умолчанию встраивается в vtm_metal_kernels.h и
+# компилируется в рантайме (newLibraryWithSource): так сборка работает без
+# Metal Toolchain (Xcode 26 выносит компилятор metal в скачиваемый компонент,
+# `xcrun metal` без него падает). Если Toolchain есть, `make metallib` (или
+# `make all` при найденном компиляторе) собирает vtm.metallib, и бэкенд
+# загрузит его вместо исходника. Сборка без Metal: WITH_METAL=0 или не-Darwin
+# — TU не добавляется, тесты проходят на CPU.
+UNAME_S := $(shell uname -s)
+WITH_METAL ?= $(if $(filter Darwin,$(UNAME_S)),1,0)
+METAL_TC := $(shell xcrun -sdk macosx metal --version >/dev/null 2>&1 && echo 1 || echo 0)
+ifeq ($(WITH_METAL),1)
+CPPFLAGS += -DVTM_WITH_METAL=1
+METAL_OBJ = backend_metal.o
+METAL_HDR = vtm_metal_kernels.h
+PLATFORM_LIBS += -framework Metal -framework Foundation
+else
+METAL_OBJ =
+METAL_HDR =
+PLATFORM_LIBS =
+endif
+
 LIB      = libvtm.a
 BIN      = vtm
 # SIMD-ядра: backend_neon.c собирается всегда (на ARM — NEON, иначе только
@@ -56,18 +81,36 @@ BENCH_BIN = bench_backend
 TSAN_SRC = ../../tests/vtm/tsan_pool.c
 TSAN_BIN = tsan_pool
 
-.PHONY: all test test-all ci tsan bench bench-backend bench-sha clean
+.PHONY: all test test-all ci tsan bench bench-backend bench-sha metallib clean
 
 all: $(BIN)
+# При установленном Metal Toolchain заодно собираем metallib: бэкенд загрузит
+# его вместо рантайм-компиляции MSL. Без Toolchain молча остаётся рантайм.
+ifeq ($(METAL_TC),1)
+all: metallib
+endif
 
 $(BIN): main.o $(LIB) $(BRIDGE) $(TOK_OBJ)
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ main.o $(LIB) $(BRIDGE) $(TOK_OBJ) $(LDLIBS) $(THREAD_LIBS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ main.o $(LIB) $(BRIDGE) $(TOK_OBJ) $(LDLIBS) $(THREAD_LIBS) $(PLATFORM_LIBS)
 
-$(LIB): $(OBJ)
-	$(AR) rcs $@ $(OBJ)
+$(LIB): $(OBJ) $(METAL_OBJ)
+	$(AR) rcs $@ $(OBJ) $(METAL_OBJ)
 
 %.o: %.c vtm.h vtm_internal.h vtm_backend.h sha256.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -c -o $@ $<
+
+# MSL -> C-строка для рантайм-компиляции. Файл генерируемый, в git не нужен.
+$(METAL_HDR): vtm_metal.metal
+	@python3 -c 'import sys; s=open(sys.argv[1]).read(); print("/* сгенерировано из vtm_metal.metal, не править */"); print("static const char vtm_metal_msl[] ="); [print("\""+l.replace("\\","\\\\").replace("\"","\\\"")+"\\n\"") for l in s.splitlines()]; print(";")' $< > $@
+
+# -std=c99 не годится для .m; остальные флаги (включая -Werror) сохраняем.
+backend_metal.o: backend_metal.m $(METAL_HDR) vtm.h vtm_internal.h vtm_backend.h
+	$(CC) $(CPPFLAGS) $(filter-out -std=c99,$(CFLAGS)) -std=gnu11 -I. -c -o $@ $<
+
+# Необязательный metallib: без Metal Toolchain цель честно говорит, что MSL
+# будет компилироваться в рантайме, и не валит сборку.
+metallib: vtm_metal.metal
+	@if xcrun -sdk macosx metal --version >/dev/null 2>&1; then 	  xcrun -sdk macosx metal -c -o vtm_metal.air vtm_metal.metal && 	  xcrun -sdk macosx metallib -o vtm.metallib vtm_metal.air && 	  echo "OK: vtm.metallib"; 	else 	  echo "Metal Toolchain недоступен — MSL компилируется в рантайме"; 	fi
 
 # api.c использует <stdatomic.h> (C11) для флага отмены и признака «занято».
 # Остальные файлы остаются на C99; -std=c11 идёт после CFLAGS намеренно,
@@ -85,32 +128,32 @@ $(TOK_OBJ): tokenizer.cpp tokenizer.hpp
 
 $(TEST_BIN): $(TEST_SRC) $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -I../.. -o $@ $(TEST_SRC) $(LIB) \
-		$(LDLIBS) $(THREAD_LIBS)
+		$(LDLIBS) $(THREAD_LIBS) $(PLATFORM_LIBS)
 
 # SHA-256 отдельно от интерпретатора: векторы, аппаратный путь против
 # портативного, откат и подмена байта в контейнере (задача 0078).
 $(TEST_SHA_BIN): $(TEST_SHA_SRC) $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -I../.. -o $@ $(TEST_SHA_SRC) $(LIB) \
-		$(LDLIBS) $(THREAD_LIBS)
+		$(LDLIBS) $(THREAD_LIBS) $(PLATFORM_LIBS)
 
 # C-ABI: колбэк стриминга и отмена из другого потока (pthread в тесте).
 $(TEST_API_BIN): $(TEST_API_SRC) $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -I../.. -o $@ $(TEST_API_SRC) $(LIB) \
-		$(LDLIBS) $(THREAD_LIBS)
+		$(LDLIBS) $(THREAD_LIBS) $(PLATFORM_LIBS)
 
 # Бенчмарк/проверка SIMD (tests/vtm/bench_backend.c). Собирается тем же CC,
 # что и библиотека, поэтому видит тот же SIMD.
 $(BENCH_BIN): $(BENCH_SRC) $(LIB)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -I../.. -o $@ $(BENCH_SRC) $(LIB) $(LDLIBS) $(THREAD_LIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -I../.. -o $@ $(BENCH_SRC) $(LIB) $(LDLIBS) $(THREAD_LIBS) $(PLATFORM_LIBS)
 
 # Стресс пула для TSan: обычная сборка тоже проходит, но смысл — в `make tsan`.
 $(TSAN_BIN): $(TSAN_SRC) $(LIB)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -I../.. -o $@ $(TSAN_SRC) $(LIB) $(LDLIBS) $(THREAD_LIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -I../.. -o $@ $(TSAN_SRC) $(LIB) $(LDLIBS) $(THREAD_LIBS) $(PLATFORM_LIBS)
 
 # Сессии KV (задача 0079): save/load/continue, обрыв и порча файла.
 $(TEST_SESSION_BIN): $(TEST_SESSION_SRC) $(LIB)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -I. -I../.. -o $@ $(TEST_SESSION_SRC) $(LIB) \
-		$(LDLIBS) $(THREAD_LIBS)
+		$(LDLIBS) $(THREAD_LIBS) $(PLATFORM_LIBS)
 
 # backend_avx2.c собирается без -mavx2: AVX2/FMA включены атрибутами только
 # на функциях-ядрах, чтобы детект CPUID не исполнял AVX2-инструкции.
@@ -261,4 +304,4 @@ bench-sha: $(TEST_SHA_BIN)
 clean:
 	rm -f *.o $(LIB) $(BIN) $(TEST_BIN) \
 		$(TEST_API_BIN) $(TEST_SESSION_BIN) $(TEST_SHA_BIN) $(BENCH_BIN) \
-		$(TSAN_BIN)
+		$(TSAN_BIN) $(METAL_OBJ) $(METAL_HDR) vtm.metallib vtm_metal.air

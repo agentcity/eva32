@@ -1283,7 +1283,7 @@
   {
     "id": "0192",
     "title": "Metal-бэкенд: GEMV и lm_head на GPU",
-    "status": "in_progress",
+    "status": "done",
     "file": "0192-metal-gemv.md",
     "assignee": "agent:metal"
   },
@@ -1297,14 +1297,14 @@
   {
     "id": "0194",
     "title": "Голосовая команда «Стоп, Ева»",
-    "status": "in_progress",
+    "status": "done",
     "file": "0194-stop-command.md",
     "assignee": "agent:stop-command"
   },
   {
     "id": "0195",
     "title": "Silero worker: модель загружена один раз",
-    "status": "in_progress",
+    "status": "done",
     "file": "0195-silero-worker.md",
     "assignee": "agent:silero-worker"
   }

@@ -254,8 +254,11 @@ static int trit_weight_at(const vtm_tensor *t, size_t index, float *out) {
 // доступный SIMD. На скалярном бэкенде ниже остаётся прежний double-цикл,
 // побитовый прогону по токену.
 static int simd_mm_enabled(const vtm_t *m) {
-    return m && m->backend && m->backend->name
-        && strncmp(m->backend->name, "simd", 4) == 0
+    const char *n = (m && m->backend) ? m->backend->name : NULL;
+    // metal (0192) отдаёт на GPU только GEMV kind 4/6/7, а плотные MM/TMV
+    // считает теми же NEON-ядрами, что simd: иначе на metal-бэкенде плотный
+    // lm_head падал бы в скалярный double-цикл.
+    return n && (strncmp(n, "simd", 4) == 0 || strcmp(n, "metal") == 0)
         && vtm_simd_available();
 }
 
@@ -4610,7 +4613,8 @@ static int batch_backend_enabled(const vtm_t *m) {
     if (be == &vtm_backend_scalar_lut || be == &vtm_backend_scalar_direct)
         return 1;
     if (be->name && strncmp(be->name, "scalar", 6) == 0) return 1;
-    if (be->name && strncmp(be->name, "simd", 4) == 0)
+    if (be->name && (strncmp(be->name, "simd", 4) == 0
+                     || strcmp(be->name, "metal") == 0))
         return vtm_simd_available();
     return 0;
 }
@@ -4623,7 +4627,10 @@ static int batch_backend_enabled(const vtm_t *m) {
 // ready), поэтому они уходят в скалярный эталон только при use_simd == 0.
 static int batch_use_simd(const vtm_t *m) {
     const vtm_backend *be = m->backend;
-    return be && be->name && strncmp(be->name, "simd", 4) == 0
+    const char *n = (be && be->name) ? be->name : NULL;
+    // metal (0192) для батча — те же SIMD-ядра: на GPU в фазе 1 уходит только
+    // одноколоночный GEMV, пачка остаётся CPU-путём.
+    return n && (strncmp(n, "simd", 4) == 0 || strcmp(n, "metal") == 0)
         && vtm_simd_available();
 }
 

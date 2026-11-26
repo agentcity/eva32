@@ -798,10 +798,51 @@ typedef struct vtm_backend {
 структуре нет: ROPE/ATTN/KVW остаются скалярными, а SIMD-ядра MM
 (`vtm_simd_mm_trit`/`vtm_simd_mm_f32` из `src/vtm/vtm_backend.h`) `op_mm()`
 вызывает напрямую, когда выбран бэкенд с именем `simd*` и CPU его умеет.
-Выбор бэкенда: `VTM_BACKEND=auto|simd|scalar|lut|direct` (по умолчанию `auto`:
-SIMD, если он собран и CPU его умеет, иначе `scalar-lut243`) или
-`vtm run --backend ...`. Так SIMD подключается без изменения байткода;
-подробности и числа — в `docs/vtm-perf.md`.
+Выбор бэкенда: `VTM_BACKEND=auto|metal|simd|scalar|lut|direct` (по умолчанию
+`auto`: metal, если сборка с Metal и устройство инициализируется, иначе SIMD,
+если он собран и CPU его умеет, иначе `scalar-lut243`) или `vtm run --backend
+...`. Так SIMD подключается без изменения байткода; подробности и числа — в
+`docs/vtm-perf.md`.
+
+### Metal-бэкенд, фаза 1 (задача 0192, ADR 0021)
+
+`VTM_BACKEND=metal` (или `--backend metal`) подменяет только одноколоночные
+GEMV, которые в декоде считают матрицы: kind 6 (Q4_K), kind 7 (Q6_K) и
+int8-таблицу словаря kind 4 (`tied lm_head`). Триты, RMSNorm, softmax,
+attention, KV-кэш и батчевый prefill остаются на CPU: бэкенд `metal` отдаёт
+те же ядра, что `simd`, и подменяет лишь перечисленные GEMV. Сборка —
+`src/vtm/backend_metal.m`, MSL — `src/vtm/vtm_metal.metal`.
+
+- **Zero-copy.** Веса не копируются: `MTLBuffer` создаётся через
+  `newBufferWithBytesNoCopy:` на выровненный вниз до страницы (16 КиБ на Apple
+  Silicon) срез mmap-региона, а смещение тензора внутри среза передаётся ядру
+  аргументом. Кэш буферов — по (указатель, длина), вытеснение LRU; при
+  `vtm_free()` кэш сбрасывается до `munmap`, иначе Metal держал бы старые
+  страницы. Если no-copy невозможен, маленькие буферы (тесты, арена) один раз
+  копируются, большие — отказ и CPU-откат.
+- **Сборка без Metal Toolchain.** Исходник MSL встраивается в
+  `vtm_metal_kernels.h` и компилируется в рантайме через
+  `newLibraryWithSource:`. `make metallib` собирает `vtm.metallib` через
+  `xcrun metal`, если Toolchain установлен (в Xcode 26 это отдельный
+  скачиваемый компонент); бэкенд загрузит `vtm.metallib` из текущего каталога
+  или `VTM_METAL_LIB`, иначе компилирует исходник. Время компиляции видно в
+  `VTM_METAL_STATS=1`.
+- **Точность.** Порядок суммирования на GPU иной, побитового паритета с CPU
+  нет: контракт — argmax и `max|Δlogits| ≤ 1e-2` (на 3B Q4_K замер дал
+  `≤ 8.4e-5`, argmax совпал на трёх промптах).
+- **Порог.** GEMV меньше `VTM_METAL_MIN_MAC` MAC (по умолчанию 1M) остаётся на
+  CPU: накладные Metal на мелких формах (K/V-проекции 256×2048) больше
+  выигрыша — ADR 0021 §5. `VTM_METAL_MIN_MAC=0` отдаёт GPU всё.
+- **Откат.** Нет устройства, не собрался MSL, ошибка командного буфера,
+  неверная форма — ядро возвращает `-1`, диспетчер `backend_scalar.c` идёт
+  прежним CPU-путём, в stderr одна строка с причиной. Прогон не падает.
+- **Диагностика.** `VTM_METAL_STATS=1` печатает на выходе время инициализации
+  и MSL, число вызовов/отказов, zero-copy и скопированные байты,
+  `MTLDevice.currentAllocatedSize`; `VTM_METAL_TRACE=1` — время GPU каждого
+  вызова; `bench_backend --metal PATH` — точность на трёх промптах, декод
+  SIMD против metal и footprint. `currentAllocatedSize` считает и no-copy
+  регистрации (растёт на размер весов), поэтому реальное отсутствие копий
+  подтверждается `copy_bytes ≈ 0` и `phys_footprint` в том же отчёте.
 
 ## CLI
 
@@ -815,9 +856,9 @@ vtm bench [--rows N --cols N --iters N] [--scale-block 128|160]
 vtm --help
 ```
 
-`--backend auto|simd|scalar|lut|direct` перекрывает `VTM_BACKEND`; без обоих
-работает `auto` (то же, что `VTM_BACKEND=auto`): SIMD при доступности, иначе
-`scalar-lut243`. Явный `scalar`/`lut` остаются для отладки и побитового паритета.
+`--backend auto|metal|simd|scalar|lut|direct` перекрывает `VTM_BACKEND`; без
+обоих работает `auto` (то же, что `VTM_BACKEND=auto`): metal при доступности,
+иначе SIMD, иначе `scalar-lut243`. Явный `scalar`/`lut` остаются для отладки и побитового паритета.
 
 Дополнительные опции `vtm run`: `--stop "текст"` (только с `--text`:
 остановиться, когда декодированный текст кончается на строку; можно
