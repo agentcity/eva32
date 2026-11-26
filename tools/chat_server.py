@@ -189,6 +189,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from eva.chat_template import DEFAULT_REASONING_BUDGET  # noqa: E402
+from eva.plugins import (  # noqa: E402
+    DEFAULT_FACT_LIMIT,
+    PluginError,
+    PluginNotFound,
+    PluginRegistry,
+    PluginRestartRequired,
+    default_registry as default_plugin_registry,
+)
+from eva.skills.intent import with_fact  # noqa: E402
 from eva.ru_gender import GenderStreamer, feminize  # noqa: E402
 
 #: Ollama — только этот адрес; клиент не может подставить свой.
@@ -1871,6 +1880,42 @@ def _last_question(messages: Sequence[Mapping[str, str]]) -> str:
     return ""
 
 
+def _fresh_fact(question: str, server: Any = None) -> str:
+    """Блок ``[Факт: …]`` из включённых skill-плагинов; пусто — фактов нет.
+
+    Задача 0209: ядро больше не знает про время/курс/котировки — оно спрашивает
+    все включённые плагины способности ``skill.fetch`` и склеивает их ответы
+    (не больше ``DEFAULT_FACT_LIMIT``). Сеть и права — на стороне плагина:
+    рантайм передаёт ему ``PluginContext`` с allowlist.
+
+    Любой сбой этого пути (плагин, сеть, парсинг) — пустая строка: чат не
+    должен падать и не должен отвечать 500 из-за недоступного ЦБ.
+    ``server`` нужен, чтобы учитывать включение/выключение через
+    ``POST /api/plugins`` без перезапуска; без него — общий реестр процесса.
+    """
+    registry = getattr(server, "plugins", None)
+    if not isinstance(registry, PluginRegistry):
+        try:
+            # Не ``default_registry``: в этом модуле так называется реестр
+            # бэкендов, и одноимённый вызов вернул бы кортеж, а не реестр
+            # плагинов (задача 0208: факты молча пропадали).
+            registry = default_plugin_registry()
+        except Exception:  # noqa: BLE001 — данные не стоят сломанного запроса
+            logger.exception("плагины: реестр не поднялся")
+            return ""
+    limit = getattr(server, "facts_limit", DEFAULT_FACT_LIMIT)
+    try:
+        facts = registry.collect_facts(question, limit=limit)
+    except Exception:  # noqa: BLE001 — данные не стоят сломанного запроса
+        logger.exception("плагины: сбор фактов упал")
+        return ""
+    if not facts:
+        return ""
+    line = "\n".join(fact.line() for fact in facts)
+    logger.debug("факты плагинов: %s", line.replace("\n", " | "))
+    return line
+
+
 def _registry_json(
     registry: Sequence[BackendSpec], *, max_tokens: int
 ) -> dict[str, Any]:
@@ -2214,9 +2259,19 @@ def _run_side(
     answer_for_history = ""
     delta_buffer: list[str] = []
     delta_flushed = time.monotonic()
-    # Женский род в первом лице (задача 0207): модель 3B пишет «я понял».
-    # Замена идёт по словам прямо в потоке, поэтому клиент и история получают
-    # один и тот же текст; недописанное слово стример придерживает до границы.
+    # Фильтры ответа (задачи 0207/0209): «я понял» → «я поняла» и прочая
+    # постобработка живут и в плагинах (``plugins/ru-gender``), и в ядре.
+    # Рантайм отдаёт потоковую стадию на каждую колонку (у стримера своё
+    # состояние), поэтому два ответа рядом не делят недописанное слово.
+    # ``GenderStreamer`` ниже — страховка на случай, если плагин рода не
+    # найден или выключен: ``feminize`` идемпотентна, двойной прогон (плагин +
+    # ядро) ничего не портит, а требование «Ева в женском роде» не зависит от
+    # discovery плагинов.
+    filters = (
+        server.plugins.stream_filter(scope="chat")
+        if server is not None
+        else None
+    )
     gender = GenderStreamer()
     try:
         iterator = iter(adapter.stream(messages, max_tokens=max_tokens))
@@ -2233,7 +2288,8 @@ def _run_side(
                             first_token_ms = max(
                                 0, int((time.monotonic() - started) * 1000)
                             )
-                        spoken = gender.feed(text)
+                        spoken = filters.feed(text) if filters is not None else text
+                        spoken = gender.feed(spoken)
                         if spoken:
                             answer_parts.append(spoken)
                             # Склеиваем куски перед отправкой: у ВТМ токен —
@@ -2277,8 +2333,10 @@ def _run_side(
                 cancelled = True
             # Хвост, ждавший границы слова («я понял» без точки в конце), —
             # в тот же поток и в историю: иначе последнее слово ответа
-            # осталось бы мужским.
-            tail = gender.flush()
+            # осталось бы мужским. Хвост плагина проходит через ядерный
+            # стример, чтобы порядок стадий не терялся.
+            tail = filters.flush() if filters is not None else ""
+            tail = gender.feed(tail) + gender.flush()
             if tail:
                 answer_parts.append(tail)
                 delta_buffer.append(tail)
@@ -2292,7 +2350,8 @@ def _run_side(
             if callable(closer):
                 closer()
     except BaseException as exc:  # noqa: BLE001 - ошибка одной колонки не рвёт другую
-        tail = gender.flush()
+        tail = filters.flush() if filters is not None else ""
+        tail = gender.feed(tail) + gender.flush()
         if tail:
             answer_parts.append(tail)
             delta_buffer.append(tail)
@@ -4363,6 +4422,9 @@ class ChatHTTPServer(ThreadingHTTPServer):
         history_turns: int = DEFAULT_HISTORY_TURNS,
         think: bool = False,
         reasoning_budget: int = DEFAULT_REASONING_BUDGET,
+        facts: bool = True,
+        facts_limit: int = DEFAULT_FACT_LIMIT,
+        plugins: PluginRegistry | None = None,
         tts: Callable[
             [str, str | None], bytes | tuple[bytes, str]
         ] | None = None,
@@ -4380,6 +4442,19 @@ class ChatHTTPServer(ThreadingHTTPServer):
         # прибавляется к max_tokens, поэтому ответ не теряется никогда.
         self.think = bool(think)
         self.reasoning_budget = max(0, int(reasoning_budget))
+        # Свежие данные (задачи 0208/0209): время, курс ЦБ РФ, котировка MOEX.
+        # Факт подкладывается в системный блок до генерации — модели не нужен
+        # tool-calling, а цифры берутся из источника, а не из весов.
+        self.facts = bool(facts)
+        #: Сколько фактов максимум просить у плагинов (0 — ни одного).
+        self.facts_limit = max(0, int(facts_limit))
+        #: Рантайм плагинов (ADR 0022): discovery, включение и способности.
+        #: Тесты подставляют свой реестр; боевой путь — plugins/ + config.
+        #: Именно ``default_plugin_registry``: ``default_registry`` в этом
+        #: модуле — реестр бэкендов, и одноимённый вызов давал кортеж.
+        self.plugins = (
+            plugins if plugins is not None else default_plugin_registry()
+        )
         # Память диалога (задача 0182): история user/assistant на колонку.
         # 0 токенов — истории нет (каждый вопрос с чистого листа).
         self.history = ChatHistory(
@@ -4563,6 +4638,8 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(200, _model_cards(self.server))
             elif path == "/api/system":
                 self._send_json(200, system_snapshot())
+            elif path == "/api/plugins":
+                self._send_json(200, self.server.plugins.as_dict())
             elif path == "/health":
                 self._send_json(200, {"status": "ok"})
             elif path == "/favicon.ico":
@@ -4608,6 +4685,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/tts":
                 self._handle_tts()
                 return
+            if path == "/api/plugins":
+                self._handle_plugins()
+                return
             if path != "/api/chat":
                 self._send_json(
                     404,
@@ -4623,6 +4703,14 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             question, use_system, max_tokens, sides = _validate_payload(
                 self.server, payload
             )
+            # Свежие данные (задачи 0208/0209): ядро спрашивает включённые
+            # skill-плагины до генерации, факты идут в системный блок обеих
+            # колонок. Сеть — только через PluginContext плагина (allowlist
+            # хостов, таймаут, кэш); сбой → «не удалось получить», а не
+            # выдуманная цифра. Выключенный плагин фактов не даёт.
+            fact = ""
+            if use_system and self.server.facts:
+                fact = _fresh_fact(question, self.server)
             # Запрос у каждой колонки свой (задача 0182): общий системный
             # промпт, её собственная история и текущий вопрос. Историю берём
             # снимком до старта генерации: дописывать её будет уже HTTP-поток
@@ -4636,6 +4724,8 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                     )
                 messages.extend(self.server.history.messages(index))
                 messages.append({"role": "user", "content": question})
+                if fact:
+                    messages = with_fact(messages, fact)
                 side_messages.append(messages)
             self._stream_sides(sides, side_messages, max_tokens)
         except ClientError as exc:
@@ -4859,6 +4949,49 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
             {"cancelled": accepted, "side": raw_side, "reason": "stop"},
         )
 
+    # -- плагины (задача 0209) -----------------------------------------------
+
+    def _handle_plugins(self) -> None:
+        """``POST /api/plugins``: включить/выключить плагин без перезапуска.
+
+        Тело — ``{"id": "time", "enabled": false}``. Ответ — обновлённый
+        список плагинов (как ``GET /api/plugins``) плюс ``changed``: так
+        страница не делает второй запрос. Плагин, который держит состояние,
+        выключать на лету нельзя — 409 с объяснением.
+        """
+        payload = self._read_json_body()
+        if not isinstance(payload, Mapping):
+            raise ClientError("Тело запроса должно быть JSON-объектом.")
+        plugin_id = payload.get("id")
+        if not isinstance(plugin_id, str) or not plugin_id.strip():
+            raise ClientError("Поле id: нужен id плагина (например, time).")
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ClientError("Поле enabled: ожидалось true или false.")
+        try:
+            record = self.server.plugins.set_enabled(
+                plugin_id.strip(), enabled
+            )
+        except PluginNotFound as exc:
+            raise ClientError(
+                str(exc), status=404, code="plugin_not_found"
+            ) from exc
+        except PluginRestartRequired as exc:
+            raise ClientError(
+                str(exc), status=409, code="restart_required"
+            ) from exc
+        except PluginError as exc:
+            raise ClientError(str(exc), code="plugin_error") from exc
+        body = self.server.plugins.as_dict()
+        body["changed"] = {
+            "id": record.id,
+            "enabled": record.enabled,
+        }
+        logger.info(
+            "плагин %s: %s", record.id, "включён" if record.enabled else "выключен"
+        )
+        self._send_json(200, body)
+
     # -- озвучка (задача 0183) -----------------------------------------------
 
     def _handle_tts(self) -> None:
@@ -4903,9 +5036,13 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                     ),
                     code="unknown_voice",
                 )
-        # Сначала род (код в бэктиках ещё виден и не переписывается), потом
-        # чистка разметки — так речь получает женские формы, а код остаётся.
-        text = clean_tts_text(feminize(raw_text))
+        # Сначала фильтры плагинов (0207: род; 0209: числа — scope tts), потом
+        # чистка разметки. Так речь получает женские формы и слова вместо
+        # цифр, а код в бэктиках ещё виден и не переписывается.
+        filtered = self.server.plugins.filter_text(raw_text, scope="tts")
+        # Страховка ядра (задача 0207): плагин ru-gender мог быть не найден или
+        # выключен. feminize идемпотентна, повторный прогон ничего не меняет.
+        text = clean_tts_text(feminize(filtered))
         if not text:
             raise ClientError(
                 "После чистки текста нечего озвучивать: остались только "
@@ -5249,6 +5386,9 @@ def create_server(
     history_turns: int = DEFAULT_HISTORY_TURNS,
     think: bool = False,
     reasoning_budget: int = DEFAULT_REASONING_BUDGET,
+    facts: bool = True,
+    facts_limit: int = DEFAULT_FACT_LIMIT,
+    plugins: PluginRegistry | None = None,
     tts: Callable[[str, str | None], bytes] | None = None,
 ) -> ChatHTTPServer:
     """Собрать сервер; ``port=0`` — свободный порт (удобно тестам).
@@ -5261,6 +5401,10 @@ def create_server(
     нет), ``history_turns`` — максимум последних реплик.
     ``think`` — разрешить рассуждение у ВТМ (по умолчанию нет);
     ``reasoning_budget`` — сколько токенов на него, сверх ``max_tokens``.
+    ``facts`` — подкладывать ли в системный блок ``[Факт: …]`` со свежими
+    данными (время, курс ЦБ, котировка MOEX; ``--no-facts`` выключает).
+    ``facts_limit`` — потолок фактов на запрос; ``plugins`` — готовый реестр
+    плагинов (по умолчанию ``plugins/`` + ``config/plugins.json``).
     """
     if host not in ("127.0.0.1", "::1"):
         raise ValueError(
@@ -5291,6 +5435,10 @@ def create_server(
         raise TypeError("reasoning_budget: ожидалось целое число")
     if reasoning_budget < 0:
         raise ValueError("reasoning_budget: ожидалось >= 0")
+    if isinstance(facts_limit, bool) or not isinstance(facts_limit, int):
+        raise TypeError("facts_limit: ожидалось целое число")
+    if facts_limit < 0:
+        raise ValueError("facts_limit: ожидалось >= 0")
 
     resolved = tuple(registry) if registry is not None else default_registry()
     resolved_adapters = (
@@ -5315,6 +5463,9 @@ def create_server(
         history_turns=history_turns,
         think=bool(think),
         reasoning_budget=int(reasoning_budget),
+        facts=bool(facts),
+        facts_limit=int(facts_limit),
+        plugins=plugins,
         tts=tts,
     )
 
@@ -5408,6 +5559,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="не подмешивать prompts/system.assistant.md",
     )
     parser.add_argument(
+        "--no-facts",
+        dest="facts",
+        action="store_false",
+        help="не подкладывать в системный блок [Факт] со свежими данными "
+        "(время, курс ЦБ, котировка MOEX); по умолчанию включено",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="подробный журнал запросов",
@@ -5443,6 +5601,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             history_turns=args.history_turns,
             think=bool(args.think),
             reasoning_budget=int(args.reasoning_budget),
+            facts=bool(getattr(args, "facts", True)),
         )
     except (OSError, ValueError, TypeError) as exc:
         print("не удалось запустить сервер: {}".format(exc), file=sys.stderr)
@@ -5469,6 +5628,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("автовыгрузка ВТМ: выключена (0 — держать всегда)")
     else:
         print("автовыгрузка ВТМ: после {:.0f} с бездействия".format(server.keep_alive))
+    if server.facts:
+        print("свежие данные: включены ([Факт] со временем, курсом ЦБ, MOEX; --no-facts выключает)")
+    else:
+        print("свежие данные: выключены (--no-facts)")
     if server.history.enabled:
         print(
             "история диалога: {} реплик, ~{} токенов на колонку "

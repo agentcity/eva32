@@ -1,0 +1,15 @@
+{
+  "id": "time",
+  "name": "Время и дата",
+  "version": "1.0.0",
+  "api": 1,
+  "entry": "plugin.py",
+  "capabilities": ["skill.fetch"],
+  "permissions": {"network": [], "filesystem": []},
+  "settings": {},
+  "description": "Текущие дата и время по Москве — из системных часов, без сети",
+  "owner": "eva32",
+  "priority": 10,
+  "scope": "chat",
+  "stateful": false
+}

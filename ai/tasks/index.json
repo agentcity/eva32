@@ -1388,21 +1388,21 @@
   {
     "id": "0208",
     "title": "Скиллы: время, курсы, котировки",
-    "status": "in_progress",
+    "status": "done",
     "file": "0208-eva-tools.md",
     "assignee": "agent:tools"
   },
   {
     "id": "0209",
     "title": "Рантайм плагинов Евы",
-    "status": "in_progress",
+    "status": "done",
     "file": "0209-plugin-runtime.md",
     "assignee": "agent:plugins"
   },
   {
     "id": "0210",
     "title": "Актуализация документации",
-    "status": "in_progress",
+    "status": "done",
     "file": "0210-docs-actualization.md",
     "assignee": "agent:docs"
   }

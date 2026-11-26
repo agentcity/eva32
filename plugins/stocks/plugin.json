@@ -1,0 +1,15 @@
+{
+  "id": "stocks",
+  "name": "Котировки MOEX",
+  "version": "1.0.0",
+  "api": 1,
+  "entry": "plugin.py",
+  "capabilities": ["skill.fetch"],
+  "permissions": {"network": ["iss.moex.com"], "filesystem": []},
+  "settings": {},
+  "description": "Цена акции на MOEX ISS: SBER, GAZP, YDEX и русские названия",
+  "owner": "eva32",
+  "priority": 30,
+  "scope": "chat",
+  "stateful": false
+}

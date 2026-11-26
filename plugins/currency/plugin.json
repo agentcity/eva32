@@ -1,0 +1,15 @@
+{
+  "id": "currency",
+  "name": "Курсы валют ЦБ РФ",
+  "version": "1.0.0",
+  "api": 1,
+  "entry": "plugin.py",
+  "capabilities": ["skill.fetch"],
+  "permissions": {"network": ["www.cbr.ru"], "filesystem": []},
+  "settings": {},
+  "description": "Курсы USD/EUR/CNY и других валют по XML ЦБ РФ; кэш на час",
+  "owner": "eva32",
+  "priority": 20,
+  "scope": "chat",
+  "stateful": false
+}

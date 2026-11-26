@@ -1,0 +1,15 @@
+{
+  "id": "ru-numbers",
+  "name": "Числа по-русски",
+  "version": "1.0.0",
+  "api": 1,
+  "entry": "plugin.py",
+  "capabilities": ["filter.run"],
+  "permissions": {"network": [], "filesystem": []},
+  "settings": {},
+  "description": "Цифры → русские слова перед озвучкой (1500 → «тысяча пятьсот»)",
+  "owner": "eva32",
+  "priority": 20,
+  "scope": "tts",
+  "stateful": false
+}

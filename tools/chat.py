@@ -88,6 +88,13 @@ from eva.chat_template import (  # noqa: E402
     reasoning_steps,
     strip_think,
 )
+from eva.plugins import (  # noqa: E402
+    DEFAULT_FACT_LIMIT,
+    PluginRegistry,
+    default_registry,
+)
+from eva.skills.intent import with_fact  # noqa: E402
+from eva.ru_gender import GenderStreamer  # noqa: E402
 
 __all__ = [
     "ChatBackendError",
@@ -1462,6 +1469,24 @@ def resolve_system(value: str | None) -> str:
 # REPL
 # --------------------------------------------------------------------------- #
 
+def _fresh_fact(question: str, registry: PluginRegistry | None = None) -> str:
+    """Блок ``[Факт: …]`` из включённых skill-плагинов; пусто — вставлять нечего.
+
+    Задача 0209: ядро не знает имён скиллов — оно спрашивает все включённые
+    плагины способности ``skill.fetch`` (не больше ``DEFAULT_FACT_LIMIT``).
+    Сбой пути данных не должен ронять чат: возвращаем пустую строку, и модель
+    отвечает как раньше.
+    """
+    try:
+        plugin_registry = registry if registry is not None else default_registry()
+        facts = plugin_registry.collect_facts(
+            question, limit=DEFAULT_FACT_LIMIT
+        )
+    except Exception:  # noqa: BLE001 — данные не стоят сломанного хода
+        return ""
+    return "\n".join(fact.line() for fact in facts)
+
+
 HELP_TEXT = """команды:
   /reset            очистить историю (системный промпт остаётся)
   /system <текст>   задать системный промпт (@файл — прочитать из файла)
@@ -1489,6 +1514,8 @@ class ChatRepl:
         stdout: Any = None,
         stderr: Any = None,
         show_stats: bool = False,
+        facts: bool = True,
+        plugins: PluginRegistry | None = None,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.backend = backend
@@ -1497,6 +1524,10 @@ class ChatRepl:
         self.stdout = stdout if stdout is not None else sys.stdout
         self.stderr = stderr if stderr is not None else sys.stderr
         self.show_stats = show_stats
+        # Свежие данные в контексте (задачи 0208/0209): время, курс ЦБ, MOEX.
+        self.facts = bool(facts)
+        #: Рантайм плагинов: facts/filters. Тесты могут подставить свой.
+        self.plugins = plugins if plugins is not None else default_registry()
         self.clock = clock
 
     # -- вывод --------------------------------------------------------------
@@ -1551,7 +1582,12 @@ class ChatRepl:
         if not text:
             return None
         self.session.add_user(text)
+        # [Факт: …] — до сборки запроса, чтобы он попал в системный блок
+        # (и в подсчёт токенов хода). Без намерения строка пустая.
+        fact = _fresh_fact(text, self.plugins) if self.facts else ""
         messages, trim = self.session.build_messages()
+        if fact:
+            messages = with_fact(messages, fact)
         if trim.trimmed:
             self._err(
                 f"(история обрезана: выброшено {trim.dropped} сообщений, "
@@ -1565,6 +1601,23 @@ class ChatRepl:
         finish: str | None = None
         failure: Exception | None = None
         interrupted = False
+        # Фильтры ответа (задачи 0207/0209): «я понял» → «я поняла» и прочая
+        # постобработка живут в плагинах. Потоковая стадия — своя на ответ,
+        # поэтому недописанное слово не переезжает в следующий ход. Плагинов
+        # нет — текст уходит как есть, чат продолжает работать.
+        filters = self.plugins.stream_filter(scope="chat")
+        # Страховка ядра (задача 0207): если плагин ``ru-gender`` не найден или
+        # выключен, женский род в первом лице всё равно применяется.
+        # ``feminize`` идемпотентна — двойной прогон (плагин + ядро) безопасен.
+        gender = GenderStreamer()
+
+        def emit(text: str) -> None:
+            piece = filters.feed(text) if filters else text
+            piece = gender.feed(piece)
+            if piece:
+                chunks.append(piece)
+                self._out(piece)
+
         try:
             if prefix:
                 self._out("assistant> ")
@@ -1575,15 +1628,18 @@ class ChatRepl:
                     if event.text:
                         if first is None:
                             first = self.clock()
-                        chunks.append(event.text)
-                        self._out(event.text)
+                        emit(event.text)
                     continue
                 if not event.text:
                     continue
                 if first is None:
                     first = self.clock()
-                chunks.append(event.text)
-                self._out(event.text)
+                emit(event.text)
+            tail = filters.flush() if filters else ""
+            tail = gender.feed(tail) + gender.flush()
+            if tail:
+                chunks.append(tail)
+                self._out(tail)
         except KeyboardInterrupt:
             interrupted = True
             self._cancel_backend()
@@ -1914,6 +1970,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="₽ за 1000 completion-токенов (для openai; иначе EVA_BIG_PRICE_COMPLETION)",
     )
     parser.add_argument(
+        "--no-facts",
+        dest="facts",
+        action="store_false",
+        help="не подкладывать в системный блок [Факт] со свежими данными "
+        "(время, курс ЦБ, котировка MOEX); по умолчанию включено",
+    )
+    parser.add_argument(
         "--no-cache-prefix",
         action="store_true",
         help="выключить кэш префикса ВТМ (по умолчанию включён: второй запрос быстрее)",
@@ -2041,6 +2104,7 @@ def main(
         stdout=out,
         stderr=err,
         show_stats=bool(args.stats),
+        facts=bool(getattr(args, "facts", True)),
     )
     try:
         if args.once is not None:

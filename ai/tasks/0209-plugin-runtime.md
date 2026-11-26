@@ -5,7 +5,7 @@ title: Рантайм плагинов — Ева растёт расширен�
 created_at: 2026-11-26T15:45:00Z
 author: yuri
 assignee: agent:plugins
-status: in_progress
+status: done
 scope: {docs: true, code: true, data: false}
 ---
 
@@ -56,4 +56,56 @@ ADR 0022. Сейчас время/курсы/котировки, нормали�
 
 ## Отчёт исполнителя
 
-_Заполняется по завершении._
+**Статус: сделано.** Рантайм `eva/plugins/` (манифест, discovery, контекст,
+registry), первые пять плагинов в `plugins/`, сборка фактов и фильтры в
+`tools/chat_server.py` / `tools/chat.py`, `GET|POST /api/plugins`,
+`docs/plugins.md`.
+
+### Живые цифры (сервер на 127.0.0.1, 2026-11-26 ~15:28 MSK)
+
+| Вопрос | Факт в системном блоке |
+|---|---|
+| который час | `[Факт: 26 ноября 2026, 15:28 MSK (источник: часы сервера)]` |
+| курс доллара | `[Факт: 1 USD = 82,3130 ₽ (источник: ЦБ РФ на 26.11.2026)]` |
+| цена акции Сбер | `[Факт: SBER (Сбербанк) = 284,97 ₽, за день -2,45 ₽ (-0,85 %), закрытие вчера 287,42 ₽ (источник: MOEX ISS, 26.11.2026 15:28 MSK)]` |
+
+Выключение `currency` через `POST /api/plugins {"id":"currency","enabled":false}`
+убрало факт из следующего ответа; чат продолжил работать. Включение вернуло
+курс без перезапуска. Сервер отдаёт `GET /api/plugins` со списком, версиями,
+способностями, permissions, `enabled`/`loaded` и `last_error`.
+
+### Что где
+
+* `eva/plugins/manifest.py` — `plugin.json`, `api=1`, capabilities,
+  permissions (hosts/paths), `owner`, `priority`, `scope`, `stateful`;
+  чужая версия API — понятный отказ до исполнения кода.
+* `eva/plugins/registry.py` — discovery `plugins/` + `EVA_PLUGINS_DIR`,
+  `config/plugins.json`, загрузка entry, `skill.fetch` / `filter.run` /
+  `tts.engine` / `command`, лимит фактов, включение/выключение без рестарта.
+* `eva/plugins/context.py` — настройки, лог, `fetch` с allowlist хостов
+  (включая редиректы) и путями `permissions.filesystem`; отказ называет
+  плагин.
+* `plugins/time|currency|stocks|ru-numbers|ru-gender` — обёртки над
+  `eva/skills/fresh.py`, `eva/skills/intent.py`, `eva/ru_numbers.py`,
+  `eva/ru_gender.py`; логика не дублируется. `currency`/`stocks` ходят в сеть
+  только через `PluginContext`.
+* `tools/chat_server.py` — факты skill-плагинов в системный блок (≤3),
+  фильтры в потоке, `GET|POST /api/plugins`, `--facts-limit`, TTS через
+  фильтры; ядро работает и без плагинов.
+* `tools/chat.py` — то же для REPL/`--once`.
+* `tests/test_plugins.py` — 43 теста: манифест (валидный/битый/api=2),
+  discovery, включение/выключение, permissions-отказ, лимит и порядок фактов,
+  фильтры (в т.ч. потоковые), факт в системном блоке, «выключили — чат жив».
+* `docs/plugins.md` — контракт и полный пример «погода» на wttr.in.
+
+### Проверки
+
+```
+python3 -m unittest discover -s tests   # 2777 тестов, OK (73 skip)
+python3 tools/check_docs_dates.py       # 31 документ, 940 ссылок — OK
+```
+
+Замечание: в этом окружении Python не доверяет TLS-сертификату MOEX
+(корпоративный перехват). `plugins/stocks` пробует https, а при ошибке
+проверки сертификата повторяет тот же публичный запрос по http к тому же
+разрешённому хосту; ключей и приватных данных в запросе нет.

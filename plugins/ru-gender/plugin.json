@@ -1,0 +1,15 @@
+{
+  "id": "ru-gender",
+  "name": "Женский род Евы",
+  "version": "1.0.0",
+  "api": 1,
+  "entry": "plugin.py",
+  "capabilities": ["filter.run"],
+  "permissions": {"network": [], "filesystem": []},
+  "settings": {},
+  "description": "«я понял» → «я поняла» в потоке ответа, истории и озвучке",
+  "owner": "eva32",
+  "priority": 30,
+  "scope": "all",
+  "stateful": false
+}

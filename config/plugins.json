@@ -1,0 +1,10 @@
+{
+  "enabled": [
+    "time",
+    "currency",
+    "ru-numbers",
+    "ru-gender",
+    "stocks"
+  ],
+  "settings": {}
+}
