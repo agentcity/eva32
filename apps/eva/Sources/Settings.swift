@@ -92,7 +92,9 @@ final class Settings {
     static let compactYKey = "eva.compactY"
 
     static let defaultServer = "http://127.0.0.1:8765"
-    static let defaultMaxTokens = 256
+    /// Длинные ответы не должны обрываться на середине: 1024 — потолок,
+    /// который модель в 1024 токена контекста ещё может отдать целиком.
+    static let defaultMaxTokens = 1024
     /// По умолчанию follow-up включён: разговор без кнопок — основной сценарий.
     static let defaultFollowUpListen = true
     /// «Стоп, Ева» включена по умолчанию: перебить голосом — основной сценарий

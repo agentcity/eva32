@@ -794,6 +794,11 @@ def format_chat_prompt(messages: Any) -> str:
 
 # --- бэкенд -----------------------------------------------------------------
 
+#: Минимальный потолок C-контекста: длинный ответ не должен обрываться на
+#: дефолтном лимите конфига. Реальный лимит прогона задаёт вызывающий код.
+_NATIVE_TOKEN_FLOOR = 4096
+
+
 def _native_token_limit(
     max_tokens: int, *, thinking: bool, reasoning_budget: int
 ) -> int:
@@ -1000,10 +1005,20 @@ class VtmBackend:
             eos_id = self.tokenizer.eos_id
         # Потолок C-контекста должен вмещать оба прогона: при рассуждении
         # первый ограничен бюджетом, второй — max_tokens (см. ниже).
-        native_limit = _native_token_limit(
-            self.config.max_tokens,
-            thinking=self._thinking,
-            reasoning_budget=self.reasoning_budget,
+        # Потолок C-контекста — НЕ лимит ответа. C останавливает генерацию
+        # по этому числу и рапортует «stop», поэтому он должен быть не меньше
+        # любого запрошенного ответа: иначе длинный ответ обрывался на
+        # config.max_tokens (256) при запросе 400 (жалоба «ответ обрезается»).
+        # Реальный лимит каждого прогона задаёт _answer_limit() и проверяет
+        # колбэк в Python; рассуждение (0200) по-прежнему считает бюджет
+        # отдельно — здесь берём максимум, чтобы ничего не срезать.
+        native_limit = max(
+            _native_token_limit(
+                self.config.max_tokens,
+                thinking=self._thinking,
+                reasoning_budget=self.reasoning_budget,
+            ),
+            _NATIVE_TOKEN_FLOOR,
         )
         self._context = _VtmContext(
             self._library,
