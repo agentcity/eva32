@@ -1517,5 +1517,19 @@
     "status": "in_progress",
     "file": "0228-more-illustrations.md",
     "assignee": "agent:more-images"
+  },
+  {
+    "id": "0230",
+    "title": "Паузы при чтении сказки",
+    "status": "in_progress",
+    "file": "0230-reading-pauses.md",
+    "assignee": "agent:pauses"
+  },
+  {
+    "id": "0231",
+    "title": "Темп готовых записей",
+    "status": "in_progress",
+    "file": "0231-recording-pace.md",
+    "assignee": "agent:rec-pace"
   }
 ]
