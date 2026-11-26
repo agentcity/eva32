@@ -18,6 +18,9 @@
 #include "vtm.h"
 #include "vtm_backend.h"
 #include <string.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>   // hw.perflevel0.physicalcpu — число P-ядер (0201)
+#endif
 
 // Metal-бэкенд (0192) собирается только на Darwin; см. src/vtm/Makefile.
 #ifndef VTM_WITH_METAL
@@ -431,6 +434,7 @@ static void pool_run_locked(int n, int nthreads, vtm_rows_fn fn, void *ctx) {
 #if VTM_HAVE_PTHREAD
 static pthread_once_t g_cfg_once = PTHREAD_ONCE_INIT;
 static int g_cfg_threads = 1;    // из VTM_THREADS или по числу ядер
+static int g_cfg_cores = 1;      // онлайн-ядер (потолок параллелизма, 0201)
 static int g_cfg_override;       // 0 — переопределения нет (тест-хук)
 
 // Переопределение читает каждое задание (vtm_parallel_rows), а пишет тест-хук
@@ -454,6 +458,37 @@ static void cfg_override_set(int n) {
 #endif
 }
 
+/* Сколько потоков брать по умолчанию (0201). На Apple Silicon ядра разные:
+   P-ядра быстрые, E-ядра примерно втрое медленнее. Пул делит работу по строкам
+   динамически, но барьер задания ждёт САМЫЙ медленный поток, поэтому два
+   E-ядра, взявшие по порции, задерживают конец задания на свою (тройную)
+   порцию: замер 0201 на 3B Q4_K — 10 потоков (8P+2E) дали 60 мс/токен против
+   34 мс на 8 потоках (P-ядра), и 72 против 62 в другом окне. Поэтому по
+   умолчанию берём число P-ядер, а E-ядра остаются доступны явно:
+   VTM_THREADS=10. hw.perflevel0.physicalcpu есть с macOS 12; нет — берём
+   онлайн-ядра, как раньше. */
+static int vtm_cfg_cores(void) {
+    long cores = 0;
+#if defined(__APPLE__)
+    {
+        int v = 0;
+        size_t sz = sizeof v;
+        if (sysctlbyname("hw.perflevel0.physicalcpu", &v, &sz, NULL, 0) == 0
+            && v > 0)
+            cores = v;
+    }
+#endif
+    if (cores <= 0) {
+#if defined(_SC_NPROCESSORS_ONLN)
+        cores = sysconf(_SC_NPROCESSORS_ONLN);
+#else
+        cores = 4;   // константа недоступна (не POSIX-система) — дефолт
+#endif
+    }
+    if (cores < 1) cores = 1;
+    return (int)cores;
+}
+
 static void cfg_init(void) {
     const char *env = getenv("VTM_THREADS");
     long n = 0, cores;
@@ -467,15 +502,10 @@ static void cfg_init(void) {
             n = 0;
         }
     }
-    if (n <= 0) {
-#if defined(_SC_NPROCESSORS_ONLN)
-        cores = sysconf(_SC_NPROCESSORS_ONLN);
-#else
-        cores = 4;   // константа недоступна (не POSIX-система) — дефолт
-#endif
-        if (cores < 1) cores = 1;
-        n = cores;
-    }
+    cores = vtm_cfg_cores();
+    if (cores > VTM_THREADS_MAX) cores = VTM_THREADS_MAX;
+    g_cfg_cores = (int)cores;
+    if (n <= 0) n = cores;
     if (n > VTM_THREADS_MAX) n = VTM_THREADS_MAX;
     g_cfg_threads = (int)n;
 }
@@ -499,17 +529,15 @@ int vtm_threads_set(int n) {
 // барьер пула дороже выигрыша от лишнего потока.
 #define VTM_PAR_CHUNK 65536.0
 
-// Потолок параллелизма одного задания. Замер на 1.5B-форме (10 ядер,
-// задания TMV 0,39–13,8 MMAC, 224 мс/токен при 4 потоках):
-//   потоки 4     5     6     7     8
-//   ток/с  15,5  17,7  17,9  16,1  14,6
-// Дальше шести выигрыша нет: задание короткое (сотни микросекунд), и
-// накладные расходы барьера — разбудить воркеров и дождаться самого
-// медленного — съедают прибавку, а на занятой машине лишние потоки ещё и
-// стоят в очереди планировщика. VTM_THREADS остаётся верхней границей:
-// просили меньше — используем меньше.
-#define VTM_PAR_THREADS_TOP 6
-
+// Потолок параллелизма одного задания. Раньше он был зашит шестёркой по
+// замеру на 1.5B-форме, и VTM_THREADS=8 всё равно давал 6 потоков. Замер 0201
+// (3B Q4_K, GEMV декода kind 6/7): пропускная способность на поток ~8,8 ГБ/с,
+// и она держится линейно до 6 потоков (226 / 115 / 59 / 42 мс на токен при
+// 1/2/4/6 потоках), то есть ядро упирается в счёт на поток, а не в полосу
+// памяти. Потолок «сколько ядер есть» (vtm_threads(), а он по умолчанию —
+// число P-ядер, см. vtm_cfg_cores) используем целиком; ограничение снизу
+// остаётся по работе (want ниже), чтобы короткие задания не платили за
+// барьер.
 void vtm_parallel_rows(int n, double work, vtm_rows_fn fn, void *ctx) {
     int vt, want;
     if (!fn || n <= 0) return;
@@ -519,11 +547,10 @@ void vtm_parallel_rows(int n, double work, vtm_rows_fn fn, void *ctx) {
         fn(ctx, 0, 0, n);
         return;
     }
-    /* Сколько потоков оправдано: не больше запрошенного, не больше
-       VTM_PAR_THREADS_TOP и не больше, чем work / VTM_PAR_CHUNK (каждому
-       потоку — не меньше порции работы). */
+    /* Сколько потоков оправдано: не больше запрошенного (VTM_THREADS) и не
+       больше, чем work / VTM_PAR_CHUNK (каждому потоку — не меньше порции
+       работы). */
     want = (int)(work / VTM_PAR_CHUNK);
-    if (want > VTM_PAR_THREADS_TOP) want = VTM_PAR_THREADS_TOP;
     if (want > vt) want = vt;
     if (want > n) want = n;
     if (want < 2) {

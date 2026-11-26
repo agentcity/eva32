@@ -673,6 +673,98 @@ static int rmsnorm_neon(float *y, const float *x, const float *w,
     return 0;
 }
 
+// --- NEON: SiLU (задача 0201) ----------------------------------------------
+//
+// SILU в декоде 3B — это 36 вызовов на 11008 значений на токен, и до 0201 он
+// считался скалярным silu_scalar() в double с exp() на элемент: замер
+// --trace-summary дал 24 мс на 13 проходов = 1,84 мс на токен (3,7% декода,
+// 51 мкс на вызов). Вектор здесь не «оптимизация ради галочки»: exp — самая
+// дорогая скалярная функция на горячем пути, который до этого не трогали.
+//
+// Точность. Эталон (silu_scalar и Python-реализация) считает в double:
+// y = x/(1+exp(−x)), при x < −700 — ровно 0. Здесь e^t для f32x4: приведение
+// t = n·ln2 + r (|r| ≤ ln2/2), многочлен Тейлора 6-й степени по r
+// (|ошибка| ≤ 3e-9 на отрезке) и масштаб 2^n сдвигом в экспоненту. Итоговая
+// относительная ошибка ≲ 2e-7 — на два порядка ниже порога тестов (1e-6 на
+// значение, тесты test_vtm.c 2117/6983), и в 36 слоях даёт ~1e-6 на логитах
+// (проверено --logits: совпадение с прежним путём).
+//
+// Переполнение: аргумент клампится в [−88, 88], поэтому 2^n всегда
+// представима. Для x ≤ −88 exp(−x) = +inf в пределе, y = x/(1+inf) = −0.0f —
+// ровно тот же ноль, что у скаляра; никаких NaN (деления на 0 нет).
+static inline float32x4_t vtm_exp_f32x4(float32x4_t t) {
+    // t = n·ln2 + r; ln2 в двух частях, чтобы r не терял точность.
+    const float32x4_t l2e = vdupq_n_f32(1.44269504088896341f);
+    const float32x4_t ln2hi = vdupq_n_f32(0.693145751953125f);
+    const float32x4_t ln2lo = vdupq_n_f32(1.428606765330187045e-6f);
+    const float32x4_t tmax = vdupq_n_f32(88.0f);
+    float32x4_t tv = vmaxq_f32(vminq_f32(t, tmax), vnegq_f32(tmax));
+    float32x4_t n = vcvtq_f32_s32(vcvtnq_s32_f32(vmulq_f32(tv, l2e)));
+    float32x4_t r = vfmsq_f32(tv, n, ln2hi);
+    float32x4_t p;
+
+    r = vfmsq_f32(r, n, ln2lo);
+    // e^r, |r| <= 0.3466: Тейлор до r^6 (3e-9), Горнер.
+    p = vdupq_n_f32(1.0f / 720.0f);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 120.0f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(0.5f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+    // 2^n: экспонента f32 = n + 127, сдвиг на 23.
+    {
+        int32x4_t e = vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(n),
+                                            vdupq_n_s32(127)), 23);
+        p = vmulq_f32(p, vreinterpretq_f32_s32(e));
+    }
+    return p;
+}
+
+// VTM_SILU=0 — прежний скалярный silu_scalar (A/B и откат, если кому-то нужна
+// побитовая сходимость с double-эталоном).
+static int silu_scalar_env(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("VTM_SILU");
+        cached = (e && *e && *e == '0');
+    }
+    return cached;
+}
+
+// y = x·sigmoid(x). Хвост (n % 4) — скалярно и в double, ровно как silu_scalar:
+// значения пишутся те же (f32), расхождения нет.
+static int silu_neon(float *y, const float *x, int n) {
+    int i = 0;
+
+    if (!y || !x || n < 0) return -1;
+    if (silu_scalar_env()) {
+        for (i = 0; i < n; i++) {
+            const double v = (double)x[i];
+            if (v < -700.0) y[i] = 0.0f;
+            else y[i] = (float)(v / (1.0 + exp(-v)));
+        }
+        return 0;
+    }
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t v = vld1q_f32(x + i);
+        const float32x4_t e = vtm_exp_f32x4(vnegq_f32(v));
+        float32x4_t r = vdivq_f32(v, vaddq_f32(vdupq_n_f32(1.0f), e));
+
+        // Та же ветка, что у скаляра: v < -700 — ровно 0 (заодно -inf, где
+        // exp(-v) переполнился бы в +inf).
+        r = vbslq_f32(vcltq_f32(v, vdupq_n_f32(-700.0f)), vdupq_n_f32(0.0f),
+                      r);
+        vst1q_f32(y + i, r);
+    }
+    for (; i < n; i++) {
+        const double v = (double)x[i];
+        if (v < -700.0) y[i] = 0.0f;
+        else y[i] = (float)(v / (1.0 + exp(-v)));
+    }
+    return 0;
+}
+
 // --- NEON: Q4 (kind 5, задача 0157) ----------------------------------------
 //
 // Раскладка — по контракту vtm_backend.h: 32 значения группы в 16 байтах
@@ -2516,6 +2608,7 @@ typedef struct {
     int cols;
     int q6;            // 0 — Q4_K, 1 — Q6_K
     int planes;        // 1..3
+    int pf;            // 0201: опережающее чтение блоков (VTM_GEMV_PF)
     // 0189: строка весов, уже развёрнутая в int8 (cols байт). Батчевый GEMM
     // разворачивает её ОДИН раз на строку и подставляет сюда, чтобы N токенов
     // пачки не распаковывали нибблы/6-битки заново. NULL (декод) — веса
@@ -2631,6 +2724,39 @@ static inline void q4k_scmn_f32(const uint8_t *scales, float32x4_t *sc0,
     *mn1 = q4k_u8x4_to_f32(mnh);
 }
 
+// --- 0201: опережающее чтение строк в GEMV декода -------------------------
+//
+// Замер на 3B Q4_K (проекция декода, 6 потоков) показал 8,8 ГБ/с на поток при
+// полосе M1 Pro ~200 ГБ/с: строка Q4_K — 1152 байта (18 линий кэша) на 43
+// блока, и поток ждёт каждую строку. Здесь — префетч блоков на PF_BLOCKS
+// вперёд по потоку (строки идут в памяти подряд, так что это просто
+// продолжение линейного потока на следующую строку) плюс префетч первой
+// линии следующей строки.
+//
+// A/B (задача 0201, отчёт): префетч НЕ помог — на 1 потоке 1,63 против
+// 1,62 мс (10 повторов, Q4_K 11008x2048), на 4 потоках 0,430 против 0,430
+// (12 повторов). Причина: строки идут в памяти подряд, и аппаратный
+// префетчер M1 уже тянет этот поток; ядро упирается в инструкции, а не в
+// задержку. Поэтому по умолчанию выключено (иначе 1 prfm на 16 байт весов —
+// это ~4% лишних инструкций). VTM_GEMV_PF=1 включает: заготовка остаётся для
+// машин/раскладок, где поток рвётся (например, если строки когда-нибудь
+// станут несмежными).
+#define VTM_GEMV_PF_BLOCKS 3
+static int gemv_pf_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("VTM_GEMV_PF");
+        cached = (e && *e && *e == '1');
+    }
+    return cached;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#define VTM_PF_READ(p) __builtin_prefetch((const void *)(p), 0, 0)
+#else
+#define VTM_PF_READ(p) ((void)(p))
+#endif
+
 // Одна строка Q4_K: y = Σ_b Σ_sb (d·sc·Σ q·x − dmin·m·Σx). Под-блоки
 // чётные/нечётные копятся в разные f32-аккумуляторы (две независимые цепочки
 // vfma), в double сворачиваются раз на 256 значений.
@@ -2646,6 +2772,7 @@ static float qk_i8_row_q4k(const qk_i8_job *j, int r) {
     // i1 + i2/254 + i3/(254·127) из контракта ядра.
     const float kf = (planes >= 3) ? (1.0f / 32258.0f)
                    : (planes == 2) ? (1.0f / 254.0f) : 1.0f;
+    const int pf = j->pf;
     double total = 0.0;
     int b, sb;
 
@@ -2691,6 +2818,9 @@ static float qk_i8_row_q4k(const qk_i8_job *j, int r) {
     } while (0)
 
     for (b = 0; b < nblocks; b++, bp += VTM_Q4K_BLOCK_BYTES) {
+        if (pf)
+            VTM_PF_READ(bp + (size_t)VTM_GEMV_PF_BLOCKS
+                        * VTM_Q4K_BLOCK_BYTES);
         const float d = q4k_f16(bp);
         const float dmin = q4k_f16(bp + 2);
         const float dk = d * kf;
@@ -2741,6 +2871,7 @@ static float qk_i8_row_q6k(const qk_i8_job *j, int r) {
     const int planes = j->planes;
     const float kf = (planes >= 3) ? (1.0f / 32258.0f)
                    : (planes == 2) ? (1.0f / 254.0f) : 1.0f;
+    const int pf = j->pf;
     double total = 0.0;
     int b, sb;
 
@@ -2786,6 +2917,9 @@ static float qk_i8_row_q6k(const qk_i8_job *j, int r) {
     } while (0)
 
     for (b = 0; b < nblocks; b++, bp += VTM_Q6K_BLOCK_BYTES) {
+        if (pf)
+            VTM_PF_READ(bp + (size_t)VTM_GEMV_PF_BLOCKS
+                        * VTM_Q6K_BLOCK_BYTES);
         const float dk = q4k_f16(bp + 208u) * kf;
         float32x4_t aq0, aq1, aq2, aq3;
         float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = acc0, acc2 = acc0;
@@ -2879,6 +3013,7 @@ int vtm_neon_qk_gemv_i8(float *y, const uint8_t *blocks, const float *x,
     job.cols = cols;
     job.q6 = q6 ? 1 : 0;
     job.planes = planes;
+    job.pf = gemv_pf_enabled();
     job.xq = (int8_t *)malloc((size_t)cols);
     job.sx = (float *)malloc((size_t)(cols / 32) * sizeof(float));
     job.xsum = (float *)malloc((size_t)(cols / 32) * sizeof(float));
@@ -4760,7 +4895,11 @@ const vtm_backend vtm_backend_simd = {
     .tmv = simd_tmv,
     .tmv_blocks = simd_tmv_blocks,
     .rmsnorm = simd_rmsnorm,
+#if VTM_SIMD_NEON
+    .silu = silu_neon,      // 0201: векторный exp; см. silu_neon выше
+#else
     .silu = NULL,
+#endif
     .mul = NULL,
     .add = NULL,
     .scal = NULL,
