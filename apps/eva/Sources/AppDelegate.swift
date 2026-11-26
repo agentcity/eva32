@@ -6,6 +6,14 @@ import Foundation
 /// поэтому он только публикует событие, а обработчик живёт на главном потоке.
 let evaHotKeyNotification = Notification.Name("EVA.hotKeyPressed")
 
+/// Решение «кто держит микрофон»: wake-ожидание в покое или стоп-слушатель
+/// во время речи. Ровно одно из полей истинно (или ни одного) — так два
+/// `AVAudioEngine` никогда не работают одновременно.
+struct EvaListenerPlan: Equatable, Sendable {
+    var wake: Bool
+    var stop: Bool
+}
+
 /// Строка меню со статус-баром, глобальный хоткей ⌥Space и связка
 /// «микрофон → /api/chat → окно → /api/tts».
 @MainActor
@@ -23,6 +31,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let answer = AnswerController()
     /// Фоновое ожидание «Привет, Ева» (задача 0187): живёт только в idle.
     private let wake = WakeWordListener()
+    /// «Стоп, Ева» (задача 0194): живёт только пока Ева думает или говорит.
+    /// С wake-слушателем никогда не пересекается — один движок на режим.
+    private let stop = StopCommandListener()
 
     /// Компактный режим: главное окно спрятано, на экране только круг.
     private var isCompact = false
@@ -57,6 +68,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Ожидание не поднялось (нет прав/офлайн-модели): не долбим системные
     /// API на каждый переход состояния. Снимается при смене настроек.
     private var wakeSuppressed = false
+    /// То же для стоп-слушателя: если микрофон/распознавание не дали, не
+    /// пытаемся поднимать его на каждой фразе (задача 0194).
+    private var stopSuppressed = false
 
     // Большой круг: одно место, где решается, что он показывает. Флаги
     // обновляют `wireRecorder`/`wireAnswer`/`ask`, а `refreshVisualState`
@@ -80,6 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wireRecorder()
         wireAnswer()
         wireWake()
+        wireStop()
         wireWindow()
         wireCompact()
         observeSettings()
@@ -97,8 +112,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let speak = Settings.shared.speakReplies
         let animate = Settings.shared.animateCircle
         let wakeWord = Settings.shared.wakeWord
+        let stopCommand = Settings.shared.stopCommand
         log("настройки: сервер=\(server) модель=\(model) голос=\(voice) озвучка=\(speak) "
             + "анимация=\(animate) ожидание=\(wakeWord) "
+            + "стоп-команда=\(stopCommand) "
             + "follow-up=\(Settings.shared.followUpListen)/\(Settings.shared.followUpSilence) с "
             + "старт-свёрнутым=\(Settings.shared.startCompact)")
 
@@ -128,6 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         answerEnded = false
         wakeSync?.cancel()
         wakeSync = nil
+        stop.stop()
         wake.stop()
         circles.setWakeWaiting(false)
         circles.stopAnimation()
@@ -433,11 +451,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `present: false` — не показывать главное окно (компактный режим:
     /// запись включена двойным кликом по кругу).
     private func startListening(followUp: Bool = false, present: Bool = true) {
-        // Двух захватов одновременно быть не должно: ожидание отпускает
-        // микрофон до того, как запись его займёт.
+        // Двух захватов одновременно быть не должно: ожидание и стоп-слушатель
+        // отпускают микрофон до того, как запись его займёт.
         wakeSync?.cancel()
         if wake.isRunning {
             wake.stop()
+        }
+        if stop.isActive {
+            stop.stop()
         }
         circles.setWakeWaiting(false)
         if followUp {
@@ -476,6 +497,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.awaitingFirstToken = false
                 self.awaitingAudio = self.expectsVoice && !self.isSpeaking
                 self.refreshVisualState("первый видимый текст")
+                // Голос ещё синтезируется — стоп-слушатель остаётся; если
+                // озвучки нет, уступаем место wake-ожиданию (задача 0194).
+                self.syncWake("первый видимый текст")
             }
         }
         answer.onFinished = { [weak self] in
@@ -497,6 +521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         answer.onSpeakingChanged = { [weak self] speaking in
             guard let self else { return }
+            let changed = self.isSpeaking != speaking
             self.isSpeaking = speaking
             if speaking {
                 self.awaitingFirstToken = false
@@ -507,10 +532,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // между «говорю» и «слушаю».
                 self.startFollowUpIfReady("озвучка кончилась")
             }
+            // `voice.stop()` в начале нового вопроса тоже присылает `false`;
+            // повторный переход не должен дёргать слушателей и журнал.
+            guard changed else { return }
             self.updateStatusIcon()
             self.refreshVisualState(speaking ? "озвучка пошла" : "озвучка кончилась")
             // Пока играет голос, микрофон ожидания выключен: иначе Ева
-            // услышит собственное «Ева» и зациклится (задача 0187).
+            // услышит собственное «Ева» и зациклится (задача 0187), а на его
+            // место встаёт стоп-слушатель (задача 0194).
             self.syncWake(speaking ? "озвучка пошла" : "озвучка кончилась")
         }
         answer.onLevel = { [weak self] level in
@@ -541,25 +570,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         window.onStop = { [weak self] in
             guard let self else { return }
-            // «Стоп» — ручное действие: follow-up после него не открываем.
-            self.answerEnded = false
-            self.followUpArmed = false
-            self.isFollowUp = false
-            self.circles.setFollowUp(false)
-            // Серверу — явный POST /api/cancel (задача 0185): обрыв SSE тоже
-            // отменяет, но флаг в C-рантайме надёжнее и виден в метриках.
-            self.cancelServerGeneration()
-            self.recorder.stop()
-            self.answer.stop()
-            self.isSpeaking = false
-            self.awaitingFirstToken = false
-            self.awaitingAudio = false
-            self.clearVisualError()
-            self.circles.setLevel(0)
-            self.refreshVisualState("стоп по кнопке")
-            self.updateStatusIcon()
-            self.syncWake("стоп по кнопке", after: 0.2)
             log("стоп по кнопке")
+            self.performStop(reason: "стоп по кнопке")
         }
         window.onSettings = { [weak self] in
             self?.settingsWindow.show()
@@ -569,6 +581,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         window.onCollapse = { [weak self] in
             self?.collapseToCompact(reason: "кнопка «Свернуть»")
+        }
+    }
+
+    /// Единый путь «остановить всё»: кнопка «Стоп» и голосовая команда
+    /// «Стоп, Ева» (задача 0194). Гасит озвучку, отменяет генерацию тем же
+    /// `POST /api/cancel`, что и кнопка, возвращает круг в idle/listening и
+    /// опускает follow-up: после явного «Стоп» микрофон сам не открывается.
+    private func performStop(reason: String) {
+        // Что именно глушим — по состоянию ДО остановки: `answer.stop()`
+        // синхронно пришлёт «озвучка кончилась» и обнулит флаги.
+        let voiceWasBusy = isSpeaking || !answer.voiceIsIdle
+        let generationWasBusy = awaitingFirstToken || awaitingAudio || !answerEnded
+        answerEnded = false
+        followUpArmed = false
+        isFollowUp = false
+        circles.setFollowUp(false)
+        // Серверу — явный POST /api/cancel (задача 0185): обрыв SSE тоже
+        // отменяет, но флаг в C-рантайме надёжнее и виден в метриках.
+        cancelServerGeneration()
+        recorder.stop()
+        answer.stop()
+        isSpeaking = false
+        awaitingFirstToken = false
+        awaitingAudio = false
+        clearVisualError()
+        circles.setLevel(0)
+        refreshVisualState(reason)
+        updateStatusIcon()
+        syncWake(reason, after: 0.2)
+        if voiceWasBusy {
+            log("стоп: озвучка остановлена")
+        }
+        if generationWasBusy {
+            log("стоп: генерация отменена")
         }
     }
 
@@ -658,8 +704,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Галочка «Анимация круга» действует и на компактный круг.
         circles.setAnimationEnabled(Settings.shared.animateCircle)
         // Человек мог включить галочку уже после отказа в правах — даём
-        // ожиданию ещё один шанс.
+        // ожиданию и стоп-слушателю ещё один шанс.
         wakeSuppressed = false
+        stopSuppressed = false
         if !Settings.shared.speakReplies {
             answer.stopVoice()
         }
@@ -708,6 +755,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         followUpArmed = false
         isFollowUp = false
         circles.setFollowUp(false)
+        // Новый ответ — новый шанс поднять стоп-слушатель (например, права
+        // выдали только что): неудача прошлого ответа не глушит команду
+        // навсегда. Wake-подавление так не сбрасываем — оно про TCC.
+        stopSuppressed = false
         clearVisualError()
         refreshVisualState("вопрос ушёл")
         syncWake("вопрос ушёл")
@@ -780,9 +831,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startListening(present: !isCompact)
     }
 
-    /// Единая точка решения «должно ли сейчас работать ожидание». Причина
-    /// попадает только в отладочный журнал: сами строки «ожидание включено/
-    /// выключено» пишет `WakeWordListener`.
+    // MARK: - «Стоп, Ева» (задача 0194)
+
+    private func wireStop() {
+        stop.onStop = { [weak self] text in
+            guard let self else { return }
+            self.handleStopCommand(text)
+        }
+        stop.onIssue = { [weak self] message in
+            guard let self else { return }
+            // Причина уже в журнале («стоп: …»); повторять её в статусе поверх
+            // ответа/озвучки не нужно. До смены настроек не поднимаем повторно.
+            self.stopSuppressed = true
+            self.logStopIssue(message)
+        }
+        // Текущая фраза нужна эхо-защите: если Ева сама произносит «стоп»,
+        // её же голос из колонок — не команда.
+        stop.currentSpokenPhrase = { [weak self] in
+            self?.answer.currentVoiceText
+        }
+    }
+
+    /// Услышали «стоп»/«хватит»/«тише»: сначала глушим звук, и только потом
+    /// отпускаем микрофон — отклик важнее, чем порядок сворачивания движка.
+    private func handleStopCommand(_ text: String) {
+        guard !isTerminating, Settings.shared.stopCommand else { return }
+        log("стоп-команда: глушу („\(text.prefix(80))“)")
+        performStop(reason: "стоп по голосу")
+        stop.stop()
+    }
+
+    /// Слушание стоп-команды не поднялось — пишем в статус только когда он не
+    /// занят ответом: иначе сообщение мгновенно перекрылось бы озвучкой.
+    private func logStopIssue(_ message: String) {
+        if !isSpeaking, !awaitingFirstToken, !awaitingAudio {
+            window.setStatus("стоп-команда: \(message)", isError: true)
+        }
+    }
+
+    /// Единая точка решения «какой слушатель держит микрофон». Причина
+    /// попадает только в отладочный журнал: сами строки «включено/выключено»
+    /// пишут слушатели.
+    ///
+    /// Один движок на режим: пока Ева думает или говорит — только
+    /// `StopCommandListener`, в покое — только `WakeWordListener`. Запись
+    /// (`SpeechRecorder`) и вспышка ошибки исключают обоих.
     private func syncWake(_ reason: String, after delay: Double = 0) {
         wakeSync?.cancel()
         wakeSync = Task { @MainActor [weak self] in
@@ -790,28 +883,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
             guard !Task.isCancelled, let self else { return }
-            self.applyWake(reason)
+            self.applyListeners(reason)
         }
     }
 
-    private func applyWake(_ reason: String) {
+    private func applyListeners(_ reason: String) {
         guard !isTerminating else { return }
-        let desired = Settings.shared.wakeWord
-            && !wakeSuppressed
-            && !isRecording
-            && !isSpeaking
-            && !followUpArmed
-            && !awaitingFirstToken
-            && !awaitingAudio
-            && !errorActive
-        if desired {
-            if !wake.isRunning {
-                log("wake: ожидание просит включиться — \(reason)")
-                wake.start()
-            }
-        } else if wake.isRunning {
+        let plan = AppDelegate.listenerPlan(
+            wakeWord: Settings.shared.wakeWord,
+            stopCommand: Settings.shared.stopCommand,
+            wakeSuppressed: wakeSuppressed,
+            stopSuppressed: stopSuppressed,
+            isRecording: isRecording,
+            isSpeaking: isSpeaking,
+            isThinking: awaitingFirstToken || awaitingAudio,
+            followUpArmed: followUpArmed,
+            errorActive: errorActive
+        )
+        // Сначала отпускаем микрофон теми, кому он больше не нужен, и только
+        // потом поднимаем нужный: два `AVAudioEngine` не должны пересечься.
+        if !plan.stop, stop.isActive {
+            log("стоп: слушание выключается — \(reason)")
+            stop.stop()
+        }
+        if !plan.wake, wake.isRunning {
             log("wake: ожидание выключается — \(reason)")
             wake.stop()
+        }
+        if plan.stop, !stop.isActive {
+            log("стоп: слушание включается — \(reason)")
+            stop.start()
+        }
+        if plan.wake, !wake.isRunning {
+            log("wake: ожидание просит включиться — \(reason)")
+            wake.start()
         }
         circles.setWakeWaiting(wake.isRunning)
     }
@@ -869,6 +974,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         followUpListen && wakeWord && !answerFailed
     }
 
+    /// Кто из двух слушателей держит микрофон прямо сейчас. `wake` и `stop`
+    /// никогда не включены одновременно — это и есть требование «один движок
+    /// на режим» (задача 0194); проверяется в `--selftest-stop`.
+    nonisolated static func listenerPlan(
+        wakeWord: Bool,
+        stopCommand: Bool,
+        wakeSuppressed: Bool,
+        stopSuppressed: Bool,
+        isRecording: Bool,
+        isSpeaking: Bool,
+        isThinking: Bool,
+        followUpArmed: Bool,
+        errorActive: Bool
+    ) -> EvaListenerPlan {
+        let busy = isRecording || errorActive
+        let stop = stopCommand && !stopSuppressed && !busy && (isSpeaking || isThinking)
+        let wake = wakeWord && !wakeSuppressed && !busy
+            && !isSpeaking && !isThinking && !followUpArmed
+            && !stop
+        return EvaListenerPlan(wake: wake, stop: stop)
+    }
+
     /// «Стоп» сообщает серверу, что генерацию пора бросить.
     private func cancelServerGeneration() {
         guard let server = effectiveServerURL else { return }
@@ -923,6 +1050,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ? String(message.dropFirst(prefix.count))
             : message
         applyVisualState(.error, reason: "\(reason.prefix(120))")
+        // Пока висит красная вспышка, микрофон не поднимаем ни одним из
+        // слушателей: сначала пусть человек увидит, что случилось.
+        syncWake("ошибка")
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_200_000_000)
             guard let self, self.errorToken == token else { return }

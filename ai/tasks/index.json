@@ -1311,14 +1311,14 @@
   {
     "id": "0196",
     "title": "Metal фаза 2: батч и один командный буфер",
-    "status": "in_progress",
+    "status": "done",
     "file": "0196-metal-phase2.md",
     "assignee": "agent:metal2"
   },
   {
     "id": "0197",
     "title": "Только Silero: голоса baya/kseniya/xenia/aidar",
-    "status": "in_progress",
+    "status": "done",
     "file": "0197-switch-to-silero-only.md",
     "assignee": "agent:silero-only"
   }

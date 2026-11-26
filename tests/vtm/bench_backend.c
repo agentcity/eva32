@@ -3825,18 +3825,62 @@ static int run_metal_bench(const char *explicit_path, int ngen) {
             printf("  ускорение декода: %.2fx\n", best[0] / best[1]);
     }
 
+    // Prefill пачкой: все токены 64-промпта за один vtm_run_batch. Парный
+    // замер в одном процессе (сначала CPU, потом metal, затем повтор) —
+    // критерий 0196 «prefill ≥100 ток/с» проверяется на тех же страницах.
+    printf("prefill 64 токена (vtm_run_batch, min из 2):\n");
+    {
+        int32_t ids[64];
+        const vtm_backend *bs[2];
+        double best[2] = {1e300, 1e300};
+        int bi, rep;
+
+        for (i = 0; i < 64; i++) ids[i] = 1000 + (i * 37) % 150000;
+        bs[0] = simd;
+        bs[1] = metal;
+        for (rep = 0; rep < 2; rep++) {
+            for (bi = 0; bi < 2; bi++) {
+                double t0, ms;
+                vtm_set_backend(m, bs[bi]);
+                vtm_reset(m);
+                vtm_set_position(m, 0);
+                t0 = now_ms();
+                if (vtm_run_batch(m, ids, 64) != VTM_OK) {
+                    fprintf(stderr, "prefill: %s — ошибка\n", bs[bi]->name);
+                    rc = 1;
+                    continue;
+                }
+                ms = now_ms() - t0;
+                if (ms < best[bi]) best[bi] = ms;
+            }
+        }
+        for (bi = 0; bi < 2; bi++) {
+            if (best[bi] < 1e299)
+                printf("  %-10s %.1f мс = %.1f ток/с (TTFT 64)\n",
+                       bs[bi]->name, best[bi], 64.0 / (best[bi] * 1e-3));
+        }
+        if (best[0] < 1e299 && best[1] < 1e299)
+            printf("  ускорение prefill: %.2fx\n", best[0] / best[1]);
+    }
+
     vtm_metal_stats_get(&st);
     printf("metal stats: init %llu мс (MSL %llu мс), вызовов %llu, отказов "
-           "%llu\n", (unsigned long long)st.init_ms,
+           "%llu, gemm %llu, отложено %llu, ожиданий %llu\n",
+           (unsigned long long)st.init_ms,
            (unsigned long long)st.compile_ms,
-           (unsigned long long)st.calls, (unsigned long long)st.failures);
+           (unsigned long long)st.calls, (unsigned long long)st.failures,
+           (unsigned long long)st.gemm_calls,
+           (unsigned long long)st.defer_ops,
+           (unsigned long long)st.defer_waits);
     printf("  zero-copy: %.1f МиБ привязано без копии, копий %.1f МиБ; "
-           "currentAllocatedSize %.1f МиБ (до init %.1f, после %.1f)\n",
+           "currentAllocatedSize %.1f МиБ (до init %.1f, после %.1f), "
+           "ожидание GPU %.1f мс\n",
            (double)st.nocopy_bytes / (1024.0 * 1024.0),
            (double)st.copy_bytes / (1024.0 * 1024.0),
            (double)st.current_allocated / (1024.0 * 1024.0),
            (double)st.alloc_before / (1024.0 * 1024.0),
-           (double)st.alloc_after / (1024.0 * 1024.0));
+           (double)st.alloc_after / (1024.0 * 1024.0),
+           (double)st.wait_ns / 1e6);
     printf("  phys_footprint: до загрузки %.1f МиБ, после загрузки %.1f МиБ, "
            "сейчас %.1f МиБ (Δ после GPU %.1f МиБ)\n",
            (double)rss0 / (1024.0 * 1024.0),

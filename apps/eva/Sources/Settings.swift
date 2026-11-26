@@ -21,25 +21,37 @@ struct ModelSpec: Equatable, Sendable {
     }
 }
 
-/// Пресет голоса, который понимает `/api/tts` (`VOICE_PRESETS` в tools/chat_server.py).
-struct VoicePreset: Equatable, Sendable {
+/// Голос Silero, который понимает `/api/tts` (`SILERO_VOICES` в
+/// tools/chat_server.py). Задача 0197: озвучка — только Silero, пресетов
+/// young/soft/irina больше нет; `aidar` валиден в API, но в UI не показывается.
+struct SileroVoice: Equatable, Sendable {
     let id: String
     let title: String
 }
 
-enum VoicePresets {
-    static let all: [VoicePreset] = [
-        VoicePreset(id: "younger", title: "моложе и мягче (по умолчанию)"),
-        VoicePreset(id: "young", title: "моложе"),
-        VoicePreset(id: "young_soft", title: "моложе, спокойнее"),
-        VoicePreset(id: "softest", title: "самый мягкий"),
-        VoicePreset(id: "soft", title: "спокойнее"),
-        VoicePreset(id: "irina", title: "Ирина, как есть"),
+enum SileroVoices {
+    /// Ровно три голоса в том же порядке, что в селекторе страницы чата.
+    static let all: [SileroVoice] = [
+        SileroVoice(id: "baya", title: "baya — живой"),
+        SileroVoice(id: "kseniya", title: "kseniya — выше"),
+        SileroVoice(id: "xenia", title: "xenia — ниже"),
     ]
-    static let defaultID = "younger"
+    static let defaultID = "baya"
 
     static func title(_ id: String) -> String {
         all.first { $0.id == id }?.title ?? id
+    }
+
+    static func isValid(_ id: String) -> Bool {
+        all.contains { $0.id == id }
+    }
+
+    /// Годный голос или `baya` по умолчанию (пустое/чужое значение — тоже).
+    static func normalize(_ raw: String?) -> String {
+        guard let id = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              isValid(id)
+        else { return defaultID }
+        return id
     }
 }
 
@@ -66,6 +78,9 @@ final class Settings {
     /// «Слушать после ответа» (задача 0190): микрофон открывается сам, чтобы
     /// следующий вопрос можно было задать без «Привет, Ева».
     static let followUpKey = "eva.followUpListen"
+    /// Голосовая команда «Стоп, Ева» (задача 0194): микрофон активен, только
+    /// пока Ева думает или говорит. По умолчанию включена.
+    static let stopCommandKey = "eva.stopCommand"
     /// Сколько секунд тишины терпит follow-up, пока не сказано ни слова.
     static let followUpSilenceKey = "eva.followUpSilence"
     /// «Запускаться свёрнутым» (задача 0188): на экране сразу только круг.
@@ -80,6 +95,9 @@ final class Settings {
     static let defaultMaxTokens = 256
     /// По умолчанию follow-up включён: разговор без кнопок — основной сценарий.
     static let defaultFollowUpListen = true
+    /// «Стоп, Ева» включена по умолчанию: перебить голосом — основной сценарий
+    /// разговора, а микрофон поднимается только на время речи Евы.
+    static let defaultStopCommand = true
     /// Варианты паузы «до ухода в ожидание»; 12 с — компромисс между
     /// «не успел собраться с мыслью» и «микрофон висит впустую».
     static let followUpSilenceOptions = [8, 12, 20]
@@ -98,15 +116,29 @@ final class Settings {
         defaults.register(defaults: [
             Settings.serverKey: Settings.defaultServer,
             Settings.modelKey: ModelSpec.fallback.storageValue,
-            Settings.voiceKey: VoicePresets.defaultID,
+            Settings.voiceKey: SileroVoices.defaultID,
             Settings.speakKey: true,
             Settings.maxTokensKey: Settings.defaultMaxTokens,
             Settings.animateCircleKey: true,
             Settings.wakeWordKey: false,
             Settings.followUpKey: Settings.defaultFollowUpListen,
+            Settings.stopCommandKey: Settings.defaultStopCommand,
             Settings.followUpSilenceKey: Settings.defaultFollowUpSilence,
             Settings.startCompactKey: Settings.defaultStartCompact,
         ])
+        migrateVoice()
+    }
+
+    /// Миграция `eva.voice` (задача 0197): пресеты Piper `young`/`soft`/`irina`
+    /// (и производные `younger`/`young_soft`/`softest`) заменяются на `baya`.
+    /// Неизвестный id — тоже `baya`: сервер не знает такого голоса и ответил
+    /// бы 400. Пишем один раз, без уведомления — UI ещё не построен.
+    private func migrateVoice() {
+        let raw = defaults.string(forKey: Settings.voiceKey)
+        let voice = SileroVoices.normalize(raw)
+        if raw != voice {
+            defaults.set(voice, forKey: Settings.voiceKey)
+        }
     }
 
     var serverText: String {
@@ -119,9 +151,11 @@ final class Settings {
         set { store(Settings.modelKey, newValue.storageValue) }
     }
 
+    /// Голос Silero: `baya`/`kseniya`/`xenia`. Старое значение в UserDefaults
+    /// (пресет Piper) читается как `baya`, даже если миграция ещё не прошла.
     var voice: String {
-        get { defaults.string(forKey: Settings.voiceKey) ?? VoicePresets.defaultID }
-        set { store(Settings.voiceKey, newValue) }
+        get { SileroVoices.normalize(defaults.string(forKey: Settings.voiceKey)) }
+        set { store(Settings.voiceKey, SileroVoices.normalize(newValue)) }
     }
 
     var speakReplies: Bool {
@@ -157,6 +191,14 @@ final class Settings {
     var followUpListen: Bool {
         get { defaults.bool(forKey: Settings.followUpKey) }
         set { store(Settings.followUpKey, newValue) }
+    }
+
+    /// Слушать «Стоп, Ева», пока идёт «думаю» или озвучка (задача 0194).
+    /// Включено по умолчанию; выключение гарантирует, что во время речи Евы
+    /// микрофон не держится вовсе.
+    var stopCommand: Bool {
+        get { defaults.bool(forKey: Settings.stopCommandKey) }
+        set { store(Settings.stopCommandKey, newValue) }
     }
 
     /// Пауза тишины в follow-up, секунды. Значение вне списка вариантов не

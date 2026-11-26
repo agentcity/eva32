@@ -231,7 +231,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         voicePopup = NSPopUpButton(frame: .zero, pullsDown: false)
         voicePopup.controlSize = .small
         voicePopup.font = .systemFont(ofSize: 11)
-        voicePopup.addItems(withTitles: VoicePresets.all.map(\.title))
+        voicePopup.addItems(withTitles: SileroVoices.all.map(\.title))
         selectVoice(Settings.shared.voice)
         voicePopup.target = self
         voicePopup.action = #selector(voiceChanged)
@@ -369,7 +369,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     }
 
     private func selectVoice(_ id: String) {
-        if let index = VoicePresets.all.firstIndex(where: { $0.id == id }) {
+        if let index = SileroVoices.all.firstIndex(where: { $0.id == id }) {
             voicePopup?.selectItem(at: index)
         } else {
             voicePopup?.selectItem(at: 0)
@@ -378,10 +378,10 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     private func selectedVoiceID() -> String? {
         guard let index = voicePopup?.indexOfSelectedItem,
-              VoicePresets.all.indices.contains(index)
+              SileroVoices.all.indices.contains(index)
         else {
             return nil
         }
-        return VoicePresets.all[index].id
+        return SileroVoices.all[index].id
     }
 }

@@ -1,6 +1,6 @@
 import AppKit
 
-/// Окно настроек: адрес сервера, модель из `/api/backends`, пресет голоса и
+/// Окно настроек: адрес сервера, модель из `/api/backends`, голос Silero и
 /// озвучка. Значения хранятся в UserDefaults (см. `Settings`).
 @MainActor
 final class SettingsWindowController: NSObject, NSWindowDelegate {
@@ -13,6 +13,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var startCompactCheck: NSButton!
     private var wakeCheck: NSButton!
     private var followUpCheck: NSButton!
+    private var stopCheck: NSButton!
     private var followUpPopup: NSPopUpButton!
     private var statusLabel: NSTextField!
 
@@ -39,7 +40,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private func build() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 600),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -73,7 +74,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         voicePopup = NSPopUpButton(frame: .zero, pullsDown: false)
         voicePopup.controlSize = .small
         voicePopup.font = .systemFont(ofSize: 11)
-        voicePopup.addItems(withTitles: VoicePresets.all.map(\.title))
+        voicePopup.addItems(withTitles: SileroVoices.all.map(\.title))
         voicePopup.target = self
         voicePopup.action = #selector(voiceChanged)
 
@@ -121,6 +122,23 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             action: #selector(followUpChanged)
         )
         followUpCheck.controlSize = .small
+
+        // «Стоп, Ева» (задача 0194): микрофон активен только пока Ева думает
+        // или говорит, поэтому галочка по умолчанию включена.
+        stopCheck = NSButton(
+            checkboxWithTitle: "Слушать „Стоп, Ева“",
+            target: self,
+            action: #selector(stopCommandChanged)
+        )
+        stopCheck.controlSize = .small
+
+        let stopHint = NSTextField(
+            wrappingLabelWithString: "микрофон активен, пока Ева думает и говорит: "
+                + "скажите «стоп», «хватит» или «тише» — она замолчит; "
+                + "распознавание локальное, звук никуда не уходит"
+        )
+        stopHint.font = .systemFont(ofSize: 11)
+        stopHint.textColor = .secondaryLabelColor
 
         followUpPopup = NSPopUpButton(frame: .zero, pullsDown: false)
         followUpPopup.controlSize = .small
@@ -197,6 +215,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             row("", followUpCheck),
             row("", followUpHint),
             row("Пауза", followUpRow),
+            row("", stopCheck),
+            row("", stopHint),
             hint,
             statusLabel,
             buttons,
@@ -243,6 +263,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         startCompactCheck.state = Settings.shared.startCompact ? .on : .off
         wakeCheck.state = Settings.shared.wakeWord ? .on : .off
         followUpCheck.state = Settings.shared.followUpListen ? .on : .off
+        stopCheck.state = Settings.shared.stopCommand ? .on : .off
         // Пауза может быть выставлена и вручную (`defaults write`) — тогда
         // показываем ближайший вариант, а хранимое значение не переписываем.
         let pause = Settings.shared.followUpSilence
@@ -254,7 +275,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             followUpPopup.selectItem(at: fallback)
         }
         let voiceID = Settings.shared.voice
-        if let index = VoicePresets.all.firstIndex(where: { $0.id == voiceID }) {
+        if let index = SileroVoices.all.firstIndex(where: { $0.id == voiceID }) {
             voicePopup.selectItem(at: index)
         }
         fillModelPopup(current: Settings.shared.model)
@@ -359,14 +380,15 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             Settings.shared.model = model
         }
         let voiceIndex = voicePopup.indexOfSelectedItem
-        if VoicePresets.all.indices.contains(voiceIndex) {
-            Settings.shared.voice = VoicePresets.all[voiceIndex].id
+        if SileroVoices.all.indices.contains(voiceIndex) {
+            Settings.shared.voice = SileroVoices.all[voiceIndex].id
         }
         Settings.shared.speakReplies = speakCheck.state == .on
         Settings.shared.animateCircle = animateCheck.state == .on
         Settings.shared.startCompact = startCompactCheck.state == .on
         Settings.shared.wakeWord = wakeCheck.state == .on
         Settings.shared.followUpListen = followUpCheck.state == .on
+        Settings.shared.stopCommand = stopCheck.state == .on
         let pauseIndex = followUpPopup.indexOfSelectedItem
         if Settings.followUpSilenceOptions.indices.contains(pauseIndex) {
             Settings.shared.followUpSilence = Settings.followUpSilenceOptions[pauseIndex]
@@ -378,6 +400,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             + "анимация=\(Settings.shared.animateCircle) "
             + "старт-свёрнутым=\(Settings.shared.startCompact) "
             + "ожидание=\(Settings.shared.wakeWord) "
+            + "стоп-команда=\(Settings.shared.stopCommand) "
             + "follow-up=\(Settings.shared.followUpListen)/\(Settings.shared.followUpSilence) с")
     }
 
@@ -417,8 +440,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     @objc private func voiceChanged() {
         let index = voicePopup.indexOfSelectedItem
-        if VoicePresets.all.indices.contains(index) {
-            Settings.shared.voice = VoicePresets.all[index].id
+        if SileroVoices.all.indices.contains(index) {
+            Settings.shared.voice = SileroVoices.all[index].id
         }
     }
 
@@ -454,6 +477,15 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         Settings.shared.followUpListen = followUpCheck.state == .on
         log("настройки: слушать после ответа="
             + "\(Settings.shared.followUpListen ? "включено" : "выключено")")
+    }
+
+    /// «Стоп, Ева» применяется сразу: `AppDelegate` слушает `Settings.didChange`
+    /// и опускает/поднимает слушатель без перезапуска. Выключили — во время
+    /// речи Евы микрофон не держится вовсе.
+    @objc private func stopCommandChanged() {
+        Settings.shared.stopCommand = stopCheck.state == .on
+        log("настройки: стоп-команда="
+            + "\(Settings.shared.stopCommand ? "включена" : "выключена")")
     }
 
     @objc private func followUpSilenceChanged() {

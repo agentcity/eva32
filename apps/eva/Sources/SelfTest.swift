@@ -19,6 +19,7 @@ enum SelfTest {
         case text
         case wake
         case followUp
+        case stop
         case wakeAudio(Double)
         case compact
         case version
@@ -41,6 +42,8 @@ enum SelfTest {
             return runWakeWord()
         case .followUp:
             return runFollowUp()
+        case .stop:
+            return runStopCommand()
         case .wakeAudio(let seconds):
             return await runWakeAudio(seconds: seconds)
         case .compact:
@@ -435,6 +438,248 @@ enum SelfTest {
               ))
 
         print(failures == 0 ? "все проверки follow-up прошли" : "провалено: \(failures)")
+        return failures == 0 ? 0 : 1
+    }
+
+    // MARK: - «Стоп, Ева» без микрофона (задача 0194)
+
+    /// Проверяет то, что можно проверить без живого микрофона и не «глуша»
+    /// настоящее приложение: нормализацию и матчер команд, эхо-защиту от
+    /// собственной речи, план «какой слушатель держит микрофон» (ровно один)
+    /// и настройку. Живой микрофон — за человеком (docs/voice-app.md).
+    @MainActor
+    private static func runStopCommand() -> Int32 {
+        var failures = 0
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            print((ok ? "OK   " : "FAIL ") + name + (detail.isEmpty ? "" : " — " + detail))
+            if !ok { failures += 1 }
+        }
+
+        check("«Слушать „Стоп, Ева“» по умолчанию включена",
+              Settings.defaultStopCommand)
+        check("ключ настройки — eva.stopCommand",
+              Settings.stopCommandKey == "eva.stopCommand",
+              Settings.stopCommandKey)
+
+        check("нормализация «Стоп, Ева!»",
+              StopCommandListener.normalized("Стоп, Ева!") == "стоп ева",
+              StopCommandListener.normalized("Стоп, Ева!").debugDescription)
+
+        let commands = [
+            "Стоп",
+            "Стоп!",
+            "стоп, ева",
+            "Стоп, Ева!",
+            "Ева, стоп",
+            "Хватит",
+            "хватит!",
+            "Тише",
+            "тише, тише",
+            "Стоп, хватит",
+        ]
+        for phrase in commands {
+            check("команда: \(phrase.debugDescription)",
+                  StopCommandListener.isStopPhrase(phrase))
+        }
+
+        let notCommands = [
+            "",
+            "привет ева",
+            "как дела",
+            "останови",
+            "стопкран",
+            "продолжай",
+        ]
+        for phrase in notCommands {
+            check("не команда: \(phrase.debugDescription)",
+                  !StopCommandListener.isStopPhrase(phrase))
+        }
+
+        // Эхо: Ева сама говорит «стоп»/«хватит» — её голос из колонок не
+        // должен глушить озвучку.
+        check("эхо: «стоп» в текущей фразе Евы → игнорирую",
+              StopCommandListener.shouldIgnore(
+                  text: "стоп",
+                  spoken: "Сейчас остановлюсь. Стоп."
+              ))
+        check("эхо: «хватит» в текущей фразе Евы → игнорирую",
+              StopCommandListener.shouldIgnore(
+                  text: "хватит",
+                  spoken: "Хватит на сегодня."
+              ))
+        check("не эхо: обычная фраза Евы → команда работает",
+              !StopCommandListener.shouldIgnore(
+                  text: "стоп ева",
+                  spoken: "Привет! Как дела?"
+              ))
+        check("не эхо: тишина → команда работает",
+              !StopCommandListener.shouldIgnore(text: "стоп", spoken: nil))
+        check("не команда: «привет ева» не глушит даже при «стоп» в речи",
+              !StopCommandListener.shouldIgnore(
+                  text: "привет ева",
+                  spoken: "Стоп."
+              ))
+        check("«тише» в речи Евы не относится к эхо-защите",
+              !StopCommandListener.shouldIgnore(
+                  text: "тише",
+                  spoken: "Говори тише, пожалуйста."
+              ))
+
+        // План слушателей: wake и stop никогда не вместе.
+        func plan(
+            speak: Bool = false,
+            thinking: Bool = false,
+            recording: Bool = false,
+            error: Bool = false,
+            wakeWord: Bool = true,
+            stopCommand: Bool = true,
+            wakeSuppressed: Bool = false,
+            stopSuppressed: Bool = false,
+            followUp: Bool = false
+        ) -> EvaListenerPlan {
+            AppDelegate.listenerPlan(
+                wakeWord: wakeWord,
+                stopCommand: stopCommand,
+                wakeSuppressed: wakeSuppressed,
+                stopSuppressed: stopSuppressed,
+                isRecording: recording,
+                isSpeaking: speak,
+                isThinking: thinking,
+                followUpArmed: followUp,
+                errorActive: error
+            )
+        }
+
+        let idle = plan()
+        check("в покое микрофон у wake-ожидания",
+              idle.wake && !idle.stop,
+              "wake=\(idle.wake), stop=\(idle.stop)")
+
+        let speaking = plan(speak: true)
+        check("во время озвучки микрофон у стоп-слушателя",
+              speaking.stop && !speaking.wake,
+              "wake=\(speaking.wake), stop=\(speaking.stop)")
+
+        let thinking = plan(thinking: true)
+        check("пока «думаю» — стоп-слушатель уже слушает",
+              thinking.stop && !thinking.wake,
+              "wake=\(thinking.wake), stop=\(thinking.stop)")
+
+        let mix = plan(speak: true, thinking: true)
+        check("«думаю» + озвучка — по-прежнему один слушатель",
+              mix.stop && !mix.wake,
+              "wake=\(mix.wake), stop=\(mix.stop)")
+
+        let disabled = plan(speak: true, stopCommand: false)
+        check("галочка снята — во время речи микрофон не держим",
+              !disabled.wake && !disabled.stop,
+              "wake=\(disabled.wake), stop=\(disabled.stop)")
+
+        let recording = plan(speak: true, recording: true)
+        check("идёт запись — ни один слушатель не работает",
+              !recording.wake && !recording.stop,
+              "wake=\(recording.wake), stop=\(recording.stop)")
+
+        let failure = plan(speak: true, error: true)
+        check("вспышка ошибки — ни один слушатель не работает",
+              !failure.wake && !failure.stop,
+              "wake=\(failure.wake), stop=\(failure.stop)")
+
+        let followUpWaiting = plan(followUp: true)
+        check("follow-up вооружён — wake ждёт, стоп не слушает",
+              !followUpWaiting.wake && !followUpWaiting.stop,
+              "wake=\(followUpWaiting.wake), stop=\(followUpWaiting.stop)")
+
+        let wakeDenied = plan(wakeSuppressed: true)
+        check("wake не поднялся из-за прав — стоп-слушатель не глушит его навсегда",
+              !wakeDenied.wake && !wakeDenied.stop,
+              "wake=\(wakeDenied.wake), stop=\(wakeDenied.stop)")
+
+        let stopDenied = plan(speak: true, stopSuppressed: true)
+        check("стоп-слушатель не поднялся — wake не занимает его место во время речи",
+              !stopDenied.wake && !stopDenied.stop,
+              "wake=\(stopDenied.wake), stop=\(stopDenied.stop)")
+
+        // Перебор всех сочетаний: два микрофонных движка не встречаются.
+        var both = 0
+        for speak in [false, true] {
+            for thinking in [false, true] {
+                for recording in [false, true] {
+                    for error in [false, true] {
+                        for wakeWord in [false, true] {
+                            for stopCommand in [false, true] {
+                                for followUp in [false, true] {
+                                    let p = plan(
+                                        speak: speak,
+                                        thinking: thinking,
+                                        recording: recording,
+                                        error: error,
+                                        wakeWord: wakeWord,
+                                        stopCommand: stopCommand,
+                                        followUp: followUp
+                                    )
+                                    if p.wake && p.stop { both += 1 }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        check("ни одно сочетание флагов не включает оба движка", both == 0,
+              "сочетаний с двумя движками: \(both)")
+
+        // Матчер — это несколько сравнений слов; 1000 вызовов должны уложиться
+        // в бюджет отклика (<300 мс) с большим запасом.
+        let started = Date()
+        var hits = 0
+        for _ in 0..<1000 {
+            if StopCommandListener.isStopPhrase("Стоп, Ева!") { hits += 1 }
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        check("1000 проверок фразы быстрее 300 мс",
+              hits == 1000 && elapsed < 0.3,
+              String(format: "%.1f мс", elapsed * 1000))
+
+        // Микрофонная решётка Mac при включённом voice processing отдаёт 3+
+        // канала, а кольцо стоп-слушателя всегда моно. `AVAudioFormat(...,
+        // channels: 3)` для такого формата возвращает nil, поэтому проверяем
+        // именно сведение каналов в кольце — без микрофона.
+        if let layout = AVAudioChannelLayout(
+            layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 3
+        ) {
+            let inputFormat = AVAudioFormat(
+                standardFormatWithSampleRate: 48_000,
+                channelLayout: layout
+            )
+            if let mono = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1),
+               let buffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 4),
+               let data = buffer.floatChannelData {
+                buffer.frameLength = 4
+                for channel in 0..<3 {
+                    for index in 0..<4 { data[channel][index] = Float(channel + 1) }
+                }
+                let ring = WakeAudioRing(format: mono, capacity: 1024)
+                ring.append(buffer)
+                if let out = ring.take(maxFrames: 16), let samples = out.floatChannelData {
+                    let values = (0..<Int(out.frameLength)).map { samples[0][$0] }
+                    check("3 канала микрофона сводятся в моно",
+                          values.count == 4 && values.allSatisfy { abs($0 - 2) < 0.0001 },
+                          "\(values)")
+                    check("распознавателю уходит моно 48 кГц",
+                          out.format.channelCount == 1 && out.format.sampleRate == 48_000,
+                          "каналов=\(out.format.channelCount), Гц=\(out.format.sampleRate)")
+                } else {
+                    check("моно-кольцо отдало буфер", false)
+                }
+            } else {
+                check("моно-формат и 3-канальный буфер создались", false)
+            }
+        } else {
+            check("канальный layout для 3 каналов создался", false)
+        }
+
+        print(failures == 0 ? "все проверки стоп-команды прошли" : "провалено: \(failures)")
         return failures == 0 ? 0 : 1
     }
 

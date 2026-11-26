@@ -39,14 +39,16 @@ Qwen одновременно, с временем и скоростью. Скр
 * ``POST /api/reset`` — новый диалог: сброс истории колонки
   (``{"side": 0}``) или обеих (``{}``); в шапке колонки — «история: N реплик ·
   ~M токенов», счётчик приходит в ``history`` у ``GET /api/models``;
-* ``POST /api/tts`` — озвучка (задачи 0183/0191): ``{"text", "voice"}`` →
-  аудио (``Cache-Control: no-store``). Content-Type — по сигнатуре:
-  ``audio/mpeg`` для MP3 ElevenLabs, ``audio/wav`` для Piper/say/espeak.
+* ``POST /api/tts`` — озвучка (задачи 0183/0191/0197): ``{"text", "voice"}``
+  → аудио (``Cache-Control: no-store``). Content-Type — по сигнатуре:
+  ``audio/mpeg`` для MP3 ElevenLabs, ``audio/wav`` для Silero/say/espeak.
+  ``voice`` — имя голоса Silero (``baya``/``kseniya``/``xenia``/``aidar``,
+  по умолчанию ``baya``); любое другое значение — 400 с перечнем допустимых.
   Текст чистится от ``<think>…</think>``, markdown и URL, длиннее 600
-  символов — 400. Синтез — ``eva/tts.py``: ElevenLabs → Piper → системный
-  ``say``/``espeak`` → null; сбой облака откатывается на Piper, а 503 «голос
-  недоступен» — только если запасного движка тоже нет; чат при этом работает
-  как раньше;
+  символов — 400. Синтез — ``eva/tts.py``: ElevenLabs → Silero → системный
+  ``say``/``espeak`` → null; сбой облака откатывается на локальный голос, а
+  503 «голос недоступен» — только если запасного движка тоже нет; чат при
+  этом работает как раньше;
 * ``POST /api/load`` / ``POST /api/unload`` — явная загрузка/выгрузка
   ВТМ-модели (задача 0166). Тело — ``{"backend": "vtm", "model": "<id>"}``,
   неизвестная модель — 400, чужой бэкенд (Ollama) — 400: её памятью
@@ -2672,12 +2674,9 @@ PAGE_HTML = """<!doctype html>
       <label class="check"><input type="checkbox" id="use-system" checked> системный промпт EVA32</label>
       <label class="field inline" for="voice">голос
         <select id="voice">
-          <option value="irina">обычный</option>
-          <option value="soft">мягче</option>
-          <option value="young">моложе</option>
-          <option value="young_soft">моложе и мягче</option>
-          <option value="softest">очень мягко</option>
-          <option value="younger" selected>очень мягко и молодо</option>
+          <option value="baya" selected>baya — живой</option>
+          <option value="kseniya">kseniya — выше</option>
+          <option value="xenia">xenia — ниже</option>
         </select>
       </label>
       <label class="field inline" for="mode">режим
@@ -3065,11 +3064,11 @@ PAGE_HTML = """<!doctype html>
 
   function ttsBox(side) { return byId("tts-" + side); }
 
-  // Пресет голоса выбирается один на страницу: «мягче» — медленнее и ровнее,
-  // «моложе» — сдвиг высоты на ~полутон, «моложе и мягче» — оба.
-  function voicePreset() {
+  // Голос Silero выбирается один на страницу: baya/kseniya/xenia/aidar.
+  // Тембр задаёт модель, пост-обработки WAV больше нет.
+  function selectedVoice() {
     var select = byId("voice");
-    return select ? select.value : "irina";
+    return select ? select.value : "baya";
   }
 
   function ttsEnabled(side) {
@@ -3191,7 +3190,7 @@ PAGE_HTML = """<!doctype html>
       return fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: "Звук включён. Я Ева, слушайте ответы.", voice: voicePreset() })
+      body: JSON.stringify({ text: "Звук включён. Я Ева, слушайте ответы.", voice: selectedVoice() })
     }).then(function (resp) {
       if (!resp.ok) { throw new Error("tts " + resp.status); }
       return resp.blob();
@@ -3273,7 +3272,7 @@ PAGE_HTML = """<!doctype html>
     var ready = fetch("/api/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Accept": "audio/wav" },
-      body: JSON.stringify({ text: text, voice: voicePreset() })
+      body: JSON.stringify({ text: text, voice: selectedVoice() })
     }).then(function (response) {
       if (!response.ok) {
         var status = response.status;
@@ -4243,149 +4242,41 @@ def looks_like_audio(data: bytes | bytearray | None) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# Пресеты голоса
+# Голоса Silero (задача 0197)
 # --------------------------------------------------------------------------- #
-# Piper даёт один женский русский голос (irina), поэтому «мягче» и «моложе» —
-# это параметры синтеза и пост-обработка, а не другой голос:
-#   rate  — темп: у Piper length_scale = 180/rate, больше значение — медленнее
-#           и спокойнее (мягче);
-#   pitch — сдвиг высоты: ресемплинг вверх (1.06 ≈ +1 полутон) делает голос
-#           моложе; темп при этом растёт на те же 6%, поэтому он компенсирован
-#           в rate.
-VOICE_PRESETS: dict[str, dict[str, float]] = {
-    "irina": {"rate": 180.0, "pitch": 1.0, "smooth": 0.0},
-    "soft": {"rate": 163.0, "pitch": 1.0, "smooth": 0.0},
-    "young": {"rate": 190.0, "pitch": 1.06, "smooth": 0.0},
-    "young_soft": {"rate": 172.0, "pitch": 1.05, "smooth": 0.0},
-    # Ещё мягче и моложе: темп ниже (длиннее паузы, ровнее интонация), высота
-    # на два полутона вверх (1.122), плюс лёгкое сглаживание — убирает
-    # «стеклянную» резкость высоких, из-за которой голос кажется взрослее.
-    "softest": {"rate": 150.0, "pitch": 1.0, "smooth": 0.35},
-    "younger": {"rate": 150.0, "pitch": 1.122, "smooth": 0.35},
-}
+# Озвучка — только Silero. В селекторах страницы и EVA.app три женских
+# голоса (baya/kseniya/xenia); aidar валиден в API и SILERO_SPEAKER, но в UI
+# не показывается. Питч-шифта и сглаживания нет: тембр задаёт сама модель.
+SILERO_VOICES: tuple[str, ...] = ("baya", "kseniya", "xenia", "aidar")
 
-
-def _smooth_wav(wav: bytes, amount: float) -> bytes:
-    """Мягкое сглаживание PCM16-моно: y[i] = (1-a)·x[i] + a·(x[i-1]+x[i+1])/2.
-
-    Доля ``amount`` — насколько примешивать соседей. Убирает резкость высоких,
-    из-за которой синтез звучит «взрослее»; больше 0.5 делает кашу, поэтому
-    ограничиваем. Нестандартный WAV возвращается как есть.
-    """
-    if amount <= 0:
-        return wav
-    amount = min(0.5, float(amount))
-    try:
-        import io
-        import wave
-
-        with wave.open(io.BytesIO(wav), "rb") as src:
-            if src.getnchannels() != 1 or src.getsampwidth() != 2:
-                return wav
-            rate = src.getframerate()
-            frames = src.readframes(src.getnframes())
-    except Exception:  # noqa: BLE001
-        return wav
-    import array
-
-    samples = array.array("h")
-    samples.frombytes(frames)
-    total = len(samples)
-    if total < 3:
-        return wav
-    out = array.array("h", bytes(2 * total))
-    out[0] = samples[0]
-    out[total - 1] = samples[total - 1]
-    for i in range(1, total - 1):
-        out[i] = int((1.0 - amount) * samples[i]
-                     + amount * 0.5 * (samples[i - 1] + samples[i + 1]))
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as dst:
-        dst.setnchannels(1)
-        dst.setsampwidth(2)
-        dst.setframerate(rate)
-        dst.writeframes(out.tobytes())
-    return buf.getvalue()
-
-
-def _pitch_shift_wav(wav: bytes, factor: float) -> bytes:
-    """Сдвинуть высоту WAV (моно, 16 бит) ресемплингом в ``factor`` раз.
-
-    Меняет и темп; вызывающий компенсирует его через ``rate``. Линейная
-    интерполяция достаточна: у нас речь, а не музыка, и слышимая разница —
-    именно высота голоса. Любая нестандартная форма волны возвращается как
-    есть — лучше обычный голос, чем испорченный.
-    """
-    if factor <= 0 or abs(factor - 1.0) < 1e-3:
-        return wav
-    try:
-        import io
-        import wave
-
-        with wave.open(io.BytesIO(wav), "rb") as src:
-            if src.getnchannels() != 1 or src.getsampwidth() != 2:
-                return wav
-            rate = src.getframerate()
-            frames = src.readframes(src.getnframes())
-    except Exception:  # noqa: BLE001 - не WAV/не тот формат
-        return wav
-    import array
-
-    samples = array.array("h")
-    samples.frombytes(frames)
-    total = len(samples)
-    if total < 2:
-        return wav
-    out_len = max(1, int(total / factor))
-    out = array.array("h", bytes(2 * out_len))
-    step = factor
-    pos = 0.0
-    for i in range(out_len):
-        left = int(pos)
-        right = min(left + 1, total - 1)
-        frac = pos - left
-        out[i] = int(samples[left] * (1.0 - frac) + samples[right] * frac)
-        pos += step
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as dst:
-        dst.setnchannels(1)
-        dst.setsampwidth(2)
-        dst.setframerate(rate)
-        dst.writeframes(out.tobytes())
-    return buf.getvalue()
+#: Голос по умолчанию — тот же, что у ``SILERO_SPEAKER`` в ``eva/tts.py``.
+DEFAULT_VOICE = "baya"
 
 
 def default_tts_speech(
     text: str, voice: str | None = None
 ) -> tuple[bytes, str]:
-    """Синтез через ``eva/tts.py``: ElevenLabs → Piper → say/espeak → null.
+    """Синтез через ``eva/tts.py``: ElevenLabs → Silero → say/espeak → null.
 
     Возвращает ``(аудиобайты, content_type)``: ElevenLabs — MP3
     (``audio/mpeg``), локальные движки — WAV (``audio/wav``). Импорт ленивый:
     страница и метрики не должны тянуть ``eva`` без нужды.
 
-    ``NullTTS`` (нет ни одного движка) возвращает ``b""`` — это «голоса нет»,
-    а не сбой процесса; HTTP-слой превращает пустой ответ в понятный 503.
-    Сбой ElevenLabs обрабатывает ``eva.tts``: логирует причину без ключа и
-    откатывается на Piper/system, поэтому сюда обычно приходит уже аудио.
-    Исключения адаптера не глотаются: их текст уходит клиенту как «голос
-    недоступен» (только если запасной движок тоже не настроен).
-
-    Пресеты (``irina``/``soft``/``young``) — параметры WAV-Piper; к MP3 они
-    неприменимы, поэтому для облачного голоса возвращаем его как есть.
+    ``voice`` — голос Silero (``baya``/``kseniya``/``xenia``/``aidar``);
+    проверка значения и подстановка ``baya`` — в HTTP-слое, чтобы неизвестное
+    имя получало 400, а не молчаливую подмену. ``NullTTS`` (нет ни одного
+    движка) возвращает ``b""`` — это «голоса нет», а не сбой процесса;
+    HTTP-слой превращает пустой ответ в понятный 503. Сбой ElevenLabs
+    обрабатывает ``eva.tts``: логирует причину без ключа и откатывается на
+    Silero/system, поэтому сюда обычно приходит уже аудио. Исключения
+    адаптера не глотаются: их текст уходит клиенту как «голос недоступен»
+    (только если запасной движок тоже не настроен).
     """
     try:
         from eva.tts import synthesize_audio
     except ImportError as exc:  # pragma: no cover - eva лежит в репозитории
         raise RuntimeError("нет адаптера синтеза eva/tts.py") from exc
-    preset = VOICE_PRESETS.get((voice or "").strip().lower())
-    if preset is None:
-        return synthesize_audio(text, voice=voice)
-    data, content_type = synthesize_audio(text, rate=preset["rate"])
-    if content_type == "audio/wav":
-        shifted = _pitch_shift_wav(data, preset["pitch"])
-        data = _smooth_wav(shifted, preset.get("smooth", 0.0))
-    return data, content_type
+    return synthesize_audio(text, voice=voice or DEFAULT_VOICE)
 
 
 # --------------------------------------------------------------------------- #
@@ -4418,7 +4309,7 @@ class ChatHTTPServer(ThreadingHTTPServer):
     ) -> None:
         self.registry = tuple(registry)
         # Озвучка (задача 0183): чем синтезировать фразу. Тесты подставляют
-        # заглушку, боевой путь — eva/tts.py (Piper → say/espeak → null).
+        # заглушку, боевой путь — eva/tts.py (ElevenLabs → Silero → say).
         self.tts = tts or default_tts_speech
         self.dynamic_models = bool(dynamic_models)
         self.vtm_tokenizer = vtm_tokenizer
@@ -4909,17 +4800,20 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
     def _handle_tts(self) -> None:
         """``POST /api/tts``: фраза → аудио (WAV или MP3) для ``<audio>``.
 
-        Тело — ``{"text": "...", "voice": "..."}``; ``voice`` необязателен и
-        уходит в адаптер (у Piper голос задаёт модель, у ``say`` — имя вроде
-        Milena, у ElevenLabs — ID голоса). Адаптер может вернуть как голые
-        байты, так и пару ``(bytes, content_type)``; MIME в ответе берём по
+        Тело — ``{"text": "...", "voice": "..."}``; ``voice`` необязателен:
+        это имя голоса Silero (``baya``/``kseniya``/``xenia``/``aidar``), по
+        умолчанию ``baya``. Неизвестное имя — 400 со списком допустимых, а не
+        молчаливая подмена: иначе опечатка в настройках приложения давала бы
+        «не тот голос» без объяснений. Адаптер может вернуть как голые байты,
+        так и пару ``(bytes, content_type)``; MIME в ответе берём по
         сигнатуре (:func:`looks_like_audio`): MP3 → ``audio/mpeg``, WAV →
         ``audio/wav``. ``Cache-Control: no-store`` остаётся: фраза одноразовая.
 
         Всё, что не синтезировалось (нет движка, процесс упал, не аудио), —
         503 с текстом «голос недоступен»: страница покажет это, а чат
-        продолжит работать. Откат ElevenLabs → Piper делает ``eva/tts.py``,
-        поэтому сюда ошибка приходит только если запасного голоса тоже нет.
+        продолжит работать. Откат ElevenLabs → Silero/system делает
+        ``eva/tts.py``, поэтому сюда ошибка приходит только если запасного
+        голоса тоже нет.
         """
         payload = self._read_json_body()
         if not isinstance(payload, Mapping):
@@ -4928,13 +4822,18 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(raw_text, str):
             raise ClientError("Поле text: нужен текст фразы для озвучки.")
         raw_voice = payload.get("voice")
-        voice: str | None = None
+        voice = DEFAULT_VOICE
         if raw_voice is not None:
             if not isinstance(raw_voice, str):
                 raise ClientError("Поле voice: ожидалась строка с именем голоса.")
-            voice = raw_voice.strip() or None
-            if voice is not None and len(voice) > 64:
-                raise ClientError("Поле voice: имя голоса длиннее 64 символов.")
+            voice = raw_voice.strip().lower() or DEFAULT_VOICE
+            if voice not in SILERO_VOICES:
+                raise ClientError(
+                    "Поле voice: неизвестный голос {!r}. Допустимо: {}.".format(
+                        raw_voice, ", ".join(SILERO_VOICES)
+                    ),
+                    code="unknown_voice",
+                )
         text = clean_tts_text(raw_text)
         if not text:
             raise ClientError(

@@ -13,10 +13,10 @@
 * кэш: повторная фраза не идёт в сеть, ``ELEVENLABS_CACHE=0`` его отключает,
   LRU держит 50 записей;
 * ошибки 401/429/таймаут/сеть/пустой ответ → ``TTSError`` без ключа в тексте;
-* автоматический откат на Piper и лог без ключа; если Piper/system нет —
-  ошибка, а не тишина;
-* порядок автовыбора ElevenLabs → Piper → system → null и перекрытие
-  ``EVA_TTS``.
+* автоматический откат на Silero/system и лог без ключа; если локального
+  голоса нет — ошибка, а не тишина;
+* порядок автовыбора ElevenLabs → Silero → system → null (Piper выключен из
+  авто, задача 0197) и перекрытие ``EVA_TTS``.
 
 HTTP подменяется фейковым opener'ом: сеть не используется вообще.
 """
@@ -413,10 +413,12 @@ class EngineSelectionElevenLabsTests(unittest.TestCase):
         self.assertIsInstance(engine, tts.ElevenLabsTTS)
         self.assertEqual(engine.name, "elevenlabs")
 
-    def test_auto_without_key_uses_piper(self):
+    def test_auto_without_key_uses_system_not_piper(self):
+        # Без ключа Silero не установлен (env изолирован), Piper не в авто.
         env = {"PIPER_BIN": str(self.piper_bin), "PIPER_MODEL": str(self.model)}
         engine = tts.select_engine(env=env)
-        self.assertIsInstance(engine, tts.PiperTTS)
+        self.assertIsInstance(engine, tts.SystemTTS)
+        self.assertEqual(engine.name, "system")
 
     def test_eva_tts_piper_overrides_elevenlabs(self):
         env = _env(
@@ -438,7 +440,7 @@ class EngineSelectionElevenLabsTests(unittest.TestCase):
 
 
 class ElevenLabsFallbackTests(unittest.TestCase):
-    """Сбой облака → Piper; ошибка только если запасного голоса нет."""
+    """Сбой облака → Silero/system; ошибка только если голоса нет."""
 
     def setUp(self) -> None:
         tts.clear_elevenlabs_cache()
@@ -455,7 +457,7 @@ class ElevenLabsFallbackTests(unittest.TestCase):
     def tearDown(self) -> None:
         tts.clear_elevenlabs_cache()
 
-    def test_401_falls_back_to_piper_and_logs_without_key(self):
+    def test_401_falls_back_to_system_and_logs_without_key(self):
         http = FakeHTTP(
             urllib.error.HTTPError(
                 "https://api.elevenlabs.io", 401, "Unauthorized", {}, None
@@ -471,11 +473,12 @@ class ElevenLabsFallbackTests(unittest.TestCase):
         self.assertTrue(data.startswith(b"RIFF"))
         self.assertEqual(len(http.requests), 1)
         self.assertEqual(len(calls), 1)
+        self.assertEqual(Path(calls[0][0]).name, "say")
         joined = "\n".join(logs.output)
-        self.assertIn("откат на piper", joined)
+        self.assertIn("откат на system", joined)
         self.assertNotIn(API_KEY, joined)
 
-    def test_429_falls_back_to_piper(self):
+    def test_429_falls_back_to_system(self):
         http = FakeHTTP(
             urllib.error.HTTPError(
                 "https://api.elevenlabs.io", 429, "Too Many Requests", {}, None
@@ -487,7 +490,7 @@ class ElevenLabsFallbackTests(unittest.TestCase):
             data = tts.synthesize("Привет", env=self.env)
         self.assertTrue(data.startswith(b"RIFF"))
 
-    def test_timeout_falls_back_to_piper(self):
+    def test_timeout_falls_back_to_system(self):
         http = FakeHTTP(TimeoutError("timed out"))
         fake, _ = fake_popen()
         with mock.patch.object(tts.urllib.request, "urlopen", http), \
@@ -495,8 +498,8 @@ class ElevenLabsFallbackTests(unittest.TestCase):
             data = tts.synthesize("Привет", env=self.env)
         self.assertTrue(data.startswith(b"RIFF"))
 
-    def test_explicit_elevenlabs_without_key_falls_back_to_piper(self):
-        # env без ключа: явный ElevenLabs недоступен, должен уйти на Piper.
+    def test_explicit_elevenlabs_without_key_falls_back_to_system(self):
+        # env без ключа: явный ElevenLabs недоступен, должен уйти на system.
         env = {
             "PIPER_BIN": str(self.piper_bin),
             "PIPER_MODEL": str(self.model),

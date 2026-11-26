@@ -21,6 +21,108 @@ extern "C" {
 // SIMD; ядра при этом работают как скалярные).
 extern const vtm_backend vtm_backend_simd;
 
+// --- Metal-бэкенд, фаза 1 (задача 0192, ADR 0021) --------------------------
+//
+// Отдельный исполнитель на GPU: GEMV для kind 6 (Q4_K), kind 7 (Q6_K) и
+// int8-таблицы словаря (kind 4). Остальные операции (attention, KV, RMSNorm,
+// softmax, триты) остаются на CPU — бэкенд отдаёт те же ядра, что simd, и
+// подменяет только перечисленные GEMV. Веса не копируются: MTLBuffer
+// создаётся на выровненный срез mmap-региона контейнера (zero-copy).
+//
+// Включение: VTM_BACKEND=metal (см. vtm_backend_by_name). auto выбирает metal,
+// если сборка с Metal; устройство проверяется лениво при первом ядре (чтобы
+// выбор бэкенда не инициализировал GPU), и при отказе прогон уходит на CPU.
+// Любая ошибка Metal (нет устройства, не собрался MSL, ошибка командного
+// буфера) — лог в stderr и откат на NEON/scalar: ядра возвращают -1,
+// вызывающий идёт прежним путём. Побитового паритета с CPU нет (GPU меняет
+// порядок суммирования): контракт точности — argmax + Δlogits ≤ 1e-2.
+//
+// Сборка без Metal (не Darwin или VTM_WITH_METAL=0): backend_metal.m не
+// компилируется, а backend_scalar.c даёт заглушки Metal-API (ядра → -1).
+int vtm_metal_available(void);       // 1 — устройство есть (шейдеры ещё нет)
+int vtm_metal_compiled(void);        // 1 — сборка с Metal (без проверки устройства)
+int vtm_metal_active(void);          // 1 — metal выбран диспетчером
+void vtm_metal_set_active(int on);   // выбрать/снять; выключен — no-op
+const vtm_backend *vtm_backend_metal(void); // .name == "metal" + ядра simd
+
+// GEMV-ядра. 0 — успех, -1 — отказ (сборка/устройство/форма/память): тогда
+// диспетчер backend_scalar.c зовёт CPU-ядро, прогон не падает.
+int vtm_metal_q4k_gemv(float *y, const uint8_t *blocks, const float *x,
+                       int rows, int cols);
+int vtm_metal_q6k_gemv(float *y, const uint8_t *blocks, const float *x,
+                       int rows, int cols);
+int vtm_metal_i8_gemv(float *y, const int8_t *q, const float *scales,
+                      const float *x, int rows, int cols);
+
+// --- фаза 2 (задача 0196, ADR 0021 §4) --------------------------------------
+//
+// Батчевый GEMM prefill: n_tokens токенов пачки против одной матрицы, один
+// dispatch на матрицу (внутри — chunk'и до 32 токенов). Раскладка — как у
+// батчевых ядер interp.c:
+//   x[t * n_tokens + j] — вход токена j по индексу t;
+//   y[r * n_tokens + j] — выход токена j по строке r.
+// kind: 0 — Q4_K, 1 — Q6_K, 2 — int8-таблица словаря (kind 4).
+// 0 — успех, -1 — отказ (нет Metal/шейдера, форма, VTM_Q4K_STRICT): вызывающий
+// обязан пойти прежним CPU-путём, прогон не падает.
+int vtm_metal_qk_gemm(int kind, float *y, const void *w, const float *scales,
+                      const float *x, int rows, int cols, int n_tokens);
+
+// Отложенная очередь декода (фаза 2): interp.c собирает подряд идущие GEMV в
+// один MTLCommandBuffer и ждёт результат только когда он нужен CPU. Между
+// begin/end сессией владеет один поток; вторая попытка begin вернёт -1 и
+// вызывающий идёт синхронным путём (одиночный GEMV выше). Сцены две
+// (ping-pong): пока GPU считает одну, CPU кодирует другую; ожидание —
+// dispatch_semaphore, а не waitUntilCompleted.
+//
+// vtm_metal_defer_gemv: 0 — dispatch поставлен в очередь; 1 — не отложено
+// (форма/порог/нет сессии/strict), считайте CPU-путём; -1 — Metal ошибся
+// (тоже CPU-путь). Результаты попадают в y после vtm_metal_defer_wait/end.
+// vtm_metal_defer_submit отдаёт накопленную сцену GPU, не дожидаясь её
+// (CPU может делать независимую работу); vtm_metal_defer_wait ждёт все
+// отданные сцены и разносит результаты по y; -1 — буфер не завершился.
+int vtm_metal_defer_begin(void);
+int vtm_metal_defer_active(void);
+int vtm_metal_defer_gemv(int kind, float *y, const void *w,
+                         const float *scales, const float *x, int rows,
+                         int cols);
+int vtm_metal_defer_submit(void);
+int vtm_metal_defer_wait(void);
+int vtm_metal_defer_end(void);
+
+// Статистика для бенчмарка/отчёта: время инициализации (в т.ч. компиляции
+// MSL), число вызовов/отказов, сколько байт весов привязано zero-copy и
+// сколько скопировано, currentAllocatedSize до/после инициализации. Поля
+// дополняются нулями; last_error — текст последней ошибки ("" — не было).
+typedef struct vtm_metal_stats {
+    int      available;
+    int      active;
+    uint64_t init_ms;       // вся инициализация (устройство + MSL + pipeline)
+    uint64_t compile_ms;    // только загрузка/компиляция библиотеки шейдеров
+    uint64_t calls;         // успешных GEMV
+    uint64_t failures;      // отказов Metal (ядро вернуло -1)
+    uint64_t buffers;       // записей в кэше MTLBuffer
+    uint64_t nocopy_bytes;  // байт весов в zero-copy буферах (не копия!)
+    uint64_t copy_bytes;    // байт, скопированных в Metal (fallback/тесты)
+    uint64_t alloc_before;  // MTLDevice.currentAllocatedSize до init
+    uint64_t alloc_after;   // ... сразу после init
+    uint64_t current_allocated; // ... сейчас
+    uint64_t gemm_calls;    // батчевых GEMM prefill
+    uint64_t defer_ops;     // GEMV, отложенных в общий командный буфер
+    uint64_t defer_waits;   // ожиданий отданных буферов
+    uint64_t wait_ns;       // суммарное время ожидания GPU
+    char     last_error[256];
+} vtm_metal_stats;
+
+void vtm_metal_stats_get(vtm_metal_stats *out);
+// Порог MAC, ниже которого GEMV остаётся на CPU (накладные Metal на мелких
+// формах больше выигрыша; ADR 0021 §5). По умолчанию 1M MAC; VTM_METAL_MIN_MAC
+// переопределяет (0 — всё на GPU).
+double vtm_metal_min_mac(void);
+// Освободить no-copy MTLBuffer'ы перед munmap/free модели (vtm_free).
+void vtm_metal_forget_all(void);
+void vtm_backend_forget_metal(void);
+
+
 // 1 — в сборке есть SIMD-ядра и CPU их поддерживает; 0 — будет откат на
 // скалярные ядра (vtm_backend_simd при этом всё равно корректен).
 int vtm_simd_available(void);
@@ -28,9 +130,14 @@ int vtm_simd_available(void);
 // "neon" | "avx2" | "none" — что реально используется (для логов/бенчмарка).
 const char *vtm_simd_isa(void);
 
-// Выбор бэкенда по имени: "auto" | "simd" | "scalar" | "direct" | "lut"
+// Выбор бэкенда по имени: "auto" | "metal" | "simd" | "scalar" | "direct" | "lut"
 // (NULL/"" — то же, что VTM_BACKEND из окружения). Неизвестное имя — NULL.
 const vtm_backend *vtm_backend_by_name(const char *name);
+
+// Внутренний хук диспетчера: запомнить фактически выбранный бэкенд машины.
+// Нужен, потому что vtm_set_backend() может сменить metal на simd/scalar уже
+// после выбора из env, а vtm_q4k_*/vtm_i8_* не получают vtm_t.
+void vtm_backend_note_active(const vtm_backend *backend);
 
 // Бэкенд из env VTM_BACKEND:
 //   не задан        -> auto: simd, если доступен, иначе scalar-lut243;

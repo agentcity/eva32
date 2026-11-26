@@ -1,11 +1,11 @@
-"""TTS-адаптер EVA32: ElevenLabs → Silero → Piper → системный say/espeak → null.
+"""TTS-адаптер EVA32: ElevenLabs → Silero → системный say/espeak → null.
 
 Задачи — [`ai/tasks/0191-elevenlabs-tts.md`](../ai/tasks/0191-elevenlabs-tts.md)
 (провайдер), [`ai/tasks/0193-silero-tts.md`](../ai/tasks/0193-silero-tts.md)
 (локальный русский нейроголос Silero),
-[`ai/tasks/0093-eva-tts-piper.md`](../ai/tasks/0093-eva-tts-piper.md)
-(локальный Piper). Весь синтез идёт через один интерфейс, а движок выбирается
-по доступности:
+[`ai/tasks/0197-switch-to-silero-only.md`](../ai/tasks/0197-switch-to-silero-only.md)
+(единственный локальный голос — Silero). Весь синтез идёт через один
+интерфейс, а движок выбирается по доступности:
 
 ============== ==========================================================
 ``elevenlabs`` облачный нейро-TTS: ``POST /v1/text-to-speech/{voice_id}``,
@@ -14,24 +14,23 @@
 ``silero``     локальный нейро-TTS: отдельный процесс ``python3.13`` с
                ``vendor/torch-py`` (torch) и моделью v4_ru в
                ``vendor/silero``; WAV 48 кГц. Ставится
-               ``tools/install_silero.sh``. Голос — ``SILERO_SPEAKER``.
-``piper``      локальный нейро-TTS: ``piper --model MODEL --output_file OUT``,
-               текст — в stdin. Пути из ``PIPER_BIN``/``PIPER_MODEL``
-               (или ``--piper-bin``/``--piper-model`` в ``voice_loop.py``).
+               ``tools/install_silero.sh``. Голос — ``SILERO_SPEAKER``
+               (``baya`` по умолчанию).
 ``system``     macOS ``say`` (голос Milena) или Linux ``espeak``/``espeak-ng``.
 ``null``       заглушка: синтеза нет, ничего не пишет, ничего не играет.
 ============== ==========================================================
 
 Автовыбор: **ElevenLabs, если задан ключ**, иначе **Silero, если установлен**
-(есть python3.13, vendor/torch-py и модель), иначе **Piper, если доступен**
-(есть бинарь и модель), иначе **SystemTTS**, иначе **NullTTS**. Явный выбор
-(``EVA_TTS=elevenlabs|silero|piper|system|null`` / ``prefer=``) перекрывает
-автовыбор — даже если движок недоступен: тогда при синтезе будет понятная
-:class:`TTSUnavailable`, а не молчаливая подмена. Исключение — облачный
-ElevenLabs и локальный Silero: если движок не сработал (401/429/сеть/пусто
-или упал процесс/нет torch), модуль логирует причину (без ключа!) и **сам
-откатывается на следующий локальный движок** (Silero → Piper → system),
-чтобы пользователь не остался без голоса.
+(есть python3.13, vendor/torch-py и модель), иначе **SystemTTS**, иначе
+**NullTTS**. Piper из автовыбора убран (задача 0197): адаптер
+:class:`PiperTTS` остался только для явного ``EVA_TTS=piper`` и в инструкциях
+не упоминается. Явный выбор (``EVA_TTS=elevenlabs|silero|system|null`` /
+``prefer=``) перекрывает автовыбор — даже если движок недоступен: тогда при
+синтезе будет понятная :class:`TTSUnavailable`, а не молчаливая подмена.
+Исключение — облачный ElevenLabs и локальный Silero: если движок не сработал
+(401/429/сеть/пусто или упал процесс/нет torch), модуль логирует причину
+(без ключа!) и **сам откатывается на следующий локальный движок**
+(Silero → system), чтобы пользователь не остался без голоса.
 
 Silero работает отдельным **долгоживущим** процессом
 ``tools/silero_worker.py`` (задача 0195): torch импортируется только внутри
@@ -40,9 +39,9 @@ Silero работает отдельным **долгоживущим** проц
 одноразовым ``tools/silero_speak.py``). Worker поднимается лениво, живёт до
 конца процесса чата (keep-alive, ``atexit``), запросы сериализуются lock'ом,
 при падении перезапускается не больше одного раза, при таймауте (20 с)
-убивается и уступает место Piper. Повторные одинаковые фразы по-прежнему
-отдаются из LRU-кэша адаптера. Замеры — в :meth:`SileroTTS.describe` и
-:func:`silero_worker_info`.
+убивается и уступает место системному TTS. Повторные одинаковые фразы
+по-прежнему отдаются из LRU-кэша адаптера. Замеры — в
+:meth:`SileroTTS.describe` и :func:`silero_worker_info`.
 
 :func:`prewarm_silero_worker` поднимает worker заранее (фоном): ленивый старт
 стоит ~1,5–2 с на импорт torch и модель, и первая фраза после старта чата
@@ -52,7 +51,7 @@ Silero работает отдельным **долгоживущим** проц
 
     from eva.tts import synthesize, synthesize_audio
 
-    wav_bytes = synthesize("Сколько стоит тариф Старт")        # bytes (Piper)
+    wav_bytes = synthesize("Сколько стоит тариф Старт")        # bytes (Silero)
     mp3, mime = synthesize_audio("Привет")                      # ElevenLabs
     path = synthesize("Привет", "/tmp/reply.wav")               # Path
 
@@ -144,7 +143,7 @@ __all__ = [
 
 
 #: Корень репозитория: ``eva/tts.py`` → ``parents[1]``. Нужен для поиска
-#: бинаря и моделей в типовых каталогах (``piper/piper``, ``models/``).
+#: вендорного torch и модели Silero (``vendor/``).
 ROOT = Path(__file__).resolve().parents[1]
 
 #: Таймаут одного синтеза по умолчанию, сек.
@@ -153,11 +152,12 @@ DEFAULT_TIMEOUT = 120.0
 #: Голос macOS ``say`` по умолчанию (ru_RU).
 DEFAULT_SAY_VOICE = os.environ.get("EVA_VOICE", "Milena").strip() or "Milena"
 
-#: Язык системного TTS (espeak) и подсказка для модели Piper.
+#: Язык системного TTS (espeak).
 DEFAULT_TTS_LANG = os.environ.get("EVA_TTS_LANG", "ru").strip() or "ru"
 
-#: Допустимые значения ``--tts``/``EVA_TTS``. Порядок — приоритет автовыбора
-#: (``auto`` не движок, а «выбери сам»).
+#: Допустимые значения ``--tts``/``EVA_TTS`` (``auto`` не движок, а «выбери
+#: сам»). ``piper`` оставлен только для явного выбора устаревшего адаптера: в
+#: автовыборе его нет и в инструкциях он не упоминается (задача 0197).
 ENGINE_CHOICES = ("auto", "elevenlabs", "silero", "piper", "system", "null")
 
 # --------------------------------------------------------------------------- #
@@ -179,7 +179,7 @@ DEFAULT_ELEVENLABS_MODEL = "eleven_multilingual_v2"
 DEFAULT_ELEVENLABS_FORMAT = "mp3_44100_128"
 
 #: Таймаут одного HTTP-запроса к ElevenLabs, сек. Облако отвечает быстрее
-#: локального Piper, но сеть бывает медленной; 30 с — с большим запасом.
+#: локального Silero, но сеть бывает медленной; 30 с — с большим запасом.
 DEFAULT_ELEVENLABS_TIMEOUT = 30.0
 
 #: Размер LRU-кэша успешных ответов (одна фраза = одна запись): экономит
@@ -251,8 +251,9 @@ ESPEAK_BINARY_NAMES = ("espeak-ng", "espeak")
 #: ``kseniya``, ``xenia``, ``aidar`` (мужской), ``eugene``, ``random``.
 DEFAULT_SILERO_SPEAKER = os.environ.get("SILERO_SPEAKER", "baya").strip() or "baya"
 
-#: Голоса v4_ru, которые понимает модель. Пресеты страницы чата
-#: (``irina``/``soft``/``young``) — от Piper и сюда не относятся.
+#: Голоса v4_ru, которые понимает модель. Страница чата и EVA.app дают
+#: выбрать ``baya``/``kseniya``/``xenia``/``aidar``; остальные доступны через
+#: ``SILERO_SPEAKER``.
 SILERO_SPEAKERS = ("aidar", "baya", "eugene", "kseniya", "xenia", "random")
 
 #: Частота Silero v4_ru: 48 кГц — лучшее качество модели; Web Audio и AVPlayer
@@ -275,7 +276,7 @@ SILERO_SCRIPT = "tools/silero_speak.py"
 SILERO_WORKER_SCRIPT = "tools/silero_worker.py"
 
 #: Таймаут одного запроса к worker'у, сек. Дольше — считаем, что он завис:
-#: фраза ждать не может, worker убивается, синтез уходит на Piper.
+#: фраза ждать не может, worker убивается, синтез уходит на системный TTS.
 DEFAULT_SILERO_WORKER_TIMEOUT = 20.0
 
 #: Таймаут старта worker'а, сек (импорт torch + загрузка модели v4_ru).
@@ -283,7 +284,7 @@ DEFAULT_SILERO_WORKER_TIMEOUT = 20.0
 DEFAULT_SILERO_WORKER_START_TIMEOUT = 30.0
 
 #: Сколько раз перезапускать worker в пределах одной фразы при падении.
-#: 1 — «не более одного раза» из задачи 0195: второй сбой = откат на Piper.
+#: 1 — «не более одного раза» из задачи 0195: второй сбой = откат на system.
 SILERO_WORKER_RESTARTS = 1
 
 #: Python для Silero. 3.13 — единственный с колёсами torch на arm64 macOS;
@@ -1024,7 +1025,7 @@ def silero_help(
         "Silero недоступен: нет " + ", ".join(missing) + ".",
         "Установите (один раз, нужна сеть):",
         "  sh tools/install_silero.sh",
-        "Без Silero работает Piper/system; принудительно: EVA_TTS=piper.",
+        "Без Silero работает системный say/espeak; принудительно: EVA_TTS=system.",
     ]
     if python is not None:
         lines.append(f"python: {python}")
@@ -1058,23 +1059,6 @@ _SILERO_CACHE_MISSES = 0
 #: Время первого реального синтеза (torch + модель), мс. Показывается в
 #: ``describe()`` как честная цена холодного старта.
 _SILERO_WARMUP_MS: float | None = None
-
-#: Один раз сообщить в лог, что автовыбор ушёл с Silero на Piper (иначе на
-#: машине без установки это сообщение повторялось бы на каждый запрос).
-_SILERO_FALLBACK_LOGGED = False
-
-
-def _log_silero_fallback_once() -> None:
-    global _SILERO_FALLBACK_LOGGED
-    if _SILERO_FALLBACK_LOGGED:
-        return
-    _SILERO_FALLBACK_LOGGED = True
-    logger.info(
-        "озвучка: Silero недоступен (нет python3.13/torch/модели), "
-        "использую Piper; установка: sh tools/install_silero.sh"
-    )
-
-
 def clear_silero_cache() -> None:
     """Очистить LRU-кэш Silero (тесты и смена голоса)."""
     global _SILERO_CACHE_HITS, _SILERO_CACHE_MISSES
@@ -1592,7 +1576,7 @@ class SileroTTS(TTSAdapter):
     ``vendor/torch-py``, ``TORCH_HOME=vendor/silero``. Один worker на процесс
     (``select_engine`` создаёт адаптер на запрос, поэтому процесс — модульный
     синглтон), запросы по одному (lock), падение — один перезапуск, таймаут
-    (20 с) — убить и уступить Piper, ``atexit`` — SIGTERM. Повторные
+    (20 с) — убить и уступить системному TTS, ``atexit`` — SIGTERM. Повторные
     одинаковые фразы отдаёт LRU-кэш и не трогает worker.
 
     ========================== ============================================
@@ -1608,9 +1592,10 @@ class SileroTTS(TTSAdapter):
     ``SILERO_CACHE``           ``0`` отключает LRU-кэш повторных фраз
     ========================== ============================================
 
-    Пресеты Piper (``irina``/``soft``/``young``) отбрасываются: у Silero
-    свой тембр и никакого питч-шифта. ``voice``, совпавший с именем голоса
-    Silero, уважается — так страница чата сможет выбрать голос явно.
+    Голос задаётся моделью, а не пост-обработкой: ``voice``, совпавший с
+    именем голоса Silero (``baya``/``kseniya``/``xenia``/``aidar`` и др.),
+    уважается — так страница чата и EVA.app выбирают голос явно. Никакого
+    питч-шифта или сглаживания WAV нет (задача 0197).
     """
 
     name = "silero"
@@ -1718,8 +1703,9 @@ class SileroTTS(TTSAdapter):
     def _speaker_for(self, requested: str | None) -> str:
         """Голос запроса, если это голос Silero, иначе настроенный.
 
-        Страница чата присылает пресеты Piper (``irina``/``soft``/``young``);
-        для Silero они бессмысленны и игнорируются.
+        Страница чата и EVA.app присылают ``baya``/``kseniya``/``xenia``;
+        любое чужое имя (или пустое) означает «голос по умолчанию» из
+        ``SILERO_SPEAKER``, а не подмену на случайный тембр.
         """
         candidate = (requested or "").strip().lower()
         if candidate in SILERO_SPEAKERS:
@@ -1851,7 +1837,7 @@ class SileroTTS(TTSAdapter):
                 except _WorkerTimeout as exc:
                     # Зависший процесс бесполезен: убиваем. Следующий вызов
                     # поднимет worker заново (это и есть «перезапуск»), а
-                    # текущая фраза уходит на Piper — ждать 2×20 с нельзя.
+                    # текущая фраза уходит на system — ждать 2×20 с нельзя.
                     _drop_silero_worker()
                     raise TTSError(
                         f"silero: {exc}; worker остановлен, "
@@ -2002,7 +1988,7 @@ class ElevenLabsTTS(TTSAdapter):
 
     Ключ не попадает ни в ``describe()``, ни в тексты ошибок: провайдер
     возвращает только понятную причину (401/429/сеть/пустой ответ). Откат на
-    Piper делает модульный :func:`synthesize`, а не сам адаптер.
+    Silero/system делает модульный :func:`synthesize`, а не сам адаптер.
 
     ``synthesize`` возвращает ``(bytes, content_type)`` — сервер выставляет
     ``audio/mpeg`` для MP3 и ``audio/wav`` для WAV-движков. С ``out_path``
@@ -2050,7 +2036,7 @@ class ElevenLabsTTS(TTSAdapter):
             raise TTSUnavailable(
                 "ElevenLabs недоступен: не задан ELEVENLABS_API_KEY. "
                 "Получите ключ в кабинете ElevenLabs и экспортируйте его; "
-                "без ключа работает Piper/system."
+                "без ключа работает Silero/system."
             )
         voice_id = (
             self._voice_id
@@ -2105,9 +2091,9 @@ class ElevenLabsTTS(TTSAdapter):
     def _voice_for(self, requested: str | None) -> str:
         """Голос запроса, если это похоже на ID ElevenLabs, иначе настроенный.
 
-        Страница чата присылает пресеты Piper (``irina``/``soft``), а не ID
-        ElevenLabs; такой ``voice`` игнорируется. ID из библиотеки — длинная
-        буквенно-цифровая строка (обычно 20 символов).
+        Страница чата и EVA.app присылают имя голоса Silero (``baya`` и т.п.),
+        а не ID ElevenLabs; такое короткое имя игнорируется. ID из библиотеки —
+        длинная буквенно-цифровая строка (обычно 20 символов).
         """
         config = self.resolve()
         candidate = (requested or "").strip()
@@ -2453,7 +2439,9 @@ class SystemTTS(TTSAdapter):
 
     ``say`` пишет WAV 16 кГц/моно/16 бит через ``-o`` и ``--data-format``;
     ``espeak`` — через ``-w`` и ``--stdin``. Оба варианта синтезируют в файл,
-    поэтому замер первого фрагмента одинаковый.
+    поэтому замер первого фрагмента одинаковый. Голос Silero (``baya`` и др.)
+    для системного TTS не годится: при откате используется ``Milena``, чтобы
+    озвучка не падала из-за неизвестного имени голоса.
     """
 
     name = "system"
@@ -2544,6 +2532,11 @@ class SystemTTS(TTSAdapter):
         target = Path(out_path).expanduser()
         if kind == "say":
             spoken = voice or self._voice or DEFAULT_SAY_VOICE
+            # Страница и EVA.app всегда присылают голос Silero; при откате на
+            # system он не годится для ``say -v`` (такого голоса нет), поэтому
+            # берём Milena — «не падать» важнее, чем угадать чужой тембр.
+            if str(spoken).strip().lower() in SILERO_SPEAKERS:
+                spoken = DEFAULT_SAY_VOICE
             return (
                 build_say_command(binary, spoken, target, text, rate=rate),
                 None,
@@ -2640,16 +2633,16 @@ def select_engine(
     """Выбрать TTS-движок.
 
     ``prefer``/``EVA_TTS``: ``auto`` (по умолчанию), ``elevenlabs``,
-    ``silero``, ``piper``, ``system``, ``null``. Явный выбор перекрывает
-    автовыбор и не подменяется: если выбранный движок не настроен,
-    :meth:`TTSAdapter.available` вернёт False, а синтез поднимет
-    :class:`TTSUnavailable` с подсказкой.
+    ``silero``, ``system``, ``null`` (``piper`` — устаревший явный выбор).
+    Явный выбор перекрывает автовыбор и не подменяется: если выбранный
+    движок не настроен, :meth:`TTSAdapter.available` вернёт False, а синтез
+    поднимет :class:`TTSUnavailable` с подсказкой.
 
     Авто: ElevenLabs (если задан ``ELEVENLABS_API_KEY``), иначе Silero (если
     установлен ``tools/install_silero.sh``: python3.13 + vendor/torch-py +
-    модель), иначе Piper (если есть бинарь **и** модель), иначе SystemTTS,
-    иначе NullTTS. Отсутствие ключа, Silero или Piper — не ошибка, а причина
-    фолбэка: локальное по умолчанию лучше облака.
+    модель), иначе SystemTTS, иначе NullTTS. Отсутствие ключа и Silero — не
+    ошибка, а причина фолбэка: локальное по умолчанию лучше облака. Piper в
+    автовыборе не участвует (задача 0197).
     """
     env_source = os.environ if env is None else env
     choice = _env(env_source, "EVA_TTS", "EVA_TTS_ENGINE")
@@ -2685,9 +2678,6 @@ def select_engine(
         return elevenlabs
     if silero.available():
         return silero
-    if piper.available():
-        _log_silero_fallback_once()
-        return piper
     system = SystemTTS(say_bin, voice=voice, lang=lang, env=env)
     if system.available():
         return system
@@ -2695,7 +2685,7 @@ def select_engine(
 
 
 def describe_engine(engine: TTSAdapter | None) -> str:
-    """Строка вида ``piper (бинарь, модель …)`` для отчёта о выборе движка."""
+    """Строка вида ``silero (worker, …)`` для отчёта о выборе движка."""
     if engine is None:
         return "none"
     try:
@@ -2714,21 +2704,19 @@ def _fallback_engines(
     lang: str = DEFAULT_TTS_LANG,
     env: Mapping[str, str] | None = None,
 ) -> list[TTSAdapter]:
-    """Локальные запасные движки в порядке предпочтения: Silero → Piper → system.
+    """Локальные запасные движки в порядке предпочтения: Silero → system.
 
     Движки из ``skip`` не предлагаются (например, Silero, который только что
     упал). Возвращается список доступных прямо сейчас; пустой список означает
-    «локального голоса нет» — вызывающий поднимает исходную ошибку.
+    «локального голоса нет» — вызывающий поднимает исходную ошибку. Параметры
+    ``piper_bin``/``piper_model`` остались ради совместимости сигнатуры: Piper
+    в откате больше не участвует (задача 0197).
     """
     engines: list[TTSAdapter] = []
     if "silero" not in skip:
         silero = SileroTTS(env=env)
         if silero.available():
             engines.append(silero)
-    if "piper" not in skip:
-        piper = PiperTTS(piper_bin, piper_model, env=env)
-        if piper.available():
-            engines.append(piper)
     if "system" not in skip:
         system = SystemTTS(say_bin, voice=voice, lang=lang, env=env)
         if system.available():
@@ -2754,9 +2742,9 @@ def _synthesize_with_fallback(
     """Синтез с откатом ElevenLabs/Silero → локальные движки.
 
     Облако может ответить 401/429/сетью, а Silero — упасть из-за
-    отсутствующего/битого torch. В обоих случаях пробуем следующие локальные
-    движки (Silero, затем Piper, затем system), логируя причину. Если не
-    осталось ни одного — поднимаем исходную ошибку, а не отдаём тишину.
+    отсутствующего/битого torch. В обоих случаях пробуем следующий локальный
+    движок (Silero, затем system), логируя причину. Если не осталось ни
+    одного — поднимаем исходную ошибку, а не отдаём тишину.
     """
     env_source = os.environ if env is None else env
     chosen = engine or select_engine(
@@ -2816,11 +2804,11 @@ def _synthesize_with_fallback(
         # «тишину». Ключ в текст не попадает (redact на всякий случай).
         if chosen.name == "elevenlabs":
             raise TTSError(
-                f"ElevenLabs: {_redact(exc, api_key)}; запасной Piper/system "
+                f"ElevenLabs: {_redact(exc, api_key)}; запасной Silero/system "
                 "тоже недоступен."
             ) from None
         raise TTSError(
-            f"Silero: {last_error}; запасной Piper/system тоже недоступен."
+            f"Silero: {last_error}; запасной system тоже недоступен."
         ) from None
 
 
@@ -2841,12 +2829,12 @@ def synthesize(
 ) -> bytes | Path | tuple[bytes, str]:
     """Синтезировать текст выбранным (или переданным) движком.
 
-    Без ``out_path`` — аудиобайты (Silero/Piper/system — WAV, ElevenLabs —
-    пара ``(mp3, "audio/mpeg")``); с ``out_path`` — путь. Если Silero и
-    Piper нет, автовыбор уходит на системный TTS, а при полном отсутствии TTS
-    вернёт пустые байты (NullTTS), не падая. Сбой ElevenLabs
-    (401/429/сеть/пусто) или Silero логируется без ключа и откатывается на
-    локальный движок (Piper/system).
+    Без ``out_path`` — аудиобайты (Silero/system — WAV, ElevenLabs — пара
+    ``(mp3, "audio/mpeg")``); с ``out_path`` — путь. Если Silero нет,
+    автовыбор уходит на системный TTS, а при полном отсутствии TTS вернёт
+    пустые байты (NullTTS), не падая. Сбой ElevenLabs (401/429/сеть/пусто) или
+    Silero логируется без ключа и откатывается на локальный движок
+    (Silero/system).
     """
     result, _ = _synthesize_with_fallback(
         text,
@@ -2882,11 +2870,11 @@ def synthesize_audio(
     """Синтезировать в память и вернуть ``(bytes, content_type)``.
 
     Обёртка над :func:`synthesize` для HTTP-слоя: ElevenLabs отдаёт MP3 и
-    ``audio/mpeg``, локальные движки (Silero/Piper/system) — WAV и
-    ``audio/wav``. Тот же откат: при сбое ElevenLabs или Silero возвращается
-    аудио локального движка, а не ошибка.
+    ``audio/mpeg``, локальные движки (Silero/system) — WAV и ``audio/wav``.
+    Тот же откат: при сбое ElevenLabs или Silero возвращается аудио локального
+    движка, а не ошибка.
     """
-    result, chosen = _synthesize_with_fallback(
+    result, _chosen = _synthesize_with_fallback(
         text,
         None,
         engine=engine,
@@ -2904,13 +2892,8 @@ def synthesize_audio(
         data, content_type = result
         return bytes(data), str(content_type)
     if isinstance(result, (bytes, bytearray)):
-        data = bytes(result)
-        if chosen.name == "silero":
-            # Страница чата шлёт пресеты Piper (irina/soft/young) и для WAV
-            # применяет питч-шифт/сглаживание. У Silero свой тембр: помечаем
-            # WAV параметром MIME, чтобы ``default_tts_speech`` не трогал
-            # звук. HTTP-слой всё равно определяет тип по сигнатуре RIFF.
-            return data, "audio/wav; engine=silero"
-        return data, "audio/wav"
+        # WAV от Silero/system: голос задаёт движок, пост-обработки нет
+        # (задача 0197). HTTP-слой всё равно определяет тип по сигнатуре RIFF.
+        return bytes(result), "audio/wav"
     # Path без out_path не возвращается, но контракт защищаем.
     return b"", "audio/wav"

@@ -385,29 +385,52 @@ final class WakeAudioRing: @unchecked Sendable {
     }
 
     /// Вызывается из аудио-тапа. Формат тапа может быть interleaved или нет;
-    /// наружу буфер всегда отдаётся в стандартном (deinterleaved float32).
+    /// каналов может быть больше, чем у кольца (voice processing открывает всю
+    /// микрофонную решётку Mac — 3 канала и больше). Тогда лишние каналы
+    /// сводятся: моно-кольцо получает среднее по каналам, многоканальное —
+    /// первые каналы. Наружу буфер всегда отдаётся в формате кольца.
     func append(_ buffer: AVAudioPCMBuffer) {
         let frames = Int(buffer.frameLength)
-        guard frames > 0,
-              Int(buffer.format.channelCount) == channelCount,
-              let data = buffer.floatChannelData
-        else {
-            return
-        }
+        guard frames > 0, let data = buffer.floatChannelData else { return }
+        let sourceChannels = Int(buffer.format.channelCount)
+        guard sourceChannels > 0 else { return }
+        let target = channelCount
+        let mono = target == 1
         lock.lock()
         if buffer.format.isInterleaved {
             let source = data[0]
-            for index in 0..<frames {
-                let slot = ((writeIndex + index) % capacity) * channelCount
-                for channel in 0..<channelCount {
-                    storage[slot + channel] = source[index * channelCount + channel]
+            if mono {
+                let scale = 1 / Float(sourceChannels)
+                for index in 0..<frames {
+                    var sum: Float = 0
+                    for channel in 0..<sourceChannels {
+                        sum += source[index * sourceChannels + channel]
+                    }
+                    storage[(writeIndex + index) % capacity] = sum * scale
+                }
+            } else {
+                for channel in 0..<target {
+                    let sourceChannel = min(channel, sourceChannels - 1)
+                    for index in 0..<frames {
+                        storage[((writeIndex + index) % capacity) * target + channel] =
+                            source[index * sourceChannels + sourceChannel]
+                    }
                 }
             }
+        } else if mono && sourceChannels > 1 {
+            let scale = 1 / Float(sourceChannels)
+            for index in 0..<frames {
+                var sum: Float = 0
+                for channel in 0..<sourceChannels {
+                    sum += data[channel][index]
+                }
+                storage[(writeIndex + index) % capacity] = sum * scale
+            }
         } else {
-            for channel in 0..<channelCount {
-                let source = data[channel]
+            for channel in 0..<target {
+                let source = data[min(channel, sourceChannels - 1)]
                 for index in 0..<frames {
-                    storage[((writeIndex + index) % capacity) * channelCount + channel] = source[index]
+                    storage[((writeIndex + index) % capacity) * target + channel] = source[index]
                 }
             }
         }

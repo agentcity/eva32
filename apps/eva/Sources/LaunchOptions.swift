@@ -13,6 +13,8 @@ import Foundation
 /// * `--selftest-wake` — триггер «Привет, Ева» и кольцевой буфер (без микрофона);
 /// * `--selftest-followup` — пауза тишины follow-up и правило «только вместе с
 ///   ожиданием „Привет, Ева“» (без микрофона);
+/// * `--selftest-stop` — матчер «Стоп, Ева», эхо-защита, план слушателей и
+///   настройка (без микрофона);
 /// * `--selftest-wake-audio N` — N секунд держать микрофон и кольцевой буфер
 ///   без распознавания: замер CPU и проверка остановки `AVAudioEngine`.
 /// * `--selftest-compact` — компактный круг: геометрия, живое окно
@@ -42,6 +44,7 @@ enum Launch {
         if arguments.contains("--selftest-text") { return .text }
         if arguments.contains("--selftest-wake") { return .wake }
         if arguments.contains("--selftest-followup") { return .followUp }
+        if arguments.contains("--selftest-stop") { return .stop }
         if arguments.contains("--selftest-compact") { return .compact }
         if let raw = value("--selftest-wake-audio") {
             return .wakeAudio(Double(raw) ?? 10)

@@ -120,6 +120,113 @@ static vtm_status req_q4(vtm_t *m, const vtm_tensor *t, uint32_t ins,
     return VTM_OK;
 }
 
+// --- Metal: отложенные GEMV декода (задача 0196, ADR 0021 §4) ---------------
+//
+// Синхронный командный буфер на каждый тензор стоил 0,15–0,25 мс при 181
+// GEMV на токен (диагноз 0196). Здесь подряд идущие TMV/MM kind 4/6/7
+// ставятся в очередь Metal-бэкенда: один MTLCommandBuffer на пачку, ожидание —
+// только когда CPU реально читает результат (attn/RMSN/softmax/сэмплинг).
+//
+// Зависимости. Перед инструкцией, которая читает или пишет тензор из очереди
+// (dst отложенного GEMV), очередь синхронизируется. Всё остальное считается
+// на CPU, пока GPU работает (ping-pong: interp кодирует следующую сцену, GPU
+// считает предыдущую). Активности отложенного GEMV копируются в staging при
+// постановке, поэтому CPU-запись тензора после этого безопасна.
+//
+// Откат. Если командный буфер не завершился, Metal выключается, а все
+// отложенные операции пересчитываются CPU-ядрами (vtm_q4k_tmv/vtm_q6k_tmv/
+// vtm_i8_gemv) — прогон не падает и не врёт.
+#if VTM_WITH_METAL
+#define VTM_METAL_PEND 96
+
+typedef struct {
+    int kind;              // 0 — Q4_K, 1 — Q6_K, 2 — int8
+    float *y;
+    const void *w;
+    const float *scales;
+    const float *x;
+    int rows, cols;
+} metal_pend_op;
+
+typedef struct {
+    int active;
+    int n;
+    uint16_t dst[VTM_METAL_PEND];
+    metal_pend_op ops[VTM_METAL_PEND];
+} metal_defer_ctx;
+
+static __thread metal_defer_ctx *g_md;
+
+static void metal_defer_replay(void) {
+    int i;
+    for (i = 0; i < g_md->n; i++) {
+        const metal_pend_op *o = &g_md->ops[i];
+        if (o->kind == 0)
+            (void)vtm_q4k_tmv(o->y, (const uint8_t *)o->w, o->x, o->rows,
+                              o->cols);
+        else if (o->kind == 1)
+            (void)vtm_q6k_tmv(o->y, (const uint8_t *)o->w, o->x, o->rows,
+                              o->cols);
+        else
+            (void)vtm_i8_gemv(o->y, (const int8_t *)o->w, o->scales, o->x,
+                              o->rows, o->cols);
+    }
+    g_md->n = 0;
+}
+
+// Дождаться GPU и разнести результаты. -1 — Metal ошибся: выключаем его и
+// пересчитываем очередь на CPU (откат на NEON/scalar).
+static int metal_defer_sync(void) {
+    int rc;
+
+    if (!g_md) return 0;
+    rc = vtm_metal_defer_wait();
+    if (rc != 0) {
+        vtm_metal_set_active(0);
+        metal_defer_replay();
+        return -1;
+    }
+    g_md->n = 0;
+    return 0;
+}
+
+// 1 — инструкция читает/пишет тензор, который ещё не досчитан GPU.
+static int metal_defer_conflicts(const vtm_instr *in) {
+    int i;
+
+    if (!g_md || g_md->n == 0) return 0;
+    for (i = 0; i < g_md->n; i++) {
+        uint16_t d = g_md->dst[i];
+        if (in->dst == d || in->a == d || in->b == d || in->c == d)
+            return 1;
+    }
+    return 0;
+}
+
+// Поставить GEMV в очередь. 1 — поставлен, 0 — считать прежним путём.
+static int metal_defer_try(int kind, float *y, const void *w,
+                           const float *scales, const float *x, int rows,
+                           int cols, uint16_t dst) {
+    if (!g_md || !g_md->active) return 0;
+    if (g_md->n >= VTM_METAL_PEND - 1) (void)metal_defer_sync();
+    if (vtm_metal_defer_gemv(kind, y, w, scales, x, rows, cols) != 0) {
+        // Ошибка Metal: доводим уже поставленное и идём CPU-путём.
+        if (vtm_metal_defer_active()) (void)metal_defer_sync();
+        return 0;
+    }
+    g_md->ops[g_md->n].kind = kind;
+    g_md->ops[g_md->n].y = y;
+    g_md->ops[g_md->n].w = w;
+    g_md->ops[g_md->n].scales = scales;
+    g_md->ops[g_md->n].x = x;
+    g_md->ops[g_md->n].rows = rows;
+    g_md->ops[g_md->n].cols = cols;
+    g_md->dst[g_md->n] = dst;
+    g_md->n++;
+    return 1;
+}
+#endif // VTM_WITH_METAL
+
 // --- kind 6/7 (Q4_K/Q6_K), задача 0165 -------------------------------------
 //
 // Контракт — ADR 0018: блоки GGML как есть (144/210 байт на 256 значений),
@@ -153,7 +260,15 @@ static vtm_status req_q4k(vtm_t *m, const vtm_tensor *t, uint32_t ins,
 }
 
 static int qk_tmv_kernel(const vtm_tensor *w, const float *x, int rows,
-                         int cols, float *y) {
+                         int cols, float *y, uint16_t dst) {
+#if VTM_WITH_METAL
+    // Декод: GEMV kind 6/7 — в общий командный буфер (задача 0196).
+    if (metal_defer_try(w->kind == VTM_TENSOR_Q4K ? 0 : 1, y,
+                        qk_blocks(w), NULL, x, rows, cols, dst))
+        return 0;
+#else
+    (void)dst;
+#endif
     if (w->kind == VTM_TENSOR_Q4K)
         return vtm_q4k_tmv(y, qk_blocks(w), x, rows, cols);
     return vtm_q6k_tmv(y, qk_blocks(w), x, rows, cols);
@@ -326,7 +441,7 @@ static vtm_status op_tmv(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         if (y->n_elements != (uint32_t)rows)
             return fail(m, ins, VTM_E_SHAPE,
                         "y: элементов %u, у W rows=%d", y->n_elements, rows);
-        if (qk_tmv_kernel(w, x->f32, rows, cols, y->f32) != 0)
+        if (qk_tmv_kernel(w, x->f32, rows, cols, y->f32, in->dst) != 0)
             return fail(m, ins, VTM_E_TENSOR,
                         "ядро Q4_K/Q6_K TMV вернуло ошибку");
         return VTM_OK;
@@ -496,7 +611,15 @@ static vtm_status op_mm(vtm_t *m, uint32_t ins, const vtm_instr *in) {
         // типовой случай: GEMV-ядро (int8-dot на NEON, иначе f32 по блокам).
         // Общий n — эталон в double, строки таблицы по-прежнему не
         // разворачиваются в fp32-копию матрицы.
-        int rc = (nn == 1)
+        int rc;
+#if VTM_WITH_METAL
+        // Декод: int8 lm_head — тот же общий командный буфер (0196).
+        if (nn == 1
+            && metal_defer_try(2, y->f32, a->i8, a->scales, b->f32, mm, kk,
+                               in->dst))
+            return VTM_OK;
+#endif
+        rc = (nn == 1)
                ? vtm_i8_gemv(y->f32, a->i8, a->scales, b->f32, mm, kk)
                : vtm_i8_mm(y->f32, a->i8, a->scales, b->f32, mm, kk, nn);
         if (rc != 0)
@@ -4799,12 +4922,23 @@ static int batch_tmv_kernel(const vtm_tensor *w, const float *xt, int C,
         return 0;
     }
     if (w->kind == VTM_TENSOR_Q4K || w->kind == VTM_TENSOR_Q6K) {
+#if VTM_WITH_METAL
+        // Prefill (0196): все токены пачки — один dispatch на матрицу.
+        // Отказ (-1: нет Metal/шейдера/формы) — прежнее CPU-ядро 0189.
+        if (vtm_metal_active()
+            && vtm_metal_qk_gemm(w->kind == VTM_TENSOR_Q4K ? 0 : 1, yt,
+                                 qk_blocks(w), NULL, xt, rows, cols,
+                                 C) == 0)
+            return 0;
+#endif
         // kind 6/7 (задача 0167): строка блоков GGML разворачивается один раз
         // на пачку. Отказ ядра (-1) — на поштучный путь (batch_token_op).
-        int rc = (w->kind == VTM_TENSOR_Q4K)
-            ? vtm_q4k_tmv_batch(yt, qk_blocks(w), xt, rows, cols, C)
-            : vtm_q6k_tmv_batch(yt, qk_blocks(w), xt, rows, cols, C);
-        return rc == 0 ? 0 : -1;
+        {
+            int rc = (w->kind == VTM_TENSOR_Q4K)
+                ? vtm_q4k_tmv_batch(yt, qk_blocks(w), xt, rows, cols, C)
+                : vtm_q6k_tmv_batch(yt, qk_blocks(w), xt, rows, cols, C);
+            return rc == 0 ? 0 : -1;
+        }
     }
     if (w->kind == VTM_TENSOR_TRIT) {
         if (use_simd && vtm_simd_tmv_blocks_batch(yt,
@@ -4848,11 +4982,27 @@ static int batch_mm_kernel(const vtm_tensor *a, const float *bt, int C,
         return 0;
     }
     if (a->kind == VTM_TENSOR_Q4K || a->kind == VTM_TENSOR_Q6K) {
-        int rc = (a->kind == VTM_TENSOR_Q4K)
+        int rc;
+#if VTM_WITH_METAL
+        if (vtm_metal_active()
+            && vtm_metal_qk_gemm(a->kind == VTM_TENSOR_Q4K ? 0 : 1, yt,
+                                 qk_blocks(a), NULL, bt, mm, kk, C) == 0)
+            return 0;
+#endif
+        rc = (a->kind == VTM_TENSOR_Q4K)
             ? vtm_q4k_mm_batch(yt, qk_blocks(a), bt, mm, kk, C)
             : vtm_q6k_mm_batch(yt, qk_blocks(a), bt, mm, kk, C);
         return rc == 0 ? 0 : -1;
     }
+#if VTM_WITH_METAL
+    if (a->kind == VTM_TENSOR_INT8) {
+        // Пришло только при vtm_metal_active() (batch_mm_ready): int8-таблица
+        // пачкой считается одним GEMM. Отказ — поштучный CPU-путь.
+        if (vtm_metal_qk_gemm(2, yt, a->i8, a->scales, bt, mm, kk, C) == 0)
+            return 0;
+        return -1;
+    }
+#endif
     if (a->kind == VTM_TENSOR_TRIT) {
         if (use_simd && vtm_simd_mm_batch(yt, (const uint8_t *)a->words,
                                           a->scales, bt, mm, kk, C,
@@ -5059,6 +5209,19 @@ static int batch_mm_ready(vtm_t *m, const vtm_instr *in,
         if ((uint64_t)a->n_qblocks != nb) return 0;
         if ((uint64_t)a->n_elements < n) return 0;
         if (*kk % (int)VTM_Q4K_BLOCK_VALUES != 0) return 0;
+    } else if (a->kind == VTM_TENSOR_INT8) {
+#if VTM_WITH_METAL
+        // int8 lm_head пачкой — только GPU-ядро (0196); без Metal — прежний
+        // поштучный путь через batch_token_op.
+        if (!vtm_metal_active()) return 0;
+        if (!a->i8 || !a->scales) return 0;
+        if (a->scale_block != VTM_SCALE_BLOCK_128) return 0;
+        if (b->C < VTM_DENSE_BATCH_MIN) return 0;
+        if ((uint64_t)a->n_elements < (uint64_t)*mm * (uint64_t)*kk) return 0;
+        return 1;
+#else
+        return 0;
+#endif
     } else if (a->kind == VTM_TENSOR_TRIT) {
         uint64_t n = (uint64_t)*mm * (uint64_t)*kk;
         if (!a->words || !a->scales) return 0;
@@ -5805,6 +5968,7 @@ vtm_status vtm_run_batch(vtm_t *m, const int32_t *ids, int n) {
     return VTM_OK;
 }
 
+
 // --- главный цикл ----------------------------------------------------------
 
 // --- трассировка по инструкциям (задача 0082) ------------------------------
@@ -5859,7 +6023,7 @@ void vtm_set_cancel(vtm_t *m, vtm_cancel_fn should_stop, void *user) {
     m->cancel_user = should_stop ? user : NULL;
 }
 
-vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {
+static vtm_status run_instrs(vtm_t *m, vtm_emit_fn emit, void *user) {
     uint32_t i;
     uint32_t seq = 0;
     int tracing;
@@ -5873,7 +6037,20 @@ vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {
 
     for (i = 0; i < m->n_instr; i++) {
         const vtm_instr *in = &m->instr[i];
-        uint64_t trace_t0 = tracing ? trace_now_ns() : 0u;
+        uint64_t trace_t0;
+#if VTM_WITH_METAL
+        // Зависимости отложенной очереди: читаем/пишем её dst — ждём GPU.
+        // Остальные инструкции (attn/RMSN/softmax/…) считаются на CPU, пока
+        // GPU ещё работает: подряд идущие GEMV уже отданы одним буфером.
+        if (g_md && g_md->active) {
+            if (metal_defer_conflicts(in))
+                (void)metal_defer_sync();
+            else if (in->opcode != VTM_OP_TMV && in->opcode != VTM_OP_MM
+                     && g_md->n > 0)
+                (void)vtm_metal_defer_submit();
+        }
+#endif
+        trace_t0 = tracing ? trace_now_ns() : 0u;
         switch (in->opcode) {
         case VTM_OP_TMV:
             st = op_tmv(m, i, in);
@@ -5952,4 +6129,32 @@ vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {
         if (st != VTM_OK) return st;
     }
     return VTM_OK;
+}
+
+// Публичный вход: одна сессия отложенной очереди Metal на прогон. Обёртка
+// гарантирует, что очередь синхронизирована на любом выходе (HALT, SAMP с
+// остановкой, ошибка, трасса): иначе тензоры остались бы недосчитанными.
+vtm_status vtm_run(vtm_t *m, vtm_emit_fn emit, void *user) {
+    vtm_status st;
+#if VTM_WITH_METAL
+    metal_defer_ctx md;
+    int md_on = 0;
+
+    if (m && vtm_metal_active() && m->trace_cb == NULL) {
+        memset(&md, 0, sizeof md);
+        md.active = 1;
+        g_md = &md;
+        md_on = vtm_metal_defer_begin() == 0;
+        if (!md_on) g_md = NULL;
+    }
+#endif
+    st = run_instrs(m, emit, user);
+#if VTM_WITH_METAL
+    if (md_on) {
+        (void)metal_defer_sync();
+        (void)vtm_metal_defer_end();
+        g_md = NULL;
+    }
+#endif
+    return st;
 }

@@ -2514,7 +2514,7 @@ class TestTtsEndpoint(TtsServerCase):
         self.assertEqual(headers.get("Cache-Control"), "no-store")
         self.assertEqual(body[:4], b"RIFF")
         self.assertEqual(body[8:12], b"WAVE")
-        self.assertEqual(self.calls, [{"text": "Привет, мир.", "voice": None}])
+        self.assertEqual(self.calls, [{"text": "Привет, мир.", "voice": "baya"}])
 
     def test_returns_mp3_with_audio_mpeg_for_tuple_result(self):
         self.server.tts = lambda text, voice=None: (make_mp3(), "audio/mpeg")
@@ -2571,9 +2571,32 @@ class TestTtsEndpoint(TtsServerCase):
         self.assertEqual(self.calls[-1]["text"], "Ответ.")
 
     def test_voice_is_forwarded(self):
-        status, _, _ = self.post_tts({"text": "Привет", "voice": " Milena "})
+        # Пробелы и регистр нормализуются: сервер ждёт id голоса Silero.
+        status, _, _ = self.post_tts({"text": "Привет", "voice": " Kseniya "})
         self.assertEqual(status, 200)
-        self.assertEqual(self.calls[-1]["voice"], "Milena")
+        self.assertEqual(self.calls[-1]["voice"], "kseniya")
+
+    def test_all_three_ui_voices_are_accepted(self):
+        for voice in ("baya", "kseniya", "xenia"):
+            status, _, body = self.post_tts({"text": "Привет", "voice": voice})
+            self.assertEqual(status, 200, (voice, body[:200]))
+            self.assertEqual(self.calls[-1]["voice"], voice)
+
+    def test_hidden_aidar_is_accepted_by_api(self):
+        # aidar скрыт из селекторов, но API и SILERO_SPEAKER его понимают.
+        status, _, body = self.post_tts({"text": "Привет", "voice": "aidar"})
+        self.assertEqual(status, 200, body[:200])
+        self.assertEqual(self.calls[-1]["voice"], "aidar")
+
+    def test_unknown_voice_is_400_with_list(self):
+        for voice in ("irina", "soft", "young", "younger", "Milena"):
+            status, _, body = self.post_tts({"text": "Привет", "voice": voice})
+            self.assertEqual(status, 400, (voice, body[:200]))
+            error = json.loads(body)["error"]
+            self.assertEqual(error["code"], "unknown_voice")
+            for allowed in ("baya", "kseniya", "xenia", "aidar"):
+                self.assertIn(allowed, error["message"])
+        self.assertEqual(self.calls, [])
 
     def test_empty_after_cleaning_is_400(self):
         status, _, body = self.post_tts({"text": "**  ##  ``  "})
@@ -2649,6 +2672,17 @@ class TestTtsPage(ServerTestCase):
 
     def test_page_has_voice_controls(self):
         page = page_html(self)
+        # Селектор — ровно три голоса Silero, baya по умолчанию (задача 0197).
+        for fragment in (
+            'value="baya" selected',
+            'value="kseniya"',
+            'value="xenia"',
+        ):
+            self.assertIn(fragment, page)
+        for legacy in (
+            'value="irina"', 'value="soft"', 'value="young"', 'value="aidar"',
+        ):
+            self.assertNotIn(legacy, page)
         for fragment in (
             'id="tts-0"',
             'id="tts-1"',

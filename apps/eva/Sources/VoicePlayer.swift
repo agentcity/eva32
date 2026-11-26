@@ -12,10 +12,17 @@ struct VoiceError: Error, Sendable, Equatable {
 
 @MainActor
 final class VoicePlayer {
+    /// Синтезированная фраза вместе с её текстом: текст нужен стоп-слушателю,
+    /// чтобы отличить команду от эха собственной реплики (задача 0194).
+    private struct PendingVoice {
+        let wav: Data
+        let text: String
+    }
+
     private var server: URL?
-    private var voice = VoicePresets.defaultID
+    private var voice = SileroVoices.defaultID
     private var texts: [String] = []
-    private var pendingWav: [Data] = []
+    private var pendingWav: [PendingVoice] = []
     private var synthesis: Task<Void, Never>?
     private var player: AVAudioPlayer?
     private var meterTimer: Timer?
@@ -37,6 +44,11 @@ final class VoicePlayer {
     var isDrained: Bool {
         player == nil && pendingWav.isEmpty && texts.isEmpty && synthesis == nil
     }
+
+    /// Текст фразы, которая звучит прямо сейчас; `nil` — тишина. Эхо-защита
+    /// стоп-команды смотрит сюда: если Ева сама говорит «…и стоп.», совпадение
+    /// с микрофона — это её же голос, а не команда (задача 0194).
+    private(set) var currentText: String?
 
     /// Уже сообщили, что очередь опустела: не повторяем на каждый чих.
     private var drainedNotified = true
@@ -67,6 +79,7 @@ final class VoicePlayer {
         stopMetering()
         player?.stop()
         player = nil
+        currentText = nil
         drainedNotified = true
         onSpeakingChanged?(false)
     }
@@ -92,7 +105,7 @@ final class VoicePlayer {
             self.synthesis = nil
             switch result {
             case .success(let wav):
-                self.pendingWav.append(wav)
+                self.pendingWav.append(PendingVoice(wav: wav, text: text))
                 self.playNextIfIdle()
             case .failure(let error):
                 self.report(error.message)
@@ -147,12 +160,14 @@ final class VoicePlayer {
 
     private func playNextIfIdle() {
         guard player == nil, !pendingWav.isEmpty else { return }
-        let wav = pendingWav.removeFirst()
+        let pending = pendingWav.removeFirst()
+        let wav = pending.wav
         do {
             let audio = try AVAudioPlayer(data: wav)
             audio.isMeteringEnabled = true
             audio.prepareToPlay()
             player = audio
+            currentText = pending.text
             let started = audio.play()
             log("озвучка: играю \(wav.count) байт, старт=\(started)")
             onSpeakingChanged?(true)
@@ -160,6 +175,7 @@ final class VoicePlayer {
             watchPlayback(generation: generation)
         } catch {
             player = nil
+            currentText = nil
             report("не удалось проиграть WAV: \(error.localizedDescription)")
             playNextIfIdle()
             notifyDrainedIfIdle()
@@ -213,6 +229,7 @@ final class VoicePlayer {
             if self.player != nil {
                 self.stopMetering()
                 self.player = nil
+                self.currentText = nil
                 self.onSpeakingChanged?(false)
                 self.playNextIfIdle()
                 self.notifyDrainedIfIdle()

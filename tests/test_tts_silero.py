@@ -8,9 +8,9 @@
 Что проверяется (задачи 0193 и 0195):
 
 * выбор движка: ``EVA_TTS`` → ElevenLabs (ключ) → Silero (установлен) →
-  Piper → system → null;
+  system → null (Piper из автовыбора убран, задача 0197);
 * Silero доступен только когда есть python3.13, vendor/torch-py и веса
-  v4_ru; без них — откат на Piper, без исключения при автовыборе;
+  v4_ru; без них — откат на system, без исключения при автовыборе;
 * протокол worker'а (``tools/silero_worker.py``) без torch: ready/ping/synth,
   WAV в файл и в base64, ошибки на битый JSON/пустой текст/чужой голос,
   выход по ``shutdown`` и по EOF, SIGTERM — штатный код 0;
@@ -18,7 +18,7 @@
   keep-alive (второй вызов не поднимает процесс), ping на старте,
   один worker на процесс (синглтон), ``describe()`` с pid;
 * падение worker'а: ровно один перезапуск, повторный сбой → ошибка и откат
-  на Piper; таймаут → процесс убит, следующий вызов поднимает заново;
+  на system; таймаут → процесс убит, следующий вызов поднимает заново;
   ответ ``ok=false`` — ошибка фразы без перезапуска;
 * конкурентные вызовы сериализуются lock'ом (ответы не путаются);
 * LRU-кэш повторных фраз (worker не запускается вовсе) и ``SILERO_CACHE=0``;
@@ -62,7 +62,7 @@ def make_executable(path: Path) -> Path:
 
 
 def output_path_of(command: list[str]) -> Path | None:
-    """Достать путь WAV из команды одноразового Silero или Piper."""
+    """Достать путь WAV из команды одноразового Silero или system."""
     for flag in ("--output_file", "-o", "-w"):
         if flag in command and command.index(flag) + 1 < len(command):
             return Path(command[command.index(flag) + 1])
@@ -76,7 +76,7 @@ def fake_popen(**spec):
     """Заменить ``subprocess.Popen`` одноразовым фейком (путь 0193).
 
     ``fail_silero`` — процесс Silero завершается кодом 1 и не пишет файл;
-    остальные (Piper fallback) работают штатно. Возвращает
+    остальные (system fallback) работают штатно. Возвращает
     ``(класс, calls, stdin_texts, envs)``.
     """
     options = {
@@ -233,7 +233,7 @@ class _FakeStdin:
 
 
 def fake_worker_popen(**spec):
-    """Заменить ``subprocess.Popen`` эмулятором worker'а (+ Piper для откатов).
+    """Заменить ``subprocess.Popen`` эмулятором worker'а (+ system для откатов).
 
     Возвращает ``(класс, behaviour, stats, created)``: ``created`` — все
     поднятые процессы, ``stats`` — счётчики синтезов и конкурентности.
@@ -280,7 +280,7 @@ def fake_worker_popen(**spec):
             self.stderr_text = ""
 
             if not self.is_worker:
-                # Piper и прочие одноразовые движки: пишем WAV и выходим 0.
+                # say/espeak и прочие одноразовые движки: пишем WAV и выходим 0.
                 self.pid = next_pid[0]
                 next_pid[0] += 1
                 target = output_path_of(self.command)
@@ -498,12 +498,14 @@ class SileroSelectionTests(InstalledSileroCase):
         engine = tts.select_engine(env=env)
         self.assertIsInstance(engine, tts.ElevenLabsTTS)
 
-    def test_without_silero_auto_uses_piper(self):
+    def test_without_silero_auto_uses_system_not_piper(self):
+        # Задача 0197: даже с установленным Piper автовыбор идёт на system.
         empty = self.tmp / "empty-silero"
         empty.mkdir()
         env = {**self.piper_env, "SILERO_MODEL_DIR": str(empty)}
         engine = tts.select_engine(env=env)
-        self.assertIsInstance(engine, tts.PiperTTS)
+        self.assertIsInstance(engine, tts.SystemTTS)
+        self.assertEqual(engine.name, "system")
 
     def test_explicit_piper_overrides_installed_silero(self):
         env = {**self.silero_env, **self.piper_env, "EVA_TTS": "piper"}
@@ -578,12 +580,28 @@ class SileroCommandTests(InstalledSileroCase):
         self.assertEqual(stdin_text, "Привет\n")
         self.assertNotIn("Привет", command)
 
-    def test_piper_presets_are_ignored(self):
+    def test_unknown_voice_falls_back_to_default(self):
+        # Пресеты Piper (irina/soft/young) и прочие чужие имена — не голоса
+        # Silero: используется настроенный baya, а не подмена на aidar.
         engine = self.one_shot_engine()
-        command, _ = engine.build_command(
-            "Привет", self.tmp / "out.wav", voice="soft"
-        )
-        self.assertEqual(command[command.index("--speaker") + 1], "baya")
+        for voice in ("irina", "soft", "young", "younger", "Milena", ""):
+            command, _ = engine.build_command(
+                "Привет", self.tmp / "out.wav", voice=voice
+            )
+            self.assertEqual(
+                command[command.index("--speaker") + 1], "baya", voice
+            )
+
+    def test_each_silero_voice_is_used(self):
+        # Три голоса из UI страницы и EVA.app + aidar через API/SILERO_SPEAKER.
+        engine = self.one_shot_engine()
+        for voice in ("baya", "kseniya", "xenia", "aidar"):
+            command, _ = engine.build_command(
+                "Привет", self.tmp / "out.wav", voice=voice
+            )
+            self.assertEqual(
+                command[command.index("--speaker") + 1], voice
+            )
 
     def test_explicit_silero_voice_is_used(self):
         engine = self.one_shot_engine()
@@ -672,7 +690,7 @@ class SileroOneShotProcessTests(InstalledSileroCase):
                 )
         self.assertIn("не уложился", str(caught.exception))
 
-    def test_failed_silero_falls_back_to_piper_and_logs(self):
+    def test_failed_silero_falls_back_to_system_and_logs(self):
         fake, calls, _, _ = fake_popen(fail_silero=True)
         env = {**self.silero_env, **self.piper_env, "SILERO_WORKER": "0"}
         with mock.patch.object(tts.subprocess, "Popen", fake):
@@ -680,7 +698,9 @@ class SileroOneShotProcessTests(InstalledSileroCase):
                 data = tts.synthesize("Привет", prefer="silero", env=env)
         self.assertTrue(bytes(data).startswith(b"RIFF"))
         self.assertEqual(len(calls), 2)
-        self.assertIn("откат на piper", "\n".join(logs.output))
+        # Второй процесс — системный say, а не Piper из окружения.
+        self.assertEqual(Path(calls[1][0]).name, "say")
+        self.assertIn("откат на system", "\n".join(logs.output))
 
 
 # --------------------------------------------------------------------------- #
@@ -970,7 +990,7 @@ class SileroWorkerStartTests(InstalledSileroCase):
 # worker-клиент: падения, таймаут, ошибки
 # --------------------------------------------------------------------------- #
 class SileroWorkerFailureTests(InstalledSileroCase):
-    """Падение, повторный сбой, таймаут и откат на Piper."""
+    """Падение, повторный сбой, таймаут и откат на system."""
 
     def test_crash_triggers_exactly_one_restart(self):
         _, _, created = self.install_fake(die_at={1})
@@ -984,16 +1004,17 @@ class SileroWorkerFailureTests(InstalledSileroCase):
         self.assertIn("перезапускаю", "\n".join(logs.output))
         self.assertEqual(tts.silero_worker_info()["pid"], created[1].pid)
 
-    def test_two_crashes_raise_and_fall_back_to_piper(self):
+    def test_two_crashes_raise_and_fall_back_to_system(self):
         _, stats, created = self.install_fake(die_at={1, 2})
         env = {**self.silero_env, **self.piper_env}
         with self.assertLogs(tts.logger, level="WARNING") as logs:
             data = tts.synthesize("Привет", prefer="silero", env=env)
         self.assertTrue(bytes(data).startswith(b"RIFF"))
         self.assertEqual(len(created), 2)
-        # Третий процесс — уже Piper, не worker.
-        self.assertTrue(any("piper" in cmd[0] for cmd in stats["commands"]))
-        self.assertIn("откат на piper", "\n".join(logs.output))
+        # Третий процесс — уже system, а не Piper из окружения.
+        self.assertFalse(any("piper" in cmd[0] for cmd in stats["commands"]))
+        self.assertTrue(any(Path(cmd[0]).name == "say" for cmd in stats["commands"]))
+        self.assertIn("откат на system", "\n".join(logs.output))
 
     def test_two_crashes_without_fallback_raise(self):
         self.install_fake(die_always=True)
@@ -1035,7 +1056,7 @@ class SileroWorkerFailureTests(InstalledSileroCase):
         self.assertEqual(len(created), 1)
         self.assertTrue(tts.silero_worker_info()["running"])
 
-    def test_failed_worker_start_falls_back_to_piper(self):
+    def test_failed_worker_start_falls_back_to_system(self):
         _, stats, created = self.install_fake(fail_start=True)
         env = {**self.silero_env, **self.piper_env}
         with self.assertLogs(tts.logger, level="WARNING") as logs:
@@ -1043,13 +1064,14 @@ class SileroWorkerFailureTests(InstalledSileroCase):
         self.assertTrue(bytes(data).startswith(b"RIFF"))
         self.assertEqual(len(created), 1)
         self.assertFalse(tts.silero_worker_info()["running"])
-        self.assertTrue(any("piper" in cmd[0] for cmd in stats["commands"]))
-        self.assertIn("откат на piper", "\n".join(logs.output))
+        self.assertFalse(any("piper" in cmd[0] for cmd in stats["commands"]))
+        self.assertTrue(any(Path(cmd[0]).name == "say" for cmd in stats["commands"]))
+        self.assertIn("откат на system", "\n".join(logs.output))
 
     def test_missing_worker_script_is_unavailable(self):
         env = dict(self.silero_env, SILERO_WORKER_SCRIPT=str(self.tmp / "нет.py"))
         engine = self.engine(env=env)
-        # Сломанная установка видна сразу: автовыбор уйдёт на Piper.
+        # Сломанная установка видна сразу: автовыбор уйдёт на system.
         self.assertFalse(engine.available())
         with self.assertRaises(tts.TTSUnavailable) as caught:
             engine.synthesize_timed("Привет", self.tmp / "a.wav")

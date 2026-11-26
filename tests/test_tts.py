@@ -172,7 +172,7 @@ class RecordingEngine(tts.TTSAdapter):
 
 
 class EngineSelectionTests(unittest.TestCase):
-    """Автовыбор: Piper → system → null; явный конфиг перекрывает."""
+    """Автовыбор: Silero → system → null; Piper выключен из авто (0197)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -182,12 +182,23 @@ class EngineSelectionTests(unittest.TestCase):
         self.model = self.tmp / "ru_RU-test-medium.onnx"
         self.model.write_bytes(b"onnx")
 
-    def test_auto_prefers_piper_when_binary_and_model_present(self):
+    def test_auto_ignores_piper_even_when_binary_and_model_present(self):
+        # Задача 0197: Piper-адаптер остался в коде, но автовыбор его не берёт.
         env = {"PIPER_BIN": str(self.piper_bin), "PIPER_MODEL": str(self.model)}
-        with mock.patch.object(tts.shutil, "which", return_value=None):
+        with mock.patch.object(tts.shutil, "which", return_value=None), \
+                mock.patch.object(
+                    tts, "find_say_binary", return_value=Path("/fake/say")
+                ), mock.patch.object(
+                    tts, "find_espeak_binary", return_value=None
+                ):
             engine = tts.select_engine(env=env)
+        self.assertIsInstance(engine, tts.SystemTTS)
+        self.assertEqual(engine.name, "system")
+
+    def test_piper_is_still_available_as_explicit_legacy_choice(self):
+        env = {"PIPER_BIN": str(self.piper_bin), "PIPER_MODEL": str(self.model)}
+        engine = tts.select_engine("piper", env=env)
         self.assertIsInstance(engine, tts.PiperTTS)
-        self.assertEqual(engine.name, "piper")
         self.assertTrue(engine.available())
         self.assertIn(self.model.name, engine.describe())
 
@@ -238,7 +249,7 @@ class EngineSelectionTests(unittest.TestCase):
             engine.synthesize("привет")
         self.assertIn("piper", str(caught.exception).lower())
 
-    def test_broken_piper_env_falls_back_instead_of_crashing(self):
+    def test_broken_piper_env_is_ignored_in_auto(self):
         with mock.patch.object(tts.shutil, "which", return_value=None):
             engine = tts.select_engine(
                 "auto", env={"PIPER_BIN": str(self.tmp / "nope-piper")}
@@ -337,6 +348,19 @@ class SystemCommandTests(unittest.TestCase):
             command, voice_loop.build_say_command(say, "Milena", "/tmp/reply.wav", "Привет", rate=180)
         )
         self.assertIn("--data-format=LEI16@16000", command)
+
+    def test_say_ignores_silero_voice_and_uses_milena(self):
+        # /api/tts всегда присылает имя голоса Silero; при откате на system
+        # `say -v baya` не должен ронять озвучку (задача 0197).
+        say = make_executable(self.tmp / "say")
+        engine = tts.SystemTTS(say, kind="say")
+        for voice in ("baya", "kseniya", "xenia", "aidar"):
+            command, _ = engine.build_command(
+                "Привет", self.tmp / "out.wav", voice=voice
+            )
+            self.assertEqual(
+                command[command.index("-v") + 1], tts.DEFAULT_SAY_VOICE, voice
+            )
 
     def test_espeak_command_reads_stdin(self):
         espeak = make_executable(self.tmp / "espeak-ng")
