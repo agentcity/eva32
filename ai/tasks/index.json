@@ -1437,8 +1437,15 @@
   {
     "id": "0215",
     "title": "4B prefill: разобрать 4,4×",
-    "status": "pending",
+    "status": "in_progress",
     "file": "0215-4b-prefill.md",
     "assignee": "agent:4b-prefill"
+  },
+  {
+    "id": "0216",
+    "title": "f16 Metal-GEMM (simdgroup_matrix)",
+    "status": "in_progress",
+    "file": "0216-metal-f16-gemm.md",
+    "assignee": "agent:metal-f16"
   }
 ]
