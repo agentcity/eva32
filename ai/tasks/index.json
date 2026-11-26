@@ -1510,5 +1510,19 @@
     "status": "done",
     "file": "0224-app-tale-images.md",
     "assignee": "saron"
+  },
+  {
+    "id": "0227",
+    "title": "Смена картинок по ходу чтения",
+    "status": "in_progress",
+    "file": "0227-image-pacing.md",
+    "assignee": "agent:image-pacing"
+  },
+  {
+    "id": "0228",
+    "title": "Иллюстрации на каждый абзац (9 сказок)",
+    "status": "in_progress",
+    "file": "0228-more-illustrations.md",
+    "assignee": "agent:more-images"
   }
 ]
