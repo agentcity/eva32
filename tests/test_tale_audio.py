@@ -127,7 +127,11 @@ class AudioCase(unittest.TestCase):
         process = FakeProcess(exit_code=exit_code)
         with mock.patch.object(
             fairy.subprocess, "Popen", return_value=process
-        ) as popen, mock.patch.object(fairy.time, "sleep"):
+        ) as popen, mock.patch.object(fairy.time, "sleep"), mock.patch.object(
+            fairy.FairyTalesPlugin, "_system_volume", return_value=None
+        ), mock.patch.object(
+            fairy.FairyTalesPlugin, "_set_system_volume", return_value=False
+        ):
             result = self.plugin.answer(self.ctx, phrase)
         return result, popen, process
 
@@ -182,7 +186,9 @@ class TestAudioRecognition(AudioCase):
         process = FakeProcess()
         with mock.patch.object(
             fairy.subprocess, "Popen", return_value=process
-        ) as popen, mock.patch.object(fairy.time, "sleep"):
+        ) as popen, mock.patch.object(fairy.time, "sleep"), mock.patch.object(
+            fairy.FairyTalesPlugin, "_system_volume", return_value=None
+        ):
             first = self.plugin.answer(self.ctx, "Включи запись сказки про теремок")
             second = self.plugin.answer(self.ctx, "Включи запись сказки про теремок")
         self.assertIsInstance(first, dict)
@@ -194,7 +200,9 @@ class TestAudioRecognition(AudioCase):
         second = FakeProcess()
         with mock.patch.object(
             fairy.subprocess, "Popen", side_effect=[first, second]
-        ), mock.patch.object(fairy.time, "sleep"):
+        ), mock.patch.object(fairy.time, "sleep"), mock.patch.object(
+            fairy.FairyTalesPlugin, "_system_volume", return_value=None
+        ):
             self.plugin.answer(self.ctx, "Включи запись сказки про теремок")
             self.plugin.answer(self.ctx, "Включи запись сказки про бабу-ягу")
         self.assertTrue(first.terminated, "старая запись должна быть остановлена")

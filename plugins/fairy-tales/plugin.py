@@ -69,11 +69,9 @@ ENDING_NIGHT = (
 
 #: Каталог иллюстраций внутри плагина: ``images/<slug>/NN.jpg``.
 IMAGES_DIR = "images"
-#: Сколько картинок максимум показываем за одну сказку.
-MAX_IMAGES = 4
+#: Сколько картинок максимум показываем за одну сказку (задача 0228: 6–10).
+MAX_IMAGES = 10
 _IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
-#: Запас: не ставим картинку в самое начало и в самое окончание текста.
-_IMAGE_MARGIN = 60
 
 #: Готовые записи сказок (задача 0223): ``audio/<slug>.mp3|ogg``.
 AUDIO_DIR = "audio"
@@ -82,6 +80,11 @@ AUDIO_SUFFIXES = (".mp3", ".ogg", ".m4a", ".wav")
 AUDIO_MAX_BYTES = 3_000_000
 #: Плеер macOS; вызов — только списком argv, без shell.
 AFPLAY = "/usr/bin/afplay"
+OSASCRIPT = "/usr/bin/osascript"
+#: Ниже этой громкости системы запись почти не слышно — поднимаем при первом
+#: включении и говорим об этом, чтобы не было «включила, но тихо».
+QUIET_THRESHOLD = 25
+DEFAULT_LOUD_VOLUME = 65
 
 #: Просьба именно записи, а не пересказа: «включи запись сказки»,
 #: «поставь аудиосказку», «сказку в исполнении». Проверяется до выбора.
@@ -263,6 +266,21 @@ _MAGIC_RE = re.compile(r"волшебн")
 _TODDLER_RE = re.compile(r"малыш|маленьк|для маленьких|ребенк|ребёнк")
 _SHORT_RE = re.compile(r"коротк")
 _SCARY_RE = re.compile(r"страшн|жутк|ужасн")
+#: «Громче/тише» и «громкость 70» — управление системным звуком Mac: запись
+#: играет afplay, а его громкость пользователю не видна (жалоба: «очень тихо,
+#: непонятно как регулировать»).
+_LOUDER_RE = re.compile(r"громче|погромче|прибавь\s+звук|сделай\s+громче")
+_QUIETER_RE = re.compile(r"тише|потише|убавь\s+звук|сделай\s+тише")
+_VOLUME_RE = re.compile(r"громкость\s*(?:на\s*)?(\d{1,3})|звук\s*(?:на\s*)?(\d{1,3})")
+_MUTE_RE = re.compile(r"выключи\s+звук|без\s+звука|молчком|mute")
+#: «Какие сказки есть», «список сказок» — перечень, чтобы можно было выбрать.
+_LIST_RE = re.compile(
+    r"(?:какие|какой|что\s+за)\s+(?:у\s+тебя\s+)?(?:есть\s+)?сказк"
+    r"|список\s+сказок|перечисли\s+сказк|покажи\s+сказк"
+)
+#: «Сказка номер 3», «третью сказку» — выбор по номеру из списка.
+_NUMBER_RE = re.compile(r"(?:номер|№)\s*(\d{1,2})|сказк[ау]?\s+(\d{1,2})")
+
 _COUNT_RE = re.compile(
     r"сколько\s+(?:у\s+тебя\s+)?(?:есть\s+)?сказ"
     r"|сколько\s+сказок"
@@ -506,39 +524,76 @@ def _title_key(text: str) -> str:
     return re.sub(r"[^а-яa-z0-9]+", "", _normalize(text))
 
 
-def _image_positions(text: str, count: int) -> list[int]:
-    """Где показать ``count`` картинок: ближайшие концы абзацев.
+def _paragraph_ends(text: str) -> list[int]:
+    """Концы абзацев ``text``: позиции сразу после ``\\n\\n``.
 
-    ``after_chars`` считается по символам уже очищенного текста. Картинки
-    распределяются по третям/четвертям, но привязываются к границе абзаца,
-    чтобы не разрывать мысль и не попадать в самое начало/окончание.
+    Последний абзац (концовка) не входит: картинка после него оказалась бы
+    за пределами текста. Все значения строго внутри ``0 < position < len``.
+    """
+    ends: list[int] = []
+    offset = 0
+    for part in text.split("\n\n")[:-1]:
+        offset += len(part) + 2
+        if 0 < offset < len(text):
+            ends.append(offset)
+    return ends
+
+
+def _sentence_ends(part: str) -> list[int]:
+    """Концы предложений внутри абзаца, относительно его начала."""
+    return [
+        match.end()
+        for match in re.finditer(r"[.!?…]+(?=\s)", part)
+        if 0 < match.end() < len(part)
+    ]
+
+
+def _image_candidates(text: str) -> list[int]:
+    """Границы абзацев плюс концы предложений в длинных абзацах.
+
+    Картинок может быть больше, чем абзацев (сказка в диалогах: «— Кто, кто
+    в терему?»). Тогда длинный абзац получает вторую картинку на границе
+    предложения — мысль всё равно не рвётся посередине.
+    """
+    candidates = _paragraph_ends(text)
+    offset = 0
+    for part in text.split("\n\n")[:-1]:
+        start = offset
+        offset += len(part) + 2
+        if len(part) < 160:
+            continue
+        for end in _sentence_ends(part):
+            position = start + end
+            if 0 < position < len(text):
+                candidates.append(position)
+    return sorted(set(candidates))
+
+
+def _image_positions(text: str, count: int) -> list[int]:
+    """Где показать ``count`` картинок: ровно по границам абзацев.
+
+    ``after_chars`` считается по символам уже очищенного текста (того, что
+    уходит в озвучку). Позиции строго возрастают и остаются внутри текста;
+    при нехватке абзацев берутся концы предложений внутри длинных абзацев.
     """
     length = len(text)
     if count <= 0 or length <= 0:
         return []
-    boundaries: list[int] = []
-    offset = 0
-    for part in text.split("\n\n")[:-1]:
-        offset += len(part) + 2
-        boundaries.append(offset)
-    candidates = [
-        position
-        for position in boundaries
-        if _IMAGE_MARGIN <= position <= length - _IMAGE_MARGIN
-    ]
+    boundaries = _paragraph_ends(text)
+    candidates = (
+        boundaries if count <= len(boundaries) else _image_candidates(text)
+    )
     if not candidates:
-        candidates = [max(1, length // 2)]
-    positions: list[int] = []
-    for index in range(1, count + 1):
-        target = length * index / (count + 1)
-        lower = (positions[-1] + 1) if positions else 0
-        available = [position for position in candidates if position > lower]
-        if not available:
-            position = min(length - 1, max(int(target), lower))
-        else:
-            position = min(available, key=lambda item: abs(item - target))
-        positions.append(max(0, min(length - 1, position)))
-    return positions
+        return [length // 2] if length > 1 else []
+    if count >= len(candidates):
+        # Картинок больше, чем границ: повторы недопустимы, поэтому берём
+        # все границы (лишние картинки просто не покажутся).
+        return candidates[:count]
+    if count == 1:
+        return [candidates[(len(candidates) - 1) // 2]]
+    last = len(candidates) - 1
+    indices = [round(index * last / (count - 1)) for index in range(count)]
+    return [candidates[index] for index in indices]
 
 
 class FairyTalesPlugin:
@@ -735,6 +790,82 @@ class FairyTalesPlugin:
             return "сказки"
         return "сказок"
 
+    def render_list(self, tales: Sequence[Tale], limit: int = 10) -> str:
+        """Перечень сказок с номерами: ребёнку проще выбрать «номер 3».
+
+        Показываем названия, а не слаги; страшные — в перечне, но с пометкой:
+        выбор по номеру уважает явный запрос, случайный — нет.
+        """
+        safe = [tale for tale in tales if not tale.is_scary]
+        shown = safe[:limit]
+        parts = [f"{index + 1}. {tale.title}" for index, tale in enumerate(shown)]
+        tail = ""
+        if len(safe) > limit:
+            tail = f" И ещё {len(safe) - limit} сказок — скажи «следующая»."
+        return "У меня есть сказки: " + "; ".join(parts) + "." + tail
+
+    def _answer_by_number(self, tales: Sequence[Tale], hit: "re.Match[str]") -> str | None:
+        """«Сказка номер 3» — выбрать по номеру из списка (без страшных)."""
+        raw = hit.group(1) or hit.group(2)
+        try:
+            number = int(raw)
+        except (TypeError, ValueError):
+            return None
+        safe = [tale for tale in tales if not tale.is_scary]
+        if not 1 <= number <= len(safe):
+            return None
+        tale = safe[number - 1]
+        with self._lock:
+            self._last_index = tales.index(tale)
+            self._last_night = False
+        return self.render(tale)
+
+    def _system_volume(self) -> int | None:
+        """Текущая громкость выхода в процентах или ``None``."""
+        try:
+            out = subprocess.run(
+                [OSASCRIPT, "-e", "output volume of (get volume settings)"],
+                capture_output=True, timeout=5, check=False,
+            )
+            value = out.stdout.decode("utf-8", "replace").strip()
+            return int(value) if value.isdigit() else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+
+    def _set_system_volume(self, percent: int) -> bool:
+        """Поставить громкость выхода (0–100) через osascript."""
+        value = max(0, min(100, int(percent)))
+        try:
+            out = subprocess.run(
+                [OSASCRIPT, "-e", f"set volume output volume {value}"],
+                capture_output=True, timeout=5, check=False,
+            )
+            return out.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def _answer_volume(self, text: str) -> str | None:
+        """«Громче/тише/громкость 70/выключи звук» — управление звуком Mac."""
+        if _MUTE_RE.search(text):
+            if self._set_system_volume(0):
+                return "Выключила звук. Скажи «громче», чтобы вернуть."
+            return None
+        hit = _VOLUME_RE.search(text)
+        if hit is not None:
+            target = int(hit.group(1) or hit.group(2))
+            if self._set_system_volume(target):
+                return f"Громкость — {max(0, min(100, target))} процентов."
+            return None
+        if _LOUDER_RE.search(text) or _QUIETER_RE.search(text):
+            current = self._system_volume()
+            if current is None:
+                return None
+            step = 15 if _LOUDER_RE.search(text) else -15
+            target = max(0, min(100, current + step))
+            if self._set_system_volume(target):
+                return f"Громкость — {target} процентов."
+        return None
+
     def render_count(self, tales: Sequence[Tale]) -> str:
         """Ответ на «сколько у тебя сказок»: число словами и пара примеров."""
         count = len(tales)
@@ -785,6 +916,14 @@ class FairyTalesPlugin:
         next_request = bool(_NEXT_RE.search(text))
         if _COUNT_RE.search(text):
             return self.render_count(tales)
+        if _LIST_RE.search(text):
+            return self.render_list(tales)
+        number_hit = _NUMBER_RE.search(text)
+        if number_hit:
+            return self._answer_by_number(tales, number_hit)
+        volume_answer = self._answer_volume(text)
+        if volume_answer is not None:
+            return volume_answer
 
         with self._lock:
             last = self._last_index
@@ -939,6 +1078,17 @@ class FairyTalesPlugin:
         под одним замком: второй вызов видит уже играющий файл и не плодит
         второй ``afplay`` (иначе «выключи» убил бы только один процесс).
         """
+        # «Включила, но очень тихо»: если выход почти выключен, поднимаем до
+        # слышимого уровня и честно сообщаем об этом. Пользователь не видит
+        # громкость afplay, поэтому молчание выглядит как поломка.
+        volume_note = ""
+        current_volume = self._system_volume()
+        if current_volume is not None and current_volume < QUIET_THRESHOLD:
+            if self._set_system_volume(DEFAULT_LOUD_VOLUME):
+                volume_note = (
+                    f" Сделала громче — было {current_volume} процентов,"
+                    f" стало {DEFAULT_LOUD_VOLUME}."
+                )
         with self._audio_lock:
             current = self._audio_process
             if (
@@ -946,7 +1096,7 @@ class FairyTalesPlugin:
                 and self._audio_slug == tale.slug
                 and not self._audio_exited(current)
             ):
-                return {"text": f"Включаю запись «{tale.title}».", "silent": True}
+                return {"text": f"Включаю запись «{tale.title}».{volume_note}", "silent": True}
             self._stop_audio()
             try:
                 process = subprocess.Popen(
@@ -971,7 +1121,7 @@ class FairyTalesPlugin:
                     self._audio_process = None
                     self._audio_slug = None
             return "Не получилось включить запись: файл не открылся."
-        return {"text": f"Включаю запись «{tale.title}».", "silent": True}
+        return {"text": f"Включаю запись «{tale.title}».{volume_note}", "silent": True}
 
     @staticmethod
     def _audio_exited(process: object) -> bool:
@@ -1062,7 +1212,8 @@ class FairyTalesPlugin:
         """Иллюстрации сказки из ``images/<slug>/`` по порядку имён файлов.
 
         Пути — относительно каталога плагина; ``after_chars`` привязан к
-        границам абзацев готового текста. Нет каталога/файлов — пустой список.
+        границам абзацев готового текста (задача 0228: до 10 картинок на
+        сказку, по одной на абзац). Нет каталога/файлов — пустой список.
         """
         directory, slug = self._image_directory(tale, ctx)
         if directory is None:
