@@ -63,6 +63,19 @@
   ``stream_chat`` -> итератор строк), поэтому бэкенд можно подставить в
   ``eva.router`` как «маленькую модель».
 
+Чат-шаблон (задача 0200):
+
+* если рядом с токенизатором есть ``tokenizer_config.json`` с ChatML-шаблоном
+  (Qwen), промпт рендерится как ``<|im_start|>role\\n…<|im_end|>\\n`` +
+  ``<|im_start|>assistant\\n`` (:mod:`eva.chat_template`); иначе — прежний
+  ``role: content``. Ручной ``prompt_builder`` по-прежнему важнее;
+* рассуждения выключены по умолчанию (``think=False``): в промпте сразу
+  закрытый пустой ``<think>``, поэтому ``max_tokens`` целиком уходит на ответ;
+* ``think=True`` включает рассуждение с бюджетом ``reasoning_budget``: при
+  исчерпании бюджет рассуждение принудительно закрывается и ответ
+  **досказывается** вторым прогоном. ``max_tokens`` тогда — лимит ответа,
+  полный лимит новых токенов = ``reasoning_budget + max_tokens``.
+
 Только стандартная библиотека: ``ctypes``, ``subprocess`` (только для
 одноразовой автосборки библиотеки), ``threading``, ``queue``.
 """
@@ -83,6 +96,13 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from .tokenizer import BPETokenizer, StreamDecoder, TokenizerError
+from ..chat_template import (
+    DEFAULT_REASONING_BUDGET,
+    THINK_CLOSE_SUFFIX,
+    ChatTemplate,
+    detect_chat_template,
+    reasoning_steps,
+)
 
 __all__ = [
     "VTMConfig",
@@ -750,11 +770,12 @@ def _role_content(message: Any) -> tuple[str, str]:
 
 
 def format_chat_prompt(messages: Any) -> str:
-    """Простой чат-шаблон по умолчанию: ``role: content`` + ``assistant:``.
+    """Переносимый дефолт для моделей без ChatML: ``role: content`` + ``assistant:``.
 
-    Настоящий чат-шаблон живёт в ``tokenizer.json`` конкретной модели; здесь
-    только переносимый дефолт для демо/тестов. Своя функция передаётся в
-    ``VtmBackend(prompt_builder=...)``.
+    Для Qwen автоматически берётся настоящий шаблон из
+    :mod:`eva.chat_template` (``<|im_start|>role\\n…``). Сюда бэкенд
+    приходит, только если рядом с токенизатором нет ``tokenizer_config.json``
+    с ChatML-шаблоном (или явно задан ``chat_template="plain"``).
     """
     if isinstance(messages, str):
         return messages
@@ -769,6 +790,22 @@ def format_chat_prompt(messages: Any) -> str:
 
 
 # --- бэкенд -----------------------------------------------------------------
+
+def _native_token_limit(
+    max_tokens: int, *, thinking: bool, reasoning_budget: int
+) -> int:
+    """Потолок ``max_new_tokens`` C-контекста с учётом бюджета рассуждения.
+
+    C-рантайм обрезает любую генерацию по этому потолку. При рассуждении
+    прогонов два (бюджет + ответ), поэтому потолок — их сумма; иначе первый
+    прогон обрывался бы по ``max_tokens`` и «бюджет» 64 молча становился 32
+    (задача 0200).
+    """
+    limit = int(max_tokens)
+    if thinking and limit > 0:
+        limit += max(0, int(reasoning_budget))
+    return limit
+
 
 class VtmBackend:
     """Локальная ВТМ как «маленькая модель»: генерация, стриминг, отмена.
@@ -793,6 +830,10 @@ class VtmBackend:
         prefill_batch: int | None = None,
         environ: Mapping[str, str] | None = None,
         prompt_builder: Callable[[Any], str] | None = None,
+        think: bool = False,
+        reasoning_budget: int = DEFAULT_REASONING_BUDGET,
+        chat_template: str = "auto",
+        no_think_suffix: bool = False,
     ) -> None:
         resolved = config if config is not None else VTMConfig.from_env(environ)
         overrides = {
@@ -811,7 +852,31 @@ class VtmBackend:
         if overrides:
             resolved = replace(resolved, **overrides)
         self.config = resolved
-        self.prompt_builder = prompt_builder or format_chat_prompt
+        if isinstance(reasoning_budget, bool) or int(reasoning_budget) < 0:
+            raise ValueError(
+                f"reasoning_budget: ожидалось >= 0, получено {reasoning_budget!r}"
+            )
+        self.think = bool(think)
+        self.reasoning_budget = int(reasoning_budget)
+        self.no_think_suffix = bool(no_think_suffix)
+        mode = str(chat_template or "auto").strip().lower()
+        if mode not in ("auto", "qwen", "plain"):
+            raise ValueError(
+                f"chat_template={chat_template!r}: ожидалось auto|qwen|plain"
+            )
+        self.chat_template = mode
+        # Шаблон ищем по соседнему tokenizer_config.json: он есть у Qwen, и в
+        # нём лежит настоящий ChatML (задача 0200). Нет шаблона — прежний
+        # переносимый ``role: content``.
+        self.template: ChatTemplate | None = (
+            None if mode == "plain" else detect_chat_template(self.config.tokenizer)
+        )
+        self._thinking = bool(
+            self.think
+            and self.template is not None
+            and self.template.supports_thinking
+        )
+        self.prompt_builder = prompt_builder or self._default_prompt_builder()
 
         self._library: _Library | None = None
         self._context: _VtmContext | None = None
@@ -821,6 +886,21 @@ class VtmBackend:
         self._closed = False
         self._active_abort: threading.Event | None = None
         self._generation_thread: threading.Thread | None = None
+
+    def _default_prompt_builder(self) -> Callable[[Any], str]:
+        """``prompt_builder``: ChatML для Qwen, иначе прежний ``role: content``.
+
+        Для ``think=True`` рендер идёт с ``enable_thinking=True``: промпт
+        кончается ``<|im_start|>assistant\\n``, и модель сама открывает
+        ``<think>``. Для ``think=False`` после ``assistant`` стоит пустой
+        закрытый ``<think>\\n\\n</think>\\n\\n`` — модель не рассуждает.
+        """
+        if self.template is None:
+            return format_chat_prompt
+        return self.template.builder(
+            enable_thinking=self._thinking,
+            no_think_suffix=self.no_think_suffix,
+        )
 
     # -- свойства ----------------------------------------------------------
 
@@ -864,6 +944,29 @@ class VtmBackend:
         with self._state:
             return self._busy
 
+    @property
+    def supports_thinking(self) -> bool:
+        """Умеет ли модель рассуждение (Qwen3 + ``think=True``)."""
+        return self._thinking
+
+    def render_chat(self, messages: Any, *, enable_thinking: bool | None = None) -> str:
+        """Промпт по шаблону модели (ChatML у Qwen) без генерации.
+
+        ``enable_thinking=None`` — как сконфигурировано (``think``); явный
+        флаг позволяет отрендерить оба режима одним бэкендом. Для модели без
+        ChatML-шаблона работает прежний ``role: content``.
+        """
+        if isinstance(messages, str):
+            return messages
+        if self.template is None:
+            return format_chat_prompt(messages)
+        thinking = self._thinking if enable_thinking is None else bool(enable_thinking)
+        return self.template.render(
+            messages,
+            enable_thinking=thinking,
+            no_think_suffix=self.no_think_suffix,
+        )
+
     # -- открытие/закрытие --------------------------------------------------
 
     def open(self) -> "VtmBackend":
@@ -892,11 +995,18 @@ class VtmBackend:
         eos_id = -1
         if self.config.tokenizer:
             eos_id = self.tokenizer.eos_id
+        # Потолок C-контекста должен вмещать оба прогона: при рассуждении
+        # первый ограничен бюджетом, второй — max_tokens (см. ниже).
+        native_limit = _native_token_limit(
+            self.config.max_tokens,
+            thinking=self._thinking,
+            reasoning_budget=self.reasoning_budget,
+        )
         self._context = _VtmContext(
             self._library,
             model_path,
             backend=self.config.backend,
-            max_new_tokens=self.config.max_tokens,
+            max_new_tokens=native_limit,
             eos_token_id=eos_id,
             cache_prefix=self.config.cache_prefix,
             prefill_batch=self.config.prefill_batch,
@@ -1159,26 +1269,104 @@ class VtmBackend:
 
     # -- клиентский интерфейс (для eva.router) ------------------------------
 
+    def _answer_limit(self, max_tokens: int | None) -> int | None:
+        """Лимит ответа: ``max_tokens`` или ``VTMConfig.max_tokens``.
+
+        ``None`` — без лимита (так было и раньше: ``max_new_tokens=None``).
+        В режиме рассуждения это лимит только ответа; бюджет размышления
+        прибавляется отдельно.
+        """
+        if max_tokens is not None:
+            limit = int(max_tokens)
+            if limit < 1:
+                raise ValueError(f"max_tokens: ожидалось >= 1, получено {limit}")
+            return limit
+        configured = int(self.config.max_tokens)
+        return configured if configured > 0 else None
+
+    def _reasoning_steps(
+        self, prompt_ids: Sequence[int], *, answer_tokens: int
+    ) -> Iterator[Any]:
+        """Шаги ответа с бюджетом рассуждения (``think=False`` — один прогон)."""
+        tokenizer = self.tokenizer
+        return reasoning_steps(
+            prompt_ids,
+            stream_ids=lambda ids, max_new_tokens: self.stream_ids(
+                ids, max_new_tokens=max_new_tokens
+            ),
+            encode=tokenizer.encode,
+            decode=tokenizer.decode,
+            answer_tokens=answer_tokens,
+            reasoning_budget=self.reasoning_budget,
+            think=self._thinking,
+            eos_id=tokenizer.eos_id,
+        )
+
     def chat(self, messages: Any, max_tokens: int | None = None) -> dict[str, Any]:
-        """``messages`` -> ответ одним куском (форма ``OpenAIClient.chat``)."""
+        """``messages`` -> ответ одним куском (форма ``OpenAIClient.chat``).
+
+        В режиме ``think=True`` текст содержит рассуждение (``<think>…``);
+        ``usage.reasoning_tokens``/``usage.answer_tokens`` показывают, сколько
+        ушло на каждую часть. Лимит новых токенов — ``reasoning_budget +
+        max_tokens``.
+        """
         prompt = self._prompt(messages)
         tokenizer = self.tokenizer
         prompt_ids = tokenizer.encode(prompt)
         if not prompt_ids:
             raise VtmError("chat: пустой промпт после токенизации")
-        generation = self.generate_result(prompt_ids, max_new_tokens=max_tokens)
-        ids = list(generation.ids)
-        if tokenizer.eos_id >= 0 and ids and ids[-1] == tokenizer.eos_id:
-            ids.pop()
+        limit = self._answer_limit(max_tokens)
+        finish = "stop"
+        reasoning_tokens = 0
+        answer_tokens = 0
+        second_pass = False
+        if limit is None:
+            # Явный «без лимита»: прежний путь одним прогоном.
+            generation = self.generate_result(prompt_ids, max_new_tokens=None)
+            ids = [
+                token
+                for token in generation.ids
+                if not (tokenizer.eos_id >= 0 and token == tokenizer.eos_id)
+            ]
+            finish = "length" if generation.finish_reason == "length" else "stop"
+        else:
+            ids = []
+            for step in self._reasoning_steps(prompt_ids, answer_tokens=limit):
+                if step.phase == "close":
+                    second_pass = True
+                    ids.extend(tokenizer.encode(THINK_CLOSE_SUFFIX))
+                    continue
+                if step.phase == "end":
+                    finish = "length" if step.reason == "length" else "stop"
+                    continue
+                if step.phase == "answer":
+                    second_pass = True
+                    answer_tokens += 1
+                else:
+                    reasoning_tokens += 1
+                ids.append(int(step.token))
         text = tokenizer.decode(ids)
+        completion = reasoning_tokens + answer_tokens if limit is not None else len(ids)
+        usage: dict[str, Any] = {
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": completion,
+            "total_tokens": len(prompt_ids) + completion,
+        }
+        if reasoning_tokens:
+            usage["reasoning_tokens"] = reasoning_tokens
+            usage["answer_tokens"] = answer_tokens
+            if second_pass:
+                # Второй прогон пересчитывает промпт вместе с рассуждением:
+                # это настоящий prefill, а не повторное использование кэша.
+                usage["second_pass_prompt_tokens"] = (
+                    len(prompt_ids)
+                    + reasoning_tokens
+                    + len(tokenizer.encode(THINK_CLOSE_SUFFIX))
+                )
         return {
             "text": text,
-            "usage": {
-                "prompt_tokens": len(prompt_ids),
-                "completion_tokens": len(ids),
-                "total_tokens": len(prompt_ids) + len(ids),
-            },
-            "finish_reason": generation.finish_reason,
+            "usage": usage,
+            "finish_reason": finish,
             "model": self.config.model or "",
         }
 
@@ -1190,10 +1378,26 @@ class VtmBackend:
         if not prompt_ids:
             raise VtmError("stream_chat: пустой промпт после токенизации")
         decoder = tokenizer.stream_decoder()
-        for token in self.stream_ids(prompt_ids, max_new_tokens=max_tokens):
-            if tokenizer.eos_id >= 0 and token == tokenizer.eos_id:
+        limit = self._answer_limit(max_tokens)
+        if limit is None:
+            tokens: Iterator[tuple[str, int | None]] = (
+                ("answer", token)
+                for token in self.stream_ids(prompt_ids, max_new_tokens=None)
+            )
+        else:
+            tokens = (
+                (step.phase, step.token)
+                for step in self._reasoning_steps(prompt_ids, answer_tokens=limit)
+            )
+        for phase, token in tokens:
+            if phase == "close":
+                yield THINK_CLOSE_SUFFIX
+                continue
+            if phase == "end" or token is None:
+                continue
+            if tokenizer.eos_id >= 0 and int(token) == tokenizer.eos_id:
                 break
-            chunk = decoder.push(token)
+            chunk = decoder.push(int(token))
             if chunk:
                 yield chunk
         tail = decoder.finish()

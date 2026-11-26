@@ -45,6 +45,15 @@
 ``/quit``. ``/system`` без аргумента показывает текущий промпт, ``-``
 очищает, ``@файл`` читает промпт из файла.
 
+Рассуждения (задача 0200): у локальной ВТМ с Qwen-шаблоном по умолчанию
+**выключены** — промпт рендерится как ChatML с пустым закрытым ``<think>``,
+поэтому ``--max-tokens`` целиком уходит на ответ. ``--think`` включает
+рассуждение с бюджетом ``--reasoning-budget`` (по умолчанию 256): при
+исчерпании бюджета рассуждение принудительно закрывается и **ответ
+досказывается** вторым прогоном (``--max-tokens`` — лимит уже ответа, общий
+лимит новых токенов = бюджет + ответ). ``--think`` действует только на ВТМ
+(``--backend vtm``): шаблон и бюджет — её свойство.
+
 Тесты (без сети и без GPU): ``python3 -m unittest tests.test_chat_cli``.
 """
 
@@ -72,11 +81,20 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# Модуль шаблонов — чистый Python без модели: его можно импортировать сразу.
+from eva.chat_template import (  # noqa: E402
+    DEFAULT_REASONING_BUDGET,
+    THINK_CLOSE_SUFFIX,
+    reasoning_steps,
+    strip_think,
+)
+
 __all__ = [
     "ChatBackendError",
     "ChatConfigError",
     "ChatRepl",
     "ChatSession",
+    "DEFAULT_REASONING_BUDGET",
     "OllamaChatBackend",
     "OpenAIChatBackend",
     "StreamEvent",
@@ -265,6 +283,8 @@ class TurnStats:
     cost_rub: float = 0.0
     cost_known: bool = False
     finish_reason: str | None = None
+    #: Сколько из completion-токенов ушло на ``<think>`` (0 — рассуждений нет).
+    reasoning_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -306,6 +326,8 @@ class ChatSession:
     system: str = DEFAULT_SYSTEM
     ctx: int = 4096
     max_tokens: int = DEFAULT_MAX_TOKENS
+    #: Бюджет размышления (0 — рассуждений нет; ``--think`` выставляет его).
+    reasoning_budget: int = 0
     counter: TokenCounter = TokenCounter()
     history: list[Message] = field(default_factory=list)
     turns: list[TurnStats] = field(default_factory=list)
@@ -316,6 +338,10 @@ class ChatSession:
             raise ValueError(f"ctx: ожидалось > 0, получено {self.ctx}")
         if self.max_tokens <= 0:
             raise ValueError(f"max_tokens: ожидалось > 0, получено {self.max_tokens}")
+        if self.reasoning_budget < 0:
+            raise ValueError(
+                f"reasoning_budget: ожидалось >= 0, получено {self.reasoning_budget}"
+            )
 
     # -- история ------------------------------------------------------------
 
@@ -353,7 +379,10 @@ class ChatSession:
             self.history,
             system=self.system,
             ctx=self.ctx,
-            max_tokens=self.max_tokens,
+            # Лимит ответа и бюджет размышления — разные вещи: в контексте
+            # нужно оставить место для обоих (иначе ``--think`` сам вызовет
+            # обрезку вопроса).
+            max_tokens=self.max_tokens + self.reasoning_budget,
             counter=self.counter,
         )
         self.last_trim = result
@@ -389,6 +418,7 @@ class ChatSession:
             cost_rub=float(usage.get("cost_rub") or 0.0),
             cost_known=bool(usage.get("cost_known")),
             finish_reason=finish_reason,
+            reasoning_tokens=max(0, int(usage.get("reasoning_tokens") or 0)),
         )
         self.turns.append(stats)
         return stats
@@ -419,8 +449,13 @@ def _cost_text(stats: TurnStats) -> str:
 
 def format_turn_brief(stats: TurnStats) -> str:
     """Одна строка после ответа (``--stats``)."""
+    think = (
+        f" ({stats.reasoning_tokens} размышление)"
+        if stats.reasoning_tokens
+        else ""
+    )
     return (
-        f"[{stats.completion_tokens} ток · {stats.tps:.1f} ток/с · "
+        f"[{stats.completion_tokens} ток{think} · {stats.tps:.1f} ток/с · "
         f"TTFT {stats.ttft_ms:.0f} мс · {stats.chars} симв · {_cost_text(stats)}]"
     )
 
@@ -443,6 +478,12 @@ def format_stats(
                 f"    TTFT:        {last.ttft_ms:.0f} мс",
                 f"    токены:      {last.prompt_tokens} prompt + "
                 f"{last.completion_tokens} completion = {last.total_tokens}",
+                *(
+                    [f"    размышление: {last.reasoning_tokens} ток "
+                     f"(бюджет {session.reasoning_budget})"]
+                    if last.reasoning_tokens or session.reasoning_budget
+                    else []
+                ),
                 f"    ток/с:       {last.tps:.1f}",
                 f"    символов:    {last.chars} "
                 f"({last.chars_per_token:.1f} симв/ток)",
@@ -678,6 +719,11 @@ class VtmChatBackend(ChatBackend):
     Токены считаются точно: промпт кодируется токенизатором модели, ответ
     идёт через ``VtmBackend.stream_ids`` (C-колбэк на каждый токен) и
     декодируется чанками. EOS в completion-токены не входит.
+
+    Рассуждение (задача 0200) — только у модели с Qwen-шаблоном: ``think``
+    рендерит промпт с ``enable_thinking=True`` и ограничивает размышление
+    ``reasoning_budget`` токенами, после чего **досказывает ответ** вторым
+    прогоном (``max_tokens`` — лимит ответа). По умолчанию выключено.
     """
 
     name = "vtm"
@@ -691,12 +737,20 @@ class VtmChatBackend(ChatBackend):
         backend: str = "auto",
         max_tokens: int = DEFAULT_MAX_TOKENS,
         cache_prefix: bool = True,
+        think: bool = False,
+        reasoning_budget: int = DEFAULT_REASONING_BUDGET,
         environ: Mapping[str, str] | None = None,
         inner: Any = None,
     ) -> None:
         self.model = str(model)
         self.tokenizer_path = tokenizer
         self.cache_prefix = bool(cache_prefix)
+        self.think = bool(think)
+        if isinstance(reasoning_budget, bool) or int(reasoning_budget) < 0:
+            raise ChatConfigError(
+                f"reasoning_budget: ожидалось >= 0, получено {reasoning_budget!r}"
+            )
+        self.reasoning_budget = int(reasoning_budget)
         self._inner = inner
         self._counter: TokenCounter | None = None
         if inner is None:
@@ -711,6 +765,18 @@ class VtmChatBackend(ChatBackend):
                 cache_prefix=cache_prefix,
                 environ=environ,
                 prompt_builder=None,
+                think=self.think,
+                reasoning_budget=self.reasoning_budget,
+            )
+        self.supports_thinking = bool(
+            getattr(self._inner, "supports_thinking", True)
+        )
+        if self.think and not self.supports_thinking:
+            raise ChatConfigError(
+                "--think: модель не умеет рассуждать по шаблону "
+                "(в tokenizer_config.json нет enable_thinking/<think>; нужен "
+                "токенизатор Qwen3, например runs/q4/qwen3-tokenizer.json). "
+                "Запустите без --think"
             )
         # точный счётчик включает токенизатор; ошибка токенизатора — на первом
         # же запросе, текст ошибки покажет REPL.
@@ -729,6 +795,22 @@ class VtmChatBackend(ChatBackend):
     def prompt_builder(self) -> Callable[[Any], str]:
         return self._inner.prompt_builder
 
+    def _decode_ids(self, ids: Sequence[int]) -> str:
+        """Декодировать id для проверки «закрыт ли ``<think>``».
+
+        У настоящего ``VtmBackend``/``BPETokenizer`` есть ``decode``; у
+        инъектированных заглушек его может не быть — тогда считаем, что тег
+        не закрыт, и второй прогон всё равно доскажет ответ.
+        """
+        for owner in (self._inner, getattr(self._inner, "tokenizer", None)):
+            decode = getattr(owner, "decode", None)
+            if callable(decode):
+                try:
+                    return str(decode(list(ids)))
+                except Exception:  # noqa: BLE001 — проверка тега не критична
+                    return ""
+        return ""
+
     def stream(
         self, messages: Sequence[Mapping[str, str]], *, max_tokens: int
     ) -> Iterator[StreamEvent]:
@@ -746,71 +828,108 @@ class VtmChatBackend(ChatBackend):
         decoder = tokenizer.stream_decoder()
         eos_id = int(getattr(tokenizer, "eos_id", -1))
         completion = 0
+        reasoning_tokens = 0
+        answer_tokens = 0
         finish = "stop"
-        eos_seen = False
         # Страж зацикливания: слабо квантованная модель иногда не выдаёт EOS и
         # повторяет одну и ту же фразу до лимита. Ловим трёхкратный повтор
         # последних 40 символов и останавливаемся — лучше короткий ответ, чем
-        # полотно с эхом.
+        # полотно с эхом. К рассуждению страж не применяется: бюджет и так
+        # ограничен, а обрыв рассуждения не должен съедать ответ.
         guard_text = ""
         #: Сколько символов держим в запасе, чтобы не отдать начало маркера.
         pending = ""
         try:
-            for token in inner.stream_ids(prompt_ids, max_new_tokens=max_tokens):
-                if eos_id >= 0 and int(token) == eos_id:
+            steps = reasoning_steps(
+                prompt_ids,
+                stream_ids=lambda ids, max_new_tokens: inner.stream_ids(
+                    ids, max_new_tokens=max_new_tokens
+                ),
+                encode=inner.encode,
+                decode=self._decode_ids,
+                answer_tokens=int(max_tokens),
+                reasoning_budget=self.reasoning_budget,
+                think=self.think,
+                eos_id=eos_id,
+            )
+            for step in steps:
+                if step.phase == "close":
+                    # Бюджет исчерпан: закрываем рассуждение сами, чтобы UI
+                    # свернул блок, а ответ пошёл уже обычным текстом.
+                    if pending:
+                        yield StreamEvent(text=pending)
+                        pending = ""
+                    yield StreamEvent(text=THINK_CLOSE_SUFFIX)
+                    continue
+                if step.phase == "end":
+                    finish = "length" if step.reason == "length" else "stop"
+                    continue
+                token = int(step.token)
+                if eos_id >= 0 and token == eos_id:
+                    # reasoning_steps уже отфильтровал EOS; страховка для
+                    # инъектированных заглушек, которые её не соблюдают.
                     finish = "stop"
-                    eos_seen = True
                     break
                 completion += 1
-                chunk = decoder.push(int(token))
-                if chunk:
-                    # Держим «хвост» неотданным: маркер конца («user:»,
-                    # <|im_end|>) может прийти в следующем куске, и тогда этот
-                    # хвост нужно не отдать, а вырезать.
-                    pending += chunk
-                    stopped_by_marker = _hit_stop_marker(pending)
-                    guard_text = (guard_text + chunk)[-400:]
-                    if stopped_by_marker:
-                        clean = _strip_stop_markers(pending)
-                        if clean:
-                            yield StreamEvent(text=clean)
-                        pending = ""
-                        finish = "stop"
-                        eos_seen = True
-                        break
-                    if _looks_like_loop(guard_text):
-                        if pending:
-                            yield StreamEvent(text=pending)
-                        pending = ""
-                        finish = "repeat"
-                        eos_seen = True
-                        break
-                    if len(pending) > _MARKER_LOOKAHEAD:
-                        cut = len(pending) - _MARKER_LOOKAHEAD
-                        yield StreamEvent(text=pending[:cut])
-                        pending = pending[cut:]
+                if step.phase == "reasoning":
+                    reasoning_tokens += 1
+                else:
+                    answer_tokens += 1
+                chunk = decoder.push(token)
+                if not chunk:
+                    continue
+                if step.phase == "reasoning":
+                    # Рассуждение отдаём как есть (модель сама пишет <think>),
+                    # без стражей: они бы оборвали его вместе с ответом.
+                    yield StreamEvent(text=chunk)
+                    continue
+                # Держим «хвост» неотданным: маркер конца («user:»,
+                # <|im_end|>) может прийти в следующем куске, и тогда этот
+                # хвост нужно не отдать, а вырезать.
+                pending += chunk
+                stopped_by_marker = _hit_stop_marker(pending)
+                guard_text = (guard_text + chunk)[-400:]
+                if stopped_by_marker:
+                    clean = _strip_stop_markers(pending)
+                    if clean:
+                        yield StreamEvent(text=clean)
+                    pending = ""
+                    finish = "stop"
+                    break
+                if _looks_like_loop(guard_text):
+                    if pending:
+                        yield StreamEvent(text=pending)
+                    pending = ""
+                    finish = "repeat"
+                    break
+                if len(pending) > _MARKER_LOOKAHEAD:
+                    cut = len(pending) - _MARKER_LOOKAHEAD
+                    yield StreamEvent(text=pending[:cut])
+                    pending = pending[cut:]
             if pending:
                 yield StreamEvent(text=pending)
                 pending = ""
             tail = decoder.finish()
             if tail:
                 yield StreamEvent(text=tail)
-            if completion >= max_tokens and not eos_seen:
-                finish = "length"
         except ChatBackendError:
             raise
         except Exception as exc:  # noqa: BLE001 — VtmError/VtmBusy/VtmCancelled
             raise ChatBackendError(self._hint(str(exc))) from exc
+        usage: dict[str, Any] = {
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": completion,
+            "total_tokens": len(prompt_ids) + completion,
+            "cost_rub": 0.0,
+            "cost_known": True,  # локально: 0 ₽
+        }
+        if reasoning_tokens:
+            usage["reasoning_tokens"] = reasoning_tokens
+            usage["answer_tokens"] = answer_tokens
         yield StreamEvent(
             done=True,
             finish_reason=finish,
-            usage={
-                "prompt_tokens": len(prompt_ids),
-                "completion_tokens": completion,
-                "total_tokens": len(prompt_ids) + completion,
-                "cost_rub": 0.0,
-                "cost_known": True,  # локально: 0 ₽
-            },
+            usage=usage,
         )
 
     def _hint(self, text: str) -> str:
@@ -1087,6 +1206,8 @@ def build_backend(
     price_prompt: float | None = None,
     price_completion: float | None = None,
     cache_prefix: bool | None = None,
+    think: bool = False,
+    reasoning_budget: int = DEFAULT_REASONING_BUDGET,
     environ: Mapping[str, str] | None = None,
     transport: Any = None,
     stream_transport: Any = None,
@@ -1094,7 +1215,8 @@ def build_backend(
     """Собрать бэкенд по флагам CLI и окружению (окружение — дефолты).
 
     Никакой сети здесь нет: HTTP-клиенты только конфигурируются, ВТМ
-    грузится лениво при первом запросе.
+    грузится лениво при первом запросе. ``think``/``reasoning_budget``
+    действуют только на ВТМ: у Ollama/OpenAI своя политика рассуждений.
     """
     name = (backend or "").strip().lower()
     if name not in DEFAULT_BACKENDS:
@@ -1142,6 +1264,8 @@ def build_backend(
             backend=_env(environ, "EVA_VTM_BACKEND") or None,
             max_tokens=max_tokens,
             cache_prefix=bool(cache_prefix),
+            think=bool(think),
+            reasoning_budget=int(reasoning_budget),
             environ=environ,
             inner=None,
         )
@@ -1291,6 +1415,13 @@ class ChatRepl:
             f"chat · backend={self.backend.name} · model={self.backend.model} · "
             f"ctx={self.session.ctx} · max_tokens={self.session.max_tokens}\n"
         )
+        if self.session.reasoning_budget:
+            self._out(
+                f"think: включено · бюджет {self.session.reasoning_budget} ток + "
+                f"{self.session.max_tokens} на ответ\n"
+            )
+        else:
+            self._out("think: выключено (--think включит, --reasoning-budget N)\n")
         if self.session.system:
             self._out(f"system: {_collapse(self.session.system, 80)}\n")
         self._out("команды: /reset /system /stats /help /quit\n")
@@ -1368,8 +1499,14 @@ class ChatRepl:
             elapsed_s=elapsed,
             finish_reason=finish,
         )
-        if answer.strip():
-            self.session.add_assistant(answer)
+        # В историю — ответ без рассуждения: <think> съедает контекст и в
+        # следующем промпте бесполезен. Если бюджет оборвал рассуждение
+        # раньше, чем начался ответ, оставляем хотя бы его — терять ход нельзя.
+        history_answer = strip_think(answer)
+        if not history_answer.strip() and answer.strip():
+            history_answer = answer
+        if history_answer.strip():
+            self.session.add_assistant(history_answer)
         else:
             self._err("(пустой ответ: в историю не записан)\n")
         if self.show_stats:
@@ -1473,6 +1610,16 @@ def _positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"ожидалось целое > 0, получено {value!r}") from exc
     if number <= 0:
         raise argparse.ArgumentTypeError(f"ожидалось > 0, получено {number}")
+    return number
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        number = int(str(value).strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"ожидалось целое >= 0, получено {value!r}") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"ожидалось >= 0, получено {number}")
     return number
 
 
@@ -1619,7 +1766,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-tokens",
         type=_positive_int,
         default=DEFAULT_MAX_TOKENS,
-        help=f"лимит completion-токенов на ответ (по умолчанию {DEFAULT_MAX_TOKENS})",
+        help=f"лимит токенов ответа (по умолчанию {DEFAULT_MAX_TOKENS}); "
+        "с --think это лимит уже ответа, бюджет размышления прибавляется сверху",
+    )
+    parser.add_argument(
+        "--think",
+        action="store_true",
+        help="разрешить рассуждение <think> у ВТМ с Qwen-шаблоном "
+        "(по умолчанию выключено: быстрее и без обрыва ответа)",
+    )
+    parser.add_argument(
+        "--reasoning-budget",
+        type=_non_negative_int,
+        default=DEFAULT_REASONING_BUDGET,
+        metavar="N",
+        help=f"токенов на рассуждение при --think (по умолчанию "
+        f"{DEFAULT_REASONING_BUDGET}); при исчерпании ответ досказывается "
+        "вторым прогоном",
     )
     parser.add_argument(
         "--price-prompt",
@@ -1670,6 +1833,10 @@ def _backend_from_args(
         price_prompt=args.price_prompt,
         price_completion=args.price_completion,
         cache_prefix=False if args.no_cache_prefix else None,
+        think=bool(getattr(args, "think", False)),
+        reasoning_budget=int(
+            getattr(args, "reasoning_budget", DEFAULT_REASONING_BUDGET)
+        ),
         environ=environ,
         transport=transport,
         stream_transport=stream_transport,
@@ -1698,6 +1865,13 @@ def main(
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.think and args.backend != "vtm":
+        print(
+            "chat: --think/--reasoning-budget действуют только на --backend vtm; "
+            "для этого бэкенда флаг проигнорирован",
+            file=err,
+        )
+
     try:
         backend = _backend_from_args(
             args, environ=environ, transport=transport, stream_transport=stream_transport
@@ -1716,6 +1890,9 @@ def main(
         system=system,
         ctx=_resolve_ctx(args),
         max_tokens=int(args.max_tokens),
+        reasoning_budget=(
+            int(args.reasoning_budget) if args.think and args.backend == "vtm" else 0
+        ),
         counter=backend.counter,
     )
     repl = ChatRepl(

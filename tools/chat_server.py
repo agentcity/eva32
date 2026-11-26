@@ -99,6 +99,14 @@ HTTP-слой знает только про ``backend``/``model`` из реес
 
 ``0`` — держать всегда, без флага автовыгрузка выключена (по умолчанию).
 
+Рассуждения (задача 0200): у ВТМ по умолчанию **выключены** — промпт
+рендерится настоящим Qwen-шаблоном с пустым закрытым ``<think>``, поэтому
+``--max-tokens`` целиком уходит на ответ. ``--think`` включает рассуждение с
+бюджетом ``--reasoning-budget`` (по умолчанию 256): при исчерпании бюджета
+рассуждение принудительно закрывается, и ответ **досказывается** вторым
+прогоном; ``--max-tokens`` тогда — лимит ответа, общий лимит новых токенов =
+бюджет + ответ. UI уже умеет сворачивать ``<think>`` в «рассуждение».
+
 Только стандартная библиотека; бэкенды берутся из ``tools/chat.py`` (внутри —
 ``eva``), их файлы не меняются.
 """
@@ -179,6 +187,9 @@ ROOT = Path(__file__).resolve().parents[1]
 # один раз, чтобы адаптеры работали при любом способе запуска.
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from eva.chat_template import DEFAULT_REASONING_BUDGET  # noqa: E402
+
 #: Ollama — только этот адрес; клиент не может подставить свой.
 OLLAMA_BASE = "http://127.0.0.1:11434/v1"
 #: Сколько новых токенов просим у обеих моделей (сравнение на равных).
@@ -795,9 +806,15 @@ class ChatCliAdapter:
 
 
 def _chat_cli_factory(
-    kind: str, model: ModelSpec, timeout: float
+    kind: str,
+    model: ModelSpec,
+    timeout: float,
+    *,
+    think: bool = False,
+    reasoning_budget: int = DEFAULT_REASONING_BUDGET,
 ) -> Callable[[], Any]:
     """Фабрика бэкенда из ``tools/chat.py``; импорт и модель — при первом запросе."""
+    budget = max(0, int(reasoning_budget))
 
     def factory() -> Any:
         try:
@@ -813,6 +830,8 @@ def _chat_cli_factory(
                 model=target,
                 tokenizer=model.tokenizer or None,
                 timeout=timeout,
+                think=bool(think),
+                reasoning_budget=budget,
             )
         if kind == "ollama":
             # Класс из chat.py напрямую, а не build_backend: иначе пустой key
@@ -872,16 +891,30 @@ def _probe_ollama_ps(model: str, *, timeout: float = 1.5) -> dict[str, Any] | No
 
 
 def default_adapters(
-    registry: Iterable[BackendSpec], *, timeout: float = 120.0
+    registry: Iterable[BackendSpec],
+    *,
+    timeout: float = 120.0,
+    think: bool = False,
+    reasoning_budget: int = DEFAULT_REASONING_BUDGET,
 ) -> dict[tuple[str, str], Any]:
-    """Адаптеры для всех моделей реестра; ВТМ открывается лениво."""
+    """Адаптеры для всех моделей реестра; ВТМ открывается лениво.
+
+    ``think``/``reasoning_budget`` — политика рассуждений ВТМ: по умолчанию
+    выключена (ответ сразу), бюджет действует только при включении.
+    """
     adapters: dict[tuple[str, str], Any] = {}
     for backend in registry:
         for model in backend.models:
             if backend.kind not in ("vtm", "ollama"):
                 continue
             adapters[(backend.id, model.id)] = ChatCliAdapter(
-                _chat_cli_factory(backend.kind, model, timeout),
+                _chat_cli_factory(
+                    backend.kind,
+                    model,
+                    timeout,
+                    think=think,
+                    reasoning_budget=reasoning_budget,
+                ),
                 label="{} / {}".format(backend.id, model.id),
                 kind=backend.kind,
                 # Сеть тестам не нужна: заглушки ``probe_ps`` не имеют.
@@ -4303,6 +4336,8 @@ class ChatHTTPServer(ThreadingHTTPServer):
         keep_alive: float | None = None,
         history_tokens: int = DEFAULT_HISTORY_TOKENS,
         history_turns: int = DEFAULT_HISTORY_TURNS,
+        think: bool = False,
+        reasoning_budget: int = DEFAULT_REASONING_BUDGET,
         tts: Callable[
             [str, str | None], bytes | tuple[bytes, str]
         ] | None = None,
@@ -4316,6 +4351,10 @@ class ChatHTTPServer(ThreadingHTTPServer):
         self.adapters = dict(adapters)
         self.system_prompt = system_prompt
         self.max_tokens = max(1, int(max_tokens))
+        # Рассуждения ВТМ (задача 0200): по умолчанию выключены. Бюджет
+        # прибавляется к max_tokens, поэтому ответ не теряется никогда.
+        self.think = bool(think)
+        self.reasoning_budget = max(0, int(reasoning_budget))
         # Память диалога (задача 0182): история user/assistant на колонку.
         # 0 токенов — истории нет (каждый вопрос с чистого листа).
         self.history = ChatHistory(
@@ -5176,6 +5215,8 @@ def create_server(
     keep_alive: float | None = None,
     history_tokens: int = DEFAULT_HISTORY_TOKENS,
     history_turns: int = DEFAULT_HISTORY_TURNS,
+    think: bool = False,
+    reasoning_budget: int = DEFAULT_REASONING_BUDGET,
     tts: Callable[[str, str | None], bytes] | None = None,
 ) -> ChatHTTPServer:
     """Собрать сервер; ``port=0`` — свободный порт (удобно тестам).
@@ -5186,6 +5227,8 @@ def create_server(
     простоя до автовыгрузки ВТМ (``None`` — выключено, ``0`` — держать всегда).
     ``history_tokens`` — бюджет истории колонки в токенах (``0`` — истории
     нет), ``history_turns`` — максимум последних реплик.
+    ``think`` — разрешить рассуждение у ВТМ (по умолчанию нет);
+    ``reasoning_budget`` — сколько токенов на него, сверх ``max_tokens``.
     """
     if host not in ("127.0.0.1", "::1"):
         raise ValueError(
@@ -5212,12 +5255,21 @@ def create_server(
             raise TypeError("keep_alive: ожидалось число секунд или None")
         if keep_alive < 0:
             raise ValueError("keep_alive: ожидалось >= 0 (0 — держать всегда)")
+    if isinstance(reasoning_budget, bool) or not isinstance(reasoning_budget, int):
+        raise TypeError("reasoning_budget: ожидалось целое число")
+    if reasoning_budget < 0:
+        raise ValueError("reasoning_budget: ожидалось >= 0")
 
     resolved = tuple(registry) if registry is not None else default_registry()
     resolved_adapters = (
         dict(adapters)
         if adapters is not None
-        else default_adapters(resolved, timeout=timeout)
+        else default_adapters(
+            resolved,
+            timeout=timeout,
+            think=bool(think),
+            reasoning_budget=int(reasoning_budget),
+        )
     )
     prompt = load_system_prompt() if system_prompt is None else str(system_prompt)
     return ChatHTTPServer(
@@ -5229,6 +5281,8 @@ def create_server(
         keep_alive=keep_alive,
         history_tokens=history_tokens,
         history_turns=history_turns,
+        think=bool(think),
+        reasoning_budget=int(reasoning_budget),
         tts=tts,
     )
 
@@ -5253,7 +5307,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-tokens",
         type=int,
         default=DEFAULT_MAX_TOKENS,
-        help="сколько новых токенов просить у моделей",
+        help="сколько новых токенов ответа просить у моделей "
+        "(с --think это лимит уже ответа)",
+    )
+    parser.add_argument(
+        "--think",
+        action="store_true",
+        help="разрешить рассуждение <think> у ВТМ с Qwen-шаблоном "
+        "(по умолчанию выключено: ответ сразу, без обрыва по max_tokens)",
+    )
+    parser.add_argument(
+        "--reasoning-budget",
+        type=int,
+        default=DEFAULT_REASONING_BUDGET,
+        metavar="N",
+        help="токенов на рассуждение при --think (по умолчанию {}); "
+        "при исчерпании ответ досказывается вторым прогоном".format(
+            DEFAULT_REASONING_BUDGET
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -5338,6 +5409,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             keep_alive=args.keep_alive,
             history_tokens=args.history_tokens,
             history_turns=args.history_turns,
+            think=bool(args.think),
+            reasoning_budget=int(args.reasoning_budget),
         )
     except (OSError, ValueError, TypeError) as exc:
         print("не удалось запустить сервер: {}".format(exc), file=sys.stderr)
@@ -5373,6 +5446,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         print("история диалога: выключена (--history-tokens 0)")
+    if server.think:
+        print(
+            "рассуждения ВТМ: включены, бюджет {} ток + {} на ответ "
+            "(при исчерпании ответ досказывается)".format(
+                server.reasoning_budget, server.max_tokens
+            )
+        )
+    else:
+        print(
+            "рассуждения ВТМ: выключены (--think включит, "
+            "--reasoning-budget N — бюджет)"
+        )
     # Голос по умолчанию — Silero (локальный нейроголос). Его worker грузит
     # torch+модель ~1,5–2,5 с, поэтому поднимаем фоном заранее: первая фраза
     # звучит за 0,05–0,2 с вместо 3 с (задача 0195). Нет Silero — no-op.

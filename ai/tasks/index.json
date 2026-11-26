@@ -1339,7 +1339,7 @@
   {
     "id": "0200",
     "title": "Qwen-шаблон и бюджет размышлений",
-    "status": "in_progress",
+    "status": "done",
     "file": "0200-qwen-template-thinking.md",
     "assignee": "agent:qwen-template"
   },
