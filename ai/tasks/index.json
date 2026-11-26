@@ -1300,5 +1300,12 @@
     "status": "in_progress",
     "file": "0194-stop-command.md",
     "assignee": "agent:stop-command"
+  },
+  {
+    "id": "0195",
+    "title": "Silero worker: модель загружена один раз",
+    "status": "in_progress",
+    "file": "0195-silero-worker.md",
+    "assignee": "agent:silero-worker"
   }
 ]
