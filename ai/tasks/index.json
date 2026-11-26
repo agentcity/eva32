@@ -1353,7 +1353,7 @@
   {
     "id": "0203",
     "title": "Спекулятивный декод (черновик 0.5B)",
-    "status": "in_progress",
+    "status": "done",
     "file": "0203-speculative-decode.md",
     "assignee": "agent:speculative"
   }

@@ -460,6 +460,24 @@ def format_turn_brief(stats: TurnStats) -> str:
     )
 
 
+def format_spec_brief(stats: Mapping[str, Any]) -> str:
+    """Одна строка о спекуляции после ответа (``--stats``)."""
+    k = stats.get("k", "?")
+    generated = int(stats.get("generated_tokens", 0) or 0)
+    elapsed = float(stats.get("elapsed_s", 0.0) or 0.0)
+    tps = generated / elapsed if elapsed > 0 else 0.0
+    return (
+        f"  spec K={k}: принято {float(stats.get('acceptance_rate', 0.0)):.2f} "
+        f"({int(stats.get('drafts_accepted', 0))}/{int(stats.get('drafts_proposed', 0))}), "
+        f"средний префикс {float(stats.get('mean_accepted_prefix', 0.0)):.2f}, "
+        f"{tps:.1f} ток/с, "
+        f"цель {float(stats.get('target_batch_s', 0.0)):.2f}+"
+        f"{float(stats.get('target_single_s', 0.0)):.2f} с, "
+        f"черновик {float(stats.get('draft_s', 0.0)):.2f} с, "
+        f"CPU {float(stats.get('cpu_s', 0.0)):.2f} с"
+    )
+
+
 def format_stats(
     session: ChatSession,
     *,
@@ -739,6 +757,9 @@ class VtmChatBackend(ChatBackend):
         cache_prefix: bool = True,
         think: bool = False,
         reasoning_budget: int = DEFAULT_REASONING_BUDGET,
+        speculative: bool = False,
+        draft: str | None = None,
+        spec_k: int = 4,
         environ: Mapping[str, str] | None = None,
         inner: Any = None,
     ) -> None:
@@ -746,6 +767,12 @@ class VtmChatBackend(ChatBackend):
         self.tokenizer_path = tokenizer
         self.cache_prefix = bool(cache_prefix)
         self.think = bool(think)
+        self.speculative = bool(speculative)
+        self.spec_draft = str(draft) if draft else None
+        self.spec_k = int(spec_k)
+        self.spec_meta: Mapping[str, Any] = {}
+        self._spec: Any = None
+        self._environ = environ if environ is not None else os.environ
         if isinstance(reasoning_budget, bool) or int(reasoning_budget) < 0:
             raise ChatConfigError(
                 f"reasoning_budget: ожидалось >= 0, получено {reasoning_budget!r}"
@@ -781,6 +808,55 @@ class VtmChatBackend(ChatBackend):
         # точный счётчик включает токенизатор; ошибка токенизатора — на первом
         # же запросе, текст ошибки покажет REPL.
         self._counter = TokenCounter(exact=True, counter=self._count_exact)
+        if self.speculative:
+            self._enable_speculative()
+
+    def _enable_speculative(self) -> None:
+        """Подменить ``stream_ids`` спекулятивным декодером (задача 0203).
+
+        Вся обвязка чата (ChatML-шаблон, рассуждение, стриминг, страж
+        зацикливания) остаётся прежней: она зовёт ``inner.stream_ids`` и не
+        знает, что токены пришли из двух моделей.
+        """
+        from eva.speculative import SpecError, SpecUnavailable, SpeculativeDecoder
+
+        if not self.spec_draft:
+            raise ChatConfigError("--speculative требует --draft")
+        draft_path = Path(self.spec_draft).expanduser()
+        if not draft_path.is_file():
+            raise ChatConfigError(f"vtm: файла черновика нет: {draft_path}")
+        if Path(self.model).resolve() == draft_path.resolve():
+            raise ChatConfigError(
+                "vtm: --draft совпадает с --model; черновик должен быть "
+                "отдельной (меньшей) моделью"
+            )
+        tokenizer = getattr(self._inner, "tokenizer", None)
+        eos_id = int(getattr(tokenizer, "eos_id", -1))
+        try:
+            backend = (
+                self._environ.get("EVA_VTM_SPEC_BACKEND")
+                or self._environ.get("EVA_VTM_BACKEND")
+                or "simd"   # паритет: батч Q4_K на simd побитов поштучному
+            )
+            self._spec = SpeculativeDecoder(
+                str(draft_path),
+                self.model,
+                k=self.spec_k,
+                backend=backend,
+                eos_token_id=eos_id,
+            )
+        except (SpecUnavailable, SpecError, OSError) as exc:
+            raise ChatConfigError(f"vtm: спекулятивный декод: {exc}") from exc
+        self.spec_draft = str(draft_path)
+        self.spec_meta = self._spec.target.sampling()
+        self._inner.stream_ids = self._spec.stream_ids
+
+    def speculative_stats(self) -> Mapping[str, Any] | None:
+        if self._spec is None:
+            return None
+        data = dict(self._spec.stats.as_dict())
+        data["k"] = self._spec.k
+        return data
 
     def _count_exact(self, text: str) -> int:
         if not text:
@@ -950,6 +1026,8 @@ class VtmChatBackend(ChatBackend):
 
     def cancel(self) -> None:
         """Прервать текущую генерацию (Ctrl-C в REPL): C-флаг, безопасен."""
+        if self._spec is not None:
+            self._spec.cancel()
         cancel = getattr(self._inner, "cancel", None)
         if callable(cancel):
             try:
@@ -958,6 +1036,12 @@ class VtmChatBackend(ChatBackend):
                 pass
 
     def close(self) -> None:
+        if self._spec is not None:
+            try:
+                self._spec.close()
+            except Exception:  # noqa: BLE001 — закрытие не должно ронять выход
+                pass
+            self._spec = None
         close = getattr(self._inner, "close", None)
         if callable(close):
             try:
@@ -1208,6 +1292,9 @@ def build_backend(
     cache_prefix: bool | None = None,
     think: bool = False,
     reasoning_budget: int = DEFAULT_REASONING_BUDGET,
+    speculative: bool = False,
+    draft: str | None = None,
+    spec_k: int = 4,
     environ: Mapping[str, str] | None = None,
     transport: Any = None,
     stream_transport: Any = None,
@@ -1222,6 +1309,15 @@ def build_backend(
     if name not in DEFAULT_BACKENDS:
         raise ChatConfigError(
             f"--backend={backend!r}: ожидалось одно из {', '.join(DEFAULT_BACKENDS)}"
+        )
+    if speculative and name != "vtm":
+        raise ChatConfigError(
+            "--speculative работает только с --backend vtm: спекуляция "
+            "требует двух контекстов ВТМ"
+        )
+    if speculative and not draft:
+        raise ChatConfigError(
+            "--speculative требует --draft (например runs/q4/0.5b-q4.vtm)"
         )
 
     if name == "vtm":
@@ -1266,6 +1362,9 @@ def build_backend(
             cache_prefix=bool(cache_prefix),
             think=bool(think),
             reasoning_budget=int(reasoning_budget),
+            speculative=bool(speculative),
+            draft=draft,
+            spec_k=int(spec_k),
             environ=environ,
             inner=None,
         )
@@ -1422,6 +1521,19 @@ class ChatRepl:
             )
         else:
             self._out("think: выключено (--think включит, --reasoning-budget N)\n")
+        if getattr(self.backend, "speculative", False):
+            draft = getattr(self.backend, "spec_draft", "?")
+            k = getattr(self.backend, "spec_k", 4)
+            self._out(f"spec: включено · draft={Path(draft).name} · K={k}\n")
+            meta = getattr(self.backend, "spec_meta", None) or {}
+            if float(meta.get("temperature", 0.0) or 0.0) > 0 or int(
+                meta.get("top_k", 0) or 0
+            ) > 0:
+                self._out(
+                    f"spec: мета цели сэмплирует (T={meta.get('temperature')}, "
+                    f"top_k={meta.get('top_k')}); включён принудительный greedy — "
+                    "выход отличается от обычного чата\n"
+                )
         if self.session.system:
             self._out(f"system: {_collapse(self.session.system, 80)}\n")
         self._out("команды: /reset /system /stats /help /quit\n")
@@ -1511,6 +1623,11 @@ class ChatRepl:
             self._err("(пустой ответ: в историю не записан)\n")
         if self.show_stats:
             self._err(format_turn_brief(stats) + "\n")
+            spec_stats = getattr(self.backend, "speculative_stats", None)
+            if callable(spec_stats):
+                data = spec_stats()
+                if data:
+                    self._err(format_spec_brief(data) + "\n")
         return stats
 
     def _cancel_backend(self) -> None:
@@ -1802,6 +1919,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="выключить кэш префикса ВТМ (по умолчанию включён: второй запрос быстрее)",
     )
     parser.add_argument(
+        "--speculative",
+        action="store_true",
+        help="спекулятивный декод: черновик (--draft) предлагает K токенов, "
+        "цель проверяет их одной пачкой (только --backend vtm)",
+    )
+    parser.add_argument(
+        "--draft",
+        default=None,
+        help="путь к .vtm черновика для --speculative (например "
+        "runs/q4/0.5b-q4.vtm)",
+    )
+    parser.add_argument(
+        "--spec-k",
+        type=_positive_int,
+        default=4,
+        help="токенов в пачке проверки при --speculative (по умолчанию 4; "
+        "включая последний принятый токен)",
+    )
+    parser.add_argument(
         "--stats",
         action="store_true",
         help="печатать краткую статистику после каждого ответа",
@@ -1837,6 +1973,9 @@ def _backend_from_args(
         reasoning_budget=int(
             getattr(args, "reasoning_budget", DEFAULT_REASONING_BUDGET)
         ),
+        speculative=bool(getattr(args, "speculative", False)),
+        draft=getattr(args, "draft", None),
+        spec_k=int(getattr(args, "spec_k", 4)),
         environ=environ,
         transport=transport,
         stream_transport=stream_transport,
