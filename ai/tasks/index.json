@@ -1370,5 +1370,12 @@
     "status": "done",
     "file": "0205-tts-numbers.md",
     "assignee": "agent:tts-numbers"
+  },
+  {
+    "id": "0206",
+    "title": "Знаки, сокращения и телефоны в озвучке",
+    "status": "in_progress",
+    "file": "0206-tts-symbols.md",
+    "assignee": "agent:tts-symbols"
   }
 ]
