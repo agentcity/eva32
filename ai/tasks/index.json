@@ -1468,5 +1468,12 @@
     "status": "done",
     "file": "0219-music-control.md",
     "assignee": "agent:music"
+  },
+  {
+    "id": "0220",
+    "title": "Корпус сказок Афанасьева до 25–30",
+    "status": "in_progress",
+    "file": "0220-afanasyev-corpus.md",
+    "assignee": "agent:tales-more"
   }
 ]
