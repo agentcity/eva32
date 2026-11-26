@@ -1496,5 +1496,12 @@
     "status": "in_progress",
     "file": "0223-tale-audio.md",
     "assignee": "agent:tale-audio"
+  },
+  {
+    "id": "0224",
+    "title": "Картинки сказок в EVA.app",
+    "status": "in_progress",
+    "file": "0224-app-tale-images.md",
+    "assignee": "agent:app-images"
   }
 ]
