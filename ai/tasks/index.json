@@ -1307,5 +1307,12 @@
     "status": "done",
     "file": "0195-silero-worker.md",
     "assignee": "agent:silero-worker"
+  },
+  {
+    "id": "0196",
+    "title": "Metal фаза 2: батч и один командный буфер",
+    "status": "in_progress",
+    "file": "0196-metal-phase2.md",
+    "assignee": "agent:metal2"
   }
 ]
