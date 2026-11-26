@@ -590,6 +590,14 @@ class PluginRegistry:
                     plugin_id=plugin_id,
                     capability=capability,
                 )
+            elif capability == "answer":
+                # Плагин отвечает сам: нужна функция answer(ctx, question).
+                _callable_of(
+                    obj,
+                    "answer",
+                    plugin_id=plugin_id,
+                    capability=capability,
+                )
 
     def _scope_of(self, record: PluginRecord) -> str:
         value = getattr(record.obj, "scope", record.manifest.scope)
@@ -845,7 +853,7 @@ class PluginRegistry:
         for record in self.enabled():
             if not record.loaded or "answer" not in record.manifest.capabilities:
                 continue
-            run = getattr(record.entry, "answer", None)
+            run = getattr(record.obj, "answer", None)
             if not callable(run):
                 logger.warning(
                     "плагин %s: capability answer без функции answer()", record.id
