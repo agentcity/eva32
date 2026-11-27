@@ -50,6 +50,32 @@ def _load_plugin_module():
 MUSIC = _load_plugin_module()
 
 
+class NextPrevPhrases(unittest.TestCase):
+    """Переключение трека: шире, чем «следующая» — так люди и говорят."""
+
+    PHRASES = {
+        "next": [
+            "следующий трек", "следующая песня", "дальше", "переключи",
+            "переключи вперёд", "включи следующий трек", "следующую",
+            "next",
+        ],
+        "prev": [
+            "предыдущий трек", "предыдущая", "назад", "верни предыдущий трек",
+            "верни прошлый трек", "вернись назад", "переключи назад",
+            "прошлый трек", "включи предыдущую песню", "prev",
+        ],
+    }
+
+    def test_phrases_map_to_actions(self) -> None:
+        music = MUSIC
+        for expected, phrases in self.PHRASES.items():
+            for phrase in phrases:
+                with self.subTest(phrase=phrase, expected=expected):
+                    intent = music._intent(music._normalize(phrase))
+                    self.assertIsNotNone(intent, phrase)
+                    self.assertEqual(intent[0], expected, phrase)
+
+
 class Completed:
     """Минимальный ``subprocess.CompletedProcess``."""
 
