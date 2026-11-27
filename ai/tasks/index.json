@@ -1535,7 +1535,7 @@
   {
     "id": "0232",
     "title": "Картинки по сюжету и фильтр сканов",
-    "status": "in_progress",
+    "status": "done",
     "file": "0232-images-by-plot.md",
     "assignee": "agent:plot-images"
   },

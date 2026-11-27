@@ -30,6 +30,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import re
@@ -73,6 +74,9 @@ ENDING_NIGHT = (
 IMAGES_DIR = "images"
 #: Сколько картинок максимум показываем за одну сказку (задача 0228: 6–10).
 MAX_IMAGES = 10
+#: Выше этой доли площади текст в скане — не иллюстрация, а страница текста
+#: (задача 0232). Значение измеряет ``tools/image_text_coverage.swift``.
+MAX_TEXT_COVERAGE = 12.0
 _IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 
 #: Готовые записи сказок (задача 0223): ``audio/<slug>.mp3|ogg``.
@@ -638,6 +642,142 @@ def _image_positions(text: str, count: int) -> list[int]:
     last = len(candidates) - 1
     indices = [round(index * last / (count - 1)) for index in range(count)]
     return [candidates[index] for index in indices]
+
+
+def _load_image_tags(
+    directory: Path,
+) -> dict[str, tuple[tuple[str, ...], float]]:
+    """Теги картинок из ``tags.json``: файл → (слова, доля текста OCR).
+
+    Формат (задача 0232)::
+
+        {"01.jpg": {"who": ["колобок"], "what": ["катится"],
+                    "where": ["дорога"], "text_pct": 0.0}}
+
+    ``text_pct`` — измеренная Vision доля площади с текстом; она нужна, чтобы
+    скан страницы не попал в ответ, даже если файл случайно оставили. Нет
+    файла или он битый — тегов нет, работает прежний порядок.
+    """
+    path = directory / "tags.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, tuple[tuple[str, ...], float]] = {}
+    for name, entry in raw.items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
+            continue
+        terms: list[str] = []
+        for key in ("who", "what", "where"):
+            values = entry.get(key)
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                if isinstance(value, str):
+                    terms.extend(_words(value))
+        try:
+            text_pct = float(entry.get("text_pct", 0.0))
+        except (TypeError, ValueError):
+            text_pct = 0.0
+        result[name] = (tuple(dict.fromkeys(terms)), text_pct)
+    return result
+
+
+def _match_score(terms: Sequence[str], words: Sequence[str]) -> int:
+    """Сколько тегов картинки встречается в словах абзаца."""
+    return sum(
+        1
+        for term in terms
+        if any(_same_root(term, word) for word in words)
+    )
+
+
+def _assign_images(
+    text: str,
+    names: Sequence[str],
+    tags: dict[str, tuple[tuple[str, ...], float]],
+) -> list[tuple[str, int]]:
+    """Подобрать картинки к абзацам по смыслу, сохранив порядок сказки.
+
+    Для каждой картинки считается пересечение её тегов со словами абзаца.
+    Затем динамическим программированием выбирается строго возрастающая
+    последовательность абзацев (по одной картинке на абзац), максимизирующая
+    сумму совпадений. Порядок картинок при этом сохраняется, а при равных
+    совпадениях они равномерно расходятся по тексту — поэтому при пустых
+    тегах работает прежний порядок. Каждая картинка и граница — один раз.
+    """
+    paragraphs: list[tuple[int, str]] = []
+    offset = 0
+    for part in text.split("\n\n")[:-1]:
+        offset += len(part) + 2
+        if 0 < offset < len(text):
+            paragraphs.append((offset, part))
+    # Первый абзац — заставка «Слушай сказку…»; иллюстрация там не нужна.
+    if len(paragraphs) > 1:
+        paragraphs = paragraphs[1:]
+    if not paragraphs or not names:
+        return []
+
+    count = min(len(names), len(paragraphs))
+    names = list(names[:count])
+    paragraph_count = len(paragraphs)
+    words_by_paragraph = [set(_keywords(part)) for _, part in paragraphs]
+
+    # Оценка пары: совпадения тегов важнее порядка, но при равенстве
+    # поощряем позицию рядом с ожидаемой (равномерной) для этой картинки.
+    base = paragraph_count + 1
+    expected = [
+        round(index * (paragraph_count - 1) / (count - 1))
+        if count > 1
+        else (paragraph_count - 1) // 2
+        for index in range(count)
+    ]
+
+    def weight(image_index: int, paragraph_index: int) -> int:
+        terms = tags.get(names[image_index], ((), 0.0))[0]
+        score = _match_score(terms, words_by_paragraph[paragraph_index])
+        spacing = paragraph_count - abs(paragraph_index - expected[image_index])
+        return score * base + spacing
+
+    negative = -10**9
+    dp = [[negative] * paragraph_count for _ in range(count)]
+    previous = [[-1] * paragraph_count for _ in range(count)]
+    for paragraph_index in range(paragraph_count):
+        dp[0][paragraph_index] = weight(0, paragraph_index)
+
+    for image_index in range(1, count):
+        best_value = negative
+        best_paragraph = -1
+        for paragraph_index in range(paragraph_count):
+            if paragraph_index:
+                candidate = dp[image_index - 1][paragraph_index - 1]
+                if candidate > best_value:
+                    best_value = candidate
+                    best_paragraph = paragraph_index - 1
+            if best_paragraph >= 0:
+                dp[image_index][paragraph_index] = (
+                    best_value + weight(image_index, paragraph_index)
+                )
+                previous[image_index][paragraph_index] = best_paragraph
+
+    final_paragraph = max(
+        range(count - 1, paragraph_count),
+        key=lambda index: dp[count - 1][index],
+        default=-1,
+    )
+    if final_paragraph < 0 or dp[count - 1][final_paragraph] == negative:
+        return []
+
+    chosen: list[tuple[str, int]] = []
+    paragraph_index = final_paragraph
+    for image_index in range(count - 1, -1, -1):
+        chosen.append((names[image_index], paragraphs[paragraph_index][0]))
+        paragraph_index = previous[image_index][paragraph_index]
+    chosen.reverse()
+    return chosen
+
 
 
 class FairyTalesPlugin:
@@ -1531,7 +1671,13 @@ class FairyTalesPlugin:
     def images_for(
         self, tale: Tale, text: str, ctx: PluginContext | None = None
     ) -> list[dict[str, object]]:
-        """Иллюстрации сказки из ``images/<slug>/`` по порядку имён файлов.
+        """Иллюстрации сказки, подобранные к абзацам по тегам.
+
+        ``tags.json`` описывает каждую картинку словами ``who``/``what``/
+        ``where``; для абзаца берётся картинка с наибольшим пересечением
+        тегов и слов, без повторов. Картинки без совпадений получают
+        оставшиеся границы абзацев по порядку. Сканы с долей текста выше
+        :data:`MAX_TEXT_COVERAGE` не показываются вовсе.
 
         Пути — относительно каталога плагина; ``after_chars`` привязан к
         границам абзацев готового текста (задача 0228: до 10 картинок на
@@ -1549,12 +1695,17 @@ class FairyTalesPlugin:
         except OSError as exc:  # pragma: no cover - странная ФС
             self._log(ctx, "иллюстрации %s не прочитаны: %s", tale.slug, exc)
             return []
-        names = names[:MAX_IMAGES]
+        tags = _load_image_tags(directory)
+        names = [
+            name
+            for name in names
+            if tags.get(name, ((), 0.0))[1] <= MAX_TEXT_COVERAGE
+        ][:MAX_IMAGES]
         if not names:
             return []
-        positions = _image_positions(text, len(names))
+        selected = _assign_images(text, names, tags)
         images: list[dict[str, object]] = []
-        for order, (name, after) in enumerate(zip(names, positions), start=1):
+        for order, (name, after) in enumerate(selected, start=1):
             images.append(
                 {
                     "path": f"{IMAGES_DIR}/{slug}/{name}",

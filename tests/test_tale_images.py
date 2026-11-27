@@ -277,6 +277,176 @@ class TestIllustrationSets(unittest.TestCase):
                     f"{image_slug}: строки таблицы должны содержать автора и файл",
                 )
                 self.assertIn("commons.wikimedia.org", section)
+                self.assertIn("Доля текста (OCR), %", section)
+                rows = [
+                    line for line in section.splitlines()
+                    if line.startswith("| `") and ".jpg`" in line
+                ]
+                self.assertTrue(rows, f"{image_slug}: нет строк таблицы")
+                for line in rows:
+                    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+                    self.assertGreaterEqual(len(cells), 6, line)
+                    self.assertLessEqual(
+                        float(cells[4]),
+                        12.0,
+                        f"{image_slug}: в credits доля текста > 12 %",
+                    )
+
+    def test_credits_list_removed_scans(self) -> None:
+        raw = (PLUGIN_DIR / "images" / "credits.md").read_text(encoding="utf-8")
+        self.assertIn("Удалённые и заменённые сканы", raw)
+        self.assertIn("13 сканов", raw)
+        self.assertGreaterEqual(raw.count("| удалён |"), 13)
+
+    def test_tags_json_valid_for_all_tales(self) -> None:
+        """У каждой сказки tags.json покрывает все файлы и не врёт про OCR."""
+        for slug, image_slug in TALE_IMAGE_SLUGS.items():
+            with self.subTest(slug=slug):
+                directory = PLUGIN_DIR / "images" / image_slug
+                tags_path = directory / "tags.json"
+                self.assertTrue(tags_path.is_file(), f"нет {tags_path}")
+                data = json.loads(tags_path.read_text(encoding="utf-8"))
+                files = sorted(path.name for path in directory.glob("*.jpg"))
+                self.assertEqual(sorted(data), files, "tags.json не покрывает файлы")
+                for name, entry in data.items():
+                    self.assertIsInstance(entry, dict, name)
+                    for key in ("who", "what", "where"):
+                        values = entry.get(key)
+                        self.assertIsInstance(values, list, f"{name}: {key}")
+                        self.assertTrue(
+                            all(isinstance(value, str) and value for value in values),
+                            f"{name}: {key}",
+                        )
+                    self.assertTrue(
+                        entry["who"] or entry["what"] or entry["where"],
+                        f"{name}: пустые теги",
+                    )
+                    self.assertLessEqual(
+                        float(entry["text_pct"]),
+                        12.0,
+                        f"{name}: скан текста в наборе",
+                    )
+
+    def test_kolobok_rolling_image_is_in_rolling_paragraph(self) -> None:
+        """Картинка с тегом «катится» стоит там, где колобок покатился."""
+        tale = self.tales["kolobok"]
+        text = self.plugin.render(tale)
+        images = self.plugin.images_for(tale, text, self.ctx)
+        parts = text.split("\n\n")[:-1]
+        ends = paragraph_ends(text)
+        index = next(
+            position
+            for position, part in enumerate(parts)
+            if "да вдруг и покатился" in part
+        )
+        image = next(
+            image for image in images if image["after_chars"] == ends[index]
+        )
+        name = str(image["path"]).rsplit("/", 1)[-1]
+        tags = json.loads(
+            (PLUGIN_DIR / "images" / "kolobok" / "tags.json").read_text(
+                encoding="utf-8"
+            )
+        )[name]
+        words = set(tags["who"]) | set(tags["what"]) | set(tags["where"])
+        self.assertTrue(
+            {"катится", "покатился", "дорога"} & words,
+            f"{name}: нет тега движения, слова: {words}",
+        )
+
+        final = next(
+            position
+            for position, part in enumerate(parts)
+            if "ам его" in part
+        )
+        final_image = next(
+            image for image in images if image["after_chars"] == ends[final]
+        )
+        final_name = str(final_image["path"]).rsplit("/", 1)[-1]
+        final_tags = json.loads(
+            (PLUGIN_DIR / "images" / "kolobok" / "tags.json").read_text(
+                encoding="utf-8"
+            )
+        )[final_name]
+        final_words = (
+            set(final_tags["who"])
+            | set(final_tags["what"])
+            | set(final_tags["where"])
+        )
+        self.assertIn("съела", final_words)
+
+    def test_repka_mouse_image_is_in_mouse_paragraph(self) -> None:
+        """На «Репке» картинка с мышкой стоит в абзаце, где зовут мышку."""
+        tale = self.tales["repka"]
+        text = self.plugin.render(tale)
+        images = self.plugin.images_for(tale, text, self.ctx)
+        parts = text.split("\n\n")[:-1]
+        ends = paragraph_ends(text)
+        index = next(
+            position
+            for position, part in enumerate(parts)
+            if "Позвала кошка мышку" in part
+        )
+        image = next(
+            image for image in images if image["after_chars"] == ends[index]
+        )
+        name = str(image["path"]).rsplit("/", 1)[-1]
+        tags = json.loads(
+            (PLUGIN_DIR / "images" / "repka" / "tags.json").read_text(
+                encoding="utf-8"
+            )
+        )[name]
+        words = set(tags["who"]) | set(tags["what"]) | set(tags["where"])
+        self.assertTrue({"мышка", "мышь", "кошка"} & words, words)
+
+    def test_text_scan_is_filtered_out(self) -> None:
+        """Файл с text_pct > 12 не попадает в ответ, даже если он в каталоге."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "images" / "kolobok"
+            directory.mkdir(parents=True)
+            data = {}
+            for index in range(1, 9):
+                name = f"{index:02d}.jpg"
+                (directory / name).write_bytes(b"\xff\xd8test")
+                data[name] = {
+                    "who": ["колобок"],
+                    "what": ["катится"],
+                    "where": ["дорога"],
+                    "text_pct": 40.0 if index == 2 else 0.0,
+                }
+            (directory / "tags.json").write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
+            tale = self.tales["kolobok"]
+            text = self.plugin.render(tale)
+            images = self.plugin.images_for(tale, text, make_ctx(root))
+            names = [
+                str(image["path"]).rsplit("/", 1)[-1] for image in images
+            ]
+            self.assertNotIn("02.jpg", names)
+            self.assertEqual(len(names), 7)
+            self.assertEqual(names, [f"{index:02d}.jpg" for index in range(1, 9) if index != 2])
+
+    def test_empty_tags_keep_file_order(self) -> None:
+        """Без тегов картинки идут по порядку имён и не повторяются."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "images" / "kolobok"
+            directory.mkdir(parents=True)
+            for index in range(1, 9):
+                (directory / f"{index:02d}.jpg").write_bytes(b"\xff\xd8test")
+            (directory / "tags.json").write_text("{}", encoding="utf-8")
+            tale = self.tales["kolobok"]
+            text = self.plugin.render(tale)
+            images = self.plugin.images_for(tale, text, make_ctx(root))
+            names = [
+                str(image["path"]).rsplit("/", 1)[-1] for image in images
+            ]
+            self.assertEqual(names, [f"{index:02d}.jpg" for index in range(1, 9)])
+            positions = [int(image["after_chars"]) for image in images]
+            self.assertEqual(positions, sorted(positions))
+            self.assertEqual(len(positions), len(set(positions)))
 
     def test_total_size_below_25_mb(self) -> None:
         total = sum(
