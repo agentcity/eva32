@@ -1542,7 +1542,7 @@
   {
     "id": "0233",
     "title": "Справочник команд Евы",
-    "status": "in_progress",
+    "status": "done",
     "file": "0233-commands-doc.md",
     "assignee": "agent:commands-doc"
   }

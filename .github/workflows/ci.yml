@@ -79,6 +79,12 @@ jobs:
       - name: Docs freshness (tools/check_docs_dates.py)
         run: python3 tools/check_docs_dates.py
 
+      # Справочник команд (0233): docs/commands.md существует, «Актуально на»
+      # есть, упомянуты все плагины из config/plugins.json и ключевые фразы,
+      # разделы «чего не умеет»/«деградация» на месте, страница есть в индексе.
+      - name: Commands doc (tools/check_commands_doc.py)
+        run: python3 tools/check_commands_doc.py
+
       # Всё то же одной командой плюс проверка «Python-набор проходит после
       # make clean». Шаги выше дают точную локализацию падения, этот —
       # повторяемость на чистом дереве.

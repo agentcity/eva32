@@ -25,7 +25,10 @@
      стороны: «быстрее» значит, что эталон устарел).
   4. Реестр задач: `python3 tools/check_tasks.py`.
   5. Документация VTM: `python3 tools/check_vtm_docs.py`.
-  6. Чистота: `make -C src/vtm clean` и ещё раз Python-набор. Ни один тест не
+  6. Справочник команд: `python3 tools/check_commands_doc.py` — страница
+     `docs/commands.md` существует, дата на месте, упомянуты все плагины из
+     `config/plugins.json` и ключевые фразы, страница есть в индексе `docs/`.
+  7. Чистота: `make -C src/vtm clean` и ещё раз Python-набор. Ни один тест не
      должен требовать собранных артефактов: на чистом клоне набор обязан
      проходить (пусть и со скипами), а не падать.
 
@@ -292,7 +295,7 @@ def step_python(verbose: bool) -> Outcome:
 
 
 def step_script(verbose: bool, title: str, script: str) -> Outcome:
-    """Шаг-скрипт: tools/check_tasks.py или tools/check_vtm_docs.py."""
+    """Шаг-скрипт: tools/check_tasks.py, check_vtm_docs.py, check_commands_doc.py."""
     rc, seconds, output = run_command([PYTHON, script], verbose=verbose)
     if rc != 0:
         return Outcome(title, "fail", seconds, "проверка вернула ошибку", output)
@@ -300,7 +303,7 @@ def step_script(verbose: bool, title: str, script: str) -> Outcome:
 
 
 def step_artifact_free(verbose: bool) -> Outcome:
-    """Шаг 5: Python-набор не требует собранных артефактов."""
+    """Шаг 7: Python-набор не требует собранных артефактов."""
     title = "Python без артефактов (после make clean)"
 
     rc, seconds, output = run_command(
@@ -908,7 +911,7 @@ def main(argv: list[str] | None = None) -> int:
 
     check_artifacts = not args.no_artifact_check
     check_perf = not args.skip_perf
-    total = 4 + (1 if check_perf else 0) + (1 if check_artifacts else 0)
+    total = 5 + (1 if check_perf else 0) + (1 if check_artifacts else 0)
 
     outcomes: list[Outcome] = []
     index = 0
@@ -958,7 +961,21 @@ def main(argv: list[str] | None = None) -> int:
     outcomes.append(outcome)
     report(outcome)
 
-    # 6. Чистота: набор не должен зависеть от собранных артефактов.
+    # 6. Справочник команд: страница «что умеет, на какие фразы, как отвечает»
+    # обязана упоминать все включённые плагины и ключевые фразы. Без этого
+    # шага документ тихо отстаёт от кода, а проверка «источник правды — код»
+    # держится только на внимательности.
+    index += 1
+    banner(index, total, "Справочник команд: tools/check_commands_doc.py")
+    outcome = step_script(
+        args.verbose,
+        "docs: check_commands_doc.py",
+        "tools/check_commands_doc.py",
+    )
+    outcomes.append(outcome)
+    report(outcome)
+
+    # 7. Чистота: набор не должен зависеть от собранных артефактов.
     if check_artifacts:
         index += 1
         banner(index, total, "Python без артефактов (после make clean)")
