@@ -1538,5 +1538,12 @@
     "status": "in_progress",
     "file": "0232-images-by-plot.md",
     "assignee": "agent:plot-images"
+  },
+  {
+    "id": "0233",
+    "title": "Справочник команд Евы",
+    "status": "in_progress",
+    "file": "0233-commands-doc.md",
+    "assignee": "agent:commands-doc"
   }
 ]
