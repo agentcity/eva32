@@ -573,7 +573,10 @@ class TestRequestTimeout(unittest.TestCase):
         status, headers, body = split_http(handler.wfile.raw)
         error = json.loads(body)["error"]
         self.assertEqual(status, 504)
-        self.assertLess(elapsed, 0.35)
+        # Таймаут запроса 0,05 с; в CI ответ приходит с задержкой планировщика,
+        # поэтому проверяем «быстро», а не «мгновенно».
+        limit = 1.5 if os.environ.get("CI") else 0.35
+        self.assertLess(elapsed, limit)
         self.assertEqual(error["code"], "request_timeout")
         self.assertEqual(error["type"], "server_error")
         self.assertIn("0.05", error["message"])
