@@ -863,6 +863,32 @@ class PluginRegistry:
             bindings.append(AnswerBinding(plugin_id=record.id, run=run, ctx=record.ctx))
         return bindings
 
+    def audio_playing(self) -> list[str]:
+        """Плагины, у которых прямо сейчас играет звук (музыка, сказка).
+
+        Приложение глушит по этому признаку микрофон: пока звучит музыка или
+        запись сказки, распознавание принимает слова песни за речь (0236).
+        Ошибка плагина не считается «играет» — лучше пусть микрофон работает,
+        чем Ева замолчит навсегда.
+        """
+        playing: list[str] = []
+        for binding in self.answers():
+            probe = getattr(binding.ctx, "obj", None) or getattr(
+                binding, "obj", None
+            )
+            run = getattr(binding, "run", None)
+            owner = getattr(run, "__self__", None)
+            probe = owner if owner is not None else probe
+            checker = getattr(probe, "audio_active", None)
+            if not callable(checker):
+                continue
+            try:
+                if checker():
+                    playing.append(binding.plugin_id)
+            except Exception:  # noqa: BLE001
+                logger.debug("плагин %s: audio_active упал", binding.plugin_id)
+        return playing
+
     def run_answer(self, question: str) -> str | dict[str, Any] | None:
         """Первый плагин, который ответил сам; ``None`` — пусть отвечает модель.
 

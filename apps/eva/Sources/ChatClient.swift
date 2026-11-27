@@ -234,6 +234,27 @@ final class ChatSession {
     ///
     /// Возвращает короткую строку для журнала; сетевые ошибки глотаются —
     /// «Стоп» уже сработал локально.
+    /// Играет ли на Mac внешнее аудио (музыка, запись сказки).
+    /// Пока играет — микрофон не должен слушать: слова песни распознаются
+    /// как речь пользователя (0236).
+    nonisolated static func activeAudioRemote(base: URL) async -> [String] {
+        var request = URLRequest(url: base.appendingPathComponent("api/audio/active"))
+        request.httpMethod = "GET"
+        request.timeoutInterval = 2
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let plugins = object["plugins"] as? [String]
+            {
+                return plugins
+            }
+        } catch {
+            // Сервер не ответил — считаем, что ничего не играет: иначе Ева
+            // замолчит навсегда из-за одной сетевой ошибки.
+        }
+        return []
+    }
+
     /// Остановить внешнее воспроизведение на Mac (запись сказки, музыка,
     /// радио). Эти звуки играет сервер через afplay/Music.app — «Стоп, Ева»
     /// их не остановит, если не позвать `/api/audio/stop` (0225).

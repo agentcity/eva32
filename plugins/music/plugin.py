@@ -560,6 +560,13 @@ class MusicPlugin:
 
     # -- Music.app -----------------------------------------------------------
 
+    def _mark_playing(self, action: str) -> None:
+        """Запомнить, играет ли Music.app (без чтения состояния по TCC)."""
+        if action in ("play", "resume", "next", "prev"):
+            self._music_playing = True
+        elif action in ("pause", "stop"):
+            self._music_playing = False
+
     def _simple(self, ctx: PluginContext, action: str, text: str) -> str:
         script = {
             "play": _PLAY_SCRIPT,
@@ -573,6 +580,7 @@ class MusicPlugin:
             self._osascript(ctx, script)
         except MusicUnavailable as exc:
             return _friendly_error(exc)
+        self._mark_playing(action)
         return text
 
     def _volume(self, ctx: PluginContext, *, up: bool) -> str:
@@ -731,6 +739,19 @@ class MusicPlugin:
             if any(alias in text or text in alias for alias in station.aliases):
                 return station
         return None
+
+    def audio_active(self) -> bool:
+        """Играет ли музыка/радио прямо сейчас (для подавления микрофона).
+
+        Пока звучит музыка, микрофон слышит слова песни и принимает их за речь
+        пользователя (жалоба: «считывает слова из музыки»). Приложение
+        опрашивает это состояние и глушит ожидание/ follow-up.
+        """
+        if self._radio_active():
+            return True
+        # Music.app: прав на чтение состояния может не быть (TCC), поэтому
+        # доверяем своей памяти: play/resume → играет, pause/stop → нет.
+        return bool(getattr(self, "_music_playing", False))
 
     def _radio_active(self) -> bool:
         process = self._radio

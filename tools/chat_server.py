@@ -4949,6 +4949,15 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(200, system_snapshot())
             elif path == "/api/plugins":
                 self._send_json(200, self.server.plugins.as_dict())
+            elif path == "/api/audio/active":
+                try:
+                    playing = self.server.plugins.audio_playing()
+                except Exception:  # noqa: BLE001
+                    logger.exception("аудио: опрос состояния упал")
+                    playing = []
+                self._send_json(
+                    200, {"active": bool(playing), "plugins": playing}
+                )
             elif path == "/health":
                 self._send_json(200, {"status": "ok"})
             elif path == "/favicon.ico":
@@ -4998,6 +5007,9 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/plugins":
                 self._handle_plugins()
+                return
+            if path == "/api/audio/active":
+                self._handle_audio_active()
                 return
             if path == "/api/audio/stop":
                 self._handle_audio_stop()
@@ -5361,6 +5373,20 @@ class ChatRequestHandler(BaseHTTPRequestHandler):
         )
 
     # -- плагины (задача 0209) -----------------------------------------------
+
+    def _handle_audio_active(self) -> None:
+        """``GET /api/audio/active`` — играет ли внешнее аудио.
+
+        Приложение опрашивает этот эндпоинт и глушит микрофон, пока звучит
+        музыка или запись сказки: иначе распознавание принимает слова песни
+        за речь пользователя (0236).
+        """
+        try:
+            playing = self.server.plugins.audio_playing()
+        except Exception:  # noqa: BLE001 - состояние не должно ломать запрос
+            logger.exception("аудио: опрос состояния упал")
+            playing = []
+        self._send_json(200, {"active": bool(playing), "plugins": playing})
 
     def _handle_audio_stop(self) -> None:
         """Остановить внешнее воспроизведение (запись сказки, музыка, радио).

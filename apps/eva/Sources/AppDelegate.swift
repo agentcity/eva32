@@ -56,6 +56,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // включено: иначе микрофон после ответа не появляется вовсе.
     /// SSE-поток закрыт (ответ дочитан); озвучка может ещё играть.
     private var answerEnded = false
+    /// Играет ли внешнее аудио на Mac (музыка, запись сказки). Опрашивается у
+    /// сервера: пока звучит песня, микрофон слышит её слова и принимает за
+    /// речь — ожидание «Привет, Ева» и follow-up должны молчать (0236).
+    private var externalAudioPlaying = false
+    private var audioPoll: Task<Void, Never>?
     /// Намерение открыть follow-up: ждём, пока смолкнет голос Евы.
     private var followUpArmed = false
     /// Текущая запись — follow-up (для журнала и приглушённого круга).
@@ -86,6 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Запуск
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        startAudioPolling()
         Settings.shared.registerDefaults()
         NSApp.setActivationPolicy(.accessory)
         buildMainMenu()
@@ -914,6 +920,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Опрос «играет ли внешнее аудио» раз в 3 с. Дешёвый GET, зато микрофон
+    /// не ловит слова песни. Ошибки сервера = «не играет».
+    private func startAudioPolling() {
+        audioPoll?.cancel()
+        audioPoll = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard let self, !self.isTerminating else { return }
+                guard let server = self.effectiveServerURL else { continue }
+                let playing = await ChatSession.activeAudioRemote(base: server)
+                let active = !playing.isEmpty
+                guard active != self.externalAudioPlaying else { continue }
+                self.externalAudioPlaying = active
+                log(active
+                    ? "аудио: играет \(playing.joined(separator: ", ")) — микрофон молчит"
+                    : "аудио: тишина — микрофон можно включать")
+                self.applyListeners("внешнее аудио")
+            }
+        }
+    }
+
     private func applyListeners(_ reason: String) {
         guard !isTerminating else { return }
         let plan = AppDelegate.listenerPlan(
@@ -926,7 +953,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             isThinking: awaitingFirstToken || awaitingAudio,
             followUpArmed: followUpArmed,
             errorActive: errorActive,
-            externalAudio: answer.isSilentAnswer
+            externalAudio: answer.isSilentAnswer || externalAudioPlaying
         )
         // Сначала отпускаем микрофон теми, кому он больше не нужен, и только
         // потом поднимаем нужный: два `AVAudioEngine` не должны пересечься.
@@ -969,7 +996,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isSpeaking, answer.voiceIsIdle else { return }
         // Внешнее аудио (запись сказки, музыка) не должно попадать в микрофон:
         // иначе Ева «слышит» сказку и считает её речью пользователя (0226).
-        guard !answer.isSilentAnswer else {
+        guard !answer.isSilentAnswer, !externalAudioPlaying else {
             log("follow-up: отложен — играет внешняя запись")
             followUpArmed = false
             return

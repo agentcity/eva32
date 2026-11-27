@@ -1204,6 +1204,16 @@ class FairyTalesPlugin:
                 return Path(plugin_dir)
         return Path(__file__).resolve().parent
 
+    def audio_active(self) -> bool:
+        """Играет ли запись сказки сейчас (микрофон должен молчать)."""
+        process = self._audio_process
+        if process is None:
+            return False
+        try:
+            return not self._audio_exited(process)
+        except Exception:  # noqa: BLE001
+            return False
+
     def _audio_file(
         self, ctx: PluginContext | None, tale: Tale
     ) -> Path | None:
