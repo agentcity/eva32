@@ -283,3 +283,9 @@ export/
 /model.vtm
 vendor/piper/
 vendor/piper-py/
+
+# Скачиваемые зависимости голоса: torch (~780 МБ) и модель Silero (~40 МБ).
+# Ставятся скриптами tools/install_silero.sh; в git не идут — это артефакты,
+# а не исходники. См. vendor/README.md.
+vendor/torch-py/
+vendor/silero/
