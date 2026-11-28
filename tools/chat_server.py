@@ -2130,7 +2130,7 @@ def _validate_model_target(
     if not isinstance(model_id, str) or not model_id.strip():
         raise ClientError(
             "Поле model: нужен id модели из реестра (например, "
-            "runs/q4/3b-q4_1.vtm)."
+            "runs/q4/3b-q4k.vtm)."
         )
     registry = _refresh_registry(server)
     catalog = {backend.id: backend for backend in registry}
