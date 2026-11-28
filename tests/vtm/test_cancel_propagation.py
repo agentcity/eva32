@@ -158,7 +158,9 @@ class TestCancelDecode(unittest.TestCase):
     def test_cancel_during_prefill_returns_fast(self) -> None:
         # Промпт длиннее пачки по умолчанию (256), чтобы отмена пришлась на
         # vtm_run_batch: до 0185 она ждала всю пачку.
-        prompt = [(index % 120) + 1 for index in range(400)]
+        # 800 токенов: пачки по 256, шанс попасть отменой в пачку выше, чем
+        # на 400 (на быстром раннере префилл успевал кончиться до «стопа»).
+        prompt = [(index % 120) + 1 for index in range(800)]
         backend = self._backend(cache_prefix=False)
         try:
             reference = backend.generate(prompt, max_new_tokens=16)

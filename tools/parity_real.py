@@ -118,7 +118,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 _HERE = Path(__file__).resolve().parent
 ROOT = _HERE.parent
@@ -874,7 +874,13 @@ def run_c_probe(
             f"C-проба не собралась (код {proc.returncode}):\n{tail(proc.stderr)}"
         )
     run_cmd = [str(binary), str(vtm_path), token_ids_arg(token_ids)]
-    proc = run_command(run_cmd)
+    # Эталон считается на CPU (Python), поэтому и C-пробу гоним CPU-путём:
+    # иначе на машине с Metal auto выбирает GPU и сравнение теряет смысл
+    # (на раннере GitHub macOS давало max|Δ| ≈ 1 — не побитово).
+    env = dict(os.environ)
+    env.setdefault("VTM_BACKEND", "simd")
+    env.setdefault("VTM_METAL_FORCE_FAIL", "1")
+    proc = run_command(run_cmd, env=env)
     if proc.returncode != 0:
         raise ParityError(
             f"C-проба не отработала (код {proc.returncode}):\n{tail(proc.stderr)}"
@@ -1540,12 +1546,14 @@ def run_command(
     *,
     cwd: Path = ROOT,
     timeout: float | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     print("[parity_real] $ " + shlex.join([str(part) for part in cmd]), flush=True)
     try:
         return subprocess.run(
             [str(part) for part in cmd],
             cwd=str(cwd),
+            env=env,
             capture_output=True,
             text=True,
             encoding="utf-8",

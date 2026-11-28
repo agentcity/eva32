@@ -231,7 +231,8 @@ class TestCurrencyRate(FreshTest):
         self.assertIn("USD", fact.data)
         self.assertIn("ЦБ РФ", fact.data)
         self.assertIsNone(fact.source)
-        self.assertEqual(format_fact(fact), f"[Факт: {fact.data}]")
+        # Задача 0212: служебной обёртки нет — её печатает секция СПРАВКА.
+        self.assertEqual(format_fact(fact), fact.data)
 
     def test_timeout_is_within_3_5_seconds(self):
         self.assertGreaterEqual(DEFAULT_TIMEOUT, 3.0)
@@ -414,13 +415,14 @@ class TestNormalize(FreshTest):
 
 class TestFormatFact(FreshTest):
     def test_with_source(self):
+        # Строка данных, а не блок: заголовок «СПРАВКА (…)» — у сама секции.
         self.assertEqual(
             format_fact(Fact("time", "26 ноября 2026, 15:30 MSK", "часы сервера")),
-            "[Факт: 26 ноября 2026, 15:30 MSK (источник: часы сервера)]",
+            "26 ноября 2026, 15:30 MSK (часы сервера)",
         )
 
     def test_without_source(self):
-        self.assertEqual(format_fact(Fact("stock", "нет данных")), "[Факт: нет данных]")
+        self.assertEqual(format_fact(Fact("stock", "нет данных")), "нет данных")
 
     def test_number_formatting(self):
         self.assertEqual(fresh.format_number(3244.5, 2), "3 244,50")
