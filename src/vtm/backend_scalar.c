@@ -12,6 +12,13 @@
 // _DARWIN_C_SOURCE нужен до первого include: на macOS sysconf(_SC_NPROCESSORS_ONLN)
 // спрятан за __DARWIN_C_FULL, а Makefile задаёт строгий _POSIX_C_SOURCE.
 // Константа нужна только для «по умолчанию — число ядер».
+// Linux/glibc: madvise() и MADV_WILLNEED объявлены только при _DEFAULT_SOURCE,
+// а Makefile задаёт строгий _POSIX_C_SOURCE=200809L. Без этого CI ubuntu
+// падал на «implicit declaration of madvise» и «MADV_WILLNEED undeclared».
+#if !defined(__APPLE__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE 1
+#endif
+
 #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
 #define _DARWIN_C_SOURCE 1
 #endif
@@ -1155,6 +1162,7 @@ typedef struct {
 #define VTM_Q4_PF 0
 #endif
 
+#if VTM_Q4_PF
 #define Q4_PF_CHUNKS 32                    // кусков в окне: пул режет по потокам
 #define Q4_PF_WINDOW ((size_t)256u << 20)  // байт вперёд за один запрос
 
@@ -1172,7 +1180,7 @@ static void q4_pf_worker(void *ctx, int tid, int r0, int r1) {
         size_t hi = (size_t)(i + 1) * j->bytes / Q4_PF_CHUNKS;
         uintptr_t a = ((uintptr_t)j->p + lo) & ~(uintptr_t)4095u;
         uintptr_t b = ((uintptr_t)j->p + hi + 4095u) & ~(uintptr_t)4095u;
-#if VTM_Q4_PF
+#if VTM_Q4_PF && defined(MADV_WILLNEED)
         (void)madvise((void *)a, (size_t)(b - a), MADV_WILLNEED);
 #else
         (void)a;
@@ -1180,6 +1188,7 @@ static void q4_pf_worker(void *ctx, int tid, int r0, int r1) {
 #endif
     }
 }
+#endif  /* VTM_Q4_PF */
 
 // p — начало Q4-тензора, bytes — его упакованные байты (не меньше окна, если
 // тензор больше окна). Окно запрашивается один раз, а дальше все тензоры
@@ -2276,7 +2285,7 @@ static void qk_tmv_neon_worker(void *p, int tid, int r0, int r1) {
 
 // VTM_Q4K_STRICT=1 (см. backend_neon.c) — эталонное f64-накопление: int8-путь
 // декода и батчевое ядро выключаются, всё идёт через qk_mm (double).
-static int q4k_strict_env(void) {
+static int VTM_MAYBE_UNUSED q4k_strict_env(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *st = getenv("VTM_Q4K_STRICT");
@@ -2401,7 +2410,7 @@ int vtm_q6k_dequant_row(float *y, const uint8_t *blocks, int64_t base,
 // VTM_Q4K_BATCH=0 — выключить батчевые ядра kind 6/7 целиком (A/B и откат).
 // VTM_Q4K_STRICT=1 — эталонное f64-накопление: ни int8, ни f32-пачка не
 // включаются, пачка идёт через qk_mm (double).
-static int q4k_batch_enabled(void) {
+static int VTM_MAYBE_UNUSED q4k_batch_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *e = getenv("VTM_Q4K_BATCH");
@@ -2416,7 +2425,7 @@ static int q4k_batch_enabled(void) {
 // VTM_Q4K_BATCH_I8=0 — f32-ядро 0167; 1/2/3 — int8 с явным числом плоскостей;
 // не задано — как у поштучного декода (vtm_q4k_i8_mode()), тогда пачка
 // побитово равна поштучному пути. Мусор в переменной — 0 (выключить int8).
-static int q4k_batch_i8_planes(void) {
+static int VTM_MAYBE_UNUSED q4k_batch_i8_planes(void) {
     static int env = -2;
 
     if (env == -2) {
@@ -2448,7 +2457,7 @@ extern int vtm_neon_qk_batch_i8_fast(float *y, const uint8_t *blocks,
 // Какое int8-ядро зовёт батчевый путь: 0 — точное (по умолчанию), 1 — быстрое.
 // VTM_Q4K_BATCH_KERNEL=fast — быстрое (A/B-замер и машины, где важнее
 // скорость: точность тогда как у f32-ядра 0167, Δlogits ~1e-4 к поштучному).
-static int q4k_batch_kernel_fast(void) {
+static int VTM_MAYBE_UNUSED q4k_batch_kernel_fast(void) {
     static int cached = -1;
 
     if (cached < 0) {

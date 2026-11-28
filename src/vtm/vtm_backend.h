@@ -628,3 +628,11 @@ void vtm_parallel_rows(int n, double work, vtm_rows_fn fn, void *ctx);
 #endif
 
 #endif // VTM_BACKEND_H
+
+// Атрибут «может быть не использована»: функция живёт под #if одной
+// платформы, а компилятор другой (gcc -Werror) считает её лишней.
+#if defined(__GNUC__) || defined(__clang__)
+#define VTM_MAYBE_UNUSED __attribute__((unused))
+#else
+#define VTM_MAYBE_UNUSED
+#endif
