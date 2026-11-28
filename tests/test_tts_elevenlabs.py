@@ -58,6 +58,19 @@ def _env(**overrides: str) -> dict[str, str]:
     return base
 
 
+def _has_system_tts() -> bool:
+    """Есть ли на машине системный синтез: say (macOS) или espeak (Linux).
+
+    Тесты запасного пути рассчитаны на `say` и на реальный вывод espeak;
+    в окружении без них честнее пропустить, чем требовать установки пакетов.
+    """
+    import shutil
+    return any(shutil.which(name) for name in ("say", "espeak-ng", "espeak"))
+
+
+HAS_SYSTEM_TTS = _has_system_tts()
+
+
 class FakeResponse:
     """Минимальный ответ ``urlopen``: read/headers/status/close."""
 
@@ -413,6 +426,7 @@ class EngineSelectionElevenLabsTests(unittest.TestCase):
         self.assertIsInstance(engine, tts.ElevenLabsTTS)
         self.assertEqual(engine.name, "elevenlabs")
 
+    @unittest.skipUnless(HAS_SYSTEM_TTS, "нет системного TTS (say/espeak)")
     def test_auto_without_key_uses_system_not_piper(self):
         # Без ключа Silero не установлен (env изолирован), Piper не в авто.
         env = {"PIPER_BIN": str(self.piper_bin), "PIPER_MODEL": str(self.model)}
@@ -457,6 +471,7 @@ class ElevenLabsFallbackTests(unittest.TestCase):
     def tearDown(self) -> None:
         tts.clear_elevenlabs_cache()
 
+    @unittest.skipUnless(HAS_SYSTEM_TTS, "нет системного TTS (say/espeak)")
     def test_401_falls_back_to_system_and_logs_without_key(self):
         http = FakeHTTP(
             urllib.error.HTTPError(
@@ -478,6 +493,7 @@ class ElevenLabsFallbackTests(unittest.TestCase):
         self.assertIn("откат на system", joined)
         self.assertNotIn(API_KEY, joined)
 
+    @unittest.skipUnless(HAS_SYSTEM_TTS, "нет системного TTS (say/espeak)")
     def test_429_falls_back_to_system(self):
         http = FakeHTTP(
             urllib.error.HTTPError(
@@ -490,6 +506,7 @@ class ElevenLabsFallbackTests(unittest.TestCase):
             data = tts.synthesize("Привет", env=self.env)
         self.assertTrue(data.startswith(b"RIFF"))
 
+    @unittest.skipUnless(HAS_SYSTEM_TTS, "нет системного TTS (say/espeak)")
     def test_timeout_falls_back_to_system(self):
         http = FakeHTTP(TimeoutError("timed out"))
         fake, _ = fake_popen()
@@ -498,6 +515,7 @@ class ElevenLabsFallbackTests(unittest.TestCase):
             data = tts.synthesize("Привет", env=self.env)
         self.assertTrue(data.startswith(b"RIFF"))
 
+    @unittest.skipUnless(HAS_SYSTEM_TTS, "нет системного TTS (say/espeak)")
     def test_explicit_elevenlabs_without_key_falls_back_to_system(self):
         # env без ключа: явный ElevenLabs недоступен, должен уйти на system.
         env = {
@@ -509,6 +527,7 @@ class ElevenLabsFallbackTests(unittest.TestCase):
             data = tts.synthesize("Привет", prefer="elevenlabs", env=env)
         self.assertTrue(data.startswith(b"RIFF"))
 
+    @unittest.skipUnless(HAS_SYSTEM_TTS, "нет системного TTS (say/espeak)")
     def test_synthesize_audio_reports_wav_after_fallback(self):
         http = FakeHTTP(TimeoutError("timed out"))
         fake, _ = fake_popen()

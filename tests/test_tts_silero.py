@@ -54,6 +54,19 @@ from tools import silero_worker  # noqa: E402
 FAKE_WAV = b"RIFF" + b"\x00" * 9000
 
 
+def _has_system_tts() -> bool:
+    """Есть ли на машине системный синтез: say (macOS) или espeak (Linux).
+
+    Тесты запасного пути рассчитаны на `say` и на реальный вывод espeak;
+    в окружении без них честнее пропустить, чем требовать установки пакетов.
+    """
+    import shutil
+    return any(shutil.which(name) for name in ("say", "espeak-ng", "espeak"))
+
+
+HAS_SYSTEM_TTS = _has_system_tts()
+
+
 def make_executable(path: Path) -> Path:
     """Пустой исполняемый файл — заглушка бинаря/интерпретатора."""
     path.write_bytes(b"#!/bin/sh\nexit 0\n")
@@ -498,6 +511,7 @@ class SileroSelectionTests(InstalledSileroCase):
         engine = tts.select_engine(env=env)
         self.assertIsInstance(engine, tts.ElevenLabsTTS)
 
+    @unittest.skipUnless(HAS_SYSTEM_TTS, "нет системного TTS (say/espeak)")
     def test_without_silero_auto_uses_system_not_piper(self):
         # Задача 0197: даже с установленным Piper автовыбор идёт на system.
         empty = self.tmp / "empty-silero"
@@ -690,6 +704,7 @@ class SileroOneShotProcessTests(InstalledSileroCase):
                 )
         self.assertIn("не уложился", str(caught.exception))
 
+    @unittest.skipUnless(HAS_SYSTEM_TTS, "нет системного TTS (say/espeak)")
     def test_failed_silero_falls_back_to_system_and_logs(self):
         fake, calls, _, _ = fake_popen(fail_silero=True)
         env = {**self.silero_env, **self.piper_env, "SILERO_WORKER": "0"}
@@ -1004,6 +1019,7 @@ class SileroWorkerFailureTests(InstalledSileroCase):
         self.assertIn("перезапускаю", "\n".join(logs.output))
         self.assertEqual(tts.silero_worker_info()["pid"], created[1].pid)
 
+    @unittest.skipUnless(HAS_SYSTEM_TTS, "нет системного TTS (say/espeak)")
     def test_two_crashes_raise_and_fall_back_to_system(self):
         _, stats, created = self.install_fake(die_at={1, 2})
         env = {**self.silero_env, **self.piper_env}
@@ -1056,6 +1072,7 @@ class SileroWorkerFailureTests(InstalledSileroCase):
         self.assertEqual(len(created), 1)
         self.assertTrue(tts.silero_worker_info()["running"])
 
+    @unittest.skipUnless(HAS_SYSTEM_TTS, "нет системного TTS (say/espeak)")
     def test_failed_worker_start_falls_back_to_system(self):
         _, stats, created = self.install_fake(fail_start=True)
         env = {**self.silero_env, **self.piper_env}

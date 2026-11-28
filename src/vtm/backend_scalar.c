@@ -1838,6 +1838,10 @@ static int q4_batch_simd(float *y, const uint8_t *q, const float *scales,
 #if VTM_Q4_NEON
     return vtm_neon_q4_batch(y, q, scales, mins, x, rows, cols, ntok, asym);
 #else
+    // На платформе без NEON/AVX2 ядра нет: параметры нужны только для
+    // сигнатуры, иначе gcc с -Werror=unused-parameter ругается (CI ubuntu).
+    (void)y; (void)q; (void)scales; (void)mins; (void)x;
+    (void)rows; (void)cols; (void)ntok; (void)asym;
     return -1;
 #endif
 }
