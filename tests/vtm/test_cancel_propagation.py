@@ -180,16 +180,19 @@ class TestCancelDecode(unittest.TestCase):
 
             thread = threading.Thread(target=run, daemon=True)
             thread.start()
-            # Ждём, пока генерация реально начнётся (на медленном раннере
-            # 5 мс сна не хватало: отмена приходила ДО входа в generate, флаг
-            # не к чему было применить, и тест падал «отмена не сработала»).
+            # Отмену ставим в цикле, пока поток жив: `_busy` выставляется ДО
+            # входа в C, и первый cancel_active() мог вернуть False («C ещё не
+            # внутри generate»), после чего генерация спокойно доходила до
+            # конца — тест падал «отмена не сработала» (macOS-раннер).
             deadline = time.monotonic() + 10.0
-            while not backend.busy and time.monotonic() < deadline:
-                time.sleep(0.002)
-            # Дать префиллу начаться и нажать «стоп» на ходу.
-            time.sleep(0.005)
+            cancelled = False
+            while time.monotonic() < deadline and thread.is_alive():
+                if backend.cancel_active():
+                    cancelled = True
+                    break
+                time.sleep(0.001)
             cancel_at.append(time.monotonic())
-            backend.cancel_active()
+            self.assertTrue(cancelled, "отмена не принялась ни разу")
             stop_at.append(time.monotonic())
             self.assertTrue(finished.wait(5.0), "генерация не остановилась за 5 с")
             stop_at[0] = time.monotonic()
