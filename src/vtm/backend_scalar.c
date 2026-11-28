@@ -131,6 +131,32 @@ int vtm_metal_graph_attn(float *out, const float *q, const float *kc,
 void vtm_metal_stats_get(vtm_metal_stats *out) {
     if (out) memset(out, 0, sizeof *out);
 }
+// Арена пачки и батчевый GEMM без Metal: bench_backend.c зовёт эти функции
+// всегда, поэтому без заглушек сборка на Linux падала «undefined reference».
+int vtm_metal_qk_gemm_arena(int kind, const void *w, const float *scales,
+                            int rows, int cols, int n_tokens,
+                            const float *x, int x_stride,
+                            float *y, int y_stride) {
+    (void)kind; (void)w; (void)scales; (void)rows; (void)cols; (void)n_tokens;
+    (void)x; (void)x_stride; (void)y; (void)y_stride;
+    return 1;  // «не взял» — считаем CPU-путём
+}
+int vtm_metal_gemm_flush(void) { return 0; }
+int vtm_metal_batch_arena(const void *ptr, size_t bytes) {
+    (void)ptr; (void)bytes;
+    return -1;
+}
+void vtm_metal_batch_arena_drop(const void *ptr) { (void)ptr; }
+int vtm_metal_attn_prefill(float *out, const float *q, const float *kc,
+                           const float *vc, int n_heads, int n_kv_heads,
+                           int head_dim, int kv_dim, int win, int n_tokens,
+                           int pos0, int q_stride, int out_stride) {
+    (void)out; (void)q; (void)kc; (void)vc; (void)n_heads; (void)n_kv_heads;
+    (void)head_dim; (void)kv_dim; (void)win; (void)n_tokens; (void)pos0;
+    (void)q_stride; (void)out_stride;
+    return 1;
+}
+int vtm_metal_gemm_pad(void) { return 1; }
 #endif
 
 #include <math.h>
